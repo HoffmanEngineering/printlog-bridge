@@ -226,9 +226,12 @@ class SimulatedPrinter:
     def agents(self) -> list[dict[str, Any]]:
         return self.request("GET", "/server/extensions/list")["agents"]
 
-    def klippy_log(self, lines: int = 40) -> str:
-        log = "/home/printer/printer_data/logs/klippy.log"
-        return docker("exec", self.container, "tail", f"-{lines}", log, check=False)
+    def klippy_log(self, lines: int = 60) -> str:
+        """The lines of klippy.log that explain a print going wrong, without the stats."""
+        pattern = "pause|resum|print|sdcard|error|shutdown|timer|exception|gcode|echo|//|!!"
+        log = "~/printer_data/logs/klippy.log"
+        script = f"grep -iE '{pattern}' {log} | grep -v '^Stats' | tail -{lines}"
+        return docker("exec", self.container, "sh", "-c", script, check=False)
 
     def wait(self, condition, what: str, timeout: float) -> None:
         deadline = time.monotonic() + timeout
