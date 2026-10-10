@@ -43,3 +43,27 @@ jobs:
           code=$?
           cat out.txt
           test "$code" -eq 1 && grep -q "FAIL  Config" out.txt
+
+  integration:
+    # The bridge against a real Moonraker (no Klipper) in Docker. See tests/integration/.
+    name: integration (Moonraker ${{ matrix.moonraker.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        moonraker:
+          # The last release, which older printer firmware (Creality, Snapmaker) is closest to,
+          # and a recent master commit. Bump the commit deliberately; a test failing here means
+          # Moonraker changed something the bridge or tests/fake_moonraker.py relies on.
+          - { name: v0.9.3, ref: v0.9.3 }
+          - { name: master 2026-10, ref: 9e676eba6b02661a4dfa3ec6e7ac3f3504498e6d }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest -m integration -v
+        env:
+          MOONRAKER_REF: ${{ matrix.moonraker.ref }}

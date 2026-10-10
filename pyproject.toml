@@ -38,6 +38,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Integration tests start a real Moonraker in Docker: `pytest -m integration`.
+addopts = "-m 'not integration'"
+markers = ["integration: runs against a real Moonraker in Docker (needs Docker)"]
 
 [tool.ruff]
 target-version = "py39"

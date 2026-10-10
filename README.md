@@ -40,7 +40,9 @@ python -m venv .venv
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-CI runs both on Python 3.9 and 3.12. To support another kind of printer, see [docs/adapters.md](docs/adapters.md).
+CI runs both on Python 3.9 and 3.12.
+
+`pytest -m integration` runs the bridge against a real Moonraker, built from source in Docker (set `MOONRAKER_REF` to pick a tag or commit; the default is `v0.9.3`). The first run builds the image, which takes a minute or two. CI runs it against the last release and a pinned recent commit. To support another kind of printer, see [docs/adapters.md](docs/adapters.md).
 
 ## License
 
