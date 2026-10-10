@@ -50,4 +50,8 @@ Use timezone-aware `datetime`s.
 
 ## Tests
 
-Test against a real local server (`aiohttp.test_utils.TestServer`) rather than mocking your HTTP client. `tests/test_moonraker_adapter.py` is the pattern: config parsing, each `check()` outcome, and an unreachable printer.
+Test against a real local server rather than mocking your HTTP client, and make that server behave like the real printer, checked against one. `tests/fake_moonraker.py` speaks Moonraker's JSON-RPC over a WebSocket and over its Unix socket, including its authorization and its one-agent-per-name rule. `tests/test_moonraker_adapter.py` covers config parsing and each `check()` outcome; `tests/test_moonraker_session.py` covers the connection, reconnects and Klipper restarts.
+
+## The Moonraker adapter
+
+`adapters/moonraker/session.py` keeps one JSON-RPC connection open: the Unix socket in local mode (each message ends with an ETX byte, `0x03`), `ws://<printer>/websocket` in remote mode. On each connect it identifies as an agent, registers its remote methods, and subscribes to `print_stats`, `toolhead.extruder`, `virtual_sdcard`, `webhooks` and, when the printer has it, `filament_detect`. It subscribes again after every `notify_klippy_ready`, and reconnects with a backoff that doubles from 1 s to 60 s and resets after a good connection. `check()` asks `server.info` over that same connection, without identifying, so `doctor` tests the path `run` uses.

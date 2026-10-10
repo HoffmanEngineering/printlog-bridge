@@ -7,8 +7,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from aiohttp import web
-from aiohttp.test_utils import TestServer
+from fake_moonraker import FakeMoonraker, eventually
 
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.core.checks import Status
@@ -59,70 +58,49 @@ def test_unknown_option_is_an_error_so_typos_surface():
         MoonrakerAdapter.from_config("u1", {"ulr": "http://x"})
 
 
-async def _serve_server_info(handler):
-    app = web.Application()
-    app.router.add_get("/server/info", handler)
-    server = TestServer(app)
-    await server.start_server()
-    return server
+def check_against(fake: FakeMoonraker, options=lambda base: {"url": base}, printer="u1"):
+    """Runs a remote adapter's check() against `fake`."""
+
+    async def scenario():
+        base = await fake.start()
+        try:
+            return await MoonrakerAdapter.from_config(printer, options(base)).check()
+        finally:
+            await fake.close()
+
+    return asyncio.run(scenario())
 
 
 def test_check_reports_moonraker_reachable():
-    async def scenario():
-        async def info(_request):
-            return web.json_response(
-                {"result": {"klippy_state": "ready", "moonraker_version": "v0.9.3"}}
-            )
+    fake = FakeMoonraker()
 
-        server = await _serve_server_info(info)
-        try:
-            adapter = MoonrakerAdapter.from_config(
-                "u1", {"url": str(server.make_url("/")).rstrip("/")}
-            )
-            return await adapter.check()
-        finally:
-            await server.close()
-
-    [result] = asyncio.run(scenario())
+    [result] = check_against(fake)
 
     assert result.status is Status.OK
     assert result.name == "Printer u1"
-    assert "Moonraker v0.9.3" in result.detail
+    assert "Moonraker v0.9.3-fake" in result.detail
     assert "Klipper ready" in result.detail
 
 
+def test_check_does_not_register_doctor_as_the_agent():
+    fake = FakeMoonraker()
+
+    check_against(fake)
+
+    assert fake.identified == []
+
+
 def test_check_warns_when_klipper_is_not_ready():
-    async def scenario():
-        async def info(_request):
-            return web.json_response({"result": {"klippy_state": "shutdown"}})
-
-        server = await _serve_server_info(info)
-        try:
-            adapter = MoonrakerAdapter.from_config("u1", {"url": str(server.make_url("/"))})
-            return await adapter.check()
-        finally:
-            await server.close()
-
-    [result] = asyncio.run(scenario())
+    [result] = check_against(FakeMoonraker(klippy_state="shutdown"))
 
     assert result.status is Status.WARN
     assert "Klipper shutdown" in result.detail
 
 
-def test_check_uses_the_websocket_urls_host():
-    async def scenario():
-        async def info(_request):
-            return web.json_response({"result": {"klippy_state": "ready"}})
-
-        server = await _serve_server_info(info)
-        try:
-            ws_url = str(server.make_url("/websocket")).replace("http://", "ws://")
-            adapter = MoonrakerAdapter.from_config("u1", {"url": ws_url})
-            return await adapter.check()
-        finally:
-            await server.close()
-
-    [result] = asyncio.run(scenario())
+def test_check_accepts_the_websocket_url():
+    [result] = check_against(
+        FakeMoonraker(), lambda base: {"url": base.replace("http://", "ws://") + "/websocket"}
+    )
 
     assert result.status is Status.OK
 
@@ -148,31 +126,77 @@ def test_check_fails_when_the_socket_is_missing(tmp_path):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets")
 def test_check_reaches_moonraker_over_its_unix_socket():
-    async def scenario(sock: str):
-        async def info(_request):
-            return web.json_response({"result": {"klippy_state": "ready"}})
+    """Moonraker's socket speaks JSON-RPC framed by ETX bytes, not HTTP."""
 
-        app = web.Application()
-        app.router.add_get("/server/info", info)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.UnixSite(runner, sock)
-        await site.start()
+    async def scenario(sock: str):
+        fake = FakeMoonraker()
+        await fake.start_unix(sock)
         try:
-            adapter = MoonrakerAdapter.from_config("voron", {"socket": sock})
-            return await adapter.check()
+            return await MoonrakerAdapter.from_config("voron", {"socket": sock}).check()
         finally:
-            await runner.cleanup()
+            await fake.close()
 
     # AF_UNIX paths are capped near 100 bytes, which pytest's tmp_path can exceed.
     with tempfile.TemporaryDirectory() as d:
         [result] = asyncio.run(scenario(os.path.join(d, "m.sock")))
 
+    assert result.status is Status.OK, result.detail
+    assert "Klipper ready" in result.detail
+
+
+def test_moonraker_api_key_is_read_for_remote_mode():
+    adapter = MoonrakerAdapter.from_config(
+        "u1", {"url": "http://u1.local", "moonraker_api_key": " abc123 "}
+    )
+
+    assert adapter.api_key == "abc123"
+
+
+def test_moonraker_api_key_is_refused_for_the_trusted_local_socket():
+    with pytest.raises(
+        ConfigError, match=r"\[printer voron\] moonraker_api_key is only for remote"
+    ):
+        MoonrakerAdapter.from_config("voron", {"moonraker_api_key": "abc123"})
+
+
+def test_check_sends_the_moonraker_api_key():
+    [result] = check_against(
+        FakeMoonraker(api_key="secret"), lambda base: {"url": base, "moonraker_api_key": "secret"}
+    )
+
     assert result.status is Status.OK
 
 
-def test_run_is_not_implemented_yet():
-    adapter = MoonrakerAdapter.from_config("u1", {"url": "http://u1.local"})
+@pytest.mark.parametrize("api_key", [None, "wrong"])
+def test_check_says_what_to_do_when_moonraker_refuses_the_bridge(api_key):
+    def options(base):
+        return {"url": base, **({"moonraker_api_key": api_key} if api_key else {})}
 
-    with pytest.raises(NotImplementedError, match="#3"):
-        asyncio.run(adapter.run(sink=None))
+    [result] = check_against(FakeMoonraker(api_key="secret"), options)
+
+    assert result.status is Status.FAIL
+    assert "rejected" in result.detail
+    assert "moonraker_api_key in [printer u1]" in result.detail
+    assert "trusted_clients" in result.detail
+
+
+def test_run_stays_connected_until_cancelled():
+    async def scenario():
+        fake = FakeMoonraker()
+        base = await fake.start()
+        try:
+            adapter = MoonrakerAdapter.from_config("u1", {"url": base})
+            task = asyncio.ensure_future(adapter.run(sink=None))
+            await eventually(lambda: fake.subscriptions)
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await eventually(lambda: fake.client_count == 0)
+            return fake
+        finally:
+            await fake.close()
+
+    fake = asyncio.run(scenario())
+
+    assert fake.identified[0]["client_name"] == "printlog-bridge"
