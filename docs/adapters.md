@@ -1,0 +1,53 @@
+# Writing an adapter
+
+An adapter watches one kind of printer and reports its jobs to the bridge. Moonraker (Klipper) is the first; PrusaLink, OctoPrint or anything else with an API can follow without a change to `core/`.
+
+## Where things live
+
+```
+src/printlog_bridge/
+  core/            printer-agnostic: config, events, API client, doctor
+  adapters/
+    __init__.py    ADAPTERS: the registry, by config name
+    moonraker/     the Klipper adapter
+  cli/             the printlog-bridge command
+```
+
+`core/` never imports from `adapters/`. The CLI hands the registry to `core` instead, and `tests/test_layout.py` fails if anything in `core/` imports an adapter.
+
+## Adding one
+
+1. Create `src/printlog_bridge/adapters/<name>/` with a subclass of `printlog_bridge.core.adapter.Adapter`.
+2. Add it to `ADAPTERS` in `src/printlog_bridge/adapters/__init__.py`, keyed by its `name`.
+3. Users select it per printer:
+
+   ```ini
+   [printer mk4]
+   adapter = prusalink
+   url = http://mk4.local
+   ```
+
+## The interface
+
+| Member | What it does |
+| --- | --- |
+| `name` | The value of `adapter = ...` in the config. Must match its key in `ADAPTERS`. |
+| `from_config(printer, options)` | Builds the adapter from its `[printer <name>]` section, minus `adapter`. Raise `ConfigError` for anything missing or invalid, naming the section and option. Do no I/O: `doctor` loads the config before checking anything, so a printer that's off must not stop the config from loading. Reject unknown options, so a typo surfaces instead of being ignored. |
+| `describe()` | One line for logs and `doctor`, such as `moonraker, remote http://u1.local:7125`. |
+| `check()` | Diagnostics for `doctor`: a list of `CheckResult`s named `Printer <name>`. Return `fail` when the bridge can't work (unreachable, wrong credentials), `warn` when it can but something needs attention (Klipper shut down). Don't raise; `doctor` reports an exception as a failed check, but your message will be better. |
+| `run(sink)` | Watches the printer until cancelled, awaiting `sink.emit(event)` for each job event, in order. Reconnect on your own after a dropped connection. Return only when cancelled. |
+
+## Events
+
+Adapters report jobs with the types in `printlog_bridge.core.events`, never with their printer's own vocabulary.
+
+- `JobStarted(printer, job_id, file_name, started_at)`
+- `JobFinished(printer, job_id, outcome, finished_at, duration_s, filament_mm)`, where `outcome` is a `JobOutcome` (`COMPLETED`, `CANCELLED` or `FAILED`) and `filament_mm` maps slot index to millimetres fed.
+
+`job_id` must be stable for the job's lifetime and unique on that printer, such as Moonraker's history `job_id`. The job lifecycle (#4) derives the API's external ID from it, so a replayed event after a restart is recognised instead of logged twice.
+
+Use timezone-aware `datetime`s.
+
+## Tests
+
+Test against a real local server (`aiohttp.test_utils.TestServer`) rather than mocking your HTTP client. `tests/test_moonraker_adapter.py` is the pattern: config parsing, each `check()` outcome, and an unreachable printer.
