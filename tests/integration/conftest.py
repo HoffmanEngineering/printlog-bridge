@@ -163,6 +163,13 @@ def own_moonraker(moonraker_image: str) -> Iterator[RealMoonraker]:
 
 KLIPPY_READY_TIMEOUT_S = 180
 
+# Klipper, a simulated printer board (simulavr) and Moonraker: Mainsail's virtual-klipper-printer,
+# pinned so a rebuild upstream can't change the tests under us.
+KLIPPER_IMAGE = (
+    "ghcr.io/mainsail-crew/virtual-klipper-printer"
+    "@sha256:6c4dabb3eca5c20e8d98c6bd3b14db406b83dd3cf62539e409073e7a021198d1"
+)
+
 
 class SimulatedPrinter:
     """Mainsail's virtual-klipper-printer. Moonraker trusts every client, as many printers do."""
@@ -251,9 +258,8 @@ class SimulatedPrinter:
 @pytest.fixture(scope="session")
 def klipper_image() -> str:
     require_docker()
-    tag = "printlog-bridge-it-klipper:latest"
-    docker("build", "-q", "-t", tag, str(HERE / "klipper"), timeout=900)
-    return tag
+    docker("pull", "-q", KLIPPER_IMAGE, timeout=900)
+    return KLIPPER_IMAGE
 
 
 def _start_printer(image: str) -> SimulatedPrinter:
@@ -279,17 +285,10 @@ def shared_printer(klipper_image: str) -> Iterator[SimulatedPrinter]:
 
 @pytest.fixture
 def printer(shared_printer: SimulatedPrinter) -> SimulatedPrinter:
-    """The module's printer, idle, with no bridge left connected by an earlier test."""
+    """The module's printer, idle, with no bridge left connected by an earlier test.
+
+    One per module: two simulated boards on one CI runner are too slow for Klipper to start.
+    """
     shared_printer.wait_until_idle()
     shared_printer.wait(lambda: not shared_printer.agents(), "no agents", 15)
     return shared_printer
-
-
-@pytest.fixture
-def own_printer(klipper_image: str) -> Iterator[SimulatedPrinter]:
-    """A printer for one test only, for tests that shut Klipper down."""
-    printer = _start_printer(klipper_image)
-    try:
-        yield printer
-    finally:
-        docker("rm", "-f", printer.container, check=False)
