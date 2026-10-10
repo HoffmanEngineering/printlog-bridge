@@ -57,7 +57,7 @@ python -m venv .venv
 
 CI runs both on Python 3.9 and 3.12.
 
-`pytest -m integration` runs the bridge against a real Moonraker, built from source in Docker (set `MOONRAKER_REF` to pick a tag or commit; the default is `v0.9.3`), and runs real prints on a simulated Klipper printer (Mainsail's [virtual-klipper-printer](https://github.com/mainsail-crew/virtual-klipper-printer), pinned by digest). The first run builds and pulls the images, which takes a few minutes. CI runs the Moonraker tests against the last release and a pinned recent commit, and the printer tests once (`-m "integration and klipper"`). To support another kind of printer, see [docs/adapters.md](docs/adapters.md).
+`pytest -m integration` runs the bridge against a real Moonraker, built from source in Docker (set `MOONRAKER_REF` to pick a tag or commit; the default is `v0.9.3`). The first run builds the image, which takes a minute or two. CI runs it against the last release and a pinned recent commit. To support another kind of printer, see [docs/adapters.md](docs/adapters.md).
 
 ## License
 

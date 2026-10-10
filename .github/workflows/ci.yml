@@ -64,19 +64,6 @@ jobs:
           python-version: "3.9"
           cache: pip
       - run: pip install -e ".[dev]"
-      - run: pytest -m "integration and not klipper" -v
+      - run: pytest -m integration -v
         env:
           MOONRAKER_REF: ${{ matrix.moonraker.ref }}
-
-  klipper:
-    # Real prints on a simulated Klipper printer, logged by the bridge. See tests/integration/.
-    name: integration (simulated Klipper printer)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.9"
-          cache: pip
-      - run: pip install -e ".[dev]"
-      - run: pytest -m "integration and klipper" -v -o log_level=INFO
