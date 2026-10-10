@@ -226,6 +226,10 @@ class SimulatedPrinter:
     def agents(self) -> list[dict[str, Any]]:
         return self.request("GET", "/server/extensions/list")["agents"]
 
+    def klippy_log(self, lines: int = 40) -> str:
+        log = "/home/printer/printer_data/logs/klippy.log"
+        return docker("exec", self.container, "tail", f"-{lines}", log, check=False)
+
     def wait(self, condition, what: str, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while not condition():

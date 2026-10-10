@@ -51,8 +51,10 @@ async def logging_to_api(tmp_path: Path, printer):
         # What each side saw, since a timeout alone says nothing about why.
         jobs = await ask(printer, "jobs")
         state = await ask(printer, "print_state")
+        klippy = await ask(printer, "klippy_log")
         raise AssertionError(
-            f"{e!r}\nprinter: {state}\nhistory: {jobs}\nAPI requests: {api.requests}"
+            f"{e!r}\nprinter: {state}\nhistory: {jobs}\nAPI requests: {api.requests}\n"
+            f"klippy.log:\n{klippy}"
         ) from e
     finally:
         await api.close()
