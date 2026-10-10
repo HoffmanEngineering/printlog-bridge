@@ -7,6 +7,7 @@ api_url = https://api.3dprintlog.com
 state_dir = ~/.local/share/printlog-bridge
 
 [printer voron]          ; one section per printer
+printer_id = 42          ; the printer in 3D Print Log (from its page's URL)
 adapter = moonraker      ; the default
 url = http://voron.local:7125
 ```
@@ -41,6 +42,8 @@ class ConfigError(Exception):
 class PrinterConfig:
     name: str
     adapter: Adapter
+    printer_id: int | None = None
+    """The printer's id in 3D Print Log, which its prints are logged to. Pairing will set it."""
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,7 @@ def _load_printer(
         raise ConfigError("[printer] needs a name, such as [printer voron]")
 
     values = dict(options)
+    printer_id = _printer_id(name, values.pop("printer_id", None))
     adapter_name = values.pop("adapter", DEFAULT_ADAPTER).strip()
     adapter_type = adapters.get(adapter_name)
     if adapter_type is None:
@@ -133,7 +137,19 @@ def _load_printer(
             f"[printer {name}]: unknown adapter {adapter_name!r} (available: {known})"
         )
 
-    return PrinterConfig(name, adapter_type.from_config(name, values))
+    return PrinterConfig(name, adapter_type.from_config(name, values), printer_id)
+
+
+def _printer_id(printer: str, value: str | None) -> int | None:
+    if value is None or not value.strip():
+        return None
+    text = value.strip()
+    if not text.isdigit() or int(text) == 0:
+        raise ConfigError(
+            f"[printer {printer}] printer_id must be the number at the end of the printer's page "
+            f"in 3D Print Log (https://www.3dprintlog.com/printers/<number>), not {text!r}"
+        )
+    return int(text)
 
 
 def _expand(value: str, home: Path) -> Path:

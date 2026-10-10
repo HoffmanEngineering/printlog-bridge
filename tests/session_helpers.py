@@ -18,6 +18,11 @@ class Recorder:
         self.status: dict[str, dict[str, Any]] = {}
         self.changes: list[Mapping[str, Any]] = []
         self.history: list[tuple[str, Mapping[str, Any]]] = []
+        self.connected: list[Any] = []
+        """For each connection, what `server.history.list` answered through the given call."""
+
+    async def on_connected(self, call) -> None:
+        self.connected.append(await call("server.history.list", {"limit": 1}))
 
     async def on_klippy_state(self, state: str) -> None:
         self.klippy.append(state)

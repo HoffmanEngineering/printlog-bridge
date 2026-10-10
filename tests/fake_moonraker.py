@@ -1,8 +1,9 @@
 """A small stand-in for Moonraker's JSON-RPC API, over a WebSocket or a Unix socket.
 
-It speaks just enough of the protocol for the bridge's connection code: identify, server.info,
-printer.objects.list/subscribe and connection.register_remote_method, plus pushing notifications
-and dropping every client to simulate a restart.
+It speaks just enough of the protocol for the bridge: identify, server.info,
+printer.objects.list/subscribe, connection.register_remote_method and server.history.list, plus
+pushing notifications and dropping every client to simulate a restart. `start_job` and
+`finish_job` drive a print the way Moonraker's history component reports one.
 
 Authorization copies real Moonraker (checked against v0.9): the WebSocket upgrade always
 succeeds, the Unix socket is trusted, and a WebSocket is authorized by an `X-Api-Key` header on
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -40,12 +42,17 @@ class FakeMoonraker:
         objects: tuple[str, ...] = DEFAULT_OBJECTS,
         api_key: str | None = None,
         reject_upgrade: bool = False,
+        history: bool = True,
     ) -> None:
         self.klippy_state = klippy_state
         self.objects = list(objects)
         self.api_key = api_key
         self.reject_upgrade = reject_upgrade
         """Answer the upgrade with 401, as a reverse proxy with its own auth would."""
+        self.history_enabled = history
+        """False is a moonraker.conf without [history]: its methods don't exist."""
+        self.jobs: list[dict[str, Any]] = []
+        """Moonraker's job history, oldest first."""
         self.status: dict[str, dict[str, Any]] = {
             "webhooks": {"state": "ready", "state_message": "Printer is ready"},
             "print_stats": {"state": "standby", "filename": ""},
@@ -188,10 +195,29 @@ class FakeMoonraker:
                     else {f: current[f] for f in fields if f in current}
                 )
             return {"eventtime": 1.0, "status": status}
+        if method == "server.history.list":
+            return self._history_list(params)
         if method == "connection.register_remote_method":
             self.registered.append(params["method_name"])
             return "ok"
-        raise _RpcError(-32601, f"Method not found: {method}")
+        raise _RpcError(-32601, "Method not found")
+
+    def _history_list(self, params: dict) -> dict:
+        if not self.history_enabled:
+            raise _RpcError(-32601, "Method not found")
+        # The same filters as Moonraker's SQL: since is start_time > since, before is
+        # end_time < before, ordered by job_id, then LIMIT and OFFSET.
+        jobs = list(self.jobs)
+        if params.get("since") is not None:
+            jobs = [j for j in jobs if j["start_time"] > params["since"]]
+        if params.get("before") is not None:
+            jobs = [j for j in jobs if (j["end_time"] or 0) < params["before"]]
+        if str(params.get("order", "desc")).lower() == "desc":
+            jobs.reverse()
+        start, limit = int(params.get("start", 0)), int(params.get("limit", 50))
+        if limit > 0:
+            jobs = jobs[start : start + limit]
+        return {"count": len(jobs), "jobs": [dict(j) for j in jobs]}
 
     def _require_klippy(self) -> None:
         if self.klippy_state != "ready":
@@ -208,6 +234,61 @@ class FakeMoonraker:
             message["params"] = list(params)
         for send in list(self._clients):
             await send(message)
+
+    async def start_job(
+        self,
+        filename: str = "benchy.gcode",
+        metadata: dict[str, Any] | None = None,
+        *,
+        notify: bool = True,
+        start_time: float | None = None,
+    ) -> dict[str, Any]:
+        """A print starts: Moonraker adds it to history and announces it."""
+        job = {
+            "job_id": f"{len(self.jobs) + 1:06X}",
+            "user": "No User",
+            "filename": filename,
+            "exists": True,
+            "status": "in_progress",
+            "start_time": time.time() if start_time is None else start_time,
+            "end_time": None,
+            "print_duration": 0.0,
+            "total_duration": 0.0,
+            "filament_used": 0.0,
+            "metadata": dict(metadata or {}),
+            "auxiliary_data": [],
+        }
+        self.jobs.append(job)
+        if notify:
+            await self.notify("notify_history_changed", {"action": "added", "job": dict(job)})
+        return job
+
+    async def finish_job(
+        self,
+        job: dict[str, Any],
+        status: str = "completed",
+        *,
+        filament_used: float = 1234.5,
+        print_duration: float = 600.0,
+        total_duration: float = 660.0,
+        notify: bool = True,
+    ) -> None:
+        """The print ends: Moonraker records the outcome and announces it."""
+        job.update(
+            status=status,
+            end_time=job["start_time"] + total_duration,
+            filament_used=filament_used,
+            print_duration=print_duration,
+            total_duration=total_duration,
+        )
+        if notify:
+            await self.notify("notify_history_changed", {"action": "finished", "job": dict(job)})
+
+    async def set_status(self, **objects: dict[str, Any]) -> None:
+        """Klipper reports new values, sent as a status update."""
+        for name, fields in objects.items():
+            self.status.setdefault(name, {}).update(fields)
+        await self.notify("notify_status_update", objects, time.monotonic())
 
     async def call_remote_method(self, method: str, params: dict) -> None:
         for send in list(self._clients):

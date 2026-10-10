@@ -10,9 +10,16 @@ from pathlib import Path
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.api_client import ApiClient, ApiUnavailable, AuthRejected
 from printlog_bridge.core.checks import CheckResult, Status
-from printlog_bridge.core.config import API_KEY_ENV, BridgeConfig, ConfigError, load_config
+from printlog_bridge.core.config import (
+    API_KEY_ENV,
+    BridgeConfig,
+    ConfigError,
+    PrinterConfig,
+    load_config,
+)
 
 API_KEYS_PAGE = "https://www.3dprintlog.com/api-keys"
+PRINTERS_PAGE = "https://www.3dprintlog.com/printers/"
 
 
 async def diagnose(
@@ -35,7 +42,8 @@ async def diagnose(
     )
     results.append(_check_state_dir(config.state_dir))
     results.append(_check_sqlite())
-    results.append(await _check_api(config))
+    api = await _check_api(config)
+    results.append(api)
 
     for printer in config.printers:
         try:
@@ -44,6 +52,8 @@ async def diagnose(
             results.append(
                 CheckResult.fail(f"Printer {printer.name}", f"the check itself failed: {e!r}")
             )
+        if api.status is Status.OK:  # otherwise the API check already says what to fix
+            results.append(await _check_printer_link(config, printer))
 
     return results
 
@@ -80,6 +90,30 @@ def _check_sqlite() -> CheckResult:
     except sqlite3.Error as e:
         return CheckResult.fail("SQLite", str(e))
     return CheckResult.ok("SQLite", sqlite3.sqlite_version)
+
+
+async def _check_printer_link(config: BridgeConfig, printer: PrinterConfig) -> CheckResult:
+    name = f"Printer {printer.name} in 3D Print Log"
+    if printer.printer_id is None:
+        return CheckResult.fail(
+            name,
+            "printer_id isn't set, so its prints have nowhere to go. Set it in "
+            f"[printer {printer.name}] to the number at the end of the printer's page "
+            f"({PRINTERS_PAGE}<number>).",
+        )
+    assert config.api_key is not None  # the API check passed
+    try:
+        async with ApiClient(config.api_url, config.api_key) as client:
+            found = await client.get_printer(printer.printer_id)
+    except (ApiUnavailable, AuthRejected) as e:
+        return CheckResult.fail(name, str(e))
+    if found is None:
+        return CheckResult.fail(
+            name,
+            f"this account has no printer {printer.printer_id}. Check printer_id in "
+            f"[printer {printer.name}] against the printer's page ({PRINTERS_PAGE}<number>).",
+        )
+    return CheckResult.ok(name, f"printer {printer.printer_id}, {found.get('name')}")
 
 
 async def _check_api(config: BridgeConfig) -> CheckResult:

@@ -7,6 +7,7 @@ it with a device token.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any
@@ -28,6 +29,10 @@ class AuthRejected(ApiError):
 
 class ApiUnavailable(ApiError):
     """The API could not be reached or failed. Worth retrying later."""
+
+
+class ApiRejected(ApiError):
+    """The API refused this request (400 or 403). Sending it again won't change the answer."""
 
 
 @dataclass(frozen=True)
@@ -70,17 +75,79 @@ class ApiClient:
         body = await self._get_json("/api/Users/me")
         return CurrentUser(id=int(body["id"]), display_name=body.get("displayName"))
 
+    async def user_settings(self) -> list[dict[str, Any]]:
+        return await self._request("GET", "/api/Users/me/user-settings")
+
+    async def get_printer(self, printer_id: int) -> dict[str, Any] | None:
+        """The printer, or None when it doesn't exist or isn't the key owner's."""
+        try:
+            return await self._request("GET", f"/api/Printers/{printer_id}", missing_ok=True)
+        except ApiRejected:
+            return None  # 403: another user's printer
+
+    async def create_print(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        """The print, and whether it is new. An `externalId` already used returns the original."""
+        status, print_ = await self._send("POST", "/api/Prints", body)
+        return print_, status == 201
+
+    async def get_print(self, print_id: int) -> dict[str, Any] | None:
+        return await self._request("GET", f"/api/Prints/{print_id}", missing_ok=True)
+
+    async def complete_print(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        return await self._request(
+            "POST", f"/api/Prints/{print_id}/complete", json=body, missing_ok=True
+        )
+
+    async def patch_print(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        return await self._request("PATCH", f"/api/Prints/{print_id}", json=body, missing_ok=True)
+
     async def _get_json(self, path: str) -> Any:
+        try:
+            return await self._request("GET", path)
+        except ApiRejected as e:
+            raise AuthRejected(str(e)) from e
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Mapping[str, Any] | None = None,
+        params: Mapping[str, str] | None = None,
+        missing_ok: bool = False,
+    ) -> Any:
+        status, body = await self._send(method, path, json, params, missing_ok=missing_ok)
+        return None if status == 404 else body
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        json: Mapping[str, Any] | None = None,
+        params: Mapping[str, str] | None = None,
+        *,
+        missing_ok: bool = False,
+    ) -> tuple[int, Any]:
         if self._session is None:
             raise RuntimeError("use ApiClient as `async with ApiClient(...) as client`")
 
         try:
-            async with self._session.get(self.base_url + path) as response:
-                if response.status in (401, 403):
+            async with self._session.request(
+                method, self.base_url + path, json=json, params=params
+            ) as response:
+                if response.status == 401:
                     raise AuthRejected(f"the API rejected the key ({response.status})")
+                if response.status == 404 and missing_ok:
+                    return 404, None
+                if response.status in (400, 403):
+                    reason = (await response.text()).strip()[:300]
+                    raise ApiRejected(
+                        f"the API refused {method} {path} ({response.status})"
+                        + (f": {reason}" if reason else "")
+                    )
                 if response.status >= 400:
                     raise ApiUnavailable(f"the API answered {response.status} for {path}")
-                return await response.json()
+                return response.status, await response.json()
         except aiohttp.ClientError as e:
             raise ApiUnavailable(f"can't reach {self.base_url}: {e}") from e
         except asyncio.TimeoutError as e:

@@ -137,3 +137,26 @@ def test_only_one_agent_per_name(kind, moonraker):
 
     assert reply["error"]["code"] == 400
     assert "already registered" in reply["error"]["message"]
+
+
+def test_history_is_listed_even_without_klipper(kind, moonraker):
+    async def steps(t):
+        async with connect(t.url, {"X-Api-Key": t.api_key}) as rpc:
+            return await rpc.call("server.history.list", {"limit": 1, "order": "desc"})
+
+    reply = exchange(kind, moonraker, steps)
+
+    assert reply["result"] == {"count": 0, "jobs": []}
+
+
+def test_an_unknown_method_is_method_not_found(kind, moonraker):
+    """What the bridge sees for server.history.list when moonraker.conf has no [history]."""
+
+    async def steps(t):
+        async with connect(t.url, {"X-Api-Key": t.api_key}) as rpc:
+            return await rpc.call("server.no_such_method")
+
+    reply = exchange(kind, moonraker, steps)
+
+    assert reply["error"]["code"] == -32601
+    assert reply["error"]["message"] == "Method not found"

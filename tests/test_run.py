@@ -12,6 +12,7 @@ from printlog_bridge.cli.main import main
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.bridge import run_bridge
 from printlog_bridge.core.config import BridgeConfig, PrinterConfig
+from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter
 
 
 class WatchingAdapter(Adapter):
@@ -49,7 +50,7 @@ def config_with(*adapters: WatchingAdapter) -> BridgeConfig:
         api_url="https://api.example.test",
         api_key="k",
         state_dir=Path("state"),
-        printers=[PrinterConfig(a.printer, a) for a in adapters],
+        printers=[PrinterConfig(a.printer, a, printer_id=42) for a in adapters],
     )
 
 
@@ -70,6 +71,52 @@ def test_runs_every_printer_until_cancelled():
     assert voron.sink is not None
 
 
+def test_logs_jobs_to_3d_print_log():
+    async def scenario():
+        voron = WatchingAdapter("voron")
+        task = asyncio.ensure_future(run_bridge(config_with(voron)))
+        await asyncio.wait_for(voron.started.wait(), 5)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return voron.sink
+
+    sink = asyncio.run(scenario())
+
+    assert isinstance(sink, JobLogger)
+    assert sink.printers == {"voron": LoggedPrinter(printer_id=42, source="watching")}
+
+
+def write_config(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "printlog-bridge.cfg"
+    path.write_text(f"[bridge]\nstate_dir = {tmp_path / 'state'}\n{text}", encoding="utf-8")
+    return path
+
+
+def test_run_without_an_api_key_says_where_to_get_one(tmp_path, capsys):
+    config = write_config(tmp_path, "[printer voron]\nprinter_id = 42\nurl = http://voron:7125\n")
+
+    assert main(["run", "--config", str(config)]) == 2
+
+    err = capsys.readouterr().err
+    assert "no API key" in err
+    assert "https://www.3dprintlog.com/api-keys" in err
+
+
+def test_run_without_a_printer_id_names_the_printer(tmp_path, capsys):
+    config = write_config(
+        tmp_path,
+        "api_key = k\n[printer voron]\nprinter_id = 42\nurl = http://voron:7125\n"
+        "[printer u1]\nurl = http://u1:7125\n",
+    )
+
+    assert main(["run", "--config", str(config)]) == 2
+
+    err = capsys.readouterr().err
+    assert "[printer u1] has no printer_id" in err
+    assert "voron" not in err
+
+
 def test_run_with_a_bad_config_says_why_and_fails(tmp_path, capsys):
     assert main(["run", "--config", str(tmp_path / "missing.cfg")]) == 2
 
@@ -86,7 +133,8 @@ def test_the_bridge_process_shows_up_in_moonraker(tmp_path):
         base = await fake.start()
         config = tmp_path / "printlog-bridge.cfg"
         config.write_text(
-            f"[bridge]\nstate_dir = {tmp_path / 'state'}\n[printer u1]\nurl = {base}\n",
+            f"[bridge]\napi_key = k\nstate_dir = {tmp_path / 'state'}\n"
+            f"[printer u1]\nprinter_id = 42\nurl = {base}\n",
             encoding="utf-8",
         )
         process = await asyncio.create_subprocess_exec(

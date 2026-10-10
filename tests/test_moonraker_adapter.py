@@ -180,13 +180,21 @@ def test_check_says_what_to_do_when_moonraker_refuses_the_bridge(api_key):
     assert "trusted_clients" in result.detail
 
 
+class NoJobsSink:
+    async def emit(self, event):  # pragma: no cover - no job runs here
+        pass
+
+    async def resume_after(self, printer):
+        return None
+
+
 def test_run_stays_connected_until_cancelled():
     async def scenario():
         fake = FakeMoonraker()
         base = await fake.start()
         try:
             adapter = MoonrakerAdapter.from_config("u1", {"url": base})
-            task = asyncio.ensure_future(adapter.run(sink=None))
+            task = asyncio.ensure_future(adapter.run(sink=NoJobsSink()))
             await eventually(lambda: fake.subscriptions)
             assert not task.done()
             task.cancel()

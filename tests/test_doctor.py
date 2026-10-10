@@ -45,8 +45,14 @@ def serve_me(status: int = 200):
             return web.Response(status=status)
         return web.json_response({"id": 7, "displayName": "Maker"})
 
+    async def printer(request):
+        if request.match_info["id"] != "7":
+            return web.Response(status=404)
+        return web.json_response({"id": 7, "name": "Voron 2.4"})
+
     app = web.Application()
     app.router.add_get("/api/Users/me", me)
+    app.router.add_get("/api/Printers/{id}", printer)
     return TestServer(app)
 
 
@@ -54,7 +60,7 @@ def write_config(tmp_path: Path, api_url: str, api_key: str = "k", printers: str
     path = tmp_path / "printlog-bridge.cfg"
     path.write_text(
         f"[bridge]\napi_url = {api_url}\napi_key = {api_key}\nstate_dir = {tmp_path / 'state'}\n"
-        + (printers or "[printer voron]\nadapter = fake\n"),
+        + (printers or "[printer voron]\nadapter = fake\nprinter_id = 7\n"),
         encoding="utf-8",
     )
     return path
@@ -87,11 +93,13 @@ def test_a_healthy_setup_passes_every_check(tmp_path):
         "SQLite",
         "3D Print Log API",
         "Printer voron",
+        "Printer voron in 3D Print Log",
     ]
     assert all(r.status is Status.OK for r in results), results
     checks = by_name(results)
     assert "1 printer" in checks["Config"].detail
     assert "signed in as Maker" in checks["3D Print Log API"].detail
+    assert checks["Printer voron in 3D Print Log"].detail == "printer 7, Voron 2.4"
     assert (tmp_path / "state").is_dir()
 
 
@@ -138,11 +146,36 @@ def test_an_unwritable_state_directory_fails(tmp_path):
 
 
 def test_each_printer_reports_its_own_check(tmp_path):
-    printers = "[printer a]\nadapter = fake\n[printer b]\nadapter = fake\n"
+    printers = "[printer a]\nadapter = fake\nprinter_id = 7\n[printer b]\nadapter = fake\n"
 
     names = [r.name for r in run_diagnose(tmp_path, printers=printers)]
 
-    assert names[-2:] == ["Printer a", "Printer b"]
+    assert names[-4:] == [
+        "Printer a", "Printer a in 3D Print Log", "Printer b", "Printer b in 3D Print Log"
+    ]  # fmt: skip
+
+
+def test_a_printer_without_a_printer_id_says_where_to_find_it(tmp_path):
+    results = run_diagnose(tmp_path, printers="[printer voron]\nadapter = fake\n")
+
+    linked = by_name(results)["Printer voron in 3D Print Log"]
+    assert linked.status is Status.FAIL
+    assert "printer_id" in linked.detail
+    assert "https://www.3dprintlog.com/printers/" in linked.detail
+
+
+def test_a_printer_id_that_is_not_the_accounts_fails(tmp_path):
+    results = run_diagnose(tmp_path, printers="[printer voron]\nadapter = fake\nprinter_id = 8\n")
+
+    linked = by_name(results)["Printer voron in 3D Print Log"]
+    assert linked.status is Status.FAIL
+    assert "no printer 8" in linked.detail
+
+
+def test_the_printer_id_is_not_looked_up_when_the_api_check_failed(tmp_path):
+    names = [r.name for r in run_diagnose(tmp_path, status=401)]
+
+    assert "Printer voron in 3D Print Log" not in names
 
 
 def test_an_adapter_that_raises_is_reported_not_fatal(tmp_path, monkeypatch):

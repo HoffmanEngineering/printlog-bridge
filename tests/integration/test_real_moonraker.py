@@ -157,7 +157,9 @@ def installed(shared_moonraker):
         "rm -rf /tmp/bridge && mkdir /tmp/bridge"
         " && tar -C /src --exclude=.venv --exclude=.git -cf - . | tar -C /tmp/bridge -xf -"
         " && /bridge-venv/bin/pip install -q --no-deps /tmp/bridge"
-        " && printf '[bridge]\\nstate_dir = /tmp/state\\n[printer local]\\n'"
+        # run needs a key and a printer_id; nothing prints here, so the API is never called.
+        " && printf '[bridge]\\napi_key = k\\nstate_dir = /tmp/state\\n"
+        "[printer local]\\nprinter_id = 1\\n'"
         "    > /root/printer_data/config/printlog-bridge.cfg",
     )
     return shared_moonraker

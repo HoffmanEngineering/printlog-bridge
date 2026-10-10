@@ -145,6 +145,28 @@ def test_adapter_option_errors_surface(tmp_path):
         load(write(tmp_path, "[printer voron]\nadapter = fake\nbroken = yes\n"))
 
 
+def test_printer_id_links_a_printer_to_3d_print_log_and_is_not_an_adapter_option(tmp_path):
+    config = load(write(tmp_path, "[printer voron]\nadapter = fake\nprinter_id = 42\n"))
+
+    [voron] = config.printers
+    assert voron.printer_id == 42
+    assert voron.adapter.options == {}
+
+
+def test_printer_id_is_optional_until_run(tmp_path):
+    config = load(write(tmp_path, "[printer voron]\nadapter = fake\n"))
+
+    assert config.printers[0].printer_id is None
+
+
+@pytest.mark.parametrize("value", ["voron", "0", "-3", "1.5"])
+def test_printer_id_must_be_a_positive_whole_number(tmp_path, value):
+    path = write(tmp_path, f"[printer voron]\nadapter = fake\nprinter_id = {value}\n")
+
+    with pytest.raises(ConfigError, match=r"\[printer voron\] printer_id must be the number"):
+        load(path)
+
+
 def test_api_url_must_be_http(tmp_path):
     path = write(tmp_path, "[bridge]\napi_url = ftp://x\n[printer a]\nadapter = fake\n")
 
