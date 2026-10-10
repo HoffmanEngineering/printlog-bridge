@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printlog-bridge"
+dynamic = ["version"]
+description = "Logs every Klipper/Moonraker print to 3D Print Log automatically."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Hoffman Engineering" }]
+# Raspberry Pi OS Bullseye ships Python 3.9, and it is still on a lot of printers.
+requires-python = ">=3.9"
+dependencies = ["aiohttp>=3.8"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[project.scripts]
+printlog-bridge = "printlog_bridge.cli.main:run"
+
+[project.urls]
+Homepage = "https://www.3dprintlog.com"
+Source = "https://github.com/HoffmanEngineering/printlog-bridge"
+
+[tool.setuptools.dynamic]
+version = { attr = "printlog_bridge.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is Raspberry Pi OS Bullseye's Python, the oldest we support.
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest
+
+  install-smoke:
+    # A clean install from the source tree in the image people will run, without dev tools.
+    runs-on: ubuntu-latest
+    container: python:3.9-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install .
+      - run: printlog-bridge --version
+      - name: doctor runs and reports a missing config
+        run: |
+          set +e
+          printlog-bridge doctor --config /nonexistent.cfg > out.txt
+          code=$?
+          cat out.txt
+          test "$code" -eq 1 && grep -q "FAIL  Config" out.txt
