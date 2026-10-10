@@ -15,7 +15,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
@@ -42,9 +42,17 @@ OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
 }
 
 RemoteMethod = Callable[[Mapping[str, Any]], Awaitable[None]]
+Call = Callable[[str, Optional[Mapping[str, Any]]], Awaitable[Any]]
 
 
 class MoonrakerListener(Protocol):
+    async def on_connected(self, call: Call) -> None:
+        """A connection is up. `call(method, params)` makes requests over it.
+
+        Called on every connect, before any notification and whether or not Klipper is ready,
+        so job history (which Moonraker keeps itself) can be read to catch up.
+        """
+
     async def on_klippy_state(self, state: str) -> None:
         """Klipper became `ready`, or stopped being (`startup`, `shutdown`, `disconnected`...)."""
 
@@ -226,6 +234,8 @@ class MoonrakerSession:
 
             for name in self.remote_methods:
                 await rpc.call("connection.register_remote_method", {"method_name": name})
+
+            await self.listener.on_connected(rpc.call)
 
             info = await rpc.call("server.info")
             klippy = info.get("klippy_state", "unknown")

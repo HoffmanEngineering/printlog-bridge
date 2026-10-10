@@ -126,6 +126,23 @@ def test_passes_history_notifications_on():
     ]
 
 
+def test_tells_the_listener_each_time_it_connects_even_without_klipper():
+    """So it can read job history, which Moonraker keeps whether or not Klipper is up."""
+
+    async def scenario():
+        recorder = Recorder()
+        down = {"klippy_state": "disconnected"}
+        async with fake_moonraker(**down) as (fake, base), running(session_for(base, recorder)):
+            await eventually(lambda: recorder.connected)
+            await fake.drop()
+            await eventually(lambda: len(recorder.connected) == 2)
+        return recorder
+
+    recorder = asyncio.run(scenario())
+
+    assert recorder.connected == [{"count": 0, "jobs": []}] * 2
+
+
 def test_reconnects_after_moonraker_drops_and_sets_everything_up_again():
     async def scenario():
         async def on_set_spool(params):  # pragma: no cover - only registered here

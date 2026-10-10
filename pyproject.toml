@@ -40,7 +40,10 @@ where = ["src"]
 testpaths = ["tests"]
 # Integration tests start a real Moonraker in Docker: `pytest -m integration`.
 addopts = "-m 'not integration'"
-markers = ["integration: runs against a real Moonraker in Docker (needs Docker)"]
+markers = [
+    "integration: runs against a real Moonraker in Docker (needs Docker)",
+    "klipper: runs a simulated Klipper printer in Docker (with integration)",
+]
 
 [tool.ruff]
 target-version = "py39"

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
-from printlog_bridge.core.bridge import run_bridge
+from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import ConfigError, find_config, load_config
 from printlog_bridge.core.doctor import diagnose, format_report
@@ -73,6 +73,7 @@ def _run(explicit_config: Path | None) -> int:
     config_path = find_config(explicit_config, env=env, home=home)
     try:
         config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        check_runnable(config)
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)

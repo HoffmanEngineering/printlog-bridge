@@ -20,6 +20,7 @@ from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import ConfigError
 from printlog_bridge.core.events import EventSink
 
+from .jobs import JobTracker
 from .session import (
     ConnectionLost,
     MoonrakerAuthError,
@@ -90,10 +91,9 @@ class MoonrakerAdapter(Adapter):
         return f"moonraker, local socket {self.socket}"
 
     async def run(self, sink: EventSink) -> None:
-        # Turning status into job events, and so using `sink`, lands with printlog-bridge#4.
         session = MoonrakerSession(
             self.printer,
-            listener=_LogListener(self.printer),
+            listener=JobTracker(self.printer, sink),
             url=self.url,
             socket=self.socket,
             api_key=self.api_key,
@@ -145,27 +145,6 @@ class MoonrakerAdapter(Adapter):
         if klippy != "ready":
             return [CheckResult.warn(name, detail)]
         return [CheckResult.ok(name, detail)]
-
-
-class _LogListener:
-    """Logs what the printer is doing, until the job lifecycle (#4) acts on it."""
-
-    def __init__(self, printer: str) -> None:
-        self.printer = printer
-        self._print_state: str | None = None
-
-    async def on_klippy_state(self, state: str) -> None:
-        log.info("[printer %s] Klipper %s", self.printer, state)
-
-    async def on_status(self, status: Mapping[str, object], changed: Mapping[str, object]) -> None:
-        print_stats = status.get("print_stats")
-        state = print_stats.get("state") if isinstance(print_stats, Mapping) else None
-        if state != self._print_state:
-            self._print_state = state
-            log.info("[printer %s] print state %s", self.printer, state)
-
-    async def on_history(self, action: str, job: Mapping[str, object]) -> None:
-        log.info("[printer %s] history %s: job %s", self.printer, action, job.get("job_id"))
 
 
 def _reason(error: BaseException) -> str:
