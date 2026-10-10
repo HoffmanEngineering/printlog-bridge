@@ -79,4 +79,4 @@ jobs:
           python-version: "3.9"
           cache: pip
       - run: pip install -e ".[dev]"
-      - run: pytest -m "integration and klipper" -v
+      - run: pytest -m "integration and klipper" -v -o log_level=INFO

@@ -47,6 +47,13 @@ async def logging_to_api(tmp_path: Path, printer):
     config = write_config(tmp_path, printer.url, await api.start())
     try:
         yield api, config
+    except BaseException as e:
+        # What each side saw, since a timeout alone says nothing about why.
+        jobs = await ask(printer, "jobs")
+        state = await ask(printer, "print_state")
+        raise AssertionError(
+            f"{e!r}\nprinter: {state}\nhistory: {jobs}\nAPI requests: {api.requests}"
+        ) from e
     finally:
         await api.close()
 
