@@ -8,9 +8,10 @@ installed on the printer itself.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -19,20 +20,33 @@ from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import ConfigError
 from printlog_bridge.core.events import EventSink
 
+from .session import (
+    ConnectionLost,
+    MoonrakerAuthError,
+    MoonrakerRpcError,
+    MoonrakerSession,
+    fetch_server_info,
+)
+
+log = logging.getLogger(__name__)
+
 DEFAULT_SOCKET = "~/printer_data/comms/moonraker.sock"
-OPTIONS = frozenset({"url", "socket"})
+OPTIONS = frozenset({"url", "socket", "moonraker_api_key"})
 CHECK_TIMEOUT_S = 5
 
-_HTTP_SCHEME_FOR = {"http": "http", "https": "https", "ws": "http", "wss": "https"}
+URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
 
 class MoonrakerAdapter(Adapter):
     name = "moonraker"
 
-    def __init__(self, printer: str, url: str | None, socket: Path | None) -> None:
+    def __init__(
+        self, printer: str, url: str | None, socket: Path | None, api_key: str | None = None
+    ) -> None:
         self.printer = printer
         self.url = url
         self.socket = socket
+        self.api_key = api_key
 
     @classmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> MoonrakerAdapter:
@@ -49,15 +63,23 @@ class MoonrakerAdapter(Adapter):
                 "url is for remote mode, socket for local mode."
             )
 
+        api_key = options.get("moonraker_api_key", "").strip() or None
+
         if "url" in options:
             url = options["url"].strip().rstrip("/")
             parsed = urlparse(url)
-            if parsed.scheme not in _HTTP_SCHEME_FOR or not parsed.netloc:
+            if parsed.scheme not in URL_SCHEMES or not parsed.netloc:
                 raise ConfigError(
                     f"[printer {printer}] url must look like http://printer.local:7125, "
                     f"not {options['url']!r}"
                 )
-            return cls(printer, url=url, socket=None)
+            return cls(printer, url=url, socket=None, api_key=api_key)
+
+        if api_key is not None:
+            raise ConfigError(
+                f"[printer {printer}] moonraker_api_key is only for remote mode (url). "
+                "Moonraker trusts its local socket without one."
+            )
 
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
         return cls(printer, url=None, socket=socket)
@@ -68,7 +90,15 @@ class MoonrakerAdapter(Adapter):
         return f"moonraker, local socket {self.socket}"
 
     async def run(self, sink: EventSink) -> None:
-        raise NotImplementedError("Watching Moonraker lands with printlog-bridge#3.")
+        # Turning status into job events, and so using `sink`, lands with printlog-bridge#4.
+        session = MoonrakerSession(
+            self.printer,
+            listener=_LogListener(self.printer),
+            url=self.url,
+            socket=self.socket,
+            api_key=self.api_key,
+        )
+        await session.run()
 
     async def check(self) -> Sequence[CheckResult]:
         name = f"Printer {self.printer}"
@@ -84,8 +114,21 @@ class MoonrakerAdapter(Adapter):
 
         where = self.url or str(self.socket)
         try:
-            info = await self._server_info()
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            info = await asyncio.wait_for(
+                fetch_server_info(
+                    self.printer, url=self.url, socket=self.socket, api_key=self.api_key
+                ),
+                CHECK_TIMEOUT_S,
+            )
+        except MoonrakerAuthError as e:
+            return [CheckResult.fail(name, str(e))]
+        except (
+            ConnectionLost,
+            MoonrakerRpcError,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+        ) as e:
             return [CheckResult.fail(name, f"can't reach Moonraker at {where}: {_reason(e)}")]
 
         klippy = info.get("klippy_state", "unknown")
@@ -103,29 +146,26 @@ class MoonrakerAdapter(Adapter):
             return [CheckResult.warn(name, detail)]
         return [CheckResult.ok(name, detail)]
 
-    async def _server_info(self) -> Mapping[str, object]:
-        timeout = aiohttp.ClientTimeout(total=CHECK_TIMEOUT_S)
-        if self.socket is not None:
-            connector: aiohttp.BaseConnector = aiohttp.UnixConnector(path=str(self.socket))
-            info_url = "http://localhost/server/info"
-        else:
-            connector = aiohttp.TCPConnector()
-            info_url = _http_base(self.url or "") + "/server/info"
 
-        session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-        async with session, session.get(info_url) as response:
-            response.raise_for_status()
-            body = await response.json()
-        return body.get("result", {})
+class _LogListener:
+    """Logs what the printer is doing, until the job lifecycle (#4) acts on it."""
 
+    def __init__(self, printer: str) -> None:
+        self.printer = printer
+        self._print_state: str | None = None
 
-def _http_base(url: str) -> str:
-    """The HTTP root for a configured URL, which may be Moonraker's websocket endpoint."""
-    parsed = urlparse(url)
-    path = parsed.path
-    if path.endswith("/websocket"):
-        path = path[: -len("/websocket")]
-    return urlunparse((_HTTP_SCHEME_FOR[parsed.scheme], parsed.netloc, path, "", "", ""))
+    async def on_klippy_state(self, state: str) -> None:
+        log.info("[printer %s] Klipper %s", self.printer, state)
+
+    async def on_status(self, status: Mapping[str, object], changed: Mapping[str, object]) -> None:
+        print_stats = status.get("print_stats")
+        state = print_stats.get("state") if isinstance(print_stats, Mapping) else None
+        if state != self._print_state:
+            self._print_state = state
+            log.info("[printer %s] print state %s", self.printer, state)
+
+    async def on_history(self, action: str, job: Mapping[str, object]) -> None:
+        log.info("[printer %s] history %s: job %s", self.printer, action, job.get("job_id"))
 
 
 def _reason(error: BaseException) -> str:
