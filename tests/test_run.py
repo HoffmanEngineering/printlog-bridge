@@ -24,10 +24,18 @@ class WatchingAdapter(Adapter):
 
     def __init__(self, printer: str) -> None:
         self.printer = printer
-        self.started = asyncio.Event()
+        self._started: asyncio.Event | None = None
         self.cancelled = False
         self.sink = None
         self.report = None
+
+    @property
+    def started(self) -> asyncio.Event:
+        # Made on first use, inside the test's loop: Python 3.9 binds an Event to the loop
+        # current when it is created, and these adapters are made before asyncio.run.
+        if self._started is None:
+            self._started = asyncio.Event()
+        return self._started
 
     @classmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> WatchingAdapter:

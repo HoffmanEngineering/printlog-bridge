@@ -18,6 +18,8 @@ from printlog_bridge import __version__
 from printlog_bridge.adapters.moonraker.session import (
     Backoff,
     MoonrakerSession,
+    _JsonRpc,
+    bounded,
     websocket_url,
 )
 
@@ -457,3 +459,92 @@ class TestStatusReport:
         during = asyncio.run(scenario())
 
         assert "another printlog-bridge" in during["moonraker"]
+
+
+class SilentTransport:
+    """A connection that sends nothing back unless the test says so."""
+
+    def __init__(self) -> None:
+        self.closed = asyncio.Event()
+
+    async def send(self, message) -> None:
+        pass
+
+    async def receive(self):
+        await self.closed.wait()
+        return None
+
+    async def close(self) -> None:
+        self.closed.set()
+
+
+def test_a_call_cancelled_as_its_answer_arrives_is_still_cancelled():
+    """`asyncio.wait_for` before 3.12 returns the answer instead (bpo-42130), so a bridge told
+    to stop mid-call would carry on, holding Moonraker's one agent slot."""
+
+    async def scenario():
+        transport = SilentTransport()
+        rpc = _JsonRpc(transport)
+        try:
+            task = asyncio.ensure_future(rpc.call("server.info"))
+            await asyncio.sleep(0)  # the call is sent and waiting for its answer
+            rpc._dispatch({"jsonrpc": "2.0", "id": 1, "result": {"klippy_state": "ready"}})
+            task.cancel()  # in the same loop iteration as the answer
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            await rpc.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_call_with_no_answer_times_out(monkeypatch):
+    monkeypatch.setattr("printlog_bridge.adapters.moonraker.session.REQUEST_TIMEOUT_S", 0.05)
+
+    async def scenario():
+        rpc = _JsonRpc(SilentTransport())
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await rpc.call("server.info")
+            assert rpc._pending == {}
+        finally:
+            await rpc.close()
+
+    asyncio.run(scenario())
+
+
+class TestBounded:
+    def test_returns_the_result(self):
+        async def answer():
+            return 42
+
+        assert asyncio.run(bounded(answer(), 5)) == 42
+
+    def test_times_out(self):
+        async def never():
+            await asyncio.Event().wait()
+
+        async def scenario():
+            with pytest.raises(asyncio.TimeoutError):
+                await bounded(never(), 0.05)
+
+        asyncio.run(scenario())
+
+    def test_a_cancel_as_it_completes_is_still_a_cancel(self):
+        """Where `asyncio.wait_for` before 3.12 returns the result and drops the cancel."""
+
+        async def scenario():
+            gate = asyncio.get_running_loop().create_future()
+
+            async def connect():
+                return await gate
+
+            task = asyncio.ensure_future(bounded(connect(), 5))
+            await asyncio.sleep(0)  # connecting
+            gate.set_result("connection")
+            await asyncio.sleep(0)  # connected, but the caller hasn't been told yet
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())

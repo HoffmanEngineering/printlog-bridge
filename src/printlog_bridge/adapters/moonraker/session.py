@@ -15,7 +15,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, TypeVar
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
@@ -43,6 +43,7 @@ OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "filament_detect": None,  # Snapmaker U1's RFID reader
 }
 
+T = TypeVar("T")
 RemoteMethod = Callable[[Mapping[str, Any]], Awaitable[None]]
 Call = Callable[[str, Optional[Mapping[str, Any]]], Awaitable[Any]]
 
@@ -319,7 +320,16 @@ class _JsonRpc:
             message["params"] = params
         try:
             await self._transport.send(message)
-            return await asyncio.wait_for(future, REQUEST_TIMEOUT_S)
+            # Not asyncio.wait_for: before Python 3.12 it returns the answer, and drops the
+            # cancellation, when both arrive in the same loop iteration (bpo-42130), so a bridge
+            # told to stop would carry on. Awaiting the future itself always honours a cancel.
+            timer = asyncio.get_running_loop().call_later(
+                REQUEST_TIMEOUT_S, _time_out, future, method
+            )
+            try:
+                return await future
+            finally:
+                timer.cancel()
         finally:
             self._pending.pop(request_id, None)
 
@@ -389,7 +399,7 @@ class _WebSocketTransport:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         headers = {"X-Api-Key": api_key} if api_key else {}
         try:
-            ws = await asyncio.wait_for(
+            ws = await bounded(
                 session.ws_connect(url, headers=headers, heartbeat=30), CONNECT_TIMEOUT_S
             )
         except aiohttp.WSServerHandshakeError as e:
@@ -430,7 +440,7 @@ class _UnixTransport:
 
     @classmethod
     async def open(cls, path: Path) -> _UnixTransport:
-        reader, writer = await asyncio.wait_for(
+        reader, writer = await bounded(
             asyncio.open_unix_connection(str(path), limit=UNIX_READ_LIMIT), CONNECT_TIMEOUT_S
         )
         return cls(reader, writer)
@@ -454,3 +464,31 @@ class _UnixTransport:
 
 def _why(error: BaseException) -> str:
     return str(error) or type(error).__name__
+
+
+async def bounded(awaitable: Awaitable[T], timeout: float) -> T:
+    """`asyncio.wait_for` for code that must stop when cancelled. Before Python 3.12, wait_for
+    returns the result and drops the cancel when both happen at once (bpo-42130). Awaiting the
+    task itself always honours a cancel."""
+    task = asyncio.ensure_future(awaitable)
+    timed_out = False
+
+    def time_out() -> None:
+        nonlocal timed_out
+        timed_out = True
+        task.cancel()
+
+    timer = asyncio.get_running_loop().call_later(timeout, time_out)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if timed_out:
+            raise asyncio.TimeoutError from None
+        raise
+    finally:
+        timer.cancel()
+
+
+def _time_out(future: asyncio.Future, method: str) -> None:
+    if not future.done():
+        future.set_exception(asyncio.TimeoutError(f"no answer to {method}"))
