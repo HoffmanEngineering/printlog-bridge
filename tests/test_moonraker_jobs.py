@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 from fake_moonraker import FakeMoonraker, eventually
-from session_helpers import running
+from session_helpers import ReportRecorder, running
 
 from printlog_bridge.adapters.moonraker.jobs import JobTracker
 from printlog_bridge.adapters.moonraker.session import Backoff, MoonrakerSession
@@ -287,3 +287,21 @@ class TestCatchingUp:
 
         assert "moonraker.conf" in caplog.text
         assert identified == 1  # no reconnect loop
+
+    def test_without_history_warns_in_the_status(self):
+        async def scenario():
+            fake = FakeMoonraker(history=False)
+            base = await fake.start()
+            report = ReportRecorder()
+            tracker = JobTracker("voron", RecordingSink(resume=at(T0)), report)
+            session = MoonrakerSession("voron", url=base, listener=tracker, backoff=FAST)
+            try:
+                async with running(session):
+                    await eventually(lambda: report.warnings)
+            finally:
+                await fake.close()
+            return report
+
+        report = asyncio.run(scenario())
+
+        assert "[history]" in report.warnings["history"]

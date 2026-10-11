@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from fake_moonraker import FakeMoonraker, eventually
-from session_helpers import Recorder, running
+from session_helpers import Recorder, ReportRecorder, running
 
 from printlog_bridge import __version__
 from printlog_bridge.adapters.moonraker.session import (
@@ -378,3 +378,82 @@ def test_a_good_connection_resets_the_backoff():
     backoff = asyncio.run(scenario())
 
     assert backoff.next() == 0.01
+
+
+class TestStatusReport:
+    def test_reports_connecting_and_klippers_state(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker(klippy_state="startup") as (fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: report.named("printer_state"))
+                fake.klippy_state = "ready"
+                await fake.notify("notify_klippy_ready")
+                await eventually(lambda: len(report.named("printer_state")) >= 2)
+                fake.klippy_state = "shutdown"
+                await fake.notify("notify_klippy_shutdown")
+                await eventually(lambda: len(report.named("printer_state")) >= 3)
+            return report
+
+        report = asyncio.run(scenario())
+
+        assert report.calls[0] == ("connected",)
+        assert report.named("printer_state") == [
+            ("printer_state", "startup"),
+            ("printer_state", "ready"),
+            ("printer_state", "shutdown"),
+        ]
+
+    def test_reports_a_dropped_connection_and_the_reconnect(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker() as (fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: fake.subscriptions)
+                await fake.drop()
+                await eventually(lambda: len(report.named("connected")) >= 2)
+            return report
+
+        report = asyncio.run(scenario())
+
+        [(_, reason)] = report.named("disconnected")
+        assert "Moonraker" in reason
+        assert report.calls[-1][0] in ("connected", "printer_state")
+
+    def test_a_refusal_is_a_warning_saying_what_to_do(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker(api_key="secret") as (_fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: report.warnings)
+            return report
+
+        report = asyncio.run(scenario())
+
+        assert "moonraker_api_key" in report.warnings["moonraker"]
+        assert report.named("disconnected")
+
+    def test_the_warning_clears_once_connected(self):
+        async def scenario():
+            async with fake_moonraker() as (fake, base):
+                first = session_for(base, Recorder())
+                async with running(first) as first_task:
+                    await eventually(lambda: fake.subscriptions)
+                    report = ReportRecorder()
+                    async with running(session_for(base, Recorder(), report=report)):
+                        await eventually(lambda: report.warnings)
+                        during = dict(report.warnings)
+                        first_task.cancel()
+                        await eventually(lambda: report.named("connected"))
+                        await eventually(lambda: not report.warnings)
+            return during
+
+        during = asyncio.run(scenario())
+
+        assert "another printlog-bridge" in during["moonraker"]

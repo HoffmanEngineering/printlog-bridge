@@ -14,12 +14,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from printlog_bridge.core.events import EventSink, JobFinished, JobOutcome, JobStarted
+from printlog_bridge.core.status import NullReport, PrinterReport
 
 from .session import Call, MoonrakerRpcError
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
+HISTORY_TOPIC = "history"
 
 STOPPED = "Moonraker stopped during the print"
 OUTCOMES: Mapping[str, tuple[JobOutcome, str | None]] = {
@@ -36,9 +38,10 @@ OUTCOMES: Mapping[str, tuple[JobOutcome, str | None]] = {
 class JobTracker:
     """A MoonrakerListener that reports each job in history to an EventSink."""
 
-    def __init__(self, printer: str, sink: EventSink) -> None:
+    def __init__(self, printer: str, sink: EventSink, report: PrinterReport | None = None) -> None:
         self.printer = printer
         self.sink = sink
+        self.report = report or NullReport()
         self._error_message: str | None = None
 
     async def on_connected(self, call: Call) -> None:
@@ -47,12 +50,14 @@ class JobTracker:
         except MoonrakerRpcError as e:
             if e.code != -32601:  # anything but "Method not found"
                 raise
-            log.error(
-                "[printer %s] Moonraker's job history is off, so no print can be logged. Add a "
-                "[history] section to moonraker.conf and restart Moonraker.",
-                self.printer,
+            problem = (
+                "Moonraker's job history is off, so no print can be logged. Add a [history] "
+                "section to moonraker.conf and restart Moonraker."
             )
+            log.error("[printer %s] %s", self.printer, problem)
+            self.report.warn(HISTORY_TOPIC, problem)
             return
+        self.report.warn(HISTORY_TOPIC, None)
         for job in jobs:
             await self._report(job)
 

@@ -19,7 +19,26 @@ cp printlog-bridge.example.cfg ~/printer_data/config/printlog-bridge.cfg   # the
 ~/printlog-bridge-env/bin/printlog-bridge doctor
 ```
 
-`doctor` checks the config, the state directory, the API key and each printer, and says what to fix. `printlog-bridge run` then watches every printer until stopped, and shows up in Moonraker's extensions list (Mainsail and Fluidd show it too).
+`doctor` checks the config, the state directory, the API key, this computer's clock and each printer, and says what to fix. `printlog-bridge run` then watches every printer until stopped, and shows up in Moonraker's extensions list (Mainsail and Fluidd show it too).
+
+`printlog-bridge status` shows what the running bridge is doing. For each printer it lists the connection, the printer's state, the last job event, the last heartbeat, how many jobs are waiting to reach 3D Print Log, and anything you need to fix:
+
+```
+printlog-bridge 0.1.0 status
+Bridge: running since 2026-10-10 09:30 UTC (version 0.1.0, pid 812)
+Printer voron (printer 42 in 3D Print Log)
+  Connection: connected for 3h 12m (moonraker, local socket /home/pi/printer_data/comms/moonraker.sock)
+  Printer state: ready
+  Pairing: not paired; logging with the API key in [bridge]
+  Last event: job 00002A completed: print 1834 (14m ago)
+  Heartbeat: 2m 10s ago
+  Outbox: empty
+  Warnings: none
+```
+
+It exits 0 while the bridge runs and 1 when it doesn't, so scripts can check it. Each printer shows up in 3D Print Log as a connection, with a heartbeat every 5 minutes; the app shows it as offline after 15 minutes without one.
+
+When you need help, run `doctor` and attach the support bundle it writes (`printlog-bridge-support.zip` in the state directory). It holds the doctor report, your config, the bridge's status, its state and its recent log (`bridge.log`), with every API key, token and password removed.
 
 Each print appears in 3D Print Log as Printing when the job starts, titled from its file name, with the slicer's estimates. When it ends, the bridge records the outcome, the print time and the filament Klipper fed:
 

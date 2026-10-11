@@ -9,8 +9,11 @@ from pathlib import Path
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted
 from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter
+from printlog_bridge.core.state import PrinterState
+from printlog_bridge.core.status import StatusBoard, read_status
 
 STARTED_AT = datetime(2026, 10, 10, 9, 30, tzinfo=timezone.utc)
 FAST_RETRIES = (0.01, 0.01)
@@ -374,3 +377,116 @@ class TestResumePoint:
         logger = run(FakePrintLogApi(), tmp_path)
 
         assert asyncio.run(logger.resume_after("voron")) == STARTED_AT
+
+
+def report_run(api: FakePrintLogApi, state_dir: Path, *events, register=None):
+    """`run`, with a status board and, optionally, a connection registered before each create."""
+
+    async def scenario():
+        board = StatusBoard(state_dir)
+        board.start(["voron"])
+        base = await api.start()
+        try:
+            async with ApiClient(base, api.api_key) as client:
+                hook = None
+                if register:
+                    hook = register(client, board)
+                logger = JobLogger(
+                    client,
+                    {"voron": LoggedPrinter(42, "moonraker")},
+                    state_dir,
+                    retry_delays=FAST_RETRIES,
+                    board=board,
+                    before_create=hook,
+                )
+                for event in events:
+                    if callable(event):
+                        event(api)
+                    else:
+                        await logger.emit(event)
+        finally:
+            await api.close()
+        return read_status(state_dir)["printers"]["voron"]
+
+    return asyncio.run(scenario())
+
+
+class TestConnection:
+    def test_the_connection_is_registered_before_the_print_so_the_print_links_to_it(self, tmp_path):
+        api = FakePrintLogApi()
+
+        def register(client, board):
+            instance_id = PrinterState.load(tmp_path, "voron").instance_id
+            heartbeat = Heartbeat(
+                client, [Connection("voron", instance_id, "moonraker", 42)], board
+            )
+            return heartbeat.ensure_registered
+
+        report_run(api, tmp_path, started(), register=register)
+
+        [print_] = api.prints.values()
+        assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
+
+    def test_a_failed_registration_still_logs_the_print(self, tmp_path):
+        api = FakePrintLogApi()
+
+        def register(client, board):
+            async def refuse(printer):
+                raise AssertionError("before_create must not be able to stop a print")
+
+            return refuse
+
+        report_run(api, tmp_path, started(), register=register)
+
+        assert len(api.prints) == 1
+
+
+class TestStatusReport:
+    def test_the_last_event_names_the_job_and_its_print(self, tmp_path):
+        api = FakePrintLogApi()
+
+        printing = report_run(api, tmp_path, started())
+        done = report_run(api, tmp_path, finished())
+
+        assert printing["last_event"] == "job 00000A started: print 1, 'Shelf Bracket'"
+        assert done["last_event"] == "job 00000A completed: print 1"
+
+    def test_a_job_that_could_not_be_logged_is_a_warning_until_one_is(self, tmp_path):
+        api = FakePrintLogApi()
+        api.fail_next(3)
+        seen = []
+
+        recovered = report_run(
+            api,
+            tmp_path,
+            started(),
+            lambda _api: seen.append(read_status(tmp_path)["printers"]["voron"]),
+            started(),  # the replay, once the API is back
+        )
+
+        [failed] = seen
+
+        assert "job 00000A" in failed["warnings"]["api"]
+        assert "503" in failed["warnings"]["api"]
+        assert recovered["warnings"] == {}
+
+    def test_a_refused_job_is_a_warning(self, tmp_path):
+        api = FakePrintLogApi(printers=(7,))
+
+        status = report_run(api, tmp_path, started())
+
+        assert "does not belong" in status["warnings"]["api"]
+
+
+class TestWaitingJobs:
+    def test_a_job_that_ended_but_was_not_logged_is_marked_as_ended(self, tmp_path):
+        api = FakePrintLogApi()
+
+        def outage(api):
+            api.fail_next(3)
+
+        run(api, tmp_path, started(), outage, finished())
+
+        [job] = PrinterState.load(tmp_path, "voron").jobs.values()
+        assert not job.finished
+        assert job.ended_at == finished().finished_at.isoformat()

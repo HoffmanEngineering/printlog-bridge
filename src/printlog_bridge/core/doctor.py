@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import platform
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from printlog_bridge.core.adapter import Adapter
@@ -20,6 +21,11 @@ from printlog_bridge.core.config import (
 
 API_KEYS_PAGE = "https://www.3dprintlog.com/api-keys"
 PRINTERS_PAGE = "https://www.3dprintlog.com/printers/"
+MAX_CLOCK_SKEW = timedelta(minutes=2)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 async def diagnose(
@@ -27,6 +33,7 @@ async def diagnose(
     adapters: Mapping[str, type[Adapter]],
     env: Mapping[str, str],
     home: Path,
+    clock: Callable[[], datetime] = _utc_now,
 ) -> list[CheckResult]:
     results = [CheckResult.ok("Python", platform.python_version())]
 
@@ -42,8 +49,10 @@ async def diagnose(
     )
     results.append(_check_state_dir(config.state_dir))
     results.append(_check_sqlite())
-    api = await _check_api(config)
+    api, server_time = await _check_api(config)
     results.append(api)
+    if server_time is not None:
+        results.append(_check_clock(server_time, clock()))
 
     for printer in config.printers:
         try:
@@ -116,14 +125,15 @@ async def _check_printer_link(config: BridgeConfig, printer: PrinterConfig) -> C
     return CheckResult.ok(name, f"printer {printer.printer_id}, {found.get('name')}")
 
 
-async def _check_api(config: BridgeConfig) -> CheckResult:
+async def _check_api(config: BridgeConfig) -> tuple[CheckResult, datetime | None]:
+    """The API check, and the API's clock when it answered."""
     name = "3D Print Log API"
     if config.api_key is None:
         return CheckResult.fail(
             name,
             f"no API key. Create one at {API_KEYS_PAGE}, then set api_key in [bridge] "
             f"or the {API_KEY_ENV} environment variable.",
-        )
+        ), None
 
     try:
         async with ApiClient(config.api_url, config.api_key) as client:
@@ -133,9 +143,23 @@ async def _check_api(config: BridgeConfig) -> CheckResult:
             name,
             f"{config.api_url} rejected the API key. Check it, or create a new one at "
             f"{API_KEYS_PAGE}.",
-        )
+        ), None
     except ApiUnavailable as e:
-        return CheckResult.fail(name, str(e))
+        return CheckResult.fail(name, str(e)), None
 
     who = user.display_name or f"user {user.id}"
-    return CheckResult.ok(name, f"{config.api_url}, signed in as {who}")
+    return CheckResult.ok(name, f"{config.api_url}, signed in as {who}"), client.server_time
+
+
+def _check_clock(server_time: datetime, now: datetime) -> CheckResult:
+    name = "Clock"
+    skew = now - server_time
+    seconds = abs(round(skew.total_seconds()))
+    if abs(skew) <= MAX_CLOCK_SKEW:
+        return CheckResult.ok(name, f"within {seconds}s of 3D Print Log's")
+    direction = "ahead of" if skew > timedelta(0) else "behind"
+    return CheckResult.warn(
+        name,
+        f"this computer's clock is {seconds}s {direction} 3D Print Log's, so the app may show the "
+        "printer as offline. Turn on NTP time sync (on Linux: sudo timedatectl set-ntp true).",
+    )

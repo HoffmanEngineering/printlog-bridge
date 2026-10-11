@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from types import TracebackType
 from typing import Any
 
@@ -46,6 +48,8 @@ class ApiClient:
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._session: aiohttp.ClientSession | None = None
+        self.server_time: datetime | None = None
+        """The API's clock, from the `Date` of its last answer, to tell when ours is off."""
 
     def __repr__(self) -> str:
         return f"ApiClient({self.base_url!r})"
@@ -101,6 +105,10 @@ class ApiClient:
     async def patch_print(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
         return await self._request("PATCH", f"/api/Prints/{print_id}", json=body, missing_ok=True)
 
+    async def put_connection(self, instance_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Registers the connection, or sends its heartbeat. Each call replaces every field."""
+        return await self._request("PUT", f"/api/Connections/{instance_id}", json=body)
+
     async def _get_json(self, path: str) -> Any:
         try:
             return await self._request("GET", path)
@@ -135,6 +143,7 @@ class ApiClient:
             async with self._session.request(
                 method, self.base_url + path, json=json, params=params
             ) as response:
+                self.server_time = _date(response.headers.get("Date")) or self.server_time
                 if response.status == 401:
                     raise AuthRejected(f"the API rejected the key ({response.status})")
                 if response.status == 404 and missing_ok:
@@ -154,3 +163,15 @@ class ApiClient:
             raise ApiUnavailable(
                 f"{self.base_url} did not answer within {REQUEST_TIMEOUT_S}s"
             ) from e
+
+
+def _date(header: str | None) -> datetime | None:
+    if not header:
+        return None
+    try:
+        parsed = parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)

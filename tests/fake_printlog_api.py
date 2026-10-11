@@ -8,6 +8,9 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
 - `POST /api/Prints/{id}/complete` sets the status and duration and merges usage rows: by
   `filamentId`, else by slot against rows with no filament. Every other field is left alone.
 - `PATCH /api/Prints/{id}` changes only the fields sent.
+- `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
+  field; `kind` and `displayName` are required and `printerId` must be the user's. A print
+  links to a connection only when it is created after the connection was registered.
 """
 
 from __future__ import annotations
@@ -39,6 +42,9 @@ class FakePrintLogApi:
         self.created: list[dict[str, Any]] = []
         """Every create body received, replays included."""
         self.completions: list[dict[str, Any]] = []
+        self.connections: dict[str, dict[str, Any]] = {}
+        self.heartbeats: list[tuple[str, dict[str, Any]]] = []
+        """Every PUT /api/Connections body received, by instance id."""
         self._ids = itertools.count(1)
         self._failures: list[int] = []
         self._server: TestServer | None = None
@@ -54,6 +60,7 @@ class FakePrintLogApi:
         app.router.add_get("/api/Prints/{id}", self._get)
         app.router.add_patch("/api/Prints/{id}", self._patch)
         app.router.add_post("/api/Prints/{id}/complete", self._complete)
+        app.router.add_put("/api/Connections/{instance}", self._put_connection)
         self._server = TestServer(app)
         await self._server.start_server()
         return str(self._server.make_url("")).rstrip("/")
@@ -143,6 +150,10 @@ class FakePrintLogApi:
             "externalSource": source,
             "externalId": external_id,
             "connectionInstanceId": body.get("connectionInstanceId"),
+            # Like the API: only a connection registered before the print was created links.
+            "connectionId": (
+                self.connections.get(body.get("connectionInstanceId") or "") or {}
+            ).get("id"),
             "printTimeInSeconds": body.get("printTimeInSeconds"),
             "estimatedPrintTimeInSeconds": body.get("estimatedPrintTimeInSeconds"),
             "filamentUsageMg": body.get("filamentUsageMg"),
@@ -150,6 +161,29 @@ class FakePrintLogApi:
             "filamentUsage": [_row(r) for r in body.get("filamentUsage") or []],
         }
         return web.json_response(self.prints[print_id], status=201)
+
+    async def _put_connection(self, request: web.Request) -> web.Response:
+        instance_id = request.match_info["instance"].strip()
+        body = await request.json()
+        self.heartbeats.append((instance_id, body))
+        for field in ("kind", "displayName"):
+            if not (body.get(field) or "").strip():
+                return web.Response(status=400, text=f"{field} is required.")
+        if body.get("printerId") is not None and body["printerId"] not in self.printers:
+            return web.Response(status=400, text="The printer does not exist or is not yours.")
+
+        existing = self.connections.get(instance_id)
+        connection = {
+            "id": existing["id"] if existing else str(uuid.uuid4()),
+            "instanceId": instance_id,
+            "kind": body["kind"].strip().lower(),
+            "displayName": body["displayName"].strip(),
+            "agentVersion": body.get("agentVersion"),
+            "printerId": body.get("printerId"),
+            "status": 1,
+        }
+        self.connections[instance_id] = connection
+        return web.json_response(connection, status=200 if existing else 201)
 
     async def _get(self, request: web.Request) -> web.Response:
         found = self.prints.get(int(request.match_info["id"]))

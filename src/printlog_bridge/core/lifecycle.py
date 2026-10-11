@@ -19,6 +19,7 @@ from typing import Any
 from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
 from printlog_bridge.core.events import JobEvent, JobFinished, JobOutcome, JobStarted
 from printlog_bridge.core.state import JobRecord, PrinterState
+from printlog_bridge.core.status import BoardReport, StatusBoard
 from printlog_bridge.core.titles import title_from_file_name
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ LAST_ALLOW_COMMENTS_SETTING = 3
 VIEW_STATUSES = {"public": 1, "unlisted": 2, "private": 3, "1": 1, "2": 2, "3": 3}
 
 RETRY_DELAYS_S = (2, 10, 30)
+API_TOPIC = "api"
 
 
 @dataclass(frozen=True)
@@ -54,29 +56,39 @@ class JobLogger:
         printers: Mapping[str, LoggedPrinter],
         state_dir: Path,
         retry_delays: Sequence[float] = RETRY_DELAYS_S,
+        board: StatusBoard | None = None,
+        before_create: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
+        """`before_create(printer)` runs before each print is created. The bridge registers the
+        printer's connection there, so the print links to it."""
         self.api = api
         self.printers = dict(printers)
         self.state_dir = state_dir
         self.retry_delays = tuple(retry_delays)
+        self.board = board
+        self.before_create = before_create
         self._states: dict[str, PrinterState] = {}
         self._defaults: tuple[int, bool] | None = None
 
     async def resume_after(self, printer: str) -> datetime | None:
-        return self._state(printer).resume_after()
+        return self.state(printer).resume_after()
 
     async def emit(self, event: JobEvent) -> None:
         target = self.printers.get(event.printer)
         if target is None:
             log.error("[printer %s] isn't linked to 3D Print Log; skipping its jobs", event.printer)
             return
-        state = self._state(event.printer)
+        state = self.state(event.printer)
         if isinstance(event, JobStarted):
             await self._started(target, state, event)
         else:
             await self._finished(target, state, event)
 
-    def _state(self, printer: str) -> PrinterState:
+    def _report(self, printer: str) -> BoardReport | None:
+        return self.board.printer(printer) if self.board is not None else None
+
+    def state(self, printer: str) -> PrinterState:
+        """The printer's state file, loaded once and kept."""
         if printer not in self._states:
             self._states[printer] = PrinterState.load(self.state_dir, printer)
         return self._states[printer]
@@ -94,18 +106,23 @@ class JobLogger:
             return  # a replay
 
         async def create() -> None:
-            print_ = await self._create(target, state, event.job_id, job)
-            log.info(
-                "[printer %s] job %s started: print %s, %r",
-                event.printer, event.job_id, print_["id"], print_.get("title"),
-            )  # fmt: skip
+            print_ = await self._create(target, state, event.printer, event.job_id, job)
+            self._logged(
+                event.printer,
+                f"job {event.job_id} started: print {print_['id']}, {print_.get('title')!r}",
+            )
 
         await self._attempt(event, create)
 
     async def _create(
-        self, target: LoggedPrinter, state: PrinterState, job_id: str, job: JobRecord
+        self, target: LoggedPrinter, state: PrinterState, printer: str, job_id: str, job: JobRecord
     ) -> dict[str, Any]:
         start = job.start
+        if self.before_create is not None:
+            try:
+                await self.before_create(printer)
+            except Exception:  # the print matters more than its link to the connection
+                log.exception("[printer %s] couldn't register the connection", printer)
         view_status, allow_comments = await self._account_defaults()
         body: dict[str, Any] = {
             "printerId": target.printer_id,
@@ -157,6 +174,9 @@ class JobLogger:
             return
         if job.finished:
             return  # a replay
+        if job.ended_at is None:
+            job.ended_at = event.finished_at.isoformat()
+            state.save()
 
         async def complete() -> None:
             await self._complete(target, state, event, job)
@@ -167,7 +187,9 @@ class JobLogger:
         self, target: LoggedPrinter, state: PrinterState, event: JobFinished, job: JobRecord
     ) -> None:
         if job.print_id is None:
-            print_: dict[str, Any] | None = await self._create(target, state, event.job_id, job)
+            print_: dict[str, Any] | None = await self._create(
+                target, state, event.printer, event.job_id, job
+            )
         else:
             print_ = await self.api.get_print(job.print_id)
         if print_ is None:
@@ -200,18 +222,30 @@ class JobLogger:
 
         job.finished = True
         state.save()
-        log.info(
-            "[printer %s] job %s %s: print %s",
-            event.printer, event.job_id, event.outcome.value, print_["id"],
-        )  # fmt: skip
+        self._logged(
+            event.printer, f"job {event.job_id} {event.outcome.value}: print {print_['id']}"
+        )
 
     def _deleted(self, state: PrinterState, event: JobFinished, job: JobRecord) -> None:
-        log.info(
-            "[printer %s] print %s for job %s was deleted in 3D Print Log; leaving it deleted",
-            event.printer, job.print_id, event.job_id,
-        )  # fmt: skip
         job.finished = True
         state.save()
+        self._logged(
+            event.printer,
+            f"job {event.job_id} {event.outcome.value}: print {job.print_id} was deleted in "
+            "3D Print Log, so it stays deleted",
+        )
+
+    def _logged(self, printer: str, what: str) -> None:
+        log.info("[printer %s] %s", printer, what)
+        report = self._report(printer)
+        if report is not None:
+            report.event(what)
+            report.warn(API_TOPIC, None)
+
+    def _not_logged(self, event: JobEvent, problem: str) -> None:
+        report = self._report(event.printer)
+        if report is not None:
+            report.warn(API_TOPIC, f"job {event.job_id} isn't logged yet: {problem}")
 
     # -- errors --------------------------------------------------------------------------------
 
@@ -231,9 +265,11 @@ class JobLogger:
                     "logged. Check api_key in [bridge], then restart the bridge.",
                     event.printer, event.job_id,
                 )  # fmt: skip
+                self._not_logged(event, "3D Print Log rejected the API key (api_key in [bridge])")
                 return
             except ApiRejected as e:
                 log.error("[printer %s] job %s isn't logged: %s", event.printer, event.job_id, e)
+                self._not_logged(event, str(e))
                 return
             except ApiUnavailable as e:
                 if delay is None:
@@ -242,6 +278,7 @@ class JobLogger:
                         "next reconnects to the printer.",
                         event.printer, event.job_id, e,
                     )  # fmt: skip
+                    self._not_logged(event, f"{e}. It is retried when the bridge reconnects.")
                     return
                 await asyncio.sleep(delay)
             except Exception:
@@ -252,6 +289,7 @@ class JobLogger:
                     "reconnects to the printer",
                     event.printer, event.job_id,
                 )  # fmt: skip
+                self._not_logged(event, "an unexpected error; see the bridge's log")
                 return
 
 

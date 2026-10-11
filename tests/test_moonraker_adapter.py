@@ -12,6 +12,7 @@ from fake_moonraker import FakeMoonraker, eventually
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import ConfigError
+from printlog_bridge.core.status import NullReport
 
 
 def test_url_selects_remote_mode():
@@ -194,7 +195,7 @@ def test_run_stays_connected_until_cancelled():
         base = await fake.start()
         try:
             adapter = MoonrakerAdapter.from_config("u1", {"url": base})
-            task = asyncio.ensure_future(adapter.run(sink=NoJobsSink()))
+            task = asyncio.ensure_future(adapter.run(sink=NoJobsSink(), report=NullReport()))
             await eventually(lambda: fake.subscriptions)
             assert not task.done()
             task.cancel()

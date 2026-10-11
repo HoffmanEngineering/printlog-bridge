@@ -30,7 +30,7 @@ class FakeAdapter(Adapter):
     def describe(self) -> str:
         return "fake"
 
-    async def run(self, sink) -> None:  # pragma: no cover - not exercised here
+    async def run(self, sink, report) -> None:  # pragma: no cover - not exercised here
         raise NotImplementedError
 
     async def check(self):  # pragma: no cover - not exercised here

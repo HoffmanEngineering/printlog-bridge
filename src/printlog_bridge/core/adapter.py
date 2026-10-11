@@ -8,6 +8,7 @@ from typing import ClassVar
 
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.events import EventSink
+from printlog_bridge.core.status import PrinterReport
 
 
 class Adapter(ABC):
@@ -35,10 +36,12 @@ class Adapter(ABC):
         """One line for `doctor` and logs, such as "moonraker, remote http://u1.local:7125"."""
 
     @abstractmethod
-    async def run(self, sink: EventSink) -> None:
+    async def run(self, sink: EventSink, report: PrinterReport) -> None:
         """Watch the printer until cancelled, emitting each job's events to `sink` in order.
 
-        Reconnect on your own after a dropped connection; return only when cancelled.
+        Tell `report` when the connection comes up or drops, the printer's own state, and
+        anything the user has to fix, for `printlog-bridge status`. Reconnect on your own after a
+        dropped connection; return only when cancelled.
         """
 
     @abstractmethod

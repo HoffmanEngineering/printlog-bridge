@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import zipfile
 from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp import web
@@ -11,6 +13,7 @@ from printlog_bridge.cli.main import main
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult, Status
 from printlog_bridge.core.doctor import diagnose, format_report
+from printlog_bridge.core.status import StatusBoard
 
 
 class FakeAdapter(Adapter):
@@ -27,7 +30,7 @@ class FakeAdapter(Adapter):
     def describe(self) -> str:
         return "fake"
 
-    async def run(self, sink) -> None:  # pragma: no cover
+    async def run(self, sink, report) -> None:  # pragma: no cover
         raise NotImplementedError
 
     async def check(self):
@@ -66,13 +69,16 @@ def write_config(tmp_path: Path, api_url: str, api_key: str = "k", printers: str
     return path
 
 
-def run_diagnose(tmp_path: Path, status: int = 200, api_key: str = "k", printers: str = ""):
+def run_diagnose(
+    tmp_path: Path, status: int = 200, api_key: str = "k", printers: str = "", clock=None
+):
     async def scenario():
         server = serve_me(status)
         await server.start_server()
         try:
             path = write_config(tmp_path, str(server.make_url("")).rstrip("/"), api_key, printers)
-            return await diagnose(path, adapters=ADAPTERS, env={}, home=tmp_path)
+            kwargs = {"clock": clock} if clock else {}
+            return await diagnose(path, adapters=ADAPTERS, env={}, home=tmp_path, **kwargs)
         finally:
             await server.close()
 
@@ -92,6 +98,7 @@ def test_a_healthy_setup_passes_every_check(tmp_path):
         "State directory",
         "SQLite",
         "3D Print Log API",
+        "Clock",
         "Printer voron",
         "Printer voron in 3D Print Log",
     ]
@@ -250,3 +257,118 @@ class TestDoctorCommand:
 
         asyncio.run(scenario())
         return exit_code["value"]
+
+
+def now_plus(offset: timedelta):
+    return lambda: datetime.now(timezone.utc) + offset
+
+
+def test_a_clock_in_step_with_the_api_passes(tmp_path):
+    clock = by_name(run_diagnose(tmp_path))["Clock"]
+
+    assert clock.status is Status.OK
+    assert "3D Print Log" in clock.detail
+
+
+def test_a_clock_off_by_minutes_is_a_warning_saying_how_to_fix_it(tmp_path):
+    clock = by_name(run_diagnose(tmp_path, clock=now_plus(timedelta(minutes=5))))["Clock"]
+
+    assert clock.status is Status.WARN
+    assert "ahead" in clock.detail
+    assert "NTP" in clock.detail
+
+
+def test_a_clock_behind_says_so(tmp_path):
+    clock = by_name(run_diagnose(tmp_path, clock=now_plus(-timedelta(minutes=5))))["Clock"]
+
+    assert "behind" in clock.detail
+
+
+def test_the_clock_is_not_checked_without_the_api(tmp_path):
+    assert "Clock" not in by_name(run_diagnose(tmp_path, status=503))
+
+
+class TestSupportBundle:
+    SECRETS = ("api-key-secret-1", "moonraker-secret-2", "env-key-secret-3")
+
+    def config(self, tmp_path, api_url):
+        path = tmp_path / "printlog-bridge.cfg"
+        path.write_text(
+            f"[bridge]\napi_url = {api_url}\napi_key = {self.SECRETS[0]}\n"
+            f"state_dir = {tmp_path / 'state'}\n"
+            "[printer voron]\nadapter = fake\nprinter_id = 7\nurl = http://voron:7125\n"
+            f"moonraker_api_key = {self.SECRETS[1]}\n"
+            "[printer u1]\nadapter = fake\nurl = http://maker:hunter2@u1:7125\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def doctor(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr("printlog_bridge.cli.main.ADAPTERS", ADAPTERS)
+        state = tmp_path / "state"
+        # Secrets where a bug could leak them: the status file and the log.
+        board = StatusBoard(state)
+        board.start(["voron"])
+        board.printer("voron").warn("api", f"refused key {self.SECRETS[2]}")
+        (state / "bridge.log").write_text(
+            f"INFO started\nERROR X-Api-Key: {self.SECRETS[0]} and {self.SECRETS[1]}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PRINTLOG_API_KEY", self.SECRETS[2])
+
+        async def scenario():
+            server = serve_me(401)  # the env key is not the API's, which doesn't matter here
+            await server.start_server()
+            try:
+                path = self.config(tmp_path, str(server.make_url("")).rstrip("/"))
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, main, ["doctor", "--config", str(path)])
+            finally:
+                await server.close()
+
+        asyncio.run(scenario())
+        return state / "printlog-bridge-support.zip", capsys.readouterr().out
+
+    def members(self, bundle: Path) -> dict[str, str]:
+        with zipfile.ZipFile(bundle) as z:
+            return {name: z.read(name).decode("utf-8") for name in z.namelist()}
+
+    def test_doctor_writes_a_bundle_and_says_where(self, tmp_path, monkeypatch, capsys):
+        bundle, out = self.doctor(tmp_path, monkeypatch, capsys)
+
+        assert bundle.is_file()
+        assert f"Support bundle: {bundle}" in out
+
+    def test_the_bundle_holds_what_support_needs(self, tmp_path, monkeypatch, capsys):
+        bundle, _ = self.doctor(tmp_path, monkeypatch, capsys)
+
+        members = self.members(bundle)
+        assert set(members) >= {
+            "doctor.txt",
+            "environment.txt",
+            "printlog-bridge.cfg",
+            "status.json",
+            "bridge.log",
+        }
+        assert "3D Print Log API" in members["doctor.txt"]
+        assert "printlog-bridge" in members["environment.txt"]
+        assert "[printer voron]" in members["printlog-bridge.cfg"]
+        assert "printer_id = 7" in members["printlog-bridge.cfg"]
+
+    def test_the_bundle_contains_no_key_or_token(self, tmp_path, monkeypatch, capsys):
+        bundle, _ = self.doctor(tmp_path, monkeypatch, capsys)
+
+        raw = bundle.read_bytes()
+        members = self.members(bundle)
+        for secret in (*self.SECRETS, "hunter2"):
+            assert secret.encode() not in raw
+            for name, text in members.items():
+                assert secret not in text, name
+        assert "api_key = <redacted>" in members["printlog-bridge.cfg"]
+        assert "moonraker_api_key = <redacted>" in members["printlog-bridge.cfg"]
+        assert "http://<redacted>@u1:7125" in members["printlog-bridge.cfg"]
+
+    def test_no_bundle_without_a_config(self, tmp_path, capsys):
+        main(["doctor", "--config", str(tmp_path / "missing.cfg")])
+
+        assert "Support bundle" not in capsys.readouterr().out

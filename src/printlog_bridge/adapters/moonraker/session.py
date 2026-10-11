@@ -21,12 +21,14 @@ from urllib.parse import urlparse, urlunparse
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.core.status import NullReport, PrinterReport
 
 log = logging.getLogger(__name__)
 
 CLIENT_NAME = "printlog-bridge"
 REPO_URL = "https://github.com/HoffmanEngineering/printlog-bridge"
 REQUEST_TIMEOUT_S = 10
+WARNING_TOPIC = "moonraker"
 CONNECT_TIMEOUT_S = 10
 UNIX_READ_LIMIT = 4 * 1024 * 1024
 ETX = b"\x03"
@@ -165,6 +167,7 @@ class MoonrakerSession:
         api_key: str | None = None,
         remote_methods: Mapping[str, RemoteMethod] | None = None,
         backoff: Backoff | None = None,
+        report: PrinterReport | None = None,
     ) -> None:
         if (url is None) == (socket is None):
             raise ValueError("pass exactly one of url or socket")
@@ -175,6 +178,7 @@ class MoonrakerSession:
         self.api_key = api_key
         self.remote_methods = dict(remote_methods or {})
         self.backoff = backoff or Backoff()
+        self.report = report or NullReport()
         self.status: dict[str, dict[str, Any]] = {}
 
     @property
@@ -184,20 +188,27 @@ class MoonrakerSession:
     async def run(self) -> None:
         """Stays connected until cancelled, reconnecting with backoff whenever the link drops."""
         while True:
+            reason = f"Moonraker at {self.where} closed the connection"
             try:
                 transport = await self._open()
                 try:
                     await self._serve(_JsonRpc(transport))
                 finally:
                     await transport.close()
-            except MoonrakerAuthError as e:
-                log.error("[printer %s] %s", self.printer, e)
-            except AlreadyConnected as e:
-                log.warning("[printer %s] %s", self.printer, e)
+            except (MoonrakerAuthError, AlreadyConnected) as e:
+                reason = str(e)
+                if isinstance(e, MoonrakerAuthError):
+                    log.error("[printer %s] %s", self.printer, e)
+                else:
+                    log.warning("[printer %s] %s", self.printer, e)
+                self.report.warn(WARNING_TOPIC, reason)
             except (ConnectionLost, MoonrakerRpcError, aiohttp.ClientError, OSError) as e:
-                log.warning("[printer %s] Moonraker at %s: %s", self.printer, self.where, _why(e))
+                reason = f"Moonraker at {self.where}: {_why(e)}"
+                log.warning("[printer %s] %s", self.printer, reason)
             except asyncio.TimeoutError:
-                log.warning("[printer %s] Moonraker at %s didn't answer", self.printer, self.where)
+                reason = f"Moonraker at {self.where} didn't answer"
+                log.warning("[printer %s] %s", self.printer, reason)
+            self.report.disconnected(reason)
 
             delay = self.backoff.next()
             log.info("[printer %s] reconnecting in %gs", self.printer, delay)
@@ -231,6 +242,8 @@ class MoonrakerSession:
 
             log.info("[printer %s] connected to Moonraker at %s", self.printer, self.where)
             self.backoff.reset()
+            self.report.connected()
+            self.report.warn(WARNING_TOPIC, None)
 
             for name in self.remote_methods:
                 await rpc.call("connection.register_remote_method", {"method_name": name})
@@ -242,7 +255,7 @@ class MoonrakerSession:
             if klippy == "ready":
                 await self._subscribe(rpc)
             else:
-                await self.listener.on_klippy_state(klippy)
+                await self._klippy_state(klippy)
 
             async for method, params in rpc.notifications():
                 await self._notified(rpc, method, params)
@@ -260,7 +273,7 @@ class MoonrakerSession:
         elif method == "notify_klippy_ready":
             await self._subscribe(rpc)
         elif method in ("notify_klippy_shutdown", "notify_klippy_disconnected"):
-            await self.listener.on_klippy_state(method[len("notify_klippy_") :])
+            await self._klippy_state(method[len("notify_klippy_") :])
         elif method in self.remote_methods:
             await self.remote_methods[method](params or {})
 
@@ -276,8 +289,12 @@ class MoonrakerSession:
             return
 
         self.status = {name: dict(fields) for name, fields in result["status"].items()}
-        await self.listener.on_klippy_state("ready")
+        await self._klippy_state("ready")
         await self.listener.on_status(self.status, self.status)
+
+    async def _klippy_state(self, state: str) -> None:
+        self.report.printer_state(state)
+        await self.listener.on_klippy_state(state)
 
 
 class _JsonRpc:
