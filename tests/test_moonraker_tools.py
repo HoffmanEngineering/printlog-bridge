@@ -89,6 +89,29 @@ class TestToolUsage:
 
         assert usage.take("cube.gcode") == {0: 100.0, 1: 80.0}
 
+    def test_a_retraction_mid_print_is_not_a_new_print(self):
+        # filament_used follows the E position, so it drops while a retraction is in effect.
+        usage = ToolUsage()
+        usage.update(status("printing", 0.0))
+        usage.update(status(used=1000.0))
+        usage.update(status(used=2000.0, tool="extruder1"))
+        usage.update(status(used=1999.2, tool="extruder1"))  # retracted
+        usage.update(status("paused", 1998.0, tool="extruder1"))  # retracted further on pause
+        usage.update(status(used=2100.0, tool="extruder1"))
+
+        assert usage.take("cube.gcode") == pytest.approx({0: 1000.0, 1: 1100.0})
+
+    def test_a_new_file_while_away_starts_over(self):
+        usage = ToolUsage()
+        usage.update(status("printing", 0.0, filename="first.gcode"))
+        usage.update(status(used=500.0, filename="first.gcode"))
+        # The bridge missed the end of first.gcode and the start of second.gcode.
+        usage.update(status(used=40.0, tool="extruder1", filename="second.gcode"))
+        usage.update(status(used=60.0, tool="extruder1", filename="second.gcode"))
+
+        assert usage.take("first.gcode") == {}
+        assert usage.take("second.gcode") == {1: 60.0}
+
     def test_is_taken_once(self):
         usage = ToolUsage()
         usage.update(status("printing", 0.0))

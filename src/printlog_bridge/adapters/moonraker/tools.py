@@ -57,8 +57,15 @@ class ToolUsage:
         used = stats.get("filament_used")
         used = float(used) if isinstance(used, (int, float)) else None
 
-        if used is not None and self._used is not None and used < self._used:
-            # Klipper loaded a new file: the total starts again from zero.
+        if (
+            used is not None
+            and self._used is not None
+            and used < self._used
+            and (state not in PRINTING or (stats.get("filename") or None) != self.filename)
+        ):
+            # Klipper loaded a new file: the total starts again from zero. While a print runs
+            # the total also drops on every retraction (it follows the E position), so a drop
+            # is only a new file when no print is running, or the file changed.
             self._restart(stats)
             if used > 0:
                 self.slots[self._slot] = used
