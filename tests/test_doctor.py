@@ -273,6 +273,7 @@ class TestApiKeyStorage:
         if key_file is not None:
             state.mkdir(parents=True, exist_ok=True)
             (state / "api_key").write_text(key_file, encoding="utf-8")
+            (state / "api_key").chmod(0o600)  # as store-key writes it
         path = config_dir / "printlog-bridge.cfg"
         path.write_text(
             f"[bridge]\napi_url = http://127.0.0.1:9\nstate_dir = {state}\n{bridge}"

@@ -191,8 +191,8 @@ def read_key_file(path: Path) -> str | None:
     """The key in a key file, or None when there is none."""
     try:
         text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
+    except (FileNotFoundError, NotADirectoryError):
+        return None  # no state directory yet, or a broken one: doctor's own check says so
     except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"can't read the API key file {path} ({API_KEY_FILE}): {e}") from None
     return text.strip() or None
