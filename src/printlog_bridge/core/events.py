@@ -31,6 +31,9 @@ class JobStarted:
     estimated_filament_mm: float | None = None
     """The slicer's estimate of filament fed, in millimetres."""
     estimated_filament_g: float | None = None
+    estimated_filament_g_by_slot: Mapping[int, float] = field(default_factory=dict)
+    """The slicer's estimate per slot (tool index), in grams, when the file has one per tool.
+    Empty for a file with a single filament, whose estimate is the totals above."""
 
 
 @dataclass(frozen=True)

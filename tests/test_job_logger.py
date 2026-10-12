@@ -1186,3 +1186,122 @@ class TestWhenTheDiskFails:
         assert fetched == []  # skipped, not queued ahead of the start and dropped
         assert "has no print to go on" not in caplog.text
         assert "thumbnail is skipped: the outbox can't be written" in caplog.text
+
+
+# A four-colour print on a four-tool printer: the slicer's grams per tool, then what each fed.
+FOUR_TOOL_ESTIMATE = {0: 30.2, 1: 9.8, 2: 3.6, 3: 1.5}
+FOUR_TOOL_USAGE = {0: 10_120.0, 1: 3_280.0, 2: 1_160.0, 3: 500.0}
+
+
+def four_tool_start(**kwargs) -> JobStarted:
+    return started(
+        estimated_filament_mm=15123.4,
+        estimated_filament_g=45.1,
+        estimated_filament_g_by_slot=FOUR_TOOL_ESTIMATE,
+        **kwargs,
+    )
+
+
+def by_slot(print_) -> dict:
+    return {row["slot"]: row for row in print_["filamentUsage"]}
+
+
+class TestPerToolUsage:
+    def test_the_slicers_estimate_is_one_row_per_tool(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, four_tool_start())
+
+        [print_] = api.prints.values()
+        rows = by_slot(print_)
+        assert sorted(rows) == [0, 1, 2, 3]
+        assert [rows[s]["estimatedAmountMg"] for s in range(4)] == [30200, 9800, 3600, 1500]
+        assert {r["estimatedSource"] for r in rows.values()} == {1}  # Weight
+        assert all(r["filament"] is None for r in rows.values())
+        assert print_["estimatedFilamentUsageMg"] == 45100
+
+    def test_a_multi_filament_file_using_one_tool_estimates_on_that_tool(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(
+            api,
+            tmp_path,
+            started(
+                estimated_filament_mm=2700.0,
+                estimated_filament_g=8.2,
+                estimated_filament_g_by_slot={2: 8.2},
+            ),
+        )
+
+        [row] = api.prints[1]["filamentUsage"]
+        assert row["slot"] == 2
+        assert row["estimatedLengthInM"] == 2.7
+        assert row["estimatedAmountMg"] == 8200
+
+    def test_each_tool_gets_its_own_row_and_they_add_up_to_the_total(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, four_tool_start(), finished(filament_mm=FOUR_TOOL_USAGE))
+
+        rows = by_slot(api.prints[1])
+        assert sorted(rows) == [0, 1, 2, 3]  # the estimate rows, filled in
+        assert [rows[s]["lengthInM"] for s in range(4)] == [10.12, 3.28, 1.16, 0.5]
+        assert [rows[s]["estimatedAmountMg"] for s in range(4)] == [30200, 9800, 3600, 1500]
+        assert {r["source"] for r in rows.values()} == {2}  # Length
+        total = sum(r["lengthInM"] for r in rows.values())
+        assert total == pytest.approx(sum(FOUR_TOOL_USAGE.values()) / 1000, rel=0.01)
+
+    def test_a_tool_with_no_spool_is_still_recorded_with_its_slot(self, tmp_path):
+        api = FakePrintLogApi()
+
+        def link_tool_1(api):
+            by_slot(api.prints[1])[1]["filament"] = {"id": "spool-blue"}
+
+        run(api, tmp_path, four_tool_start(), link_tool_1, finished(filament_mm=FOUR_TOOL_USAGE))
+
+        [completion] = api.completions
+        sent = {row["slot"]: row for row in completion["filamentUsage"]}
+        assert sent[1]["filamentId"] == "spool-blue"
+        for slot in (0, 2, 3):
+            assert "filamentId" not in sent[slot]
+            assert sent[slot]["lengthInM"] > 0
+        rows = by_slot(api.prints[1])
+        assert rows[1]["filament"] == {"id": "spool-blue"}
+        assert rows[1]["lengthInM"] == 3.28
+        assert rows[3]["filament"] is None
+        assert rows[3]["lengthInM"] == 0.5
+
+    def test_one_spool_linked_to_two_tools_is_one_row(self, tmp_path):
+        """The API takes one row per spool, so two would be refused and the print never done."""
+        api = FakePrintLogApi()
+
+        def link_both(api):
+            rows = by_slot(api.prints[1])
+            rows[0]["filament"] = {"id": "spool-white"}
+            rows[2]["filament"] = {"id": "spool-white"}
+
+        run(api, tmp_path, four_tool_start(), link_both, finished(filament_mm=FOUR_TOOL_USAGE))
+
+        [completion] = api.completions
+        white = [r for r in completion["filamentUsage"] if r.get("filamentId") == "spool-white"]
+        assert [(r["slot"], r["lengthInM"]) for r in white] == [(0, 11.28)]
+        assert api.prints[1]["status"] == 3
+
+    def test_a_tool_that_fed_nothing_sends_no_row(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), finished(filament_mm={0: 900.0, 1: 0.0}))
+
+        [completion] = api.completions
+        assert [r["slot"] for r in completion["filamentUsage"]] == [0]
+
+    def test_the_estimate_per_tool_survives_a_restart(self, tmp_path):
+        api = FakePrintLogApi()
+        api.offline = True
+        run(api, tmp_path, four_tool_start(), timeout=0.1)
+        api.offline = False
+
+        run(api, tmp_path)
+
+        rows = by_slot(api.prints[1])
+        assert [rows[s]["estimatedAmountMg"] for s in range(4)] == [30200, 9800, 3600, 1500]

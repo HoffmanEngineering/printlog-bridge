@@ -6,7 +6,11 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
   with 200 instead of a duplicate. A replay applies only the fields a connector owns (status,
   durations, filament totals, usage rows) and never moves a finished print back to Printing.
 - `POST /api/Prints/{id}/complete` sets the status and duration and merges usage rows: by
-  `filamentId`, else by slot against rows with no filament. Every other field is left alone.
+  `filamentId`, else by `slot` against rows with no filament, else in order against the
+  unlinked rows left (per-slot usage, api#146). A matched row's actual weight, length and volume
+  are all replaced; its estimate is kept. It refuses with 400 a `filamentId` sent twice, a slot
+  sent twice among rows with no `filamentId`, and a row with no measurement (or a `source`
+  naming one it didn't send). Every other field is left alone.
 - `PATCH /api/Prints/{id}` changes only the fields sent.
 - `POST /api/Prints/{id}/image` adds an image from a multipart form (`image`, `isDefault`):
   jpeg, png, gif, webp or bmp by the part's content type, under 10 MB, at most 5 per print
@@ -284,32 +288,68 @@ class FakePrintLogApi:
         if body.get("status") not in FINISHED:
             return web.Response(status=400, text="status must be a finished status.")
 
+        usage = body.get("filamentUsage") or []
+        problem = _usage_problem(usage)
+        if problem:
+            return web.Response(status=400, text=problem)
+
         found["status"] = body["status"]
         if body.get("printTimeInSeconds") is not None:
             found["printTimeInSeconds"] = body["printTimeInSeconds"]
         rows = found["filamentUsage"]
-        for incoming in body.get("filamentUsage") or []:
+        unlinked = [r for r in rows if r["filament"] is None]
+        # Rows that name a slot claim theirs first, so an in-order match can't take it.
+        by_slot = {}
+        for incoming in usage:
+            if not incoming.get("filamentId") and incoming.get("slot") is not None:
+                match = next((r for r in unlinked if r["slot"] == incoming["slot"]), None)
+                if match is not None:
+                    unlinked.remove(match)
+                by_slot[incoming["slot"]] = match
+        for incoming in usage:
             if incoming.get("filamentId"):
                 match = next(
                     (r for r in rows if (r["filament"] or {}).get("id") == incoming["filamentId"]),
                     None,
                 )
+            elif incoming.get("slot") is not None:
+                match = by_slot[incoming["slot"]]
             else:
-                match = next(
-                    (
-                        r
-                        for r in rows
-                        if r["filament"] is None and r["slot"] == incoming.get("slot")
-                    ),
-                    None,
-                )
+                match = unlinked.pop(0) if unlinked else None
             if match is None:
                 rows.append(_row(incoming))
             else:
-                for field in ("amountMg", "lengthInM", "volumeMl", "source"):
-                    if incoming.get(field) is not None:
-                        match[field] = incoming[field]
+                # All three values are replaced, so an earlier completion's can't outlive it.
+                match["source"] = _source(incoming)
+                for field in ("amountMg", "lengthInM", "volumeMl"):
+                    match[field] = incoming.get(field)
         return web.json_response(found)
+
+
+MEASUREMENTS = {1: "amountMg", 2: "lengthInM", 3: "volumeMl"}  # Weight, Length, Volume
+
+
+def _source(row: dict[str, Any]) -> int | None:
+    """The measurement a usage row carries: the one named, or the first sent; None if absent."""
+    if row.get("source") is not None:
+        return row["source"] if row.get(MEASUREMENTS.get(row["source"], "")) is not None else None
+    return next((s for s, f in MEASUREMENTS.items() if row.get(f) is not None), None)
+
+
+def _usage_problem(usage: list[dict[str, Any]]) -> str | None:
+    """`CompletePrintDto.Validate`'s rules for usage rows, with its messages."""
+    linked = [r["filamentId"] for r in usage if r.get("filamentId")]
+    if len(linked) != len(set(linked)):
+        return "Each filamentId may appear at most once."
+    slots = [r["slot"] for r in usage if not r.get("filamentId") and r.get("slot") is not None]
+    if len(slots) != len(set(slots)):
+        return "Each slot may appear at most once among rows with no filamentId."
+    if any(_source(r) is None for r in usage):
+        return (
+            "Each usage row needs amountMg, lengthInM or volumeMl, and source must name one "
+            "that was sent."
+        )
+    return None
 
 
 def _row(sent: dict[str, Any]) -> dict[str, Any]:
