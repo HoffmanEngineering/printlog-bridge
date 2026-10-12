@@ -47,6 +47,11 @@ class ApiUnavailable(ApiError):
 class ApiRejected(ApiError):
     """The API refused this request (400, 403, 413, 415). Sending it again won't change that."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        """The HTTP status the API refused it with."""
+
 
 @dataclass(frozen=True)
 class CurrentUser:
@@ -99,6 +104,34 @@ class ApiClient:
             return await self._request("GET", f"/api/Printers/{printer_id}", missing_ok=True)
         except ApiRejected:
             return None  # 403: another user's printer
+
+    async def put_printer(self, printer_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Replaces the whole printer (every field; loaded spools left out are unloaded)."""
+        return await self._request("PUT", f"/api/Printers/{printer_id}", json=body, missing_ok=True)
+
+    async def loaded_filament(self, printer_id: int) -> list[dict[str, Any]] | None:
+        """The spools loaded on the printer, in slot order. None when the printer is gone."""
+        return await self._request("GET", f"/api/Printers/{printer_id}/filament", missing_ok=True)
+
+    async def load_slot(
+        self, printer_id: int, slot: int, filament_id: str, label: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Loads the spool into the slot, unloading it from anywhere else. Returns what's loaded.
+
+        Raises ApiRejected for a slot beyond the printer's `slotCount`, or another user's spool.
+        """
+        return await self._request(
+            "PUT",
+            f"/api/Printers/{printer_id}/slots/{slot}",
+            json={"filamentId": filament_id, "slotLabel": label},
+        )
+
+    async def unload_slot(self, printer_id: int, slot: int) -> None:
+        await self._request("DELETE", f"/api/Printers/{printer_id}/slots/{slot}")
+
+    async def filament_by_tag(self, uid: str) -> dict[str, Any] | None:
+        """The key owner's spool with this RFID/NFC tag, or None when none of theirs has it."""
+        return await self._request("GET", f"/api/Filaments/by-tag/{uid}", missing_ok=True)
 
     async def create_print(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         """The print, and whether it is new. An `externalId` already used returns the original."""
@@ -188,7 +221,8 @@ class ApiClient:
                     reason = (await response.text()).strip()[:300]
                     raise ApiRejected(
                         f"the API refused {method} {path} ({response.status})"
-                        + (f": {reason}" if reason else "")
+                        + (f": {reason}" if reason else ""),
+                        status=response.status,
                     )
                 if response.status >= 400:
                     raise ApiUnavailable(
@@ -196,6 +230,8 @@ class ApiClient:
                         _retry_after(response.headers.get("Retry-After"), self.server_time),
                         status=response.status,
                     )
+                if response.status == 204:
+                    return 204, None
                 return response.status, await response.json()
         except aiohttp.ClientError as e:
             raise ApiUnavailable(f"can't reach {self.base_url}: {e}") from e
