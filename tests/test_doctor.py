@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import zipfile
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
@@ -99,6 +101,7 @@ def test_a_healthy_setup_passes_every_check(tmp_path):
         "Config",
         "State directory",
         "SQLite",
+        "API key",
         "3D Print Log API",
         "Clock",
         "Printer voron",
@@ -259,6 +262,87 @@ class TestDoctorCommand:
 
         asyncio.run(scenario())
         return exit_code["value"]
+
+
+class TestApiKeyStorage:
+    """Moonraker serves its config folder to anyone who can open Mainsail or Fluidd."""
+
+    def key_check(self, config_dir: Path, bridge: str, env=None, key_file: str | None = None):
+        config_dir.mkdir(parents=True, exist_ok=True)
+        state = config_dir.parent / "state"
+        if key_file is not None:
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "api_key").write_text(key_file, encoding="utf-8")
+        path = config_dir / "printlog-bridge.cfg"
+        path.write_text(
+            f"[bridge]\napi_url = http://127.0.0.1:9\nstate_dir = {state}\n{bridge}"
+            "[printer voron]\nadapter = fake\nprinter_id = 7\n",
+            encoding="utf-8",
+        )
+        results = asyncio.run(
+            diagnose(path, adapters=ADAPTERS, env=env or {}, home=config_dir.parent)
+        )
+        return by_name(results).get("API key")
+
+    def test_a_key_in_a_config_moonraker_serves_is_a_warning_saying_how_to_move_it(self, tmp_path):
+        config_dir = tmp_path / "printer_data" / "config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "moonraker.conf").write_text("[server]\n", encoding="utf-8")
+
+        check = self.key_check(config_dir, "api_key = k\n")
+
+        assert check.status is Status.WARN
+        assert "Moonraker" in check.detail
+        assert "printlog-bridge store-key" in check.detail
+
+    def test_a_key_in_a_config_folder_named_like_klippers_is_a_warning(self, tmp_path):
+        check = self.key_check(tmp_path / "printer_data" / "config", "api_key = k\n")
+
+        assert check.status is Status.WARN
+
+    def test_a_key_in_a_config_elsewhere_is_fine(self, tmp_path):
+        check = self.key_check(tmp_path / ".config" / "printlog-bridge", "api_key = k\n")
+
+        assert check.status is Status.OK
+        assert "printlog-bridge.cfg" in check.detail
+
+    def test_a_key_in_the_key_file_is_fine(self, tmp_path):
+        check = self.key_check(tmp_path / "printer_data" / "config", "", key_file="k\n")
+
+        assert check.status is Status.OK
+        assert str(tmp_path / "printer_data" / "state" / "api_key") in check.detail
+
+    def test_a_key_from_the_environment_is_fine(self, tmp_path):
+        check = self.key_check(
+            tmp_path / "printer_data" / "config", "", env={"PRINTLOG_API_KEY": "k"}
+        )
+
+        assert check.status is Status.OK
+        assert "PRINTLOG_API_KEY" in check.detail
+
+    def test_a_key_left_in_a_served_config_is_a_warning_even_when_unused(self, tmp_path):
+        check = self.key_check(
+            tmp_path / "printer_data" / "config", "api_key = old\n", key_file="new\n"
+        )
+
+        assert check.status is Status.WARN
+        assert "isn't used" in check.detail
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+    def test_a_key_file_others_can_read_is_a_warning(self, tmp_path):
+        config_dir = tmp_path / ".config" / "printlog-bridge"
+        state = tmp_path / ".config" / "state"
+        state.mkdir(parents=True)
+        (state / "api_key").write_text("k\n", encoding="utf-8")
+        (state / "api_key").chmod(0o644)
+
+        check = self.key_check(config_dir, "")
+
+        assert check.status is Status.WARN
+        assert "chmod 600" in check.detail
+
+    def test_no_key_leaves_it_to_the_api_check(self, tmp_path):
+        assert self.key_check(tmp_path / "config", "") is None
 
 
 def now_plus(offset: timedelta):

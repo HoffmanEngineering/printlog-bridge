@@ -19,6 +19,7 @@ from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import ConfigError
 from printlog_bridge.core.events import EventSink
+from printlog_bridge.core.images import scrub_url
 from printlog_bridge.core.status import PrinterReport
 
 from .images import MoonrakerImages
@@ -29,6 +30,7 @@ from .session import (
     MoonrakerRpcError,
     MoonrakerSession,
     fetch_server_info,
+    where,
 )
 
 log = logging.getLogger(__name__)
@@ -105,7 +107,7 @@ class MoonrakerAdapter(Adapter):
 
     def describe(self) -> str:
         if self.url is not None:
-            return f"moonraker, remote {self.url}"
+            return f"moonraker, remote {where(self.url, None)}"
         return f"moonraker, local socket {self.socket}"
 
     async def run(self, sink: EventSink, report: PrinterReport) -> None:
@@ -138,7 +140,6 @@ class MoonrakerAdapter(Adapter):
                 )
             ]
 
-        where = self.url or str(self.socket)
         try:
             info = await asyncio.wait_for(
                 fetch_server_info(
@@ -155,7 +156,13 @@ class MoonrakerAdapter(Adapter):
             asyncio.TimeoutError,
             OSError,
         ) as e:
-            return [CheckResult.fail(name, f"can't reach Moonraker at {where}: {_reason(e)}")]
+            return [
+                CheckResult.fail(
+                    name,
+                    f"can't reach Moonraker at {where(self.url, self.socket)}: "
+                    f"{_reason(e, self.url)}",
+                )
+            ]
 
         klippy = info.get("klippy_state", "unknown")
         version = info.get("moonraker_version")
@@ -173,7 +180,7 @@ class MoonrakerAdapter(Adapter):
         return [CheckResult.ok(name, detail)]
 
 
-def _reason(error: BaseException) -> str:
+def _reason(error: BaseException, url: str | None) -> str:
     if isinstance(error, asyncio.TimeoutError):
         return f"no answer within {CHECK_TIMEOUT_S}s"
-    return str(error) or type(error).__name__
+    return scrub_url(error, url)

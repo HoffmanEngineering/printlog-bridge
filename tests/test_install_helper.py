@@ -220,10 +220,16 @@ class TestConfig:
                 "/home/pi/printer_data",
                 "--name",
                 "voron",
+                "--key-file",
+                str(self.key_file(tmp_path)),
                 *extra,
             ],  # fmt: skip
             env=env or {},
         )
+
+    @staticmethod
+    def key_file(tmp_path):
+        return tmp_path / ".local" / "share" / "printlog-bridge" / "api_key"
 
     def load(self, tmp_path):
         return load_config(
@@ -237,6 +243,7 @@ class TestConfig:
 
         config = self.load(tmp_path)
         assert config.api_key == "k-1"
+        assert config.api_key_file == self.key_file(tmp_path)
         [printer] = config.printers
         assert printer.name == "voron"
         assert printer.printer_id == 42
@@ -260,6 +267,40 @@ class TestConfig:
 
         assert path.read_text(encoding="utf-8") == "[bridge]\napi_key = mine\n"
         assert capsys.readouterr().out.strip() == "exists"
+
+    def test_the_key_is_kept_out_of_the_folder_moonraker_serves(self, tmp_path):
+        (tmp_path / "config").mkdir()
+
+        self.write(tmp_path, env={"PRINTLOG_API_KEY": "k-secret-1"})
+
+        assert "k-secret-1" not in (tmp_path / "config" / "printlog-bridge.cfg").read_text(
+            encoding="utf-8"
+        )
+        assert self.key_file(tmp_path).read_text(encoding="utf-8") == "k-secret-1\n"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+    def test_only_this_user_can_read_the_key(self, tmp_path):
+        (tmp_path / "config").mkdir()
+
+        self.write(tmp_path, env={"PRINTLOG_API_KEY": "k-secret-1"})
+
+        assert self.key_file(tmp_path).stat().st_mode & 0o777 == 0o600
+        assert self.key_file(tmp_path).parent.stat().st_mode & 0o077 == 0
+
+    def test_no_key_writes_no_key_file(self, tmp_path):
+        (tmp_path / "config").mkdir()
+
+        self.write(tmp_path)
+
+        assert not self.key_file(tmp_path).exists()
+
+    def test_installing_again_leaves_the_stored_key_alone(self, tmp_path):
+        (tmp_path / "config").mkdir()
+        self.write(tmp_path, env={"PRINTLOG_API_KEY": "first"})
+
+        self.write(tmp_path, env={"PRINTLOG_API_KEY": "second"})
+
+        assert self.load(tmp_path).api_key == "first"
 
     def test_a_printer_name_from_any_host_name_is_a_valid_section(self):
         assert helper.printer_name("Voron 2.4 (garage)") == "voron-2-4-garage"

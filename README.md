@@ -22,12 +22,13 @@ cd ~ && git clone https://github.com/HoffmanEngineering/printlog-bridge.git
 It asks for an API key and the printer's number in 3D Print Log (press Enter to fill them in later), then:
 
 - makes a virtualenv in `~/printlog-bridge-env` and installs the bridge into it;
+- stores the API key in `~/.local/share/printlog-bridge/api_key`, readable only by you (not in the config folder, which Moonraker serves to anyone who can open Mainsail or Fluidd);
 - writes `~/printer_data/config/printlog-bridge.cfg`, next to `printer.cfg`, unless you already have one;
 - installs and starts a `printlog-bridge` systemd service;
 - adds `printlog-bridge` to `~/printer_data/moonraker.asvc`, so Mainsail and Fluidd can restart it;
 - adds an `[update_manager printlog-bridge]` section to `moonraker.conf`, so updates show up in Mainsail's and Fluidd's update panels, and restarts Moonraker to load it.
 
-Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key or the printer for later, set them in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it) and restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
+Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key for later, store it with `~/printlog-bridge-env/bin/printlog-bridge store-key`; set the printer in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it). Then restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
 
 `./printlog-bridge/uninstall.sh` removes the service and the virtualenv, and puts `moonraker.conf` and `moonraker.asvc` back exactly as they were. It keeps your config and the state directory (including prints not yet logged) for a reinstall; `--purge` removes those too.
 
@@ -50,7 +51,7 @@ Bridge: running since 2026-10-10 09:30 UTC (version 0.1.0, pid 812)
 Printer voron (printer 42 in 3D Print Log)
   Connection: connected for 3h 12m (moonraker, local socket /home/pi/printer_data/comms/moonraker.sock)
   Printer state: ready
-  Pairing: not paired; logging with the API key in [bridge]
+  Pairing: not paired; API key from /home/pi/.local/share/printlog-bridge/api_key
   Last event: job 00002A completed: print 1834 (14m ago)
   Heartbeat: 2m 10s ago
   Outbox: empty
@@ -78,7 +79,11 @@ When 3D Print Log can't be reached (the internet is down, or the API is busy), n
 
 The bridge reads Moonraker's job history, so `[history]` must be in moonraker.conf (most installs have it; `run` logs how to add it when it's missing). It remembers what it has logged in its state directory, and on every start or reconnect it catches up on jobs that started or ended while it was away. On its very first run it picks up a print already running, but not older history.
 
-Until pairing lands, the bridge signs in with a personal API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys). Put it in `[bridge] api_key`, or in the `PRINTLOG_API_KEY` environment variable to keep it out of the file.
+Until pairing lands, the bridge signs in with a personal API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys). Store it with `printlog-bridge store-key`, which keeps it in `api_key` in the state directory, readable only by you. The bridge looks for the key in the `PRINTLOG_API_KEY` environment variable, then that file, then `api_key` in `[bridge]`. A key in `[bridge]` still works, but in local mode the config sits in Klipper's config folder, which Moonraker serves to anyone who can open Mainsail or Fluidd: `doctor` warns about it, and `store-key` moves it out of the config for you.
+
+## Privacy and security
+
+The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail and, unless you turn snapshots off, one webcam frame when it ends. It never reads or uploads G-code. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS, and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
 
 ## Config
 
@@ -88,7 +93,7 @@ Each printer is a `[printer <name>]` section, so one bridge can watch several. S
 
 In remote mode, if Moonraker has `[authorization]` enabled and the bridge's host isn't in `trusted_clients`, set `moonraker_api_key` in the printer's section to Moonraker's API key. The local socket is always trusted, so local mode never needs one. Moonraker accepts one bridge per printer; a second one waits until the first stops.
 
-Each print gets the largest thumbnail the slicer embedded in its file (OrcaSlicer, PrusaSlicer, Cura and SuperSlicer all embed one) as its picture when it starts. When it ends, the bridge also adds one frame from the printer's first webcam (its `snapshot_url` in Mainsail or Fluidd); for a failed print that frame becomes the picture shown. Set `snapshots = false` in the printer's section to never ask the webcam for anything. Pictures wait in the outbox with the print's other events (the image files in `images/` in the state directory), and never hold up logging the print: one that takes longer than 10 seconds, is over 10 MB or that 3D Print Log refuses (a print holds 5 pictures on the free plan) is skipped. A webcam address with a password in it is never written to the log.
+Each print gets the largest thumbnail the slicer embedded in its file (OrcaSlicer, PrusaSlicer, Cura and SuperSlicer all embed one) as its picture when it starts. When it ends, the bridge also adds one frame from the printer's first webcam (its `snapshot_url` in Mainsail or Fluidd); for a failed print that frame becomes the picture shown. Set `snapshots = false` in the printer's section to never ask the webcam for anything. Pictures wait in the outbox with the print's other events (the image files in `images/` in the state directory), and never hold up logging the print: one that takes longer than 10 seconds, is over 10 MB or that 3D Print Log refuses (a print holds 5 pictures on the free plan) is skipped. A Moonraker or webcam address with a password or token in it is shown with them hidden, in the log, `status` and `doctor`.
 
 ## Development
 

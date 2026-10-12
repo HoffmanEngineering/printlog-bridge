@@ -35,7 +35,8 @@ Options:
   -e, --venv DIR            the virtualenv install.sh made (default: ~/printlog-bridge-env)
   -m, --moonraker-service S Moonraker's systemd service (default: moonraker)
       --purge               also remove printlog-bridge.cfg and the state directory
-                            (${STATE_DIR}), including prints not yet logged
+                            (${STATE_DIR}), including the API key and prints not
+                            yet logged
   -y, --yes                 don't ask before purging
   -h, --help                show this
 EOF

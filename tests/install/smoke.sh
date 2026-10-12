@@ -68,7 +68,8 @@ check "moonraker.conf keeps what it had" \
 check "moonraker.asvc allows the service" grep -qx printlog-bridge "${DATA}/moonraker.asvc"
 check "the config was written" test -f "$CONFIG"
 check "the config has the printer" grep -qx 'printer_id = 42' "$CONFIG"
-check "the config waits for an API key" grep -qx 'api_key = ' "$CONFIG"
+check "the config holds no API key" sh -c "! grep -q '^api_key' '$CONFIG'"
+check "no key file without a key" test ! -e "${HOME}/.local/share/printlog-bridge/api_key"
 check "only this user can read the config" test "$(stat -c %a "$CONFIG")" = 600
 check "the config uses the local socket" \
     grep -qx "socket = ${DATA}/comms/moonraker.sock" "$CONFIG"
@@ -121,6 +122,18 @@ check "the config is kept" test -f "$CONFIG"
 echo "== uninstall.sh --purge"
 "${REPO}/uninstall.sh" --purge --yes </dev/null
 check "the config is gone" test ! -e "$CONFIG"
+
+# With a key but no printer, so install.sh doesn't run doctor (which would call the real API).
+echo "== install.sh with an API key"
+KEY_FILE="${HOME}/.local/share/printlog-bridge/api_key"
+PRINTLOG_API_KEY=smoke-test-key "${REPO}/install.sh" --yes </dev/null >"${WORK}/install.txt"
+check "the key is stored in the state directory" grep -qx smoke-test-key "$KEY_FILE"
+check "only this user can read the key" test "$(stat -c %a "$KEY_FILE")" = 600
+check "the key isn't in the config Moonraker serves" sh -c "! grep -q smoke-test-key '$CONFIG'"
+check "install.sh never prints the key" sh -c "! grep -q smoke-test-key '${WORK}/install.txt'"
+check "install.sh asks only for the printer" grep -q "Set printer_id" "${WORK}/install.txt"
+"${REPO}/uninstall.sh" --purge --yes </dev/null >/dev/null
+check "purge removes the key" test ! -e "$KEY_FILE"
 
 if [ "$failures" -ne 0 ]; then
     echo "${failures} check(s) failed"

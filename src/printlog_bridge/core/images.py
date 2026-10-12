@@ -2,8 +2,9 @@
 
 Adapters use these to fetch a job's slicer thumbnail or a webcam snapshot. Neither may hold up
 logging the print, so every fetch has a time limit and a size limit, and fails with
-`ImageUnavailable`, never anything else. Webcam URLs can carry a password, so a URL only ever
-reaches a message or the log through `mask_url`.
+`ImageUnavailable`, never anything else. Webcam URLs (and Moonraker's, in remote mode) can carry
+a password or a token, so a URL only ever reaches a message, the log or the status file through
+`mask_url`, and an error that might repeat one through `scrub_url`.
 """
 
 from __future__ import annotations
@@ -90,7 +91,7 @@ async def fetch_image(
     except asyncio.TimeoutError:
         raise ImageUnavailable(f"{shown} didn't answer within {timeout:g}s") from None
     except (aiohttp.ClientError, OSError, ValueError) as e:
-        raise ImageUnavailable(f"can't reach {shown}: {_scrub(e, url)}") from None
+        raise ImageUnavailable(f"can't reach {shown}: {scrub_url(e, url)}") from None
     if image_type(bytes(data)) is None:
         raise ImageUnavailable(f"{shown} sent something that is not an image")
     return bytes(data)
@@ -138,13 +139,21 @@ async def read_image_file(path: Path, *, max_bytes: int = MAX_IMAGE_BYTES) -> by
     return data
 
 
-def _scrub(error: BaseException, url: str) -> str:
-    """The error's message, without the URL's user or password should it repeat them."""
+def scrub_url(error: BaseException, url: str | None) -> str:
+    """The error's message, without the URL's user, password or secret query values should it
+    repeat them."""
     text = str(error) or type(error).__name__
+    if not url:
+        return text
     text = text.replace(url, mask_url(url))
     try:
         parts = urlsplit(url)
         secrets = [parts.password, parts.username]
+        secrets += [
+            value
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if _SECRET_QUERY.search(key)
+        ]
     except ValueError:
         secrets = []
     for secret in secrets:

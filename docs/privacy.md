@@ -1,0 +1,68 @@
+# Privacy and security
+
+What printlog-bridge sends, where it connects, and how it keeps your keys. Each guarantee below is what the code does today, and a test fails if that changes: most are in [`tests/test_privacy.py`](../tests/test_privacy.py), and the others are named where they come up.
+
+## What leaves the printer
+
+The bridge sends 3D Print Log exactly these calls, and nothing else:
+
+| Call | When | What it carries |
+| --- | --- | --- |
+| `GET /api/Users/me` | `doctor` | nothing; checks the key |
+| `GET /api/Printers/{id}` | `doctor` | nothing; checks `printer_id` |
+| `GET /api/Users/me/user-settings` | first print after a start | nothing; reads your default visibility and comment settings |
+| `PUT /api/Connections/{instance}` | at start, then every 5 minutes | `kind` (`moonraker`), `displayName` (`printlog-bridge (<printer name from your config>)`), `agentVersion`, `printerId` |
+| `POST /api/Prints` | a print starts | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id), the slicer's estimated print time and filament (length and weight), when the file has them |
+| `GET /api/Prints/{id}` | a print ends | nothing; reads what you changed in the app |
+| `POST /api/Prints/{id}/complete` | a print ends | `status` (the outcome), `endedAt`, `printTimeInSeconds`, and per extruder the filament length Klipper fed (linked to the spool you chose in the app) |
+| `PATCH /api/Prints/{id}` | a print fails or is cut short | `notes`: a line saying why, with Klipper's error message when there is one |
+| `POST /api/Prints/{id}/image` | a print starts, and when it ends | the slicer's thumbnail (at start), one webcam frame (at end, unless `snapshots = false`) |
+
+Every request also carries the API key (`X-Api-Key`) and `User-Agent: printlog-bridge/<version>`.
+
+That is all. In particular:
+
+- **No G-code leaves the printer.** The bridge never reads, downloads or uploads a G-code file. The thumbnail is read from the picture Moonraker extracted into `.thumbs/`, and only from a file named as a picture (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`); anything else is skipped before it is opened. A file that isn't a picture is never sent, whatever its name. Uploading the G-code is a planned opt-in (printlog-bridge#15); until it exists, nothing uploads it.
+- **No folder names or paths.** `fileName` is the file's own name; the folders it sits in on the printer are dropped.
+- **No other printer data.** Temperatures, positions, macros, the rest of `printer.cfg` and the rest of Moonraker's history stay on the printer.
+- **The webcam is asked only when a print ends**, for one frame, and never when `snapshots = false` is set for the printer.
+
+Tests: `TestWhatIsSent` runs a whole print through the bridge and checks every call against this table and every field against these lists, that the only images uploaded are the thumbnail and the webcam frame, and that Moonraker was never asked for the G-code file. `TestGcodeIsNeverRead` points a thumbnail at the G-code file itself, and `test_with_snapshots_off_the_webcam_is_never_asked` does what it says.
+
+## Where it connects
+
+The bridge only makes outbound connections, to:
+
+1. **Moonraker**: its Unix socket in local mode, or the `url` you set in remote mode (HTTP and WebSocket, on your network). In remote mode it also downloads the thumbnail from Moonraker's file API.
+2. **The webcam's `snapshot_url`**, as Mainsail or Fluidd have it set in Moonraker (usually the printer itself), when a print ends.
+3. **3D Print Log**, at `api_url` (`https://api.3dprintlog.com` by default), **over HTTPS only.** The config refuses a plain `http://` `api_url`, except to this computer itself (`localhost`, `127.0.0.1`, `::1`), for a test server or a TLS proxy on the same host.
+
+It **never listens on a port**: nothing can connect to the bridge. Pairing (printlog-bridge#2) will add 3D Print Log's sign-in site while pairing, and nothing else.
+
+Tests: `test_connects_only_to_moonraker_its_webcam_and_3d_print_log` records every connection during a print. `TestOnlyOutboundConnections` fails if any code in the bridge starts a server or listens on a socket, if a module other than the API client, the image fetcher and the Moonraker session opens a connection, or if `api_url` accepts plain http to another host.
+
+## Your keys and passwords
+
+The bridge holds up to three secrets: your 3D Print Log API key, Moonraker's API key (`moonraker_api_key`, remote mode only), and any password or token in a Moonraker or webcam URL (`http://user:password@host`, `?token=...`).
+
+**The API key is kept out of the folder Moonraker serves.** In local mode, `printlog-bridge.cfg` sits in Klipper's config folder, and Moonraker lets anyone who can open Mainsail or Fluidd read and download every file in it. So:
+
+- `install.sh` stores the key in `~/.local/share/printlog-bridge/api_key` (the bridge's state directory), mode 600 so only you can read it, and never writes it into `printlog-bridge.cfg`.
+- `printlog-bridge store-key` stores or replaces the key there. Run it on an older install to move `api_key` out of `printlog-bridge.cfg`: it writes the key file and empties the line in the config.
+- The bridge looks for the key in this order: the `PRINTLOG_API_KEY` environment variable, the key file, then `api_key` in `[bridge]`. A key in the config still works, so existing installs keep running.
+- `doctor` warns when `api_key` is in a config file Moonraker serves (even an unused one), when the key file is in a folder Moonraker serves, and when other users on the computer can read the key file.
+
+`moonraker_api_key` stays in the config. It is only for remote mode, where the bridge usually runs on another computer, away from any folder Moonraker serves; `doctor` doesn't check where it is.
+
+**Secrets never reach the log, the status file, `status`, `doctor` or the support bundle.** URLs are shown with their user, password and secret-looking query values (`token`, `key`, `pass`, `auth`, `sig`, `user`, ...) replaced by `***`, in `bridge.log`, `status.json`, `status`, `doctor`, and every error message. The support bundle `doctor` writes removes every key, token and password it knows of (from the config, the key file and the environment) from every file in it, and never includes the key file.
+
+Tests: `test_no_secret_reaches_the_log`, `..._the_state_directory` and `..._status` run a print with every kind of secret set and look for each in everything the bridge wrote. `TestMoonrakerUrlsAreMasked` covers `doctor`'s messages, `TestSupportBundle` here and in `tests/test_doctor.py` the bundle, `tests/test_install_helper.py` and `tests/install/smoke.sh` where install.sh puts the key, and `TestApiKeyStorage` in `tests/test_doctor.py` the warnings.
+
+## What it keeps on the printer
+
+In the state directory (`~/.local/share/printlog-bridge` by default): the key file, which job it logged as which print (`printers/`), the outbox of events and pictures not yet sent (`outbox.sqlite3`, `images/`), `status.json` and `bridge.log`. An event still unsent after 30 days is dropped. `uninstall.sh --purge` removes all of it.
+
+## Not covered yet
+
+- **Pairing** (printlog-bridge#2) will replace the personal API key with a device token that can only log prints, kept in the state directory. Until then the bridge uses an API key with your account's full API access, so keep it to yourself and revoke it at [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) if it leaks.
+- **Traffic on your network is as secure as Moonraker's.** Remote mode talks to Moonraker over the URL you give it, usually plain HTTP on your LAN, as Mainsail and Fluidd do.

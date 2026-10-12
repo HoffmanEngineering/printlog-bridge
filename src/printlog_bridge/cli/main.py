@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import getpass
 import logging
 import logging.handlers
 import os
@@ -17,8 +18,16 @@ from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
-from printlog_bridge.core.config import ConfigError, find_config, load_config
-from printlog_bridge.core.doctor import diagnose, format_report
+from printlog_bridge.core.config import (
+    API_KEY_ENV,
+    ConfigError,
+    clear_config_api_key,
+    find_config,
+    load_config,
+    read_key_file,
+    write_key_file,
+)
+from printlog_bridge.core.doctor import API_KEYS_PAGE, diagnose, format_report
 from printlog_bridge.core.status import format_status
 from printlog_bridge.core.support import BUNDLE_NAME, write_support_bundle
 
@@ -38,7 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser(
         "status", help="what the running bridge is doing: each printer's connection and outbox"
     )
-    for command in (doctor, run, status):
+    store_key = commands.add_parser(
+        "store-key",
+        help="keep the API key in the state directory, where Moonraker can't serve it: moves "
+        "api_key out of the config, or asks for a key",
+    )
+    for command in (doctor, run, status, store_key):
         command.add_argument(
             "--config",
             type=Path,
@@ -59,6 +73,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run(args.config)
     if args.command == "status":
         return _status(args.config)
+    if args.command == "store-key":
+        return _store_key(args.config)
 
     parser.print_usage(sys.stderr)
     return 2
@@ -110,6 +126,60 @@ def _status(explicit_config: Path | None) -> int:
     print(f"printlog-bridge {__version__} status")
     print(text)
     return code
+
+
+def _store_key(explicit_config: Path | None) -> int:
+    """Writes the key file (mode 600). A key in the config's [bridge] is moved there, and emptied
+    in the config; otherwise the key is read from the terminal, or standard input."""
+    env = dict(os.environ)
+    home = Path.home()
+    config_path = find_config(explicit_config, env=env, home=home)
+    try:
+        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+    except ConfigError as e:
+        print(f"printlog-bridge: {e}", file=sys.stderr)
+        return 2
+
+    key = config.config_api_key
+    moving = key is not None
+    stored = read_key_file(config.api_key_file)
+    if moving and stored is not None and stored != key:
+        print(
+            f"printlog-bridge: {config.api_key_file} already holds a different key, and it is "
+            f"the one in use. Delete api_key from {config.path} instead.",
+            file=sys.stderr,
+        )
+        return 1
+    if not moving:
+        key = _ask_for_key()
+    if not key:
+        print(f"No API key given, so nothing was stored. Create one at {API_KEYS_PAGE}.",
+              file=sys.stderr)  # fmt: skip
+        return 1
+
+    try:
+        write_key_file(config.api_key_file, key)
+        if moving:
+            clear_config_api_key(config.path)
+    except OSError as e:
+        print(f"printlog-bridge: couldn't store the key: {e}", file=sys.stderr)
+        return 1
+
+    if moving:
+        print(f"Moved the API key from {config.path} to {config.api_key_file}.")
+    else:
+        print(f"Stored the API key in {config.api_key_file}.")
+    print("Only you can read it. Restart printlog-bridge to use it.")
+    if env.get(API_KEY_ENV):
+        print(f"Note: {API_KEY_ENV} is set here, and wins over the stored key while it is.")
+    return 0
+
+
+def _ask_for_key() -> str:
+    if sys.stdin.isatty():
+        print(f"Paste an API key from {API_KEYS_PAGE} (it isn't shown).")
+        return getpass.getpass("API key: ").strip()
+    return sys.stdin.readline().strip()
 
 
 def _run(explicit_config: Path | None) -> int:

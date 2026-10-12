@@ -143,8 +143,8 @@ def test_a_rejected_key_says_what_to_do(tmp_path, caplog):
         run(scenario)
 
     warning = read_status(tmp_path)["printers"]["voron"]["warnings"]["heartbeat"]
-    assert "api_key" in warning
-    assert any("api_key" in r.getMessage() for r in caplog.records)
+    assert "printlog-bridge doctor" in warning
+    assert any("printlog-bridge doctor" in r.getMessage() for r in caplog.records)
 
 
 def test_a_printer_that_is_not_the_accounts_is_a_warning(tmp_path):

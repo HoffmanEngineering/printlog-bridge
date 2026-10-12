@@ -2,8 +2,9 @@
 
 Secrets are removed twice. The config file is redacted option by option (any option named like a
 key, token, secret or password, and passwords in URLs), and then every known secret value, from
-the config and the environment, is replaced wherever it appears in any file of the bundle, in
-case one was ever written to the log or the status file.
+the config, the key file and the environment, is replaced wherever it appears in any file of
+the bundle, in case one was ever written to the log or the status file. The key file itself
+(`<state_dir>/api_key`) is never bundled.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from printlog_bridge import __version__
-from printlog_bridge.core.config import API_KEY_ENV
+from printlog_bridge.core.config import API_KEY_ENV, API_KEY_FILE
 from printlog_bridge.core.outbox import read_entries
 from printlog_bridge.core.status import STATUS_FILE
 
@@ -44,9 +45,12 @@ def write_support_bundle(
     env: Mapping[str, str],
 ) -> Path:
     config_text = _read(config_path)
-    secrets = sorted(
-        _secrets(config_text or "", env), key=len, reverse=True
-    )  # longest first, so a secret containing another is replaced whole
+    found = _secrets(config_text or "", env)
+    key_file = (_read(state_dir / API_KEY_FILE) or "").strip()  # never bundled itself
+    if len(key_file) >= MIN_SECRET_LENGTH:
+        found.add(key_file)
+    secrets = sorted(found, key=len, reverse=True)
+    # longest first, so a secret containing another is replaced whole
 
     files: dict[str, str] = {
         "doctor.txt": report,

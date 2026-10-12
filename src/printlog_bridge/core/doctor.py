@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
@@ -13,6 +14,7 @@ from printlog_bridge.core.api_client import ApiClient, ApiUnavailable, AuthRejec
 from printlog_bridge.core.checks import CheckResult, Status
 from printlog_bridge.core.config import (
     API_KEY_ENV,
+    ApiKeySource,
     BridgeConfig,
     ConfigError,
     PrinterConfig,
@@ -22,6 +24,8 @@ from printlog_bridge.core.config import (
 API_KEYS_PAGE = "https://www.3dprintlog.com/api-keys"
 PRINTERS_PAGE = "https://www.3dprintlog.com/printers/"
 MAX_CLOCK_SKEW = timedelta(minutes=2)
+MOONRAKER_SERVED = ("config", "gcodes", "logs")
+"""The folders of Moonraker's data folder (printer_data) that it serves to its clients."""
 
 
 def _utc_now() -> datetime:
@@ -49,6 +53,9 @@ async def diagnose(
     )
     results.append(_check_state_dir(config.state_dir))
     results.append(_check_sqlite())
+    key_storage = _check_key_storage(config)
+    if key_storage is not None:
+        results.append(key_storage)
     api, server_time = await _check_api(config)
     results.append(api)
     if server_time is not None:
@@ -125,14 +132,70 @@ async def _check_printer_link(config: BridgeConfig, printer: PrinterConfig) -> C
     return CheckResult.ok(name, f"printer {printer.printer_id}, {found.get('name')}")
 
 
+def moonraker_serves(path: Path) -> bool:
+    """Whether `path` is in a folder Moonraker serves to its clients: Klipper's config folder,
+    or its gcodes or logs, next to Moonraker's `comms` folder. Anyone who can open Mainsail or
+    Fluidd can download what is in them."""
+    folder = path.parent
+    if any((folder / name).is_file() for name in ("moonraker.conf", "printer.cfg")):
+        return True
+    for ancestor in (folder, *folder.parents):
+        if ancestor.name not in MOONRAKER_SERVED:
+            continue
+        data = ancestor.parent
+        if data.name == "printer_data" or (data / "comms").is_dir():
+            return True
+    return False
+
+
+def _check_key_storage(config: BridgeConfig) -> CheckResult | None:
+    """Where the API key is kept, and a warning when someone else could read it."""
+    name = "API key"
+    move = (
+        f"Move it to {config.api_key_file}, which only you can read: run "
+        "`printlog-bridge store-key`, then restart printlog-bridge."
+    )
+    if config.config_api_key is not None and moonraker_serves(config.path):
+        unused = (
+            f" It isn't used (the key in {config.describe_api_key()} is), so delete it from "
+            "the file."
+            if config.api_key_source is not ApiKeySource.CONFIG
+            else f" {move}"
+        )
+        return CheckResult.warn(
+            name,
+            f"api_key is in {config.path}, which Moonraker serves to anyone who can open "
+            f"Mainsail or Fluidd.{unused}",
+        )
+    if config.api_key_source is None:
+        return None  # the API check says what to do
+    if config.api_key_source is ApiKeySource.KEY_FILE:
+        key_file = config.api_key_file
+        if moonraker_serves(key_file):
+            return CheckResult.warn(
+                name,
+                f"{key_file} is in a folder Moonraker serves to anyone who can open Mainsail "
+                "or Fluidd. Set state_dir in [bridge] to a folder outside printer_data.",
+            )
+        if os.name == "posix":
+            mode = key_file.stat().st_mode & 0o777
+            if mode & 0o077:
+                return CheckResult.warn(
+                    name,
+                    f"other users on this computer can read {key_file} (mode {mode:o}). "
+                    f"Run: chmod 600 {key_file}",
+                )
+    return CheckResult.ok(name, f"in {config.describe_api_key()}")
+
+
 async def _check_api(config: BridgeConfig) -> tuple[CheckResult, datetime | None]:
     """The API check, and the API's clock when it answered."""
     name = "3D Print Log API"
     if config.api_key is None:
         return CheckResult.fail(
             name,
-            f"no API key. Create one at {API_KEYS_PAGE}, then set api_key in [bridge] "
-            f"or the {API_KEY_ENV} environment variable.",
+            f"no API key. Create one at {API_KEYS_PAGE}, then run `printlog-bridge store-key` "
+            f"to store it (or set the {API_KEY_ENV} environment variable).",
         ), None
 
     try:
