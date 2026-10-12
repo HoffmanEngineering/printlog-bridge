@@ -927,6 +927,71 @@ class TestImages:
         assert print_["status"] == 3
         assert read_waiting(tmp_path) == {}
 
+    def test_an_upload_cut_off_while_the_api_answers_is_given_up_so_the_print_completes(
+        self, tmp_path, caplog
+    ):
+        api = FakePrintLogApi()
+        api.image_cut = True
+
+        with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
+            run(api, tmp_path, started(), image(), finished(), timeout=3)
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert print_["images"] == []
+        assert read_waiting(tmp_path) == {}
+        assert "wasn't added to its print after 10 tries" in caplog.text
+        assert not list((tmp_path / "images").iterdir())
+
+    def test_an_upload_made_while_the_api_is_out_of_reach_is_not_given_up(self, tmp_path):
+        api = FakePrintLogApi()
+        run(api, tmp_path, started())
+        api.offline = True
+
+        run(api, tmp_path, image(), finished(), timeout=3)  # many more than 10 tries
+        api.offline = False
+        run(api, tmp_path)
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert len(print_["images"]) == 1
+
+    def test_an_image_lost_before_it_was_queued_is_fetched_again_on_a_replay(self, tmp_path):
+        api = FakePrintLogApi()
+
+        def power_cut(*_args):
+            raise OSError("the power went")
+
+        async def scenario():
+            async with logging_to(api, tmp_path) as logger:
+                try:
+                    await logger.emit(started())
+                    await drain(logger)
+                    logger._queue = power_cut  # between writing the file and queueing it
+                    with pytest.raises(OSError):
+                        await logger.emit(image())
+                finally:
+                    logger.close()
+
+        asyncio.run(scenario())
+        fetched: list = []
+        run(api, tmp_path, started(), image(fetched=fetched), image(fetched=fetched))
+
+        [print_] = api.prints.values()
+        assert len(print_["images"]) == 1
+        assert fetched == [ImageKind.THUMBNAIL]
+
+    def test_outcomes_are_not_kept_for_jobs_without_a_snapshot(self, tmp_path):
+        api = FakePrintLogApi()
+
+        logger = run(
+            api,
+            tmp_path,
+            *(e for n in range(5) for e in (started(f"0{n}"), finished(f"0{n}"))),
+        )
+
+        assert len(logger._outcomes) <= 1
+
     def test_a_rate_limited_upload_waits_rather_than_being_given_up(self, tmp_path):
         api = FakePrintLogApi()
         api.image_status = 429

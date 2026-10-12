@@ -70,9 +70,13 @@ IMAGES_DIR = "images"
 IMAGE_TIMEOUT_S = 15.0
 """How long the bridge waits on an adapter for a picture. Adapters give up after 10 s."""
 IMAGE_MAX_ATTEMPTS = 10
-"""An upload the API keeps answering with an error is given up after this many tries, so the
-print's completion behind it isn't held up. One that can't reach the API, or is rate limited,
-waits like any event."""
+"""An upload that keeps failing while the API is reachable is given up after this many tries,
+so the print's completion behind it isn't held up: pictures must never stop a print from being
+logged. A try counts when the API answers with an error, or when the upload is cut off or times
+out but a small request to the API right after goes through (a proxy that resets large bodies,
+an uplink too slow for the file). A rate limited upload, or one made while the API can't be
+reached at all, waits like any event: then nothing behind it could be sent either. Tries are
+counted for this run of the bridge; a restart starts the count over."""
 TOO_MANY_REQUESTS = 429
 
 
@@ -114,8 +118,11 @@ class JobLogger:
         self.image_timeout = image_timeout
         self.images_dir = state_dir / IMAGES_DIR
         self.outbox = Outbox.open(state_dir, clock=clock)
-        self._outcomes: dict[tuple[str, str], JobOutcome] = {}
-        """How each job seen ending in this run ended, for whether its snapshot is the default."""
+        self._outcomes: dict[str, tuple[str, JobOutcome]] = {}
+        """Each printer's last job seen ending in this run, and how it ended, for whether its
+        snapshot is the default. One per printer, and gone once the snapshot comes."""
+        self._image_tries: dict[int, int] = {}
+        """The counted failed tries of each image entry (see IMAGE_MAX_ATTEMPTS)."""
         self._remove_stray_images()
         self._states: dict[str, PrinterState] = {}
         self._defaults: tuple[int, bool] | None = None
@@ -170,7 +177,7 @@ class JobLogger:
                     event.printer, event.job_id,
                 )  # fmt: skip
                 return
-            self._outcomes[(event.printer, event.job_id)] = event.outcome
+            self._outcomes[event.printer] = (event.job_id, event.outcome)
             if job.finished:
                 return  # a replay
             if job.ended_at is None:
@@ -184,6 +191,11 @@ class JobLogger:
 
     async def _emit_image(self, state: PrinterState, event: JobImage) -> None:
         kind = event.kind.value
+        outcome = None
+        if event.kind is ImageKind.SNAPSHOT:
+            last = self._outcomes.pop(event.printer, None)
+            if last is not None and last[0] == event.job_id:
+                outcome = last[1]
         job = state.jobs.get(event.job_id)
         if job is None or kind in job.images:
             return  # a job the bridge isn't logging, or a picture it already has
@@ -203,16 +215,15 @@ class JobLogger:
                 event.printer, event.job_id, kind,
             )  # fmt: skip
             content_type = None
-        job.images[kind] = content_type is not None
-        state.save()
         if data is None or content_type is None:
+            job.images[kind] = False
+            state.save()
             return
 
         # The thumbnail is the print's picture, unless the print failed: then what the camera
         # saw tells more. Without a thumbnail, the snapshot is all there is.
         default = event.kind is ImageKind.THUMBNAIL or (
-            self._outcomes.pop((event.printer, event.job_id), None) is JobOutcome.FAILED
-            or not job.images.get(ImageKind.THUMBNAIL.value)
+            outcome is JobOutcome.FAILED or not job.images.get(ImageKind.THUMBNAIL.value)
         )
         name = safe_file_name(f"{event.printer}-{event.job_id}-{kind}") + EXTENSIONS[content_type]
         self.images_dir.mkdir(parents=True, exist_ok=True)
@@ -225,6 +236,10 @@ class JobLogger:
             kind,
             {"file": name, "content_type": content_type, "default": default},
         )
+        # Marked only once queued, so a crash before then fetches it again on the replay. The
+        # outbox holds one entry per job and kind, and nothing is sent before this save.
+        job.images[kind] = True
+        state.save()
 
     async def _fetch(self, event: JobImage) -> bytes | None:
         """The adapter's picture, or None when there's none, it fails, or it takes too long."""
@@ -322,7 +337,7 @@ class JobLogger:
             self._not_logged(entry, problem)
         except ApiRejected as e:
             if image:
-                return self._image_failed(entry, e)
+                return await self._image_failed(entry, e)
             # Sending it again won't change the answer. The job stays unfinished in the state
             # file, so a replay after the user fixes the cause (a restart) queues it again.
             log.error("[printer %s] job %s isn't logged: %s", entry.printer, entry.job_id, e)
@@ -330,11 +345,11 @@ class JobLogger:
             self._not_logged(entry, str(e))
         except ApiUnavailable as e:
             if image:
-                return self._image_failed(entry, e)
+                return await self._image_failed(entry, e)
             self._retry_later(entry, str(e), e.retry_after)
         except Exception as e:
             if image:
-                return self._image_failed(entry, e)
+                return await self._image_failed(entry, e)
             # A bug, or an answer the bridge doesn't understand, must never stop the rest. The
             # traceback is logged once, not on every retry.
             if entry.attempts == 0:
@@ -346,28 +361,39 @@ class JobLogger:
         else:
             self._done(entry)
 
-    def _image_failed(self, entry: Entry, error: Exception) -> None:
+    async def _image_failed(self, entry: Entry, error: Exception) -> None:
         """A picture that didn't go through. Only an API out of reach is worth waiting for."""
         where = f"[printer {entry.printer}] job {entry.job_id}'s {entry.kind}"
-        if isinstance(error, ApiUnavailable) and (
-            error.status in (None, TOO_MANY_REQUESTS) or entry.attempts + 1 < IMAGE_MAX_ATTEMPTS
-        ):
-            self._retry_later(entry, str(error), error.retry_after)
-            return
-        if isinstance(error, ApiRejected):
+        if isinstance(error, ApiUnavailable):
+            tries = self._image_tries.get(entry.seq, 0)
+            if error.status != TOO_MANY_REQUESTS and (
+                error.status is not None or await self._api_reachable()
+            ):
+                tries = self._image_tries[entry.seq] = tries + 1
+            if tries < IMAGE_MAX_ATTEMPTS:
+                self._retry_later(entry, str(error), error.retry_after)
+                return
+            log.warning("%s wasn't added to its print after %d tries: %s", where, tries, error)
+        elif isinstance(error, ApiRejected):
             log.warning("%s wasn't added to its print: %s", where, error)
-        elif isinstance(error, ApiUnavailable):
-            log.warning(
-                "%s wasn't added to its print after %d tries: %s",
-                where, entry.attempts + 1, error,
-            )  # fmt: skip
         else:
             log.warning("%s wasn't added to its print", where, exc_info=error)
         self._done(entry)
 
+    async def _api_reachable(self) -> bool:
+        """Whether the API answers a small request, after an upload that got no answer."""
+        try:
+            await self.api.current_user()
+        except AuthRejected:
+            return True
+        except Exception:
+            return False
+        return True
+
     def _done(self, entry: Entry) -> None:
         self.outbox.remove(entry.seq)
         self._due.pop(entry.seq, None)
+        self._image_tries.pop(entry.seq, None)
         if entry.kind in IMAGE_KINDS:
             _unlink(self.images_dir / str(entry.payload.get("file")))
 
@@ -402,6 +428,7 @@ class JobLogger:
                 entry.last_error or "none",
             )  # fmt: skip
             self._due.pop(entry.seq, None)
+            self._image_tries.pop(entry.seq, None)
             if entry.kind in IMAGE_KINDS:
                 # Only the picture is lost; the print's own events are judged on their own.
                 _unlink(self.images_dir / str(entry.payload.get("file")))

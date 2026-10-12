@@ -56,6 +56,9 @@ class FakePrintLogApi:
         self.max_images = 5
         self.image_status: int | None = None
         """When set, every image upload is answered with this status, as a broken store would."""
+        self.image_cut = False
+        """While True, every image upload is cut off before an answer (a proxy resetting large
+        bodies, an uplink too slow), while every other request is answered."""
         self.offline = False
         """While True, every request is cut off before an answer, as with the internet down."""
         self._ids = itertools.count(1)
@@ -212,6 +215,10 @@ class FakePrintLogApi:
         found = self.prints.get(int(request.match_info["id"]))
         if found is None:
             return web.Response(status=404)
+        if self.image_cut:
+            if request.transport is not None:
+                request.transport.close()
+            raise web.HTTPServiceUnavailable()  # never reaches the bridge: the line is cut
         if self.image_status is not None:
             return web.Response(status=self.image_status)
         form = await request.post()
