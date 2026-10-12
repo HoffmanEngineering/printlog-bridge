@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Undoes install.sh: stops and removes the printlog-bridge service, puts moonraker.conf and
-# moonraker.asvc back as they were before the install, and removes the virtualenv.
+# Undoes install.sh: stops and removes the printlog-bridge service, puts moonraker.conf,
+# moonraker.asvc and printer.cfg back as they were before the install, removes the macros it
+# installed (printlog.cfg, unless it was changed since), and removes the virtualenv.
 #
 # The config (printlog-bridge.cfg) and the state directory (what the bridge has logged, and any
 # prints still waiting to reach 3D Print Log) are kept, so a reinstall carries on where this one
@@ -67,6 +68,8 @@ parse_args() {
     MOONRAKER_CONF="${PRINTER_DATA}/config/moonraker.conf"
     MOONRAKER_ASVC="${PRINTER_DATA}/moonraker.asvc"
     RECORD="${REPO_DIR}/.install-record.json"
+    PRINTER_CFG="${PRINTER_DATA}/config/printer.cfg"
+    MACROS_RECORD="${REPO_DIR}/.install-macros.json"
 }
 
 remove_service() {
@@ -91,6 +94,18 @@ remove_from_moonraker() {
     if [ "$result" = changed ]; then
         say "Restarting Moonraker"
         run_root "$SYSTEMCTL" restart "$MOONRAKER_SERVICE"
+    fi
+}
+
+remove_macros() {
+    local result
+    result="$(
+        "$PYTHON" "${REPO_DIR}/scripts/install_helper.py" macros-remove \
+            --printer-cfg "$PRINTER_CFG" --record "$MACROS_RECORD"
+    )"
+    if [ "$result" = changed ]; then
+        say "Removed the PRINTLOG_SET_SPOOL macros and their include from printer.cfg"
+        echo "  Klipper drops them when it next restarts."
     fi
 }
 
@@ -132,6 +147,7 @@ main() {
     command -v "$PYTHON" >/dev/null || fail "$PYTHON not found"
     remove_service
     remove_from_moonraker
+    remove_macros
     remove_venv
     purge
 }

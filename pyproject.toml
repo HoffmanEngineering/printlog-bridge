@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.5"]
+dev = ["pytest>=7", "ruff>=0.5", "jinja2>=3"]  # jinja2 renders klipper/printlog.cfg in tests
 
 [project.scripts]
 printlog-bridge = "printlog_bridge.cli.main:run"

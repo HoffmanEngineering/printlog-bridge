@@ -18,7 +18,11 @@ printf '[server]\nhost: 0.0.0.0\n\n[update_manager mainsail]\ntype: web\nrepo: m
     >"${DATA}/config/moonraker.conf"
 printf 'klipper_mcu\nwebcamd\nMoonCord\nKlipperScreen\nmoonraker-telegram-bot\ncrowsnest\n' \
     >"${DATA}/moonraker.asvc"
+# A printer.cfg with Klipper's SAVE_CONFIG block, which must stay last.
+printf '[printer]\nkinematics: corexy\n\n#*# <---------------------- SAVE_CONFIG ---------------------->\n#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n#*#\n' \
+    >"${DATA}/config/printer.cfg"
 cp "${DATA}/config/moonraker.conf" "${WORK}/moonraker.conf.before"
+cp "${DATA}/config/printer.cfg" "${WORK}/printer.cfg.before"
 cp "${DATA}/moonraker.asvc" "${WORK}/moonraker.asvc.before"
 
 cat >"${WORK}/bin/systemctl" <<EOF
@@ -66,6 +70,11 @@ check "moonraker.conf has the update manager section" \
 check "moonraker.conf keeps what it had" \
     grep -qx 'repo: mainsail-crew/mainsail' "${DATA}/config/moonraker.conf"
 check "moonraker.asvc allows the service" grep -qx printlog-bridge "${DATA}/moonraker.asvc"
+check "the macros are next to printer.cfg" cmp -s "${DATA}/config/printlog.cfg" "${REPO}/klipper/printlog.cfg"
+check "printer.cfg includes the macros" grep -qx '\[include printlog.cfg\]' "${DATA}/config/printer.cfg"
+check "SAVE_CONFIG's block is still last in printer.cfg" \
+    sh -c "tail -n 1 '${DATA}/config/printer.cfg' | grep -qx '#\*#'"
+check "Klipper isn't restarted" sh -c "! grep -q klipper '${WORK}/systemctl.log'"
 check "the config was written" test -f "$CONFIG"
 check "the config has the printer" grep -qx 'printer_id = 42' "$CONFIG"
 check "the config holds no API key" sh -c "! grep -q '^api_key' '$CONFIG'"
@@ -85,12 +94,15 @@ check "doctor reads the config" grep -q "ok    Config" "${WORK}/doctor.txt"
 
 echo "== install.sh again"
 cp "${DATA}/config/moonraker.conf" "${WORK}/moonraker.conf.installed"
+cp "${DATA}/config/printer.cfg" "${WORK}/printer.cfg.installed"
 : >"${WORK}/systemctl.log"
 "${REPO}/install.sh" --yes </dev/null
 check "a second install leaves moonraker.conf alone" \
     cmp -s "${DATA}/config/moonraker.conf" "${WORK}/moonraker.conf.installed"
 check "a second install doesn't restart Moonraker" sh -c "! grep -qx 'restart moonraker' '${WORK}/systemctl.log'"
 check "a second install keeps the config" grep -qx 'printer_id = 42' "$CONFIG"
+check "a second install leaves printer.cfg alone" \
+    cmp -s "${DATA}/config/printer.cfg" "${WORK}/printer.cfg.installed"
 
 echo "== install.sh for a second printer_data folder"
 mkdir -p "${WORK}/other_data/config"
@@ -116,6 +128,9 @@ check "moonraker.conf is as it was before the install" \
     cmp "${DATA}/config/moonraker.conf" "${WORK}/moonraker.conf.before"
 check "moonraker.asvc is as it was before the install" \
     cmp "${DATA}/moonraker.asvc" "${WORK}/moonraker.asvc.before"
+check "printer.cfg is as it was before the install" \
+    cmp "${DATA}/config/printer.cfg" "${WORK}/printer.cfg.before"
+check "the macros are gone" test ! -e "${DATA}/config/printlog.cfg"
 check "the virtualenv is gone" test ! -e "$VENV"
 check "the config is kept" test -f "$CONFIG"
 
@@ -134,6 +149,13 @@ check "install.sh never prints the key" sh -c "! grep -q smoke-test-key '${WORK}
 check "install.sh asks only for the printer" grep -q "Set printer_id" "${WORK}/install.txt"
 "${REPO}/uninstall.sh" --purge --yes </dev/null >/dev/null
 check "purge removes the key" test ! -e "$KEY_FILE"
+
+echo "== install.sh --no-macros"
+"${REPO}/install.sh" --yes --no-macros </dev/null >/dev/null
+check "--no-macros leaves printer.cfg alone" \
+    cmp -s "${DATA}/config/printer.cfg" "${WORK}/printer.cfg.before"
+check "--no-macros installs no macros" test ! -e "${DATA}/config/printlog.cfg"
+"${REPO}/uninstall.sh" --purge --yes </dev/null >/dev/null
 
 if [ "$failures" -ne 0 ]; then
     echo "${failures} check(s) failed"

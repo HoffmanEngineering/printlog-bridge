@@ -5,12 +5,21 @@ with the system's python3, after the bridge's virtualenv may be gone.
     install_helper.py moonraker-remove --conf C --asvc A --record R
     install_helper.py write-config --path P --printer-data DIR --name NAME --key-file F
                                    [--printer-id N]
+    install_helper.py macros-add --printer-cfg P --source F --record R
+    install_helper.py macros-remove --printer-cfg P --record R
 
 `moonraker-add` appends an `[update_manager printlog-bridge]` section to moonraker.conf, between
 two marker comments, and `printlog-bridge` to moonraker.asvc, so Mainsail and Fluidd can update
 and restart the bridge. It records what it changed (a JSON file), and `moonraker-remove` uses
 that record to put both files back exactly as they were, byte for byte. Without the record it
 still removes the marked section and the service line.
+
+`macros-add` copies the PRINTLOG_SET_SPOOL macros (klipper/printlog.cfg) next to printer.cfg
+and includes them from printer.cfg, between the same marker comments, before Klipper's
+SAVE_CONFIG block. A printlog.cfg the user changed, or one of their own, is never overwritten
+(nor included); one this installed, unchanged, is updated. `macros-remove` takes the include out
+and deletes the file only if it is still the one this installed. Klipper only reads the macros
+when it restarts, which is left to the user: a restart during a print would end it.
 
 `write-config` writes a local-mode printlog-bridge.cfg, unless one exists. The API key comes from
 the PRINTLOG_API_KEY environment variable, never from the command line, where `ps` shows it, and
@@ -21,6 +30,7 @@ Moonraker serves Klipper's config folder to anyone who can open Mainsail or Flui
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -103,6 +113,41 @@ def remove_service(text: str, service: str, change: Change) -> str:
     return text
 
 
+MACROS_FILE = "printlog.cfg"
+INCLUDE = f"[include {MACROS_FILE}]"
+INCLUDED = re.compile(r"^[ \t]*\[include\s+printlog\.cfg\s*\]", re.M | re.I)
+MACROS_DEFINED = re.compile(r"^[ \t]*\[gcode_macro\s+printlog_(set|clear)_spool\s*\]", re.M | re.I)
+SAVE_CONFIG = re.compile(r"^#\*# <-+ SAVE_CONFIG -+>", re.M)
+"""Where Klipper's SAVE_CONFIG block starts. It must stay last in printer.cfg."""
+
+
+def add_include(text: str) -> tuple[str, dict]:
+    """printer.cfg including printlog.cfg, unless it does already or defines the macros itself.
+    The include goes before the SAVE_CONFIG block when there is one, else at the end."""
+    if INCLUDED.search(text) or MACROS_DEFINED.search(text):
+        return text, {"added": False, "newline": False}
+    block = f"{BEGIN}\n{INCLUDE}\n{END}\n"
+    save_config = SAVE_CONFIG.search(text)
+    if save_config is not None:
+        at = save_config.start()
+        return text[:at] + block + "\n" + text[at:], {"added": True, "before_save_config": True}
+    newline = bool(text) and not text.endswith("\n")
+    prefix = text + ("\n" if newline else "") + ("\n" if text else "")
+    return prefix + block, {"added": True, "newline": newline}
+
+
+def remove_include(text: str, change: Change) -> str:
+    """printer.cfg without the marked include: as it was, when nothing was added after it."""
+    if change is not None and change.get("before_save_config"):
+        block = f"{BEGIN}\n{INCLUDE}\n{END}\n\n"
+        return text.replace(block, "", 1) if block in text else remove_section(text, None)
+    return remove_section(text, change)
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def printer_name(host: str) -> str:
     """A `[printer <name>]` name from the host's name."""
     name = re.sub(r"[^a-z0-9_]+", "-", host.lower()).strip("-")
@@ -149,6 +194,21 @@ def _write(path: Path, text: str) -> None:
             f.write(text)
         if path.exists():
             shutil.copymode(str(path), temporary)
+        os.replace(temporary, str(path))
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+
+
+def _write_bytes(path: Path, data: bytes) -> None:
+    """Replaces the file in one step, through a symlink as `_write` does."""
+    path = Path(os.path.realpath(str(path)))
+    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.chmod(temporary, 0o644)  # mkstemp's 600 would hide it from Mainsail's editor
         os.replace(temporary, str(path))
     except BaseException:
         if os.path.exists(temporary):
@@ -221,6 +281,77 @@ def moonraker_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def macros_add(args: argparse.Namespace) -> int:
+    printer_cfg, source, record_path = Path(args.printer_cfg), Path(args.source), Path(args.record)
+    if not printer_cfg.is_file():
+        print(
+            f"{printer_cfg} not found, so the PRINTLOG_SET_SPOOL macros aren't installed. Include "
+            f"{source} from your Klipper config to use them.",
+            file=sys.stderr,
+        )
+        print("skipped")
+        return 0
+    record = _load_record(record_path)
+    dest = printer_cfg.parent / MACROS_FILE
+    new = source.read_bytes()
+    changed = False
+    if dest.exists():
+        current = dest.read_bytes()
+        if current == new:
+            record["macros"] = sha256(new)
+        elif sha256(current) == record.get("macros"):
+            _write_bytes(dest, new)  # the one an earlier install put there, unchanged: update
+            record["macros"] = sha256(new)
+            changed = True
+        else:
+            print(
+                f"{dest} isn't the one install.sh put there (changed, or your own), so it is kept "
+                f"as it is and not included from {printer_cfg.name}. The bridge's macros are in "
+                f"{source}.",
+                file=sys.stderr,
+            )
+            record_path.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
+            print("kept")
+            return 0
+    else:
+        _write_bytes(dest, new)
+        record["macros"] = sha256(new)
+        changed = True
+
+    text, change = add_include(_read(printer_cfg))
+    if change["added"]:
+        _write(printer_cfg, text)
+        changed = True
+    if "include" not in record or change["added"]:
+        record["include"] = change
+    record_path.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
+    print("changed" if changed else "unchanged")
+    return 0
+
+
+def macros_remove(args: argparse.Namespace) -> int:
+    printer_cfg, record_path = Path(args.printer_cfg), Path(args.record)
+    record = _load_record(record_path) if record_path.is_file() else None
+    changed = False
+    if printer_cfg.is_file():
+        before = _read(printer_cfg)
+        after = remove_include(before, record.get("include") if record else None)
+        if after != before:
+            _write(printer_cfg, after)
+            changed = True
+    dest = printer_cfg.parent / MACROS_FILE
+    installed = record.get("macros") if record else None
+    if dest.is_file() and installed and sha256(dest.read_bytes()) == installed:
+        dest.unlink()
+        changed = True
+    elif dest.exists() and installed:
+        print(f"{dest} was changed since it was installed, so it is kept.", file=sys.stderr)
+    if record_path.exists():
+        record_path.unlink()
+    print("changed" if changed else "unchanged")
+    return 0
+
+
 def write_key_file(path: Path, key: str) -> None:
     """The bridge's key file: mode 600, in a folder made mode 700. As the bridge's own
     `write_key_file`, which this can't import: it runs with the system's python3."""
@@ -270,6 +401,12 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
             command.add_argument("--repo", required=True)
             command.add_argument("--venv", required=True)
             command.add_argument("--origin", required=True)
+    for name in ("macros-add", "macros-remove"):
+        command = commands.add_parser(name)
+        command.add_argument("--printer-cfg", required=True)
+        command.add_argument("--record", required=True)
+        if name == "macros-add":
+            command.add_argument("--source", required=True)
     config = commands.add_parser("write-config")
     config.add_argument("--path", required=True)
     config.add_argument("--printer-data", required=True)
@@ -282,6 +419,10 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
         return moonraker_add(args)
     if args.command == "moonraker-remove":
         return moonraker_remove(args)
+    if args.command == "macros-add":
+        return macros_add(args)
+    if args.command == "macros-remove":
+        return macros_remove(args)
     return write_config(args, os.environ if env is None else env)
 
 

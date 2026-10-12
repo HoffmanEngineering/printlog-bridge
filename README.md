@@ -26,11 +26,12 @@ It asks for an API key and the printer's number in 3D Print Log (press Enter to 
 - writes `~/printer_data/config/printlog-bridge.cfg`, next to `printer.cfg`, unless you already have one;
 - installs and starts a `printlog-bridge` systemd service;
 - adds `printlog-bridge` to `~/printer_data/moonraker.asvc`, so Mainsail and Fluidd can restart it;
-- adds an `[update_manager printlog-bridge]` section to `moonraker.conf`, so updates show up in Mainsail's and Fluidd's update panels, and restarts Moonraker to load it.
+- adds an `[update_manager printlog-bridge]` section to `moonraker.conf`, so updates show up in Mainsail's and Fluidd's update panels, and restarts Moonraker to load it;
+- copies the `PRINTLOG_SET_SPOOL` macros to `~/printer_data/config/printlog.cfg` and adds `[include printlog.cfg]` to `printer.cfg` (above its SAVE_CONFIG block), unless you pass `--no-macros`. Restart Klipper when it isn't printing to load them; the installer doesn't, since that would end a print.
 
 Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key for later, store it with `~/printlog-bridge-env/bin/printlog-bridge store-key`; set the printer in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it). Then restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
 
-`./printlog-bridge/uninstall.sh` removes the service and the virtualenv, and puts `moonraker.conf` and `moonraker.asvc` back exactly as they were. It keeps your config and the state directory (including prints not yet logged) for a reinstall; `--purge` removes those too.
+`./printlog-bridge/uninstall.sh` removes the service and the virtualenv, puts `moonraker.conf`, `moonraker.asvc` and `printer.cfg` back exactly as they were, and removes `printlog.cfg` unless you changed it. It keeps your config and the state directory (including prints not yet logged) for a reinstall; `--purge` removes those too.
 
 ## Try it
 
@@ -74,6 +75,22 @@ Each print appears in 3D Print Log as Printing when the job starts, titled from 
 | `interrupted`, `server_exit` | Failed | "Moonraker stopped during the print" |
 
 On a printer with more than one tool (a toolchanger, an IDEX, a Snapmaker U1), each tool gets its own usage row, numbered from 0 the way Klipper numbers its extruders (`extruder` is tool 0, `extruder1` tool 1). The bridge watches which extruder is active while Klipper's filament count grows, and scales what it saw to Moonraker's total for the job, so the rows always add up to it. When the slicer listed a weight per filament (PrusaSlicer, OrcaSlicer, Snapmaker Orca), the print starts with an estimate on each tool's row, and a job that ran while the bridge was away is split in those proportions. Not covered yet: a multi-material unit on one extruder (ERCF, Happy Hare, AFC), where everything is counted on tool 0, and IDEX copy or mirror mode, where Klipper counts what two heads print once.
+
+### Spools
+
+Each tool's usage row is linked to the spool loaded in its slot in 3D Print Log (in the web or Android app, on the printer's page). The bridge reads the loaded spools when it starts, every 5 minutes, and again when each print starts and ends, so changing a spool in the app between prints is on the next print. On a single-tool printer, a print also keeps its spool loaded in 3D Print Log.
+
+From the printer's console or a macro, with [`klipper/printlog.cfg`](klipper/printlog.cfg) included (`install.sh` does it; in remote mode copy it to the printer's config folder and add `[include printlog.cfg]` yourself, where the printer allows it):
+
+```
+PRINTLOG_SET_SPOOL TOOL=2 TAG=04A23F11   ; T2 has the spool with this RFID/NFC tag
+PRINTLOG_SET_SPOOL ID=<spool id>         ; the active tool has this spool
+PRINTLOG_CLEAR_SPOOL TOOL=1              ; T1 has no spool
+```
+
+`TOOL` is 0 for T0 or a single-tool printer; without it, it's the active tool. A tag is the UID stored on the spool in 3D Print Log, in any common format (`04:a2:3f:11` is `04A23F11`). The bridge answers on the console within a second or two, and adds slots to the printer in 3D Print Log when it has fewer than its tools. The macros only print a line for the bridge to read, so they never fail and never stop a print, even with the bridge offline: if no answer comes, run it again once the bridge is back. Assign spools before a print starts; a print keeps the spools it started with, and you can change them on the print in the app. The bridge never touches Moonraker's Spoolman integration, its active spool or what it reports.
+
+On a Snapmaker U1, when the RFID reader reads a Snapmaker spool's tag in a slot, the bridge assigns the spool in your 3D Print Log inventory that has that tag. When none has it, and the tag's material or color doesn't match the spool assigned to that slot, the print gets a note saying so; it's logged all the same. The U1 support follows Snapmaker's published firmware and hasn't been tried on a printer yet.
 
 What you change in the app while it prints is kept: the title, your notes (a note is added after them), the spool on a usage row, and a status you already chose, such as Partial success. A print you delete stays deleted.
 
