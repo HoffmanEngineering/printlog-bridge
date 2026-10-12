@@ -36,6 +36,7 @@ from urllib.parse import urlparse
 from printlog_bridge.core.adapter import Adapter
 
 DEFAULT_API_URL = "https://api.3dprintlog.com"
+ALLOW_HTTP_ON_LAN_ENV = "PRINTLOG_ALLOW_HTTP_ON_LAN"
 DEFAULT_ADAPTER = "moonraker"
 CONFIG_FILE_NAME = "printlog-bridge.cfg"
 
@@ -128,7 +129,10 @@ def load_config(
 
     bridge = parser["bridge"] if parser.has_section("bridge") else {}
 
-    api_url = _api_url(bridge.get("api_url", DEFAULT_API_URL))
+    allow_http_on_lan = _flag(bridge.get("allow_http_on_lan", ""), "allow_http_on_lan") or _flag(
+        env.get(ALLOW_HTTP_ON_LAN_ENV, ""), ALLOW_HTTP_ON_LAN_ENV
+    )
+    api_url = _api_url(bridge.get("api_url", DEFAULT_API_URL), allow_http_on_lan)
 
     state_dir_option = bridge.get("state_dir", "").strip() or (env.get(STATE_DIR_ENV) or "").strip()
     state_dir = (
@@ -151,19 +155,49 @@ def load_config(
     return BridgeConfig(path, api_url, api_key, state_dir, printers, source, config_api_key)
 
 
-def _api_url(value: str) -> str:
+def _api_url(value: str, allow_http_on_lan: bool = False) -> str:
     """3D Print Log's address. Plain http is refused except to this computer itself (a test
-    server, or a proxy on the same host), so the key and the prints only ever travel over TLS."""
+    server, or a proxy on the same host), so the key and the prints only ever travel over TLS.
+    `allow_http_on_lan` also allows it to a private-network address, such as a development API
+    on another computer; a public address is still refused."""
     api_url = value.strip().rstrip("/")
     parsed = urlparse(api_url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ConfigError(f"[bridge] api_url must be an https URL, not {api_url!r}")
     if parsed.scheme == "http" and not _is_loopback(parsed.hostname):
-        raise ConfigError(
-            f"[bridge] api_url must use https, not {api_url!r}: the API key and your prints "
-            "are never sent unencrypted. (Plain http is allowed only to this computer.)"
-        )
+        if _is_private(parsed.hostname):
+            if not allow_http_on_lan:
+                raise ConfigError(
+                    f"[bridge] api_url must use https, not {api_url!r}. For a development API "
+                    "on your own network, set allow_http_on_lan = true in [bridge] (or "
+                    f"{ALLOW_HTTP_ON_LAN_ENV}=1): the API key then travels unencrypted on it."
+                )
+        else:
+            raise ConfigError(
+                f"[bridge] api_url must use https, not {api_url!r}: the API key and your prints "
+                "are never sent unencrypted. (Plain http is allowed only to this computer, or "
+                "to a private-network address with allow_http_on_lan.)"
+            )
     return api_url
+
+
+def _is_private(host: str) -> bool:
+    """An IP address on a private network (RFC 1918, link-local, IPv6 unique local). Names are
+    never private here: what a name resolves to can change."""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_private and not address.is_loopback and not address.is_unspecified
+
+
+def _flag(value: str, name: str) -> bool:
+    text = value.strip().lower()
+    if text in ("", "0", "false", "no", "off"):
+        return False
+    if text in ("1", "true", "yes", "on"):
+        return True
+    raise ConfigError(f"{name} must be true or false, not {value!r}")
 
 
 def _is_loopback(host: str) -> bool:

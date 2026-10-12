@@ -396,6 +396,36 @@ class TestOnlyOutboundConnections:
 
         assert load_config(path, adapters=ADAPTERS, env={}, home=tmp_path).api_url == url
 
+    @pytest.mark.parametrize(
+        "url", ["http://192.168.4.65:5000", "http://10.0.0.2:5000", "http://[fd00::2]:5000"]
+    )
+    def test_plain_http_to_a_lan_address_needs_the_opt_in(self, tmp_path, url):
+        """A development API on another computer on the network, for testing before a release."""
+        path = tmp_path / "printlog-bridge.cfg"
+        cfg = f"api_url = {url}\n[printer v]\nurl = http://v:7125\n"
+        path.write_text(f"[bridge]\n{cfg}")
+        with pytest.raises(ConfigError, match="allow_http_on_lan"):
+            load_config(path, adapters=ADAPTERS, env={}, home=tmp_path)
+
+        path.write_text(f"[bridge]\nallow_http_on_lan = true\n{cfg}")
+        assert load_config(path, adapters=ADAPTERS, env={}, home=tmp_path).api_url == url
+
+        path.write_text(f"[bridge]\n{cfg}")
+        env = {"PRINTLOG_ALLOW_HTTP_ON_LAN": "1"}
+        assert load_config(path, adapters=ADAPTERS, env=env, home=tmp_path).api_url == url
+
+    @pytest.mark.parametrize(
+        "url", ["http://api.3dprintlog.com", "http://8.8.8.8:5000", "http://dev-pc.local:5000"]
+    )
+    def test_the_opt_in_never_allows_plain_http_off_the_lan(self, tmp_path, url):
+        path = tmp_path / "printlog-bridge.cfg"
+        path.write_text(
+            f"[bridge]\nallow_http_on_lan = true\napi_url = {url}\n[printer v]\nurl = http://v:7125\n"
+        )
+
+        with pytest.raises(ConfigError, match="https"):
+            load_config(path, adapters=ADAPTERS, env={}, home=tmp_path)
+
 
 class TestMoonrakerUrlsAreMasked:
     URL = f"http://maker:{PASSWORD}@u1.local:7125/?token={WEBCAM_TOKEN}"

@@ -39,7 +39,7 @@ The bridge only makes outbound connections, to:
 
 1. **Moonraker**: its Unix socket in local mode, or the `url` you set in remote mode (HTTP and WebSocket, on your network). In remote mode it also downloads the thumbnail from Moonraker's file API.
 2. **The webcam's `snapshot_url`**, as Mainsail or Fluidd have it set in Moonraker (usually the printer itself), when a print ends.
-3. **3D Print Log**, at `api_url` (`https://api.3dprintlog.com` by default), **over HTTPS only.** The config refuses a plain `http://` `api_url`, except to this computer itself (`localhost`, `127.0.0.1`, `::1`), for a test server or a TLS proxy on the same host.
+3. **3D Print Log**, at `api_url` (`https://api.3dprintlog.com` by default), **over HTTPS only.** The config refuses a plain `http://` `api_url`, except to this computer itself (`localhost`, `127.0.0.1`, `::1`), for a test server or a TLS proxy on the same host. With `allow_http_on_lan = true` (or `PRINTLOG_ALLOW_HTTP_ON_LAN=1`) it also accepts plain http to a private-network IP address (RFC 1918, link-local, IPv6 unique local), for a development API on your own network; the API key then travels unencrypted on that network. A public address or a host name is refused either way.
 
 It **never listens on a port**: nothing can connect to the bridge. Pairing (printlog-bridge#2) will add 3D Print Log's sign-in site while pairing, and nothing else.
 
