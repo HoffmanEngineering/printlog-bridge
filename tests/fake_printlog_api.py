@@ -5,6 +5,8 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
 - `POST /api/Prints` with an `externalSource`/`externalId` pair already used returns that print
   with 200 instead of a duplicate. A replay applies only the fields a connector owns (status,
   durations, filament totals, usage rows) and never moves a finished print back to Printing.
+  Its usage rows name their spool as `filament: {id}`, the print's own shape; a `filamentId`
+  there is ignored, as the API's `AddPrintDTO` has no such field.
 - `POST /api/Prints/{id}/complete` sets the status and duration and merges usage rows: by
   `filamentId`, else by `slot` against rows with no filament, else in order against the
   unlinked rows left (per-slot usage, api#146). A matched row's actual weight, length and volume
@@ -359,10 +361,10 @@ class FakePrintLogApi:
                 if body.get(field) is not None:
                     existing[field] = body[field]
             if body.get("filamentUsage"):
-                existing["filamentUsage"] = [_row(r) for r in body["filamentUsage"]]
+                existing["filamentUsage"] = [_row(r, _spool(r)) for r in body["filamentUsage"]]
             return web.json_response(existing, status=200)
 
-        spools = [r.get("filamentId") for r in body.get("filamentUsage") or []]
+        spools = [_spool(r) for r in body.get("filamentUsage") or []]
         if any(f and f not in self.filaments for f in spools):
             return web.Response(status=403, text="User does not have access to filament.")
         if self.slot_counts.get(body["printerId"], 1) <= 1:
@@ -399,7 +401,7 @@ class FakePrintLogApi:
             "estimatedPrintTimeInSeconds": body.get("estimatedPrintTimeInSeconds"),
             "filamentUsageMg": body.get("filamentUsageMg"),
             "estimatedFilamentUsageMg": body.get("estimatedFilamentUsageMg"),
-            "filamentUsage": [_row(r) for r in body.get("filamentUsage") or []],
+            "filamentUsage": [_row(r, _spool(r)) for r in body.get("filamentUsage") or []],
             "images": [],
         }
         return web.json_response(self.prints[print_id], status=201)
@@ -529,7 +531,7 @@ class FakePrintLogApi:
             else:
                 match = unlinked.pop(0) if unlinked else None
             if match is None:
-                rows.append(_row(incoming))
+                rows.append(_row(incoming, incoming.get("filamentId")))
             else:
                 # All three values are replaced, so an earlier completion's can't outlive it.
                 match["source"] = _source(incoming)
@@ -576,8 +578,12 @@ def _usage_problem(usage: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def _row(sent: dict[str, Any]) -> dict[str, Any]:
-    filament_id = sent.get("filamentId") or (sent.get("filament") or {}).get("id")
+def _spool(sent: dict[str, Any]) -> str | None:
+    """The spool a create's usage row names: `filament.id`, as `AddPrintDTO` reads it."""
+    return (sent.get("filament") or {}).get("id")
+
+
+def _row(sent: dict[str, Any], filament_id: str | None) -> dict[str, Any]:
     return {
         "id": str(uuid.uuid4()),
         "slot": sent.get("slot"),
