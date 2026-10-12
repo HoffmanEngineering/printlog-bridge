@@ -103,3 +103,23 @@ def test_never_replaces_a_stored_key_with_a_different_one_left_in_the_config(tmp
 def test_a_config_that_does_not_load_is_an_error(tmp_path, capsys):
     assert main(["store-key", "--config", str(tmp_path / "missing.cfg")]) == 2
     assert "not found" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("line", ["API_KEY = k-inline", "Api_Key: k-inline"])
+def test_empties_the_key_whatever_its_case(tmp_path, line):
+    path = write_config(tmp_path, line + "\n")  # configparser ignores an option's case
+    assert load(path).config_api_key == "k-inline"
+
+    assert main(["store-key", "--config", str(path)]) == 0
+
+    assert "k-inline" not in path.read_text(encoding="utf-8")
+    assert load(path).api_key_source is ApiKeySource.KEY_FILE
+
+
+def test_says_so_when_the_key_line_can_not_be_found(tmp_path, monkeypatch, capsys):
+    path = write_config(tmp_path, "api_key = k-inline\n")
+    monkeypatch.setattr("printlog_bridge.cli.main.clear_config_api_key", lambda path: False)
+
+    assert main(["store-key", "--config", str(path)]) == 1
+
+    assert "Delete it there yourself" in capsys.readouterr().err

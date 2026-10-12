@@ -255,7 +255,7 @@ def _expand(value: str, home: Path) -> Path:
 
 
 _SECTION = re.compile(r"^\s*\[([^\]]*)\]")
-_API_KEY_LINE = re.compile(r"^(\s*)api_key\s*[=:]")
+_API_KEY_LINE = re.compile(r"^(\s*)api_key\s*[=:]", re.IGNORECASE)  # configparser ignores case
 
 
 def clear_config_api_key(path: Path) -> bool:

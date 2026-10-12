@@ -159,8 +159,13 @@ def _store_key(explicit_config: Path | None) -> int:
 
     try:
         write_key_file(config.api_key_file, key)
-        if moving:
-            clear_config_api_key(config.path)
+        if moving and not clear_config_api_key(config.path):
+            print(
+                f"printlog-bridge: stored the key in {config.api_key_file}, but couldn't find "
+                f"the api_key line to empty in {config.path}. Delete it there yourself.",
+                file=sys.stderr,
+            )
+            return 1
     except OSError as e:
         print(f"printlog-bridge: couldn't store the key: {e}", file=sys.stderr)
         return 1
