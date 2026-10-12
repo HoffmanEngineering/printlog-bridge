@@ -776,6 +776,9 @@ def _link_loaded(rows: list[dict[str, Any]], loaded: Mapping[int, str], single_t
     On a single-tool printer, creating a print makes its spools the printer's loaded ones, so
     a print with no estimate still gets a row for the loaded spool: without it, logging the
     print would unload the spool in 3D Print Log.
+
+    A create names the spool as `filament: {id}`, the print's own shape: the API's create has
+    no `filamentId` and drops it without an error (completing takes `filamentId`).
     """
     if not rows and single_tool and 0 in loaded:
         rows.append({"slot": 0})
@@ -783,7 +786,7 @@ def _link_loaded(rows: list[dict[str, Any]], loaded: Mapping[int, str], single_t
     for row in rows:
         spool = loaded.get(row["slot"])
         if spool is not None and spool not in linked:
-            row["filamentId"] = spool
+            row["filament"] = {"id": spool}
             linked.add(spool)
 
 
