@@ -80,7 +80,7 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
    ```yaml
    services:
      printlog-bridge:
-       image: ghcr.io/hoffmanengineering/printlog-bridge:latest
+       image: ghcr.io/hoffmanengineering/printlog-bridge:edge
        container_name: printlog-bridge
        restart: unless-stopped
        user: "1026:100"

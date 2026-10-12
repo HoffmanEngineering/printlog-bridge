@@ -82,6 +82,13 @@ adapter = fake
     assert voron.options == {"color": "red"}
 
 
+def test_a_config_saved_with_a_byte_order_mark_loads(tmp_path):
+    # Windows editors (e.g. Notepad over an SMB share to a NAS) can save UTF-8 with a BOM.
+    config = load(write(tmp_path, "﻿[printer voron]\nadapter = fake\n"))
+
+    assert [p.name for p in config.printers] == ["voron"]
+
+
 def test_bridge_section_is_optional_and_has_defaults(tmp_path):
     config = load(write(tmp_path, "[printer voron]\nadapter = fake\n"))
 

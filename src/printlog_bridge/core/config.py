@@ -119,7 +119,7 @@ def load_config(
 ) -> BridgeConfig:
     parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
     try:
-        with path.open(encoding="utf-8") as f:
+        with path.open(encoding="utf-8-sig") as f:
             parser.read_file(f)
     except FileNotFoundError:
         raise ConfigError(f"Config file not found: {path}") from None
