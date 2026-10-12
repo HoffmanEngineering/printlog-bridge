@@ -8,6 +8,10 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
 - `POST /api/Prints/{id}/complete` sets the status and duration and merges usage rows: by
   `filamentId`, else by slot against rows with no filament. Every other field is left alone.
 - `PATCH /api/Prints/{id}` changes only the fields sent.
+- `POST /api/Prints/{id}/image` adds an image from a multipart form (`image`, `isDefault`):
+  jpeg, png, gif, webp or bmp by the part's content type, under 10 MB, at most 5 per print
+  (the free plan; 20 with Pro), each refused with 400. `isDefault` makes it the only default.
+  It isn't idempotent: the same image sent twice is two images.
 - `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
   field; `kind` and `displayName` are required and `printerId` must be the user's. A print
   links to a connection only when it is created after the connection was registered.
@@ -24,6 +28,8 @@ from aiohttp.test_utils import TestServer
 
 PRINTING = 2
 FINISHED = (3, 4, 5, 6)  # Success, Cancelled, Failed, PartialSuccess
+IMAGE_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp")
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 CONNECTOR_OWNED = (
     "printTimeInSeconds",
     "estimatedPrintTimeInSeconds",
@@ -45,9 +51,18 @@ class FakePrintLogApi:
         self.connections: dict[str, dict[str, Any]] = {}
         self.heartbeats: list[tuple[str, dict[str, Any]]] = []
         """Every PUT /api/Connections body received, by instance id."""
+        self.images: dict[int, bytes] = {}
+        """Every image's bytes, by image id. A print's `images` lists their ids and defaults."""
+        self.max_images = 5
+        self.image_status: int | None = None
+        """When set, every image upload is answered with this status, as a broken store would."""
+        self.image_cut = False
+        """While True, every image upload is cut off before an answer (a proxy resetting large
+        bodies, an uplink too slow), while every other request is answered."""
         self.offline = False
         """While True, every request is cut off before an answer, as with the internet down."""
         self._ids = itertools.count(1)
+        self._image_ids = itertools.count(1)
         self._failures: list[tuple[int, dict[str, str]]] = []
         self._server: TestServer | None = None
 
@@ -62,6 +77,7 @@ class FakePrintLogApi:
         app.router.add_get("/api/Prints/{id}", self._get)
         app.router.add_patch("/api/Prints/{id}", self._patch)
         app.router.add_post("/api/Prints/{id}/complete", self._complete)
+        app.router.add_post("/api/Prints/{id}/image", self._upload_image)
         app.router.add_put("/api/Connections/{instance}", self._put_connection)
         self._server = TestServer(app)
         await self._server.start_server()
@@ -168,6 +184,7 @@ class FakePrintLogApi:
             "filamentUsageMg": body.get("filamentUsageMg"),
             "estimatedFilamentUsageMg": body.get("estimatedFilamentUsageMg"),
             "filamentUsage": [_row(r) for r in body.get("filamentUsage") or []],
+            "images": [],
         }
         return web.json_response(self.prints[print_id], status=201)
 
@@ -193,6 +210,58 @@ class FakePrintLogApi:
         }
         self.connections[instance_id] = connection
         return web.json_response(connection, status=200 if existing else 201)
+
+    async def _upload_image(self, request: web.Request) -> web.Response:
+        found = self.prints.get(int(request.match_info["id"]))
+        if found is None:
+            return web.Response(status=404)
+        if self.image_cut:
+            if request.transport is not None:
+                request.transport.close()
+            raise web.HTTPServiceUnavailable()  # never reaches the bridge: the line is cut
+        if self.image_status is not None:
+            return web.Response(status=self.image_status)
+        form = await request.post()
+        image = form.get("image")
+        if not isinstance(image, web.FileField):
+            return web.Response(status=400, text="Image file is required.")
+        if (image.content_type or "").lower() not in IMAGE_TYPES:
+            return web.Response(
+                status=400, text="Only image files are accepted (jpeg, png, gif, webp, bmp)."
+            )
+        data = image.file.read()
+        if len(data) > MAX_IMAGE_BYTES:
+            return web.Response(status=400, text="Image must be under 10MB.")
+        if len(found["images"]) >= self.max_images:
+            return web.Response(
+                status=400, text=f"Maximum of {self.max_images} images per print allowed"
+            )
+        flag = str(form.get("isDefault", "false")).strip().lower()
+        if flag not in ("true", "false"):
+            return web.Response(status=400, text="The value is not valid for isDefault.")
+        is_default = flag == "true"
+        if is_default:
+            for other in found["images"]:
+                other["isDefault"] = False
+        image_id = next(self._image_ids)
+        self.images[image_id] = data
+        row = {
+            "id": image_id,
+            "isDefault": is_default,
+            "displayOrder": max((i["displayOrder"] for i in found["images"]), default=-1) + 1,
+            "contentType": image.content_type,
+        }
+        found["images"].append(row)
+        return web.json_response(
+            {k: row[k] for k in ("id", "isDefault", "displayOrder")}, status=201
+        )
+
+    def default_image(self, print_id: int) -> bytes | None:
+        """The bytes of the image shown for the print, if it has one."""
+        for image in self.prints[print_id]["images"]:
+            if image["isDefault"]:
+                return self.images[image["id"]]
+        return None
 
     async def _get(self, request: web.Request) -> web.Response:
         found = self.prints.get(int(request.match_info["id"]))

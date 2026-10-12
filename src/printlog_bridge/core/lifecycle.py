@@ -9,12 +9,19 @@ Every call is safe to repeat. The print is created with an external ID (`<instan
 the API deduplicates on, the state file recognises a replayed event before anything is queued,
 and completing only ever sets what the printer measured. What the user edits in the app while
 the job runs (title, notes, a PartialSuccess status, the spool on a usage row) is kept.
+
+Pictures (the slicer's thumbnail at the start, a webcam snapshot at the end) go through the
+outbox too, in the print's order, so one is only added once its print exists. The image is
+kept in `images/` in the state directory until it is sent. A picture never holds up its print:
+one that can't be fetched in time is skipped, and one the API refuses, or keeps failing to take,
+is dropped so the print's completion behind it goes through.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -22,9 +29,17 @@ from pathlib import Path
 from typing import Any
 
 from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
-from printlog_bridge.core.events import JobEvent, JobFinished, JobOutcome, JobStarted
+from printlog_bridge.core.events import (
+    ImageKind,
+    JobEvent,
+    JobFinished,
+    JobImage,
+    JobOutcome,
+    JobStarted,
+)
+from printlog_bridge.core.images import EXTENSIONS, MAX_IMAGE_BYTES, ImageUnavailable, image_type
 from printlog_bridge.core.outbox import Entry, Outbox, utc_now
-from printlog_bridge.core.state import JobRecord, PrinterState
+from printlog_bridge.core.state import JobRecord, PrinterState, safe_file_name
 from printlog_bridge.core.status import BoardReport, StatusBoard
 from printlog_bridge.core.titles import title_from_file_name
 
@@ -50,6 +65,19 @@ MAX_RETRY_AFTER_S = 60 * 60
 """A `Retry-After` longer than this is taken as this, in case the API ever asks for days."""
 API_TOPIC = "api"
 START, FINISH = "start", "finish"
+IMAGE_KINDS = frozenset(kind.value for kind in ImageKind)
+IMAGES_DIR = "images"
+IMAGE_TIMEOUT_S = 15.0
+"""How long the bridge waits on an adapter for a picture. Adapters give up after 10 s."""
+IMAGE_MAX_ATTEMPTS = 10
+"""An upload that keeps failing while the API is reachable is given up after this many tries,
+so the print's completion behind it isn't held up: pictures must never stop a print from being
+logged. A try counts when the API answers with an error, or when the upload is cut off or times
+out but a small request to the API right after goes through (a proxy that resets large bodies,
+an uplink too slow for the file). A rate limited upload, or one made while the API can't be
+reached at all, waits like any event: then nothing behind it could be sent either. Tries are
+counted for this run of the bridge; a restart starts the count over."""
+TOO_MANY_REQUESTS = 429
 
 
 @dataclass(frozen=True)
@@ -77,6 +105,7 @@ class JobLogger:
         board: StatusBoard | None = None,
         before_create: Callable[[str], Awaitable[None]] | None = None,
         clock: Callable[[], datetime] = utc_now,
+        image_timeout: float = IMAGE_TIMEOUT_S,
     ) -> None:
         """`before_create(printer)` runs before each print is created. The bridge registers the
         printer's connection there, so the print links to it."""
@@ -86,7 +115,15 @@ class JobLogger:
         self.backoff = backoff
         self.board = board
         self.before_create = before_create
+        self.image_timeout = image_timeout
+        self.images_dir = state_dir / IMAGES_DIR
         self.outbox = Outbox.open(state_dir, clock=clock)
+        self._outcomes: dict[str, tuple[str, JobOutcome]] = {}
+        """Each printer's last job seen ending in this run, and how it ended, for whether its
+        snapshot is the default. One per printer, and gone once the snapshot comes."""
+        self._image_tries: dict[int, int] = {}
+        """The counted failed tries of each image entry (see IMAGE_MAX_ATTEMPTS)."""
+        self._remove_stray_images()
         self._states: dict[str, PrinterState] = {}
         self._defaults: tuple[int, bool] | None = None
         self._due: dict[int, float] = {}
@@ -118,7 +155,9 @@ class JobLogger:
             log.error("[printer %s] isn't linked to 3D Print Log; skipping its jobs", event.printer)
             return
         state = self.state(event.printer)
-        if isinstance(event, JobStarted):
+        if isinstance(event, JobImage):
+            await self._emit_image(state, event)
+        elif isinstance(event, JobStarted):
             job = state.jobs.get(event.job_id)
             if job is None:
                 start = asdict(event)
@@ -138,6 +177,7 @@ class JobLogger:
                     event.printer, event.job_id,
                 )  # fmt: skip
                 return
+            self._outcomes[event.printer] = (event.job_id, event.outcome)
             if job.finished:
                 return  # a replay
             if job.ended_at is None:
@@ -148,6 +188,94 @@ class JobLogger:
     def _queue(self, printer: str, job_id: str, kind: str, payload: dict[str, Any]) -> None:
         if self.outbox.add(printer, job_id, kind, payload):
             self._wake.set()
+
+    async def _emit_image(self, state: PrinterState, event: JobImage) -> None:
+        kind = event.kind.value
+        outcome = None
+        if event.kind is ImageKind.SNAPSHOT:
+            last = self._outcomes.pop(event.printer, None)
+            if last is not None and last[0] == event.job_id:
+                outcome = last[1]
+        job = state.jobs.get(event.job_id)
+        if job is None or kind in job.images:
+            return  # a job the bridge isn't logging, or a picture it already has
+        if event.kind is ImageKind.THUMBNAIL and job.finished:
+            return  # a job logged before (a history replay); its start is long gone
+        data = await self._fetch(event)
+        content_type = image_type(data) if data is not None else None
+        if data is not None and content_type is None:
+            log.info(
+                "[printer %s] job %s's %s isn't an image 3D Print Log takes (jpeg, png, gif, "
+                "webp, bmp); skipping it",
+                event.printer, event.job_id, kind,
+            )  # fmt: skip
+        elif data is not None and len(data) > MAX_IMAGE_BYTES:
+            log.info(
+                "[printer %s] job %s's %s is over 10 MB; skipping it",
+                event.printer, event.job_id, kind,
+            )  # fmt: skip
+            content_type = None
+        if data is None or content_type is None:
+            job.images[kind] = False
+            state.save()
+            return
+
+        # The thumbnail is the print's picture, unless the print failed: then what the camera
+        # saw tells more. Without a thumbnail, the snapshot is all there is.
+        default = event.kind is ImageKind.THUMBNAIL or (
+            outcome is JobOutcome.FAILED or not job.images.get(ImageKind.THUMBNAIL.value)
+        )
+        name = safe_file_name(f"{event.printer}-{event.job_id}-{kind}") + EXTENSIONS[content_type]
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self.images_dir / (name + ".tmp")
+        temporary.write_bytes(data)
+        os.replace(temporary, self.images_dir / name)
+        self._queue(
+            event.printer,
+            event.job_id,
+            kind,
+            {"file": name, "content_type": content_type, "default": default},
+        )
+        # Marked only once queued, so a crash before then fetches it again on the replay. The
+        # outbox holds one entry per job and kind, and nothing is sent before this save.
+        job.images[kind] = True
+        state.save()
+
+    async def _fetch(self, event: JobImage) -> bytes | None:
+        """The adapter's picture, or None when there's none, it fails, or it takes too long."""
+        task = asyncio.ensure_future(event.fetch())
+        try:
+            # asyncio.wait, not wait_for, which can swallow a cancel before Python 3.12.
+            done, _ = await asyncio.wait({task}, timeout=self.image_timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        where = f"[printer {event.printer}] job {event.job_id}'s {event.kind.value}"
+        if not done:
+            task.cancel()
+            log.info("%s took longer than %gs; skipping it", where, self.image_timeout)
+            return None
+        try:
+            data = task.result()
+        except ImageUnavailable as e:
+            log.info("%s: %s; skipping it", where, e)
+            return None
+        except Exception as e:
+            # Not the exception's text: it could hold a webcam URL with its password.
+            log.warning("%s couldn't be fetched (%s); skipping it", where, type(e).__name__)
+            return None
+        if data is None:
+            log.debug("%s: there is none", where)
+        return data
+
+    def _remove_stray_images(self) -> None:
+        """Image files no outbox entry needs: left by a power cut between writing and queueing."""
+        if not self.images_dir.is_dir():
+            return
+        wanted = {e.payload.get("file") for e in self.outbox.entries() if e.kind in IMAGE_KINDS}
+        for path in self.images_dir.iterdir():
+            if path.name not in wanted:
+                _unlink(path)
 
     # -- sending -------------------------------------------------------------------------------
 
@@ -188,9 +316,12 @@ class JobLogger:
 
     async def _send(self, entry: Entry) -> None:
         loop = asyncio.get_running_loop()
+        image = entry.kind in IMAGE_KINDS
         try:
             if entry.kind == START:
                 await self._send_start(entry)
+            elif image:
+                await self._send_image(entry)
             else:
                 await self._send_finish(entry)
         except AuthRejected:
@@ -205,14 +336,20 @@ class JobLogger:
             self._paused_until = loop.time() + AUTH_PAUSE_S
             self._not_logged(entry, problem)
         except ApiRejected as e:
+            if image:
+                return await self._image_failed(entry, e)
             # Sending it again won't change the answer. The job stays unfinished in the state
             # file, so a replay after the user fixes the cause (a restart) queues it again.
             log.error("[printer %s] job %s isn't logged: %s", entry.printer, entry.job_id, e)
             self._done(entry)
             self._not_logged(entry, str(e))
         except ApiUnavailable as e:
+            if image:
+                return await self._image_failed(entry, e)
             self._retry_later(entry, str(e), e.retry_after)
-        except Exception:
+        except Exception as e:
+            if image:
+                return await self._image_failed(entry, e)
             # A bug, or an answer the bridge doesn't understand, must never stop the rest. The
             # traceback is logged once, not on every retry.
             if entry.attempts == 0:
@@ -224,9 +361,41 @@ class JobLogger:
         else:
             self._done(entry)
 
+    async def _image_failed(self, entry: Entry, error: Exception) -> None:
+        """A picture that didn't go through. Only an API out of reach is worth waiting for."""
+        where = f"[printer {entry.printer}] job {entry.job_id}'s {entry.kind}"
+        if isinstance(error, ApiUnavailable):
+            tries = self._image_tries.get(entry.seq, 0)
+            if error.status != TOO_MANY_REQUESTS and (
+                error.status is not None or await self._api_reachable()
+            ):
+                tries = self._image_tries[entry.seq] = tries + 1
+            if tries < IMAGE_MAX_ATTEMPTS:
+                self._retry_later(entry, str(error), error.retry_after)
+                return
+            log.warning("%s wasn't added to its print after %d tries: %s", where, tries, error)
+        elif isinstance(error, ApiRejected):
+            log.warning("%s wasn't added to its print: %s", where, error)
+        else:
+            log.warning("%s wasn't added to its print", where, exc_info=error)
+        self._done(entry)
+
+    async def _api_reachable(self) -> bool:
+        """Whether the API answers a small request, after an upload that got no answer."""
+        try:
+            await self.api.current_user()
+        except AuthRejected:
+            return True
+        except Exception:
+            return False
+        return True
+
     def _done(self, entry: Entry) -> None:
         self.outbox.remove(entry.seq)
         self._due.pop(entry.seq, None)
+        self._image_tries.pop(entry.seq, None)
+        if entry.kind in IMAGE_KINDS:
+            _unlink(self.images_dir / str(entry.payload.get("file")))
 
     def _retry_later(self, entry: Entry, problem: str, retry_after: float | None) -> None:
         loop = asyncio.get_running_loop()
@@ -259,6 +428,11 @@ class JobLogger:
                 entry.last_error or "none",
             )  # fmt: skip
             self._due.pop(entry.seq, None)
+            self._image_tries.pop(entry.seq, None)
+            if entry.kind in IMAGE_KINDS:
+                # Only the picture is lost; the print's own events are judged on their own.
+                _unlink(self.images_dir / str(entry.payload.get("file")))
+                continue
             state = self.state(entry.printer)
             job = state.jobs.get(entry.job_id)
             if job is not None and not job.finished:
@@ -281,6 +455,33 @@ class JobLogger:
         self._logged(
             entry.printer,
             f"job {entry.job_id} started: print {print_['id']}, {print_.get('title')!r}",
+        )
+
+    async def _send_image(self, entry: Entry) -> None:
+        where = f"[printer {entry.printer}] job {entry.job_id}'s {entry.kind}"
+        job = self.state(entry.printer).jobs.get(entry.job_id)
+        if job is None or job.print_id is None:
+            log.info("%s has no print to go on (the print wasn't logged); dropping it", where)
+            return
+        payload = entry.payload
+        try:
+            data = (self.images_dir / str(payload["file"])).read_bytes()
+        except OSError:
+            log.warning("%s is gone from %s; skipping it", where, self.images_dir)
+            return
+        content_type = str(payload["content_type"])
+        added = await self.api.upload_print_image(
+            job.print_id,
+            data,
+            content_type,
+            entry.kind + EXTENSIONS.get(content_type, ""),
+            bool(payload.get("default")),
+        )
+        if added is None:
+            log.info("%s: print %s was deleted in 3D Print Log", where, job.print_id)
+            return
+        self._logged(
+            entry.printer, f"job {entry.job_id}: {entry.kind} added to print {job.print_id}"
         )
 
     async def _send_finish(self, entry: Entry) -> None:
@@ -435,6 +636,15 @@ def _finish_event(entry: Entry) -> JobFinished:
         filament_mm={int(slot): mm for slot, mm in (payload.get("filament_mm") or {}).items()},
         note=payload.get("note"),
     )
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("couldn't remove %s: %s", path, e)
 
 
 def _seconds(delay: float) -> str:
