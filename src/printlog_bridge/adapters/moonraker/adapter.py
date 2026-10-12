@@ -17,10 +17,11 @@ import aiohttp
 
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult
-from printlog_bridge.core.config import ConfigError
+from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.images import scrub_url
 from printlog_bridge.core.status import PrinterReport
+from printlog_bridge.core.trace import Trace
 
 from .images import MoonrakerImages
 from .jobs import JobTracker
@@ -41,10 +42,6 @@ log = logging.getLogger(__name__)
 
 DEFAULT_SOCKET = "~/printer_data/comms/moonraker.sock"
 OPTIONS = frozenset({"url", "socket", "moonraker_api_key", "snapshots"})
-BOOLEANS = {
-    "true": True, "yes": True, "on": True, "1": True,
-    "false": False, "no": False, "off": False, "0": False,
-}  # fmt: skip
 CHECK_TIMEOUT_S = 5
 
 URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
@@ -68,6 +65,7 @@ class MoonrakerAdapter(Adapter):
         self.snapshots = snapshots
         """Whether a frame from the printer's webcam is added to each print when it ends."""
         self.spools: SpoolSink | None = None
+        self.trace: Trace | None = None
 
     @classmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> MoonrakerAdapter:
@@ -136,11 +134,15 @@ class MoonrakerAdapter(Adapter):
             socket=self.socket,
             api_key=self.api_key,
             report=report,
+            trace=self.trace,
         )
         await session.run()
 
     def use_spools(self, spools: SpoolSink) -> None:
         self.spools = spools
+
+    def use_trace(self, trace: Trace) -> None:
+        self.trace = trace
 
     async def check(self) -> Sequence[CheckResult]:
         name = f"Printer {self.printer}"

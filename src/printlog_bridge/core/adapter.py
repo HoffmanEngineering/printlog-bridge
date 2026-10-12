@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.status import PrinterReport
+
+if TYPE_CHECKING:
+    from printlog_bridge.core.trace import Trace
 
 
 class Adapter(ABC):
@@ -47,6 +50,11 @@ class Adapter(ABC):
     def use_spools(self, spools: SpoolSink) -> None:  # noqa: B027 - optional, does nothing
         """Called before `run` with where to send spool commands and slot readings, for an
         adapter whose printer has them (PRINTLOG_SET_SPOOL, an RFID reader). Optional."""
+
+    def use_trace(self, trace: Trace) -> None:  # noqa: B027 - optional, does nothing
+        """Called before `run` when `trace = true`: record every message to and from the
+        printer with `trace.record(SEND | RECEIVE, raw)`, and connections with `trace.mark`.
+        Optional; an adapter without it simply isn't traced."""
 
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:

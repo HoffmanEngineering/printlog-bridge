@@ -45,6 +45,12 @@ API_KEY_FILE = "api_key"
 CONFIG_PATH_ENV = "PRINTLOG_BRIDGE_CONFIG"
 STATE_DIR_ENV = "PRINTLOG_BRIDGE_STATE_DIR"
 """The state directory when the config doesn't set `state_dir` (the Docker image sets it)."""
+TRACE_ENV = "PRINTLOG_BRIDGE_TRACE"
+"""`trace` without editing the config (for Docker); wins over `trace` in `[bridge]`."""
+BOOLEANS = {
+    "true": True, "yes": True, "on": True, "1": True,
+    "false": False, "no": False, "off": False, "0": False,
+}  # fmt: skip
 
 PRINTER_PREFIX = "printer"
 
@@ -78,6 +84,8 @@ class BridgeConfig:
     """Where `api_key` came from, or None without one."""
     config_api_key: str | None = None
     """`api_key` in `[bridge]`, even when another source wins: doctor warns about it."""
+    trace: bool = False
+    """Record every message to and from each printer in `state_dir/traces` (core/trace.py)."""
 
     @property
     def api_key_file(self) -> Path:
@@ -148,7 +156,30 @@ def load_config(
     if not printers:
         raise ConfigError(f"{path}: no [printer <name>] section, so there is nothing to watch")
 
-    return BridgeConfig(path, api_url, api_key, state_dir, printers, source, config_api_key)
+    return BridgeConfig(
+        path,
+        api_url,
+        api_key,
+        state_dir,
+        printers,
+        source,
+        config_api_key,
+        trace=_trace(bridge.get("trace"), env.get(TRACE_ENV)),
+    )
+
+
+def _trace(option: str | None, variable: str | None) -> bool:
+    if variable is not None and variable.strip():
+        value = BOOLEANS.get(variable.strip().lower())
+        if value is None:
+            raise ConfigError(f"{TRACE_ENV} must be 1 or 0 (true or false), not {variable!r}")
+        return value
+    if option is None or not option.strip():
+        return False
+    value = BOOLEANS.get(option.strip().lower())
+    if value is None:
+        raise ConfigError(f"[bridge] trace must be true or false, not {option.strip()!r}")
+    return value
 
 
 def _api_url(value: str) -> str:

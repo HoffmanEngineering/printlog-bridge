@@ -169,7 +169,8 @@ async def one_print(tmp_path: Path, *, snapshots: bool = True, webcam_status: in
     (state / "api_key").write_text(API_KEY + "\n", encoding="utf-8")
     config_path = tmp_path / "printlog-bridge.cfg"
     config_path.write_text(
-        f"[bridge]\napi_url = {api_url}\nstate_dir = {state}\n"
+        # Traced, so the trace is checked for secrets with everything else the bridge writes.
+        f"[bridge]\napi_url = {api_url}\nstate_dir = {state}\ntrace = true\n"
         f"[printer voron]\nprinter_id = 42\nurl = {with_password(moonraker_url)}\n"
         f"moonraker_api_key = {MOONRAKER_KEY}\nsnapshots = {'true' if snapshots else 'false'}\n",
         encoding="utf-8",
@@ -274,6 +275,9 @@ class TestWhatIsSent:
     def test_no_secret_reaches_the_state_directory(self, run):
         files = state_files(run["state"])
         assert "status.json" in files
+        [trace] = [name for name in files if name.startswith("traces/voron-")]
+        assert "server.webcams.list" in files[trace]  # it holds the webcam's URL, scrubbed
+        assert "server.connection.identify" in files[trace]  # and Moonraker's key, removed
         for name, text in files.items():
             for secret in SECRETS:
                 assert secret not in text, name

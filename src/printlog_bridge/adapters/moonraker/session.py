@@ -23,6 +23,7 @@ import aiohttp
 from printlog_bridge import __version__
 from printlog_bridge.core.images import mask_url, scrub_url
 from printlog_bridge.core.status import NullReport, PrinterReport
+from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 log = logging.getLogger(__name__)
 
@@ -143,14 +144,19 @@ async def fetch_server_info(
 
 
 async def _open_transport(
-    printer: str, url: str | None, socket: Path | None, api_key: str | None
+    printer: str,
+    url: str | None,
+    socket: Path | None,
+    api_key: str | None,
+    trace: Trace | None = None,
 ) -> _Transport:
     if socket is not None:
-        return await _UnixTransport.open(socket)
+        return await _UnixTransport.open(socket, trace)
     return await _WebSocketTransport.open(
         websocket_url(url or ""),
         api_key,
         lambda detail: rejection(printer, where(url, None), detail),
+        trace,
     )
 
 
@@ -206,6 +212,7 @@ class MoonrakerSession:
         remote_methods: Mapping[str, RemoteMethod] | None = None,
         backoff: Backoff | None = None,
         report: PrinterReport | None = None,
+        trace: Trace | None = None,
     ) -> None:
         if (url is None) == (socket is None):
             raise ValueError("pass exactly one of url or socket")
@@ -217,6 +224,8 @@ class MoonrakerSession:
         self.remote_methods = dict(remote_methods or {})
         self.backoff = backoff or Backoff()
         self.report = report or NullReport()
+        self.trace = trace
+        """Where every message sent and received is recorded, with `trace = true`."""
         self.status: dict[str, dict[str, Any]] = {}
 
     @property
@@ -229,10 +238,14 @@ class MoonrakerSession:
             reason = f"Moonraker at {self.where} closed the connection"
             try:
                 transport = await self._open()
+                if self.trace is not None:
+                    self.trace.mark("open")
                 try:
                     await self._serve(_JsonRpc(transport))
                 finally:
                     await transport.close()
+                    if self.trace is not None:
+                        self.trace.mark("close")
             except (MoonrakerAuthError, AlreadyConnected) as e:
                 reason = str(e)
                 if isinstance(e, MoonrakerAuthError):
@@ -253,7 +266,7 @@ class MoonrakerSession:
             await asyncio.sleep(delay)
 
     async def _open(self) -> _Transport:
-        return await _open_transport(self.printer, self.url, self.socket, self.api_key)
+        return await _open_transport(self.printer, self.url, self.socket, self.api_key, self.trace)
 
     async def _serve(self, rpc: _JsonRpc) -> None:
         try:
@@ -428,13 +441,23 @@ class _Transport(Protocol):
 
 
 class _WebSocketTransport:
-    def __init__(self, session: aiohttp.ClientSession, ws: aiohttp.ClientWebSocketResponse):
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        ws: aiohttp.ClientWebSocketResponse,
+        trace: Trace | None = None,
+    ):
         self._session = session
         self._ws = ws
+        self._trace = trace
 
     @classmethod
     async def open(
-        cls, url: str, api_key: str | None, rejected: Callable[[str], Exception]
+        cls,
+        url: str,
+        api_key: str | None,
+        rejected: Callable[[str], Exception],
+        trace: Trace | None = None,
     ) -> _WebSocketTransport:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         headers = {"X-Api-Key": api_key} if api_key else {}
@@ -450,15 +473,20 @@ class _WebSocketTransport:
         except BaseException:
             await session.close()
             raise
-        return cls(session, ws)
+        return cls(session, ws, trace)
 
     async def send(self, message: Mapping[str, Any]) -> None:
-        await self._ws.send_str(json.dumps(message))
+        text = json.dumps(message)
+        if self._trace is not None:
+            self._trace.record(SEND, text)
+        await self._ws.send_str(text)
 
     async def receive(self) -> Mapping[str, Any] | None:
         while True:
             msg = await self._ws.receive()
             if msg.type is aiohttp.WSMsgType.TEXT:
+                if self._trace is not None:
+                    self._trace.record(RECEIVE, msg.data)
                 return json.loads(msg.data)
             if msg.type in (
                 aiohttp.WSMsgType.CLOSE,
@@ -474,19 +502,28 @@ class _WebSocketTransport:
 
 
 class _UnixTransport:
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        trace: Trace | None = None,
+    ) -> None:
         self._reader = reader
         self._writer = writer
+        self._trace = trace
 
     @classmethod
-    async def open(cls, path: Path) -> _UnixTransport:
+    async def open(cls, path: Path, trace: Trace | None = None) -> _UnixTransport:
         reader, writer = await bounded(
             asyncio.open_unix_connection(str(path), limit=UNIX_READ_LIMIT), CONNECT_TIMEOUT_S
         )
-        return cls(reader, writer)
+        return cls(reader, writer, trace)
 
     async def send(self, message: Mapping[str, Any]) -> None:
-        self._writer.write(json.dumps(message).encode() + ETX)
+        text = json.dumps(message)
+        if self._trace is not None:
+            self._trace.record(SEND, text)
+        self._writer.write(text.encode() + ETX)
         await self._writer.drain()
 
     async def receive(self) -> Mapping[str, Any] | None:
@@ -494,6 +531,8 @@ class _UnixTransport:
             data = await self._reader.readuntil(ETX)
         except asyncio.IncompleteReadError:
             return None
+        if self._trace is not None:
+            self._trace.record(RECEIVE, data[:-1].decode("utf-8", errors="replace"))
         return json.loads(data[:-1])
 
     async def close(self) -> None:

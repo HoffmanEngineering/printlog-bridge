@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from printlog_bridge import __version__
 from printlog_bridge.core.outbox import read_waiting
+from printlog_bridge.core.trace import trace_dir
 
 if TYPE_CHECKING:  # config imports the adapter interface, which imports this module
     from printlog_bridge.core.config import BridgeConfig
@@ -75,7 +76,7 @@ class StatusBoard:
         self._data: dict[str, Any] = {}
         self._failing = False
 
-    def start(self, printers: Iterable[str]) -> None:
+    def start(self, printers: Iterable[str], trace: bool = False) -> None:
         now = self._now()
         self._data = {
             "version": __version__,
@@ -83,6 +84,7 @@ class StatusBoard:
             "started_at": now,
             "updated_at": now,
             "stopped_at": None,
+            "trace": trace,
             "printers": {
                 name: {
                     "connection": "starting",
@@ -229,6 +231,9 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
             f"Bridge: not running: it last checked in {_ago(now, status['updated_at'])} ago and "
             "may have crashed. Check its log."
         ]
+    trace = _trace_line(config, status, running)
+    if trace:
+        lines.append(trace)
 
     for printer in config.printers:
         known = status.get("printers", {}).get(printer.name)
@@ -241,6 +246,20 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
         lines.extend(f"  {line}" for line in _printer_lines(printer, known, running, config, now))
 
     return "\n".join(lines), 0 if running else 1
+
+
+def _trace_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str | None:
+    folder = trace_dir(config.state_dir)
+    if running and status.get("trace"):
+        return f"Trace: on, recording every Moonraker message in {folder}"
+    if not config.trace:
+        return None
+    if running:
+        return (
+            "Trace: on in the config, but the running bridge started without it; restart it "
+            "to start recording"
+        )
+    return f"Trace: on; the bridge records every Moonraker message while it runs, in {folder}"
 
 
 def _printer_lines(printer, known, running: bool, config: BridgeConfig, now: datetime) -> list[str]:
