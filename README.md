@@ -33,6 +33,92 @@ Running it again is safe. Options: `--printer-data DIR` when Moonraker's data fo
 
 `./printlog-bridge/uninstall.sh` removes the service and the virtualenv, puts `moonraker.conf`, `moonraker.asvc` and `printer.cfg` back exactly as they were, and removes `printlog.cfg` unless you changed it. It keeps your config and the state directory (including prints not yet logged) for a reinstall; `--purge` removes those too.
 
+## Run it in Docker (remote mode)
+
+One container watches every printer in its config over the network, through each printer's Moonraker WebSocket. That suits a NAS, a home server or a Pi that isn't a printer. The image is `ghcr.io/hoffmanengineering/printlog-bridge`, for `linux/amd64`, `linux/arm64` and `linux/arm/v7` (32-bit Raspberry Pi OS):
+
+| Tag | What it is |
+| --- | --- |
+| `latest`, `1.2`, `1.2.3` | releases |
+| `edge` | the newest commit on `main` |
+
+Everything the bridge keeps is in one folder, mounted at `/data`:
+
+| Path | What it is |
+| --- | --- |
+| `/data/printlog-bridge.cfg` | the config, which you write |
+| `/data/state/api_key` | the API key, if you store it with `store-key` |
+| `/data/state/outbox.sqlite3`, `images/` | job events and pictures not sent yet |
+| `/data/state/printers/`, `status.json` | what has been logged, and what `status` shows |
+| `/data/state/bridge.log` | the log (`docker logs` shows it too) |
+| `/data/state/printlog-bridge-support.zip` | the support bundle `doctor` writes |
+
+The image sets `PRINTLOG_BRIDGE_CONFIG=/data/printlog-bridge.cfg` and `PRINTLOG_BRIDGE_STATE_DIR=/data/state`; a `state_dir` in the config's `[bridge]` still wins, so leave it out.
+
+The container runs as a normal user, never root: `1000:1000` unless you give it another one. It opens no ports.
+
+### On a Synology NAS (Container Manager)
+
+1. **Make the folder.** In File Station, make `docker/printlog-bridge` (on a NAS with one volume, that's `/volume1/docker/printlog-bridge`).
+2. **Write the config** as `printlog-bridge.cfg` in that folder, with a `[printer <name>]` section per printer:
+   ```ini
+   [printer voron]
+   printer_id = 41
+   url = http://192.168.1.50:7125
+
+   [printer u1]
+   printer_id = 42
+   url = http://192.168.1.51:7125
+
+   [printer k2]
+   printer_id = 43
+   url = http://192.168.1.52:7125
+   ```
+   Use the printers' IP addresses (give each a fixed one in your router): names like `voron.local` usually don't resolve inside a container. Moonraker sees the bridge coming from the NAS's address, so if a printer has `[authorization]` on, add the NAS to its `trusted_clients`, or set `moonraker_api_key` in that printer's section.
+3. **Pick the user.** The container should run as the DSM user that owns the folder. Over SSH, `id <your DSM user>` shows its numbers, such as `uid=1026 ... gid=100(users)`; put them in `user:` below. (Without `user:`, the container runs as `1000:1000` and needs the folder to be writable by that uid.)
+4. **Create the project.** Container Manager > Project > Create, with the folder above as its path and [`docker-compose.yml`](docker-compose.yml) as its file:
+   ```yaml
+   services:
+     printlog-bridge:
+       image: ghcr.io/hoffmanengineering/printlog-bridge:latest
+       container_name: printlog-bridge
+       restart: unless-stopped
+       user: "1026:100"
+       environment:
+         TZ: Europe/Berlin
+       volumes:
+         - /volume1/docker/printlog-bridge:/data
+   ```
+   `restart: unless-stopped` brings it back after a crash and after the NAS restarts. `TZ` (a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)) sets the times in its log; `status` and 3D Print Log use UTC either way.
+5. **Give it the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys), one of two ways:
+   - Store it in the folder, where only that user can read it. Over SSH:
+     ```sh
+     sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
+       ghcr.io/hoffmanengineering/printlog-bridge store-key
+     ```
+   - Or add `PRINTLOG_API_KEY: <key>` under `environment:`. That's simpler, but anyone who can manage containers on the NAS can read it in the container's settings.
+6. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge status`). Over SSH:
+   ```sh
+   sudo docker exec printlog-bridge printlog-bridge doctor   # checks the config, the key and every printer
+   sudo docker exec printlog-bridge printlog-bridge status   # what each printer is doing
+   ```
+   `doctor` leaves the support bundle at `/volume1/docker/printlog-bridge/state/printlog-bridge-support.zip`, which you can download from File Station.
+
+If the config needs fixing (no key, a printer without `printer_id`), the bridge says what to fix in the container's log and exits, and the restart policy tries again every few seconds until you fix it. After editing `printlog-bridge.cfg`, restart the container.
+
+### Anywhere else (Unraid, a Pi, any Linux host)
+
+The same `docker-compose.yml` works after changing the folder (`/mnt/user/appdata/printlog-bridge` on Unraid, say) and `user:`. Without Compose:
+
+```sh
+docker run -d --name printlog-bridge --restart unless-stopped \
+  -e TZ=Europe/Berlin -v "$PWD/printlog-bridge:/data" \
+  ghcr.io/hoffmanengineering/printlog-bridge
+docker exec printlog-bridge printlog-bridge doctor
+```
+
+Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
+
 ## Try it
 
 ```sh
@@ -106,7 +192,7 @@ The bridge sends 3D Print Log the print's file name (without its folders), times
 
 ## Config
 
-One `printlog-bridge.cfg`, looked up in this order: `--config`, `$PRINTLOG_BRIDGE_CONFIG`, `~/printer_data/config/`, `~/.config/printlog-bridge/`. See [printlog-bridge.example.cfg](printlog-bridge.example.cfg).
+One `printlog-bridge.cfg`, looked up in this order: `--config`, `$PRINTLOG_BRIDGE_CONFIG`, `~/printer_data/config/`, `~/.config/printlog-bridge/`. See [printlog-bridge.example.cfg](printlog-bridge.example.cfg). The state directory is `state_dir` in `[bridge]`, then `$PRINTLOG_BRIDGE_STATE_DIR`, then `~/.local/share/printlog-bridge`.
 
 Each printer is a `[printer <name>]` section, so one bridge can watch several. Set `printer_id` in each to the printer's number in 3D Print Log, the end of its page's address (`https://www.3dprintlog.com/printers/42`); pairing will set it for you.
 
@@ -124,6 +210,8 @@ python -m venv .venv
 ```
 
 CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`.
+
+The Docker workflow builds the image for amd64 and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run` and `status` inside the container, as a non-root user, against three fake Moonrakers and a fake 3D Print Log API on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. It then builds all three platforms, and pushes them to GHCR from `main` (`edge`) and from `v*` tags. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev`.
 
 `pytest -m integration` runs the bridge against a real Moonraker, built from source in Docker (set `MOONRAKER_REF` to pick a tag or commit; the default is `v0.9.3`). The first run builds the image, which takes a minute or two. CI runs it against the last release and a pinned recent commit. To support another kind of printer, see [docs/adapters.md](docs/adapters.md).
 
