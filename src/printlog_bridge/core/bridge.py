@@ -10,6 +10,7 @@ from printlog_bridge.core.config import API_KEY_ENV, BridgeConfig, ConfigError
 from printlog_bridge.core.connections import HEARTBEAT_INTERVAL_S, Connection, Heartbeat
 from printlog_bridge.core.doctor import API_KEYS_PAGE, PRINTERS_PAGE
 from printlog_bridge.core.lifecycle import BACKOFF_S, JobLogger, LoggedPrinter
+from printlog_bridge.core.spools import REFRESH_INTERVAL_S, Spools
 from printlog_bridge.core.status import TOUCH_INTERVAL_S, StatusBoard
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ async def run_bridge(
     heartbeat_interval: float = HEARTBEAT_INTERVAL_S,
     touch_interval: float = TOUCH_INTERVAL_S,
     backoff: tuple[float, float] = BACKOFF_S,
+    spool_interval: float = REFRESH_INTERVAL_S,
 ) -> None:
     """Runs every printer's adapter until cancelled, logging their jobs to the API.
 
@@ -51,6 +53,12 @@ async def run_bridge(
     board.start([p.name for p in config.printers])
     try:
         async with ApiClient(config.api_url, config.api_key) as api:
+            spools = Spools(
+                api,
+                {p.name: p.printer_id for p in config.printers if p.printer_id is not None},
+                board,
+                interval=spool_interval,
+            )
             sink = JobLogger(
                 api,
                 {
@@ -61,6 +69,7 @@ async def run_bridge(
                 config.state_dir,
                 backoff=backoff,
                 board=board,
+                spools=spools,
             )
             heartbeat = Heartbeat(
                 api,
@@ -79,6 +88,7 @@ async def run_bridge(
             )
             sink.before_create = heartbeat.ensure_registered
             for printer in config.printers:
+                printer.adapter.use_spools(spools)
                 log.info(
                     "[printer %s] watching: %s, logging to printer %s",
                     printer.name, printer.adapter.describe(), printer.printer_id,
@@ -87,6 +97,7 @@ async def run_bridge(
                 await asyncio.gather(
                     sink.run(),
                     heartbeat.run(),
+                    spools.run(),
                     _keep_touching(board, touch_interval),
                     *(p.adapter.run(sink, board.printer(p.name)) for p in config.printers),
                 )

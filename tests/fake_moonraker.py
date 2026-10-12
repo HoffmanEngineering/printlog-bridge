@@ -1,8 +1,9 @@
 """A small stand-in for Moonraker's JSON-RPC API, over a WebSocket or a Unix socket.
 
 It speaks just enough of the protocol for the bridge: identify, server.info,
-printer.objects.list/subscribe, connection.register_remote_method, server.history.list,
-server.files.roots, server.files.metadata and server.webcams.list, plus pushing notifications
+printer.objects.list/subscribe, printer.gcode.script, connection.register_remote_method,
+server.history.list, server.files.roots, server.files.metadata and server.webcams.list, plus
+pushing notifications (console lines among them)
 and dropping every client to simulate a restart. `start_job` and `finish_job` drive a print the
 way Moonraker's history component reports one. Over HTTP it serves the gcodes root's files
 (`GET /server/files/gcodes/<path>`), which is how a remote bridge gets a thumbnail.
@@ -76,6 +77,8 @@ class FakeMoonraker:
         self.identified: list[dict] = []
         self.subscriptions: list[dict] = []
         self.registered: list[str] = []
+        self.scripts: list[str] = []
+        """Every G-code script run through printer.gcode.script."""
         self.upgrade_headers: list[dict[str, str]] = []
         self._clients: dict[Send, Callable[[], Awaitable[None]]] = {}
         self._ids = 0
@@ -233,6 +236,10 @@ class FakeMoonraker:
             return {"filename": filename, **self.file_metadata[filename]}
         if method == "server.webcams.list":
             return {"webcams": [dict(w) for w in self.webcams]}
+        if method == "printer.gcode.script":
+            self._require_klippy()
+            self.scripts.append(params["script"])
+            return "ok"
         if method == "connection.register_remote_method":
             self.registered.append(params["method_name"])
             return "ok"
@@ -325,6 +332,10 @@ class FakeMoonraker:
         for name, fields in objects.items():
             self.status.setdefault(name, {}).update(fields)
         await self.notify("notify_status_update", objects, time.monotonic())
+
+    async def respond(self, line: str) -> None:
+        """Klipper prints a line to the console, as `action_respond_info` does."""
+        await self.notify("notify_gcode_response", line)
 
     async def call_remote_method(self, method: str, params: dict) -> None:
         for send in list(self._clients):

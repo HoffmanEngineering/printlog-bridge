@@ -244,6 +244,18 @@ def test_registers_remote_methods_and_calls_them():
     assert calls == [{"tool": 1, "spool": 7}]
 
 
+def test_passes_console_lines_to_the_listener():
+    async def scenario():
+        recorder = Recorder()
+        async with fake_moonraker() as (fake, base), running(session_for(base, recorder)):
+            await eventually(lambda: recorder.klippy)
+            await fake.respond("// printlog: SET_SPOOL TOOL=1 TAG=04A23F11")
+            await eventually(lambda: recorder.console)
+        return recorder.console
+
+    assert asyncio.run(scenario()) == ["// printlog: SET_SPOOL TOOL=1 TAG=04A23F11"]
+
+
 def test_sends_the_moonraker_api_key():
     async def scenario():
         async with fake_moonraker(api_key="secret") as (fake, base):

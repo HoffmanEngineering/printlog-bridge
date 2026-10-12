@@ -66,6 +66,36 @@ class MoonrakerListener(Protocol):
     async def on_history(self, action: str, job: Mapping[str, Any]) -> None:
         """A job was `added` to or `finished` in Moonraker's history: the authoritative record."""
 
+    async def on_gcode_response(self, line: str) -> None:
+        """Klipper printed a line to the console (`notify_gcode_response`)."""
+
+
+class Listeners:
+    """Several listeners as one, each told everything in turn."""
+
+    def __init__(self, *listeners: MoonrakerListener) -> None:
+        self.listeners = listeners
+
+    async def on_connected(self, call: Call) -> None:
+        for listener in self.listeners:
+            await listener.on_connected(call)
+
+    async def on_klippy_state(self, state: str) -> None:
+        for listener in self.listeners:
+            await listener.on_klippy_state(state)
+
+    async def on_status(self, status: Mapping[str, Any], changed: Mapping[str, Any]) -> None:
+        for listener in self.listeners:
+            await listener.on_status(status, changed)
+
+    async def on_history(self, action: str, job: Mapping[str, Any]) -> None:
+        for listener in self.listeners:
+            await listener.on_history(action, job)
+
+    async def on_gcode_response(self, line: str) -> None:
+        for listener in self.listeners:
+            await listener.on_gcode_response(line)
+
 
 class MoonrakerAuthError(Exception):
     """Moonraker refused the bridge. Retrying won't help until its key or trust changes."""
@@ -278,6 +308,9 @@ class MoonrakerSession:
             await self.listener.on_status(self.status, changed)
         elif method == "notify_history_changed":
             await self.listener.on_history(params[0]["action"], params[0]["job"])
+        elif method == "notify_gcode_response":
+            for line in params or []:
+                await self.listener.on_gcode_response(str(line))
         elif method == "notify_klippy_ready":
             await self._subscribe(rpc)
         elif method in ("notify_klippy_shutdown", "notify_klippy_disconnected"):

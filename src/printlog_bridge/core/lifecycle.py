@@ -40,6 +40,7 @@ from printlog_bridge.core.events import (
 )
 from printlog_bridge.core.images import EXTENSIONS, MAX_IMAGE_BYTES, ImageUnavailable, image_type
 from printlog_bridge.core.outbox import Entry, Outbox, utc_now
+from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState, safe_file_name
 from printlog_bridge.core.status import BoardReport, StatusBoard
 from printlog_bridge.core.titles import title_from_file_name
@@ -110,10 +111,13 @@ class JobLogger:
         before_create: Callable[[str], Awaitable[None]] | None = None,
         clock: Callable[[], datetime] = utc_now,
         image_timeout: float = IMAGE_TIMEOUT_S,
+        spools: Spools | None = None,
     ) -> None:
         """`before_create(printer)` runs before each print is created. The bridge registers the
-        printer's connection there, so the print links to it."""
+        printer's connection there, so the print links to it. With `spools`, each print's usage
+        rows are linked to the spools loaded in their slots."""
         self.api = api
+        self.spools = spools
         self.printers = dict(printers)
         self.state_dir = state_dir
         self.backoff = backoff
@@ -584,6 +588,12 @@ class JobLogger:
         if start.get("estimated_filament_g"):
             body["estimatedFilamentUsageMg"] = round(start["estimated_filament_g"] * 1000)
         rows = _estimate_rows(start)
+        if self.spools is not None:
+            loaded = await self.spools.current(printer)
+            _link_loaded(rows, loaded, single_tool=(self.spools.slot_count(printer) or 1) <= 1)
+            notes = self.spools.mismatches(printer, [row["slot"] for row in rows] or [0])
+            if notes:
+                body["notes"] = "\n\n".join(notes)
         if rows:
             body["filamentUsage"] = rows
 
@@ -628,7 +638,8 @@ class JobLogger:
         }
         if event.duration_s is not None:
             body["printTimeInSeconds"] = round(event.duration_s)
-        rows = _usage_rows(event, print_.get("filamentUsage") or [])
+        loaded = await self.spools.current(event.printer) if self.spools is not None else {}
+        rows = _usage_rows(event, print_.get("filamentUsage") or [], loaded)
         if rows:
             body["filamentUsage"] = rows
 
@@ -759,13 +770,34 @@ def _estimate_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [row]
 
 
-def _usage_rows(event: JobFinished, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _link_loaded(rows: list[dict[str, Any]], loaded: Mapping[int, str], single_tool: bool) -> None:
+    """Links each estimate row to the spool loaded in its slot, once per spool.
+
+    On a single-tool printer, creating a print makes its spools the printer's loaded ones, so
+    a print with no estimate still gets a row for the loaded spool: without it, logging the
+    print would unload the spool in 3D Print Log.
+    """
+    if not rows and single_tool and 0 in loaded:
+        rows.append({"slot": 0})
+    linked = set()
+    for row in rows:
+        spool = loaded.get(row["slot"])
+        if spool is not None and spool not in linked:
+            row["filamentId"] = spool
+            linked.add(spool)
+
+
+def _usage_rows(
+    event: JobFinished,
+    rows: Sequence[Mapping[str, Any]],
+    loaded: Mapping[int, str] | None = None,
+) -> list[dict[str, Any]]:
     """One row per slot that fed filament, linked to the spool in that slot when it's known.
 
     A slot with no spool still gets its row, with its slot and no `filamentId`. The API takes
     one row per spool, so a spool on two slots gets one row, on the first, with both lengths.
     """
-    spools = _spools_by_slot(rows)
+    spools = _spools_by_slot(rows, loaded or {})
     usage: list[dict[str, Any]] = []
     mm_by_spool: dict[str, float] = {}
     for slot, mm in sorted(event.filament_mm.items()):
@@ -785,15 +817,20 @@ def _usage_rows(event: JobFinished, rows: Sequence[Mapping[str, Any]]) -> list[d
     return usage
 
 
-def _spools_by_slot(rows: Sequence[Mapping[str, Any]]) -> dict[int, str]:
-    """The spool (filament id) in each slot, as the user linked it on the print's usage rows.
+def _spools_by_slot(rows: Sequence[Mapping[str, Any]], loaded: Mapping[int, str]) -> dict[int, str]:
+    """The spool (filament id) in each slot: as linked on the print's usage rows, else the one
+    loaded in the slot in 3D Print Log now.
 
-    The one place a slot's spool is decided: spool macros and the U1's RFID reader (#6) add the
-    spool loaded in each slot here, with the user's choice on the print still winning.
+    The one place a slot's spool is decided. The print's rows hold the spools loaded when it
+    was created, and whatever the user linked since, which wins: spool macros and the U1's
+    RFID reader (#6) only change what's loaded on the printer.
     """
     spools: dict[int, str] = {}
     for row in rows:
         slot, filament = row.get("slot"), row.get("filament")
         if slot is not None and filament and slot not in spools:
             spools[slot] = filament["id"]
+    for slot, spool in loaded.items():
+        if slot not in spools and spool not in spools.values():
+            spools[slot] = spool
     return spools

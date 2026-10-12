@@ -8,8 +8,9 @@
 # It makes a virtualenv, writes printlog-bridge.cfg next to printer.cfg, installs and starts a
 # printlog-bridge systemd service, and lets Moonraker manage it: `printlog-bridge` in
 # moonraker.asvc, so Mainsail and Fluidd can restart it, and an [update_manager printlog-bridge]
-# section in moonraker.conf, so they offer its updates. Running it again is safe.
-# uninstall.sh undoes all of it.
+# section in moonraker.conf, so they offer its updates. It also puts the PRINTLOG_SET_SPOOL
+# macros (printlog.cfg) next to printer.cfg and includes them from it, unless --no-macros.
+# Running it again is safe. uninstall.sh undoes all of it.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +23,7 @@ VENV="${HOME}/printlog-bridge-env"
 MOONRAKER_SERVICE=moonraker
 PRINTER_ID=""
 ASSUME_YES=0
+MACROS=1
 
 # For tests only (tests/install/smoke.sh): where unit files go, and the commands that change the
 # system, so CI can run this script against a fake systemctl.
@@ -43,6 +45,8 @@ Options:
   -e, --venv DIR            where to make the virtualenv (default: ~/printlog-bridge-env)
   -p, --printer-id N        the printer's number in 3D Print Log (the end of its page's address)
   -m, --moonraker-service S Moonraker's systemd service (default: moonraker)
+      --no-macros           don't install the PRINTLOG_SET_SPOOL macros (printlog.cfg) or
+                            include them from printer.cfg
   -y, --yes                 don't ask anything; fill in the config afterwards
   -h, --help                show this
 
@@ -66,6 +70,7 @@ parse_args() {
             -e | --venv) VENV="${2:?$1 needs a folder}"; shift 2 ;;
             -p | --printer-id) PRINTER_ID="${2:?$1 needs a number}"; shift 2 ;;
             -m | --moonraker-service) MOONRAKER_SERVICE="${2:?$1 needs a name}"; shift 2 ;;
+            --no-macros) MACROS=0; shift ;;
             -y | --yes) ASSUME_YES=1; shift ;;
             -h | --help) usage; exit 0 ;;
             *) usage >&2; fail "unknown option: $1" ;;
@@ -77,6 +82,8 @@ parse_args() {
     MOONRAKER_CONF="${PRINTER_DATA}/config/moonraker.conf"
     MOONRAKER_ASVC="${PRINTER_DATA}/moonraker.asvc"
     RECORD="${REPO_DIR}/.install-record.json"
+    PRINTER_CFG="${PRINTER_DATA}/config/printer.cfg"
+    MACROS_RECORD="${REPO_DIR}/.install-macros.json"
     # The API key goes here, not in printlog-bridge.cfg: Moonraker serves the config folder to
     # anyone who can open Mainsail or Fluidd. The bridge's default state directory.
     KEY_FILE="${HOME}/.local/share/printlog-bridge/api_key"
@@ -209,6 +216,26 @@ add_to_moonraker() {
     fi
 }
 
+# The macros are copied rather than linked, so printer.cfg never includes a file that goes away
+# with the checkout. Klipper reads them when it next restarts; this doesn't restart it, since that
+# would end a print.
+install_macros() {
+    if [ "$MACROS" != 1 ]; then
+        return
+    fi
+    say "Installing the PRINTLOG_SET_SPOOL macros"
+    local result
+    result="$(
+        "$PYTHON" "${REPO_DIR}/scripts/install_helper.py" macros-add \
+            --printer-cfg "$PRINTER_CFG" --source "${REPO_DIR}/klipper/printlog.cfg" \
+            --record "$MACROS_RECORD"
+    )"
+    if [ "$result" = changed ]; then
+        echo "  Added ${PRINTER_DATA}/config/printlog.cfg, included from printer.cfg."
+        echo "  Restart Klipper (FIRMWARE_RESTART, when it isn't printing) to load the macros."
+    fi
+}
+
 start_service() {
     say "Starting ${SERVICE}"
     run_root "$SYSTEMCTL" restart "$SERVICE"
@@ -250,6 +277,7 @@ main() {
     write_config
     install_service
     add_to_moonraker
+    install_macros
     start_service
     finish
 }

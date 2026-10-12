@@ -316,3 +316,187 @@ def test_requirements_txt_matches_the_packages_dependencies():
     required = sorted(line for line in lines if line.strip() and not line.startswith("#"))
 
     assert required == declared
+
+
+SAVE_CONFIG_BLOCK = (
+    "#*# <---------------------- SAVE_CONFIG ---------------------->\n"
+    "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n"
+    "#*#\n#*# [extruder]\n#*# pid_kp = 21.5\n"
+)
+PRINTER_CFGS = [
+    "",
+    "[printer]\nkinematics: corexy\n",
+    "[printer]\nkinematics: corexy",  # no newline at the end
+    "[printer]\nkinematics: corexy\n\n",
+    "[printer]\r\nkinematics: corexy\r\n",
+    "[printer]\nkinematics: corexy\n\n" + SAVE_CONFIG_BLOCK,
+    "[printer]\nkinematics: corexy\n" + SAVE_CONFIG_BLOCK,
+]
+
+
+@pytest.mark.parametrize("original", PRINTER_CFGS)
+def test_removing_the_include_restores_printer_cfg_exactly(original):
+    added, change = helper.add_include(original)
+
+    assert "[include printlog.cfg]" in added
+    assert helper.remove_include(added, change) == original
+
+
+def test_the_include_goes_before_klippers_save_config_block():
+    added, _ = helper.add_include("[printer]\nkinematics: corexy\n\n" + SAVE_CONFIG_BLOCK)
+
+    assert added.index("[include printlog.cfg]") < added.index("SAVE_CONFIG")
+    assert added.endswith(SAVE_CONFIG_BLOCK)  # Klipper needs it last
+
+
+def test_what_save_config_writes_later_is_kept_on_uninstall():
+    added, change = helper.add_include("[printer]\nkinematics: corexy\n")
+    saved = added + SAVE_CONFIG_BLOCK  # SAVE_CONFIG appends its block below ours
+
+    assert helper.remove_include(saved, change) == "[printer]\nkinematics: corexy\n" + (
+        SAVE_CONFIG_BLOCK
+    )
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        "[include printlog.cfg]\n",
+        "[include  printlog.cfg ]\n",
+        "[gcode_macro PRINTLOG_SET_SPOOL]\ngcode:\n  M117 mine\n",
+    ],
+)
+def test_an_include_or_macros_the_user_has_are_left_alone(existing):
+    added, change = helper.add_include(existing)
+
+    assert added == existing
+    assert change["added"] is False
+
+
+class TestMacroCommands:
+    SOURCE = ROOT / "klipper" / "printlog.cfg"
+
+    def args(self, tmp_path, printer_cfg: str = "[printer]\nkinematics: corexy\n"):
+        (tmp_path / "printer.cfg").write_bytes(printer_cfg.encode())
+        return [
+            "--printer-cfg", str(tmp_path / "printer.cfg"),
+            "--record", str(tmp_path / "macros.json"),
+        ]  # fmt: skip
+
+    def add(self, args):
+        return helper.main(["macros-add", *args, "--source", str(self.SOURCE)])
+
+    def test_add_then_remove_leaves_the_config_folder_as_it_was(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+
+        assert self.add(args) == 0
+        assert capsys.readouterr().out.strip() == "changed"
+        assert (tmp_path / "printlog.cfg").read_bytes() == self.SOURCE.read_bytes()
+        assert b"[include printlog.cfg]" in (tmp_path / "printer.cfg").read_bytes()
+
+        assert helper.main(["macros-remove", *args]) == 0
+        assert (tmp_path / "printer.cfg").read_bytes() == b"[printer]\nkinematics: corexy\n"
+        assert not (tmp_path / "printlog.cfg").exists()
+        assert not (tmp_path / "macros.json").exists()
+
+    def test_installing_again_changes_nothing(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+        self.add(args)
+        before = (tmp_path / "printer.cfg").read_bytes()
+        capsys.readouterr()
+
+        self.add(args)
+
+        assert capsys.readouterr().out.strip() == "unchanged"
+        assert (tmp_path / "printer.cfg").read_bytes() == before
+
+    def test_an_update_replaces_the_macros_the_user_didnt_change(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+        self.add(args)
+        old = b"[gcode_macro PRINTLOG_SET_SPOOL]\ngcode:\n  M117 old\n"
+        (tmp_path / "printlog.cfg").write_bytes(old)
+        record = json.loads((tmp_path / "macros.json").read_text())
+        record["macros"] = helper.sha256(old)  # as an older install would have recorded
+        (tmp_path / "macros.json").write_text(json.dumps(record))
+
+        self.add(args)
+
+        assert (tmp_path / "printlog.cfg").read_bytes() == self.SOURCE.read_bytes()
+
+    def test_macros_the_user_changed_are_kept_and_kept_on_uninstall(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+        self.add(args)
+        mine = (tmp_path / "printlog.cfg").read_bytes() + b"\n# my change\n"
+        (tmp_path / "printlog.cfg").write_bytes(mine)
+        capsys.readouterr()
+
+        self.add(args)
+        assert "kept" in capsys.readouterr().err
+        assert (tmp_path / "printlog.cfg").read_bytes() == mine
+
+        helper.main(["macros-remove", *args])
+        assert (tmp_path / "printlog.cfg").read_bytes() == mine
+        assert b"[include printlog.cfg]" not in (tmp_path / "printer.cfg").read_bytes()
+
+    def test_a_printlog_cfg_of_the_users_own_is_not_included(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+        (tmp_path / "printlog.cfg").write_bytes(b"[gcode_macro SOMETHING_ELSE]\ngcode:\n")
+
+        assert self.add(args) == 0
+
+        assert "[include printlog.cfg]" not in (tmp_path / "printer.cfg").read_text()
+        assert (tmp_path / "printlog.cfg").read_bytes() == b"[gcode_macro SOMETHING_ELSE]\ngcode:\n"
+        helper.main(["macros-remove", *args])
+        assert (tmp_path / "printlog.cfg").exists()
+
+    def test_without_printer_cfg_nothing_is_done(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+        (tmp_path / "printer.cfg").unlink()
+
+        assert self.add(args) == 0
+
+        assert capsys.readouterr().out.strip() == "skipped"
+        assert not (tmp_path / "printlog.cfg").exists()
+
+    def test_a_symlinked_printer_cfg_stays_a_symlink(self, tmp_path, capsys):
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        (backup / "printer.cfg").write_bytes(b"[printer]\nkinematics: corexy\n")
+        args = self.args(tmp_path)
+        (tmp_path / "printer.cfg").unlink()
+        try:
+            (tmp_path / "printer.cfg").symlink_to(backup / "printer.cfg")
+        except OSError:
+            pytest.skip("this system can't make symlinks")
+
+        self.add(args)
+        assert (tmp_path / "printer.cfg").is_symlink()
+        assert b"[include printlog.cfg]" in (backup / "printer.cfg").read_bytes()
+
+        helper.main(["macros-remove", *args])
+        assert (tmp_path / "printer.cfg").is_symlink()
+        assert (backup / "printer.cfg").read_bytes() == b"[printer]\nkinematics: corexy\n"
+
+    def test_a_copy_the_user_included_themselves_survives_uninstall(self, tmp_path, capsys):
+        # They followed printlog.cfg's own instructions, then ran install.sh and uninstall.sh.
+        printer_cfg = "[include printlog.cfg]\n[printer]\nkinematics: corexy\n"
+        args = self.args(tmp_path, printer_cfg)
+        (tmp_path / "printlog.cfg").write_bytes(self.SOURCE.read_bytes())
+
+        self.add(args)
+        helper.main(["macros-remove", *args])
+
+        assert (tmp_path / "printer.cfg").read_text() == printer_cfg
+        assert (tmp_path / "printlog.cfg").exists()  # else Klipper won't start
+
+    def test_an_include_left_in_printer_cfg_keeps_its_file(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+        self.add(args)
+        # The markers were lost (the file was saved with CRLF line ends), the include kept.
+        text = (tmp_path / "printer.cfg").read_text().replace("\n", "\r\n")
+        (tmp_path / "printer.cfg").write_bytes(text.encode())
+
+        helper.main(["macros-remove", *args])
+
+        assert b"[include printlog.cfg]" in (tmp_path / "printer.cfg").read_bytes()
+        assert (tmp_path / "printlog.cfg").exists()

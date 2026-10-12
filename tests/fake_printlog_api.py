@@ -19,11 +19,31 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
 - `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
   field; `kind` and `displayName` are required and `printerId` must be the user's. A print
   links to a connection only when it is created after the connection was registered.
+
+Spools and slots (api#146, PR 158; api#147, PR 159):
+
+- `GET /api/Printers/{id}` has `slotCount` (1 unless set) and `loadedFilaments`, and
+  `GET /api/Printers/{id}/filament` lists the loaded spools: by slot, unslotted ones last.
+- `PUT /api/Printers/{id}/slots/{slot}` with `{filamentId, slotLabel?}` loads a spool. Whatever
+  was in the slot is unloaded, and so is the spool from any other slot or printer. Loading the
+  spool already there keeps its row and `loadedAt` and only updates the label. 400 for a slot
+  outside `0..slotCount-1` or a label over 20 characters, 403 for a spool that isn't the
+  user's, 404 for a printer that doesn't exist. Returns the loaded list.
+- `DELETE /api/Printers/{id}/slots/{slot}` unloads the slot: 204, also when it was empty.
+- `PUT /api/Printers/{id}` replaces the printer. `slotCount` (1-64) is kept when left out, and
+  the loaded spools become the ones sent, by id: a spool kept keeps its slot and loaded time, a
+  spool left out is unloaded. `make`, `model` and `name` are required.
+- `GET /api/Filaments/by-tag/{uid}` finds the user's spool with that tag UID, in any case and
+  with `:` `-` `.` `_` or spaces between bytes (`TagUid.Normalize`): 400 for a UID that isn't
+  whole hex bytes (64 hex characters at most), 404 when none of the user's spools has it.
+- `AddPrint` on a printer with one slot makes the print's spools the printer's loaded list (so a
+  print with no spool unloads it); on a printer with more slots it leaves the slots alone.
 """
 
 from __future__ import annotations
 
 import itertools
+import re
 import uuid
 from typing import Any
 
@@ -65,6 +85,19 @@ class FakePrintLogApi:
         bodies, an uplink too slow), while every other request is answered."""
         self.offline = False
         """While True, every request is cut off before an answer, as with the internet down."""
+        self.filaments: dict[str, dict[str, Any]] = {}
+        """The user's spools, by id (`add_spool`)."""
+        self.slot_counts: dict[int, int] = {}
+        """Each printer's `slotCount`, when it isn't 1."""
+        self.loaded: dict[int, list[dict[str, Any]]] = {p: [] for p in printers}
+        """Each printer's loaded spools: `{id, slot, slotLabel, loadedAt, filamentId}`."""
+        self.printer_puts: list[dict[str, Any]] = []
+        """Every PUT /api/Printers/{id} body received."""
+        self.slot_puts: list[dict[str, Any]] = []
+        """Every PUT /api/Printers/{id}/slots/{slot} body received."""
+        self._loaded_at = itertools.count(1)
+        self._printer_fields: dict[int, dict[str, Any]] = {}
+        """What the last PUT /api/Printers/{id} set, beyond slots and spools."""
         self._ids = itertools.count(1)
         self._image_ids = itertools.count(1)
         self._failures: list[tuple[int, dict[str, str]]] = []
@@ -77,6 +110,11 @@ class FakePrintLogApi:
         app.router.add_get("/api/Users/me", self._me)
         app.router.add_get("/api/Users/me/user-settings", self._settings)
         app.router.add_get("/api/Printers/{id}", self._printer)
+        app.router.add_put("/api/Printers/{id}", self._put_printer)
+        app.router.add_get("/api/Printers/{id}/filament", self._loaded_filament)
+        app.router.add_put("/api/Printers/{id}/slots/{slot}", self._load_slot)
+        app.router.add_delete("/api/Printers/{id}/slots/{slot}", self._unload_slot)
+        app.router.add_get("/api/Filaments/by-tag/{uid}", self._by_tag)
         app.router.add_post("/api/Prints", self._create)
         app.router.add_get("/api/Prints/{id}", self._get)
         app.router.add_patch("/api/Prints/{id}", self._patch)
@@ -117,6 +155,36 @@ class FakePrintLogApi:
         """What the user changes in the app while the print runs."""
         self.prints[print_id].update(fields)
 
+    def add_spool(
+        self,
+        display_name: str = "Spool",
+        *,
+        material: str = "PLA",
+        color_hex: str | None = None,
+        tags: tuple[str, ...] = (),
+    ) -> str:
+        """A spool in the user's inventory, as the app would add it. Returns its id."""
+        filament_id = str(uuid.uuid4())
+        self.filaments[filament_id] = {
+            "id": filament_id,
+            "displayName": display_name,
+            "materialType": material,
+            "colorHex": color_hex,
+            "tagUids": sorted(normalize_tag(t) for t in tags),
+        }
+        return filament_id
+
+    def user_loads(self, printer_id: int, slot: int | None, filament_id: str) -> None:
+        """The user loads a spool in the app (or loads it with no slot, as older apps do)."""
+        self._unload_everywhere(filament_id)
+        rows = self.loaded[printer_id]
+        rows[:] = [r for r in rows if slot is None or r["slot"] != slot]
+        rows.append(self._loaded_row(slot, None, filament_id))
+
+    def slot_spools(self, printer_id: int) -> dict[int | None, str]:
+        """What's loaded on the printer: filament id by slot."""
+        return {r["slot"]: r["filamentId"] for r in self.loaded[printer_id]}
+
     def by_external_id(self, external_id: str) -> dict[str, Any]:
         [found] = [p for p in self.prints.values() if p["externalId"] == external_id]
         return found
@@ -133,7 +201,136 @@ class FakePrintLogApi:
         printer_id = int(request.match_info["id"])
         if printer_id not in self.printers:
             return web.Response(status=404)
-        return web.json_response({"id": printer_id, "name": f"Printer {printer_id}"})
+        return web.json_response(self._printer_detail(printer_id))
+
+    def _printer_detail(self, printer_id: int) -> dict[str, Any]:
+        detail = {
+            "id": printer_id,
+            "make": "Snapmaker",
+            "model": "U1",
+            "name": f"Printer {printer_id}",
+            "description": None,
+            "nozzleDiameter": 0.4,
+            "filamentDiameter": 1.75,
+            "isActive": True,
+            "category": {"nickname": "FDM"},
+            "slotCount": self.slot_counts.get(printer_id, 1),
+            "loadedFilaments": self._loaded_list(printer_id),
+        }
+        detail.update(self._printer_fields.get(printer_id, {}))
+        return detail
+
+    async def _put_printer(self, request: web.Request) -> web.Response:
+        printer_id = int(request.match_info["id"])
+        body = await request.json()
+        self.printer_puts.append(body)
+        if body.get("id") != printer_id:
+            return web.Response(status=400, text="ID in route does not match body.")
+        if printer_id not in self.printers:
+            return web.Response(status=404)
+        for field in ("make", "model", "name"):
+            if not (body.get(field) or "").strip():
+                return web.Response(status=400, text=f"The {field} field is required.")
+        count = body.get("slotCount")
+        if count is not None:
+            if not 1 <= count <= 64:
+                return web.Response(status=400, text="slotCount must be between 1 and 64.")
+            self.slot_counts[printer_id] = count
+        wanted = [r.get("filamentId") for r in body.get("loadedFilaments") or []]
+        if any(f not in self.filaments for f in wanted):
+            return web.Response(status=403, text="User does not have access to filament.")
+        rows = self.loaded[printer_id]
+        kept = [r for r in rows if r["filamentId"] in wanted]
+        held = {r["filamentId"] for r in kept}
+        rows[:] = kept + [self._loaded_row(None, None, f) for f in wanted if f not in held]
+        self._printer_fields[printer_id] = {
+            k: v
+            for k, v in body.items()
+            if k not in ("id", "slotCount", "loadedFilaments", "category")
+        }
+        return web.json_response(self._printer_detail(printer_id))
+
+    async def _loaded_filament(self, request: web.Request) -> web.Response:
+        printer_id = int(request.match_info["id"])
+        if printer_id not in self.printers:
+            return web.Response(status=404)
+        return web.json_response(self._loaded_list(printer_id))
+
+    async def _load_slot(self, request: web.Request) -> web.Response:
+        printer_id, slot = int(request.match_info["id"]), int(request.match_info["slot"])
+        if printer_id not in self.printers:
+            return web.Response(status=404)
+        body = await request.json()
+        self.slot_puts.append(body)
+        count = self.slot_counts.get(printer_id, 1)
+        if not 0 <= slot < count:
+            return web.Response(
+                status=400,
+                text=f"slot must be between 0 and {count - 1}; this printer has {count}.",
+            )
+        label = (body.get("slotLabel") or "").strip() or None
+        if label is not None and len(label) > 20:
+            return web.Response(status=400, text="The field SlotLabel must be at most 20.")
+        filament_id = body.get("filamentId")
+        if not filament_id:
+            return web.Response(status=400, text="The FilamentId field is required.")
+        if filament_id not in self.filaments:
+            return web.Response(status=403, text="User does not have access to filament.")
+        rows = self.loaded[printer_id]
+        here = next((r for r in rows if r["slot"] == slot), None)
+        if here is not None and here["filamentId"] == filament_id:
+            here["slotLabel"] = label  # already there: keeps its row and loaded time
+        else:
+            self._unload_everywhere(filament_id)
+            rows[:] = [r for r in rows if r["slot"] != slot]
+            rows.append(self._loaded_row(slot, label, filament_id))
+        return web.json_response(self._loaded_list(printer_id))
+
+    async def _unload_slot(self, request: web.Request) -> web.Response:
+        printer_id, slot = int(request.match_info["id"]), int(request.match_info["slot"])
+        if printer_id not in self.printers:
+            return web.Response(status=404)
+        rows = self.loaded[printer_id]
+        rows[:] = [r for r in rows if r["slot"] != slot]
+        return web.Response(status=204)
+
+    async def _by_tag(self, request: web.Request) -> web.Response:
+        uid = normalize_tag(request.match_info["uid"])
+        if uid is None:
+            return web.Response(status=400, text="The tag UID must be hex bytes.")
+        for filament in self.filaments.values():
+            if uid in filament["tagUids"]:
+                return web.json_response(filament)
+        return web.Response(status=404)
+
+    def _loaded_row(self, slot: int | None, label: str | None, filament_id: str) -> dict:
+        return {
+            "id": str(uuid.uuid4()),
+            "slot": slot,
+            "slotLabel": label,
+            "loadedAt": next(self._loaded_at),
+            "filamentId": filament_id,
+        }
+
+    def _loaded_list(self, printer_id: int) -> list[dict[str, Any]]:
+        rows = sorted(
+            self.loaded[printer_id],
+            key=lambda r: (r["slot"] is None, r["slot"] or 0, r["loadedAt"]),
+        )
+        return [
+            {
+                "id": r["id"],
+                "slot": r["slot"],
+                "slotLabel": r["slotLabel"],
+                "loadedAt": f"2026-10-12T00:00:{r['loadedAt']:02d}+00:00",
+                "filament": dict(self.filaments.get(r["filamentId"]) or {"id": r["filamentId"]}),
+            }
+            for r in rows
+        ]
+
+    def _unload_everywhere(self, filament_id: str) -> None:
+        for rows in self.loaded.values():
+            rows[:] = [r for r in rows if r["filamentId"] != filament_id]
 
     async def _create(self, request: web.Request) -> web.Response:
         body = await request.json()
@@ -164,6 +361,21 @@ class FakePrintLogApi:
             if body.get("filamentUsage"):
                 existing["filamentUsage"] = [_row(r) for r in body["filamentUsage"]]
             return web.json_response(existing, status=200)
+
+        spools = [r.get("filamentId") for r in body.get("filamentUsage") or []]
+        if any(f and f not in self.filaments for f in spools):
+            return web.Response(status=403, text="User does not have access to filament.")
+        if self.slot_counts.get(body["printerId"], 1) <= 1:
+            # The print's spools become the printer's loaded list; not on a multi-slot printer.
+            # `setLoadedFilament`: a spool already loaded keeps its row, slot and loaded time.
+            wanted = list(dict.fromkeys(f for f in spools if f))
+            rows = self.loaded[body["printerId"]]
+            kept = [r for r in rows if r["filamentId"] in wanted]
+            held = {r["filamentId"] for r in kept}
+            for filament_id in wanted:
+                if filament_id not in held:
+                    self._unload_everywhere(filament_id)
+            rows[:] = kept + [self._loaded_row(None, None, f) for f in wanted if f not in held]
 
         print_id = next(self._ids)
         self.prints[print_id] = {
@@ -324,6 +536,18 @@ class FakePrintLogApi:
                 for field in ("amountMg", "lengthInM", "volumeMl"):
                     match[field] = incoming.get(field)
         return web.json_response(found)
+
+
+TAG_SEPARATORS = re.compile(r"[:\-._\s]")
+HEX = re.compile(r"[0-9A-F]+")
+
+
+def normalize_tag(uid: str) -> str | None:
+    """`TagUid.Normalize`: uppercase hex without separators, whole bytes, 64 characters at most."""
+    cleaned = TAG_SEPARATORS.sub("", uid).upper()
+    if not cleaned or len(cleaned) % 2 or len(cleaned) > 64 or not HEX.fullmatch(cleaned):
+        return None
+    return cleaned
 
 
 MEASUREMENTS = {1: "amountMg", 2: "lengthInM", 3: "volumeMl"}  # Weight, Length, Volume

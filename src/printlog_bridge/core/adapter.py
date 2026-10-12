@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import ClassVar
 
 from printlog_bridge.core.checks import CheckResult
-from printlog_bridge.core.events import EventSink
+from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.status import PrinterReport
 
 
@@ -43,6 +43,10 @@ class Adapter(ABC):
         anything the user has to fix, for `printlog-bridge status`. Reconnect on your own after a
         dropped connection; return only when cancelled.
         """
+
+    def use_spools(self, spools: SpoolSink) -> None:  # noqa: B027 - optional, does nothing
+        """Called before `run` with where to send spool commands and slot readings, for an
+        adapter whose printer has them (PRINTLOG_SET_SPOOL, an RFID reader). Optional."""
 
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:

@@ -344,3 +344,87 @@ class TestImages:
             asyncio.run(scenario())
 
         assert e.value.status is None
+
+
+class TestSlots:
+    """The calls behind spool assignment (#6): api#146's slot endpoints, api#147's tag lookup."""
+
+    def test_loaded_filament_reads_the_printers_slots(self):
+        async def loaded(_request):
+            return web.json_response([{"id": "r1", "slot": 2, "filament": {"id": "f1"}}])
+
+        rows = serve([("GET", "/api/Printers/9/filament", loaded)], lambda c: c.loaded_filament(9))
+
+        assert rows == [{"id": "r1", "slot": 2, "filament": {"id": "f1"}}]
+
+    def test_load_slot_puts_the_spool_and_returns_the_loaded_list(self):
+        seen = []
+
+        async def load(request):
+            seen.append(await request.json())
+            return web.json_response([{"slot": 2, "filament": {"id": "f1"}}])
+
+        rows = serve(
+            [("PUT", "/api/Printers/9/slots/2", load)], lambda c: c.load_slot(9, 2, "f1", "T2")
+        )
+
+        assert seen == [{"filamentId": "f1", "slotLabel": "T2"}]
+        assert rows == [{"slot": 2, "filament": {"id": "f1"}}]
+
+    def test_unload_slot_takes_the_apis_204(self):
+        async def unload(_request):
+            return web.Response(status=204)
+
+        assert (
+            serve([("DELETE", "/api/Printers/9/slots/1", unload)], lambda c: c.unload_slot(9, 1))
+            is None
+        )
+
+    def test_a_tag_no_spool_has_is_none(self):
+        async def missing(_request):
+            return web.Response(status=404)
+
+        found = serve(
+            [("GET", "/api/Filaments/by-tag/04A23F11", missing)],
+            lambda c: c.filament_by_tag("04A23F11"),
+        )
+
+        assert found is None
+
+    def test_a_tag_finds_its_spool(self):
+        async def found(_request):
+            return web.json_response({"id": "f1", "tagUids": ["04A23F11"]})
+
+        spool = serve(
+            [("GET", "/api/Filaments/by-tag/04A23F11", found)],
+            lambda c: c.filament_by_tag("04A23F11"),
+        )
+
+        assert spool == {"id": "f1", "tagUids": ["04A23F11"]}
+
+    def test_put_printer_sends_the_whole_printer(self):
+        seen = []
+
+        async def put(request):
+            seen.append(await request.json())
+            return web.json_response({"id": 9, "slotCount": 4})
+
+        serve(
+            [("PUT", "/api/Printers/9", put)],
+            lambda c: c.put_printer(9, {"id": 9, "slotCount": 4}),
+        )
+
+        assert seen == [{"id": 9, "slotCount": 4}]
+
+    def test_a_refusal_says_its_status(self):
+        async def forbidden(_request):
+            return web.Response(status=403, text="User does not have access to filament.")
+
+        with pytest.raises(ApiRejected) as e:
+            serve(
+                [("PUT", "/api/Printers/9/slots/0", forbidden)],
+                lambda c: c.load_slot(9, 0, "f1"),
+            )
+
+        assert e.value.status == 403
+        assert "does not have access" in str(e.value)

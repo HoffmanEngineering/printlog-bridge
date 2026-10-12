@@ -104,6 +104,9 @@ class JobTracker:
         if action in ("added", "finished"):
             await self._report(job, live=True, latest=True)
 
+    async def on_gcode_response(self, line: str) -> None:
+        pass
+
     async def _jobs_to_replay(self, call: Call) -> list[Mapping[str, Any]]:
         resume = await self.sink.resume_after(self.printer)
         if resume is None:

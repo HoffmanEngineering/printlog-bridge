@@ -30,7 +30,10 @@ from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.adapters.moonraker.images import MoonrakerImages
 from printlog_bridge.adapters.moonraker.session import MoonrakerSession
+from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.config import ConfigError, load_config
+from printlog_bridge.core.events import SpoolCommand
+from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.status import format_status
 from printlog_bridge.core.support import write_support_bundle
 
@@ -66,11 +69,16 @@ API_CALLS = [
     ("PATCH", r"/api/Prints/\d+"),
     ("POST", r"/api/Prints/\d+/complete"),
     ("POST", r"/api/Prints/\d+/image"),
+    # Spool assignment (#6): PRINTLOG_SET_SPOOL, and the U1's RFID reader.
+    ("GET", r"/api/Filaments/by-tag/[0-9A-F]+"),
+    ("PUT", r"/api/Printers/\d+/slots/\d+"),
+    ("DELETE", r"/api/Printers/\d+/slots/\d+"),
+    ("PUT", r"/api/Printers/\d+"),
 ]
 CREATE_FIELDS = {
     "printerId", "title", "fileName", "startDate", "status", "viewStatus", "allowComments",
     "externalSource", "externalId", "connectionInstanceId", "estimatedPrintTimeInSeconds",
-    "estimatedFilamentUsageMg", "filamentUsage",
+    "estimatedFilamentUsageMg", "filamentUsage", "notes",
 }  # fmt: skip
 COMPLETE_FIELDS = {"status", "endedAt", "printTimeInSeconds", "filamentUsage"}
 USAGE_FIELDS = {
@@ -78,6 +86,7 @@ USAGE_FIELDS = {
     "estimatedAmountMg",
 }  # fmt: skip
 CONNECTION_FIELDS = {"kind", "displayName", "agentVersion", "printerId"}
+SLOT_FIELDS = {"filamentId", "slotLabel"}
 
 
 def with_password(url: str, user: str = "maker") -> str:
@@ -459,3 +468,38 @@ class TestSupportBundle:
             assert "api_key" not in z.namelist()
             for name in z.namelist():
                 assert API_KEY not in z.read(name).decode("utf-8"), name
+
+
+class TestSpoolCalls:
+    """What assigning spools sends (#6): ids and tags, and the printer's own fields back."""
+
+    def test_assigning_spools_sends_only_ids_tags_and_the_printers_own_fields(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Silk Gold", tags=("04A23F11",))
+
+        async def scenario():
+            base = await api.start()
+            try:
+                async with ApiClient(base, api.api_key) as client:
+                    spools = Spools(client, {"u1": 42})
+                    await spools.spool_command(SpoolCommand("u1", 3, tag="04:A2:3F:11"))
+                    await spools.spool_command(SpoolCommand("u1", 3))
+                    await spools.spool_command(SpoolCommand("u1", 0, filament_id=spool))
+            finally:
+                await api.close()
+
+        before = api._printer_detail(42)
+        asyncio.run(scenario())
+
+        for method, path in api.requests:
+            assert any(method == m and re.fullmatch(pattern, path) for m, pattern in API_CALLS), (
+                f"{method} {path} isn't in docs/privacy.md"
+            )
+        for body in api.slot_puts:
+            assert set(body) <= SLOT_FIELDS
+        [put] = api.printer_puts  # only to add slots
+        assert put["slotCount"] == 4
+        for field, value in put.items():
+            if field not in ("slotCount", "category", "loadedFilaments"):
+                assert before[field] == value, field
+        assert put["category"] == before["category"]["nickname"]
