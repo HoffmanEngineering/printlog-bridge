@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 from printlog_bridge import __version__
@@ -164,6 +165,35 @@ def test_the_file_is_plain_json(tmp_path):
     board(tmp_path).start(["voron"])
 
     assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+
+
+def test_a_full_or_read_only_disk_never_stops_the_bridge(tmp_path, caplog):
+    # A directory where the file goes makes every write fail, as a full disk would.
+    (tmp_path / "status.json").mkdir()
+    b = board(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
+        b.start(["voron"])
+        b.printer("voron").connected()
+        b.printer("voron").warn("api", "the API answered 503")
+        b.touch()
+        b.stopped()
+
+    assert b.get("voron")["connection"] == "connected"
+    assert caplog.text.count("couldn't write") == 1  # once, not on every change
+
+
+def test_writes_again_once_the_disk_has_room(tmp_path, caplog):
+    (tmp_path / "status.json").mkdir()
+    b = board(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
+        b.start(["voron"])
+        b.printer("voron").connected()
+    (tmp_path / "status.json").rmdir()
+
+    b.touch()
+
+    assert read_status(tmp_path)["printers"]["voron"]["connection"] == "connected"
 
 
 # -- printlog-bridge status ---------------------------------------------------------------------

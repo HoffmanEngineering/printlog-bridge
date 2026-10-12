@@ -10,6 +10,27 @@ It runs in **local mode** on the printer's own host (Moonraker Unix socket) or i
 
 Python 3.9 or newer (Raspberry Pi OS Bullseye and later) and a printer running Moonraker.
 
+## Install on the printer (local mode)
+
+On the printer's own host (MainsailOS, FluiddPi, or any Klipper install with Moonraker), as the user Klipper runs as:
+
+```sh
+cd ~ && git clone https://github.com/HoffmanEngineering/printlog-bridge.git
+./printlog-bridge/install.sh
+```
+
+It asks for an API key and the printer's number in 3D Print Log (press Enter to fill them in later), then:
+
+- makes a virtualenv in `~/printlog-bridge-env` and installs the bridge into it;
+- writes `~/printer_data/config/printlog-bridge.cfg`, next to `printer.cfg`, unless you already have one;
+- installs and starts a `printlog-bridge` systemd service;
+- adds `printlog-bridge` to `~/printer_data/moonraker.asvc`, so Mainsail and Fluidd can restart it;
+- adds an `[update_manager printlog-bridge]` section to `moonraker.conf`, so updates show up in Mainsail's and Fluidd's update panels, and restarts Moonraker to load it.
+
+Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key or the printer for later, set them in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it) and restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
+
+`./printlog-bridge/uninstall.sh` removes the service and the virtualenv, and puts `moonraker.conf` and `moonraker.asvc` back exactly as they were. It keeps your config and the state directory (including prints not yet logged) for a reinstall; `--purge` removes those too.
+
 ## Try it
 
 ```sh
@@ -19,7 +40,7 @@ cp printlog-bridge.example.cfg ~/printer_data/config/printlog-bridge.cfg   # the
 ~/printlog-bridge-env/bin/printlog-bridge doctor
 ```
 
-`doctor` checks the config, the state directory, the API key, this computer's clock and each printer, and says what to fix. `printlog-bridge run` then watches every printer until stopped, and shows up in Moonraker's extensions list (Mainsail and Fluidd show it too).
+`doctor` checks the config, the state directory, the API key, this computer's clock and each printer, and says what to fix. `printlog-bridge run` then watches every printer until stopped (Ctrl-C, or SIGTERM from systemd), and shows up in Moonraker's extensions list (Mainsail and Fluidd show it too).
 
 `printlog-bridge status` shows what the running bridge is doing. For each printer it lists the connection, the printer's state, the last job event, the last heartbeat, how many jobs are waiting to reach 3D Print Log, and anything you need to fix:
 
@@ -53,7 +74,7 @@ Each print appears in 3D Print Log as Printing when the job starts, titled from 
 
 What you change in the app while it prints is kept: the title, your notes (a note is added after them), the spool on a usage row, and a status you already chose, such as Partial success. A print you delete stays deleted.
 
-When 3D Print Log can't be reached (the internet is down, or the API is busy), nothing is lost. The bridge writes each job event to an outbox in its state directory (`outbox.sqlite3`) before it sends anything, and sends it from there, oldest first and each print's events in order. It retries with a wait that doubles from 2 seconds to a minute, or as long as the API asks, so a print shows up within a minute or two of the connection coming back, even if the bridge was restarted in between. A power cut in the middle of a send doesn't lose the event or log it twice. An event that still hasn't got through after 30 days is dropped, with a warning in the log. `status` shows how many jobs are waiting and why the last try failed.
+When 3D Print Log can't be reached (the internet is down, or the API is busy), nothing is lost. The bridge writes each job event to an outbox in its state directory (`outbox.sqlite3`) before it sends anything, and sends it from there, oldest first and each print's events in order. It retries with a wait that doubles from 2 seconds to a minute, or as long as the API asks, so a print shows up within a minute or two of the connection coming back, even if the bridge was restarted in between. A power cut in the middle of a send doesn't lose the event or log it twice. An event that still hasn't got through after 30 days is dropped, with a warning in the log. `status` shows how many jobs are waiting and why the last try failed. A full or read-only disk doesn't stop the bridge either: it keeps the job events it couldn't write in memory, warns in `status`, and writes them once it can.
 
 The bridge reads Moonraker's job history, so `[history]` must be in moonraker.conf (most installs have it; `run` logs how to add it when it's missing). It remembers what it has logged in its state directory, and on every start or reconnect it catches up on jobs that started or ended while it was away. On its very first run it picks up a print already running, but not older history.
 
@@ -78,7 +99,7 @@ python -m venv .venv
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-CI runs both on Python 3.9 and 3.12.
+CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`.
 
 `pytest -m integration` runs the bridge against a real Moonraker, built from source in Docker (set `MOONRAKER_REF` to pick a tag or commit; the default is `v0.9.3`). The first run builds the image, which takes a minute or two. CI runs it against the last release and a pinned recent commit. To support another kind of printer, see [docs/adapters.md](docs/adapters.md).
 

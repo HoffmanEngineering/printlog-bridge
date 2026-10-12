@@ -8,8 +8,9 @@ import contextlib
 import logging
 import logging.handlers
 import os
+import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 from pathlib import Path
 
 from printlog_bridge import __version__
@@ -126,8 +127,34 @@ def _run(explicit_config: Path | None) -> int:
     configure_logging(config.state_dir)
     logging.getLogger(__name__).info("printlog-bridge %s, config %s", __version__, config.path)
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(run_bridge(config))
+        asyncio.run(until_stopped(run_bridge(config)))
     return 0
+
+
+async def until_stopped(work: Awaitable[None]) -> None:
+    """Runs `work` until it ends, or until SIGTERM (how systemd stops a service), which stops it
+    the way Ctrl-C does: cancelled, so it can record that it stopped."""
+    task = asyncio.ensure_future(work)
+    stopping = False
+
+    def stop() -> None:
+        nonlocal stopping
+        logging.getLogger(__name__).info("stopping (SIGTERM)")
+        stopping = True
+        task.cancel()
+
+    loop = asyncio.get_running_loop()
+    # Windows has no signal handlers in asyncio; there, only Ctrl-C stops the bridge.
+    with contextlib.suppress(NotImplementedError, RuntimeError):
+        loop.add_signal_handler(signal.SIGTERM, stop)
+    try:
+        await task
+    except asyncio.CancelledError:
+        if not stopping:
+            raise
+    finally:
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.remove_signal_handler(signal.SIGTERM)
 
 
 LOG_FILE = "bridge.log"

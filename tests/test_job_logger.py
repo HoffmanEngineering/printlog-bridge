@@ -3,18 +3,20 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sqlite3
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import ImageKind, JobFinished, JobImage, JobOutcome, JobStarted
 from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter, backoff_delay
-from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, read_waiting
+from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, Outbox, read_waiting
 from printlog_bridge.core.state import JobRecord, PrinterState
 from printlog_bridge.core.status import StatusBoard, read_status
 
@@ -960,7 +962,7 @@ class TestImages:
         api = FakePrintLogApi()
 
         def power_cut(*_args):
-            raise OSError("the power went")
+            raise PowerCut
 
         async def scenario():
             async with logging_to(api, tmp_path) as logger:
@@ -968,7 +970,7 @@ class TestImages:
                     await logger.emit(started())
                     await drain(logger)
                     logger._queue = power_cut  # between writing the file and queueing it
-                    with pytest.raises(OSError):
+                    with pytest.raises(PowerCut):
                         await logger.emit(image())
                 finally:
                     logger.close()
@@ -1075,3 +1077,112 @@ class TestImages:
         [print_] = api.prints.values()
         assert print_["status"] == 3
         assert print_["images"] == []
+
+
+class BrokenDisk:
+    """Makes the outbox's writes fail as a full disk (or a locked database) would, until fixed."""
+
+    def __init__(self, monkeypatch, *methods: str) -> None:
+        self.broken = True
+        for method in methods:
+            monkeypatch.setattr(Outbox, method, self._failing(getattr(Outbox, method)))
+
+    def _failing(self, original):
+        def method(outbox, *args, **kwargs):
+            if self.broken:
+                raise sqlite3.OperationalError("database or disk is full")
+            return original(outbox, *args, **kwargs)
+
+        return method
+
+    def fix(self) -> None:
+        self.broken = False
+
+
+class TestWhenTheDiskFails:
+    def test_an_event_that_cannot_be_queued_is_kept_and_queued_once_it_can(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        api = FakePrintLogApi()
+        disk = BrokenDisk(monkeypatch, "add")
+        seen = []
+
+        def look_then_fix(api):
+            seen.append(read_status(tmp_path)["printers"]["voron"])
+            disk.fix()
+
+        with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
+            recovered = report_run(api, tmp_path, started(), finished(), look_then_fix)
+
+        [broken] = seen
+        assert "disk is full" in broken["warnings"]["outbox"]
+        assert "couldn't write the outbox" in caplog.text
+        [print_] = api.prints.values()
+        assert print_["status"] == 3  # created, then completed, in order
+        assert len(api.completions) == 1
+        assert "outbox" not in recovered["warnings"]
+
+    def test_a_failure_to_record_a_failed_send_does_not_stop_the_sender(
+        self, tmp_path, monkeypatch
+    ):
+        api = FakePrintLogApi()
+        api.offline = True
+        disk = BrokenDisk(monkeypatch, "failed")
+
+        async def scenario():
+            async with logging_to(api, tmp_path) as logger:
+                sender = asyncio.ensure_future(logger.run())
+                try:
+                    await logger.emit(started())
+                    await asyncio.sleep(0.2)
+                    assert not sender.done()  # still sending, not crashed
+                    disk.fix()
+                    api.offline = False
+                    await eventually(lambda: api.prints)
+                finally:
+                    sender.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await sender
+                    logger.close()
+
+        asyncio.run(scenario())
+
+        assert len(api.prints) == 1
+
+    def test_a_picture_that_cannot_be_queued_is_skipped(self, tmp_path, monkeypatch, caplog):
+        api = FakePrintLogApi()
+        run(api, tmp_path, started())
+        BrokenDisk(monkeypatch, "add")
+
+        with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
+            run(api, tmp_path, image())
+
+        [print_] = api.prints.values()
+        assert print_["images"] == []
+        assert "thumbnail" in caplog.text
+
+    def test_a_picture_never_goes_ahead_of_its_jobs_event_waiting_to_be_queued(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        api = FakePrintLogApi()
+        disk = BrokenDisk(monkeypatch, "add")
+        fetched: list = []
+
+        async def scenario():
+            async with logging_to(api, tmp_path) as logger:
+                try:
+                    await logger.emit(started())  # kept in memory
+                    disk.fix()  # a lock that clears, before the sender tries again
+                    await logger.emit(image(fetched=fetched))
+                    await drain(logger)
+                finally:
+                    logger.close()
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            asyncio.run(scenario())
+
+        [print_] = api.prints.values()
+        assert print_["images"] == []
+        assert fetched == []  # skipped, not queued ahead of the start and dropped
+        assert "has no print to go on" not in caplog.text
+        assert "thumbnail is skipped: the outbox can't be written" in caplog.text

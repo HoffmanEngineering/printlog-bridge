@@ -28,12 +28,22 @@ jobs:
       - run: ruff format --check .
       - run: pytest
 
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --version
+      - run: shellcheck install.sh uninstall.sh tests/install/smoke.sh
+
   install-smoke:
     # A clean install from the source tree in the image people will run, without dev tools.
     runs-on: ubuntu-latest
     container: python:3.9-slim
     steps:
+      # git first, so the checkout is a real clone, as install.sh expects for Moonraker updates.
+      - run: apt-get update && apt-get install -y --no-install-recommends git
       - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: pip install .
       - run: printlog-bridge --version
       - name: doctor runs and reports a missing config
@@ -43,6 +53,8 @@ jobs:
           code=$?
           cat out.txt
           test "$code" -eq 1 && grep -q "FAIL  Config" out.txt
+      - name: install.sh and uninstall.sh, against a fake systemctl
+        run: bash tests/install/smoke.sh
 
   integration:
     # The bridge against a real Moonraker (no Klipper) in Docker. See tests/integration/.

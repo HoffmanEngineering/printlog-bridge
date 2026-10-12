@@ -7,6 +7,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
 from fake_moonraker import FakeMoonraker, eventually
 from fake_printlog_api import FakePrintLogApi
 
@@ -181,6 +182,43 @@ def test_the_bridge_process_shows_up_in_moonraker(tmp_path):
 
     assert identity["client_name"] == "printlog-bridge"
     assert identity["type"] == "agent"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is how systemd stops a service")
+def test_sigterm_stops_the_bridge_like_ctrl_c(tmp_path):
+    """`systemctl stop` sends SIGTERM: the bridge records that it stopped and exits cleanly."""
+
+    async def scenario():
+        fake = FakeMoonraker()
+        base = await fake.start()
+        state = tmp_path / "state"
+        config = tmp_path / "printlog-bridge.cfg"
+        config.write_text(
+            # The heartbeat goes to a closed port, not to the real API.
+            f"[bridge]\napi_url = http://127.0.0.1:9\napi_key = k\nstate_dir = {state}\n"
+            f"[printer u1]\nprinter_id = 42\nurl = {base}\n",
+            encoding="utf-8",
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "printlog_bridge", "run", "--config", str(config),
+            stderr=asyncio.subprocess.PIPE,
+        )  # fmt: skip
+        try:
+            await eventually(lambda: fake.subscriptions, timeout=20)
+            process.terminate()
+            _, err = await asyncio.wait_for(process.communicate(), 10)
+            return process.returncode, err.decode(), read_status(state)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            await fake.close()
+
+    code, err, status = asyncio.run(scenario())
+
+    assert code == 0, err
+    assert status["stopped_at"] is not None
+    assert "Traceback" not in err
 
 
 def test_registers_each_printers_connection(tmp_path):

@@ -7,6 +7,7 @@ The running bridge rewrites the file whenever something changes, and at least ev
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,8 @@ STALE_HEARTBEAT = timedelta(minutes=15)
 """When 3D Print Log starts showing a connection as offline."""
 
 Clock = Callable[[], datetime]
+
+log = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -70,6 +73,7 @@ class StatusBoard:
         self.path = state_dir / STATUS_FILE
         self.clock = clock
         self._data: dict[str, Any] = {}
+        self._failing = False
 
     def start(self, printers: Iterable[str]) -> None:
         now = self._now()
@@ -116,11 +120,26 @@ class StatusBoard:
         return self.clock().isoformat()
 
     def _write(self) -> None:
+        """Writes the file. A full or read-only disk is logged once and never raised: the
+        status file is only a report, and the bridge must keep logging prints without it."""
         self._data["updated_at"] = self._now()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self._data, indent=1), encoding="utf-8")
-        os.replace(temporary, self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self._data, indent=1), encoding="utf-8")
+            os.replace(temporary, self.path)
+        except OSError as e:
+            if not self._failing:
+                log.warning(
+                    "couldn't write %s (%s); `printlog-bridge status` is out of date until it "
+                    "can be written again",
+                    self.path, e,
+                )  # fmt: skip
+            self._failing = True
+        else:
+            if self._failing:
+                log.info("%s is written again", self.path)
+            self._failing = False
 
 
 class BoardReport:
