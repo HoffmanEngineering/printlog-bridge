@@ -11,6 +11,7 @@ import logging.handlers
 import os
 import signal
 import sys
+import tempfile
 from collections.abc import Awaitable, Sequence
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import (
     API_KEY_ENV,
     ConfigError,
+    clean_key,
     clear_config_api_key,
     find_config,
     load_config,
@@ -183,8 +185,8 @@ def _store_key(explicit_config: Path | None) -> int:
 def _ask_for_key() -> str:
     if sys.stdin.isatty():
         print(f"Paste an API key from {API_KEYS_PAGE} (it isn't shown).")
-        return getpass.getpass("API key: ").strip()
-    return sys.stdin.readline().strip()
+        return clean_key(getpass.getpass("API key: "))
+    return clean_key(sys.stdin.readline())
 
 
 def _run(explicit_config: Path | None) -> int:
@@ -194,6 +196,7 @@ def _run(explicit_config: Path | None) -> int:
     try:
         config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
         check_runnable(config)
+        check_writable(config.state_dir)
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
@@ -204,6 +207,23 @@ def _run(explicit_config: Path | None) -> int:
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(until_stopped(run_bridge(config)))
     return 0
+
+
+def check_writable(state_dir: Path) -> None:
+    """Raises ConfigError, saying whose folder it is, when this user can't write the state
+    directory: in Docker, a folder mounted at /data that another user owns."""
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=state_dir):
+            pass
+    except OSError as e:
+        uid = f" (uid {os.getuid()})" if hasattr(os, "getuid") else ""
+        raise ConfigError(
+            f"can't write the state directory {state_dir}: {e.strerror or e}. The bridge "
+            f"runs as a user{uid} that must be able to write it. In Docker, run the container "
+            "as the user and group that own the folder mounted at /data (`user:` in "
+            "docker-compose.yml, `--user` with docker run)."
+        ) from None
 
 
 async def until_stopped(work: Awaitable[None]) -> None:

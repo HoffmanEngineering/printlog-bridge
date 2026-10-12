@@ -53,6 +53,7 @@ The bridge holds up to three secrets: your 3D Print Log API key, Moonraker's API
 
 - `install.sh` stores the key in `~/.local/share/printlog-bridge/api_key` (the bridge's state directory), mode 600 so only you can read it, and never writes it into `printlog-bridge.cfg`.
 - `printlog-bridge store-key` stores or replaces the key there. Run it on an older install to move `api_key` out of `printlog-bridge.cfg`: it writes the key file and empties the line in the config.
+- In the Docker image, `store-key` keeps it in `/data/state/api_key` in the mounted folder, mode 600, owned by the user the container runs as. The image itself never holds a key; `PRINTLOG_API_KEY` can be set on the container instead, where anyone who can manage the host's containers can read it.
 - The bridge looks for the key in this order: the `PRINTLOG_API_KEY` environment variable, the key file, then `api_key` in `[bridge]`. A key in the config still works, so existing installs keep running.
 - `doctor` warns when `api_key` is in a config file Moonraker serves (even an unused one), when the key file is in a folder Moonraker serves, and when other users on the computer can read the key file.
 

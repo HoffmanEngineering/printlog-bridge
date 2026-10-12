@@ -4,7 +4,7 @@
 [bridge]
 api_key = ...            ; better: `printlog-bridge store-key` (see below), or PRINTLOG_API_KEY
 api_url = https://api.3dprintlog.com
-state_dir = ~/.local/share/printlog-bridge
+state_dir = ~/.local/share/printlog-bridge   ; or $PRINTLOG_BRIDGE_STATE_DIR when not set here
 
 [printer voron]          ; one section per printer
 printer_id = 42          ; the printer in 3D Print Log (from its page's URL)
@@ -43,6 +43,8 @@ API_KEY_ENV = "PRINTLOG_API_KEY"
 API_KEY_FILE = "api_key"
 """The key file's name in the state directory."""
 CONFIG_PATH_ENV = "PRINTLOG_BRIDGE_CONFIG"
+STATE_DIR_ENV = "PRINTLOG_BRIDGE_STATE_DIR"
+"""The state directory when the config doesn't set `state_dir` (the Docker image sets it)."""
 
 PRINTER_PREFIX = "printer"
 
@@ -117,7 +119,7 @@ def load_config(
 ) -> BridgeConfig:
     parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
     try:
-        with path.open(encoding="utf-8") as f:
+        with path.open(encoding="utf-8-sig") as f:
             parser.read_file(f)
     except FileNotFoundError:
         raise ConfigError(f"Config file not found: {path}") from None
@@ -128,7 +130,7 @@ def load_config(
 
     api_url = _api_url(bridge.get("api_url", DEFAULT_API_URL))
 
-    state_dir_option = bridge.get("state_dir", "").strip()
+    state_dir_option = bridge.get("state_dir", "").strip() or (env.get(STATE_DIR_ENV) or "").strip()
     state_dir = (
         _expand(state_dir_option, home)
         if state_dir_option
@@ -195,7 +197,13 @@ def read_key_file(path: Path) -> str | None:
         return None  # no state directory yet, or a broken one: doctor's own check says so
     except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"can't read the API key file {path} ({API_KEY_FILE}): {e}") from None
-    return text.strip() or None
+    return clean_key(text) or None
+
+
+def clean_key(text: str) -> str:
+    """A key as typed, piped or saved, without surrounding whitespace or a leading UTF-8 byte
+    order mark (PowerShell can put one at the start of what it pipes; editors may save one)."""
+    return text.strip().removeprefix("﻿").strip()
 
 
 def write_key_file(path: Path, key: str) -> None:
@@ -207,7 +215,7 @@ def write_key_file(path: Path, key: str) -> None:
         temporary.unlink()
     fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        f.write(key.strip() + "\n")
+        f.write(clean_key(key) + "\n")
     os.replace(str(temporary), str(path))
 
 
