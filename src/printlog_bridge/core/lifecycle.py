@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -64,6 +65,9 @@ AUTH_PAUSE_S = 15 * 60
 MAX_RETRY_AFTER_S = 60 * 60
 """A `Retry-After` longer than this is taken as this, in case the API ever asks for days."""
 API_TOPIC = "api"
+OUTBOX_TOPIC = "outbox"
+STORAGE_ERRORS = (OSError, sqlite3.Error)
+"""A full or read-only disk, or an outbox another process holds locked past SQLite's timeout."""
 START, FINISH = "start", "finish"
 IMAGE_KINDS = frozenset(kind.value for kind in ImageKind)
 IMAGES_DIR = "images"
@@ -131,6 +135,10 @@ class JobLogger:
         self._paused_until = 0.0
         """No entry is sent before this (the API's `Retry-After`, or a rejected key)."""
         self._wake = asyncio.Event()
+        self._unqueued: list[JobEvent] = []
+        """Job events the outbox couldn't take (a full disk), in order, until it can."""
+        self._storage_failures = 0
+        """Writes to the state directory that failed in a row."""
 
     def close(self) -> None:
         self.outbox.close()
@@ -150,7 +158,29 @@ class JobLogger:
     # -- queueing ------------------------------------------------------------------------------
 
     async def emit(self, event: JobEvent) -> None:
-        """Queues the event in the outbox, on disk, unless it's a replay. Never waits on the API."""
+        """Queues the event in the outbox, on disk, unless it's a replay. Never waits on the API.
+
+        When the state directory can't be written (a full disk), the event is kept in memory and
+        queued, in order, once it can be, and `status` shows a warning meanwhile. A picture is
+        skipped instead: it is fetched now or never.
+        """
+        if self._unqueued and not isinstance(event, JobImage):
+            self._unqueued.append(event)  # nothing jumps ahead of what waits to be queued
+            return
+        try:
+            await self._emit(event)
+        except STORAGE_ERRORS as e:
+            self._storage_failed(e)
+            if isinstance(event, JobImage):
+                log.warning(
+                    "[printer %s] job %s's %s is skipped: the outbox can't be written",
+                    event.printer, event.job_id, event.kind.value,
+                )  # fmt: skip
+            else:
+                self._unqueued.append(event)
+                self._wake.set()
+
+    async def _emit(self, event: JobEvent) -> None:
         if event.printer not in self.printers:
             log.error("[printer %s] isn't linked to 3D Print Log; skipping its jobs", event.printer)
             return
@@ -298,9 +328,23 @@ class JobLogger:
         """Sends every entry that may be sent now, in order.
 
         Returns the seconds until the next entry falls due, or None when the outbox is empty
-        (or holds only entries for printers no longer in the config).
+        (or holds only entries for printers no longer in the config). When the state directory
+        can't be written, returns when to try again rather than raising: the bridge keeps
+        running, and nothing that was queued is lost.
         """
+        try:
+            wait = await self._send_due()
+        except STORAGE_ERRORS as e:
+            return self._storage_failed(e)
+        if self._storage_failures:
+            self._storage_recovered()
+        return wait
+
+    async def _send_due(self) -> float | None:
         loop = asyncio.get_running_loop()
+        while self._unqueued:
+            await self._emit(self._unqueued[0])
+            self._unqueued.pop(0)
         self._drop_expired()
         while True:
             now = loop.time()
@@ -608,6 +652,30 @@ class JobLogger:
         if report is not None:
             report.event(what)
             report.warn(API_TOPIC, None)
+
+    def _storage_failed(self, error: Exception) -> float:
+        """Logs and reports a failed write to the state directory. Returns when to try again."""
+        self._storage_failures += 1
+        delay = backoff_delay(self._storage_failures, *self.backoff)
+        problem = (
+            f"couldn't write the outbox in {self.state_dir} ({error}). Check the disk has room. "
+            f"Jobs are kept until it can be written; the bridge tries again in {_seconds(delay)}."
+        )
+        level = logging.WARNING if self._storage_failures == 1 else logging.DEBUG
+        log.log(level, "%s", problem)
+        for printer in self.printers:
+            report = self._report(printer)
+            if report is not None:
+                report.warn(OUTBOX_TOPIC, problem)
+        return delay
+
+    def _storage_recovered(self) -> None:
+        log.info("the outbox in %s can be written again", self.state_dir)
+        self._storage_failures = 0
+        for printer in self.printers:
+            report = self._report(printer)
+            if report is not None:
+                report.warn(OUTBOX_TOPIC, None)
 
     def _not_logged(self, entry: Entry, problem: str) -> None:
         report = self._report(entry.printer)
