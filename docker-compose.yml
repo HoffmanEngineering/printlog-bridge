@@ -13,6 +13,8 @@ services:
       TZ: Europe/Berlin # times in the log; status and 3D Print Log use UTC either way
       # The API key, if you'd rather not store it in /data/state/api_key with `store-key`:
       # PRINTLOG_API_KEY: ...
+      # Record every Moonraker message in /data/state/traces, to report a problem (README):
+      # PRINTLOG_BRIDGE_TRACE: "1"
     volumes:
       # Holds the config (printlog-bridge.cfg) and the state directory (state/: the outbox, the
       # key file, the log and the support bundle).
