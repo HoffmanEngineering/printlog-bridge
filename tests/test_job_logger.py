@@ -414,6 +414,24 @@ class TestWhenTheApiIsDown:
         assert 29 < again <= 30
         assert sent_meanwhile == 0
 
+    @pytest.mark.parametrize("retry_after", ["0", "Thu, 01 Jan 1970 00:00:00 GMT"])
+    def test_a_retry_after_of_zero_still_backs_off(self, tmp_path, retry_after):
+        api = FakePrintLogApi()
+
+        async def scenario():
+            async with logging_to(api, tmp_path, backoff=(10, 10)) as logger:
+                try:
+                    api.fail_next(1, status=503, headers={"Retry-After": retry_after})
+                    await logger.emit(started())
+                    return await logger.send_due()
+                finally:
+                    logger.close()
+
+        wait = asyncio.run(scenario())
+
+        assert 9 < wait <= 10
+        assert api.requests == [("GET", "/api/Users/me/user-settings")]  # not sent again at once
+
     def test_does_not_retry_a_revoked_key_but_keeps_the_job(self, tmp_path, caplog):
         api = FakePrintLogApi(api_key="the-real-key")
 

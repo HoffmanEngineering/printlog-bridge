@@ -232,11 +232,13 @@ class JobLogger:
         loop = asyncio.get_running_loop()
         attempts = entry.attempts + 1
         self.outbox.failed(entry.seq, problem)
+        # Never sooner than the backoff: a `Retry-After` of 0, or a date already past, would
+        # otherwise resend at once, as fast as the API answers.
+        delay = backoff_delay(attempts, *self.backoff)
         if retry_after is not None:
-            delay = min(retry_after, MAX_RETRY_AFTER_S)
-            self._paused_until = max(self._paused_until, loop.time() + delay)
-        else:
-            delay = backoff_delay(attempts, *self.backoff)
+            pause = min(retry_after, MAX_RETRY_AFTER_S)
+            self._paused_until = max(self._paused_until, loop.time() + pause)
+            delay = max(delay, pause)
         self._due[entry.seq] = loop.time() + delay
         # The first failure is worth a warning; the rest of a long outage only fills the log.
         level = logging.WARNING if attempts == 1 else logging.DEBUG
