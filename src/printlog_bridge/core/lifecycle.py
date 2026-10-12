@@ -167,6 +167,16 @@ class JobLogger:
         if self._unqueued and not isinstance(event, JobImage):
             self._unqueued.append(event)  # nothing jumps ahead of what waits to be queued
             return
+        if isinstance(event, JobImage) and any(
+            (e.printer, e.job_id) == (event.printer, event.job_id) for e in self._unqueued
+        ):
+            # Queued now, it would go ahead of its job's start or end: a thumbnail before the
+            # print exists is dropped, and a snapshot before the end misses its outcome.
+            log.warning(
+                "[printer %s] job %s's %s is skipped: the outbox can't be written",
+                event.printer, event.job_id, event.kind.value,
+            )  # fmt: skip
+            return
         try:
             await self._emit(event)
         except STORAGE_ERRORS as e:

@@ -1160,3 +1160,29 @@ class TestWhenTheDiskFails:
         [print_] = api.prints.values()
         assert print_["images"] == []
         assert "thumbnail" in caplog.text
+
+    def test_a_picture_never_goes_ahead_of_its_jobs_event_waiting_to_be_queued(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        api = FakePrintLogApi()
+        disk = BrokenDisk(monkeypatch, "add")
+        fetched: list = []
+
+        async def scenario():
+            async with logging_to(api, tmp_path) as logger:
+                try:
+                    await logger.emit(started())  # kept in memory
+                    disk.fix()  # a lock that clears, before the sender tries again
+                    await logger.emit(image(fetched=fetched))
+                    await drain(logger)
+                finally:
+                    logger.close()
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            asyncio.run(scenario())
+
+        [print_] = api.prints.values()
+        assert print_["images"] == []
+        assert fetched == []  # skipped, not queued ahead of the start and dropped
+        assert "has no print to go on" not in caplog.text
+        assert "thumbnail is skipped: the outbox can't be written" in caplog.text

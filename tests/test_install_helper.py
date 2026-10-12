@@ -189,6 +189,25 @@ class TestCommands:
 
         assert self.add(tmp_path, files) == 1
 
+    def test_a_symlinked_moonraker_conf_stays_a_symlink(self, tmp_path, capsys):
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        (backup / "moonraker.conf").write_bytes(b"[server]\nhost: 0.0.0.0\n")
+        files = self.files(tmp_path)
+        (tmp_path / "moonraker.conf").unlink()
+        try:
+            (tmp_path / "moonraker.conf").symlink_to(backup / "moonraker.conf")
+        except OSError:
+            pytest.skip("this system can't make symlinks")
+
+        assert self.add(tmp_path, files) == 0
+        assert (tmp_path / "moonraker.conf").is_symlink()
+        assert b"printlog-bridge" in (backup / "moonraker.conf").read_bytes()
+
+        assert helper.main(["moonraker-remove", *files]) == 0
+        assert (tmp_path / "moonraker.conf").is_symlink()
+        assert (backup / "moonraker.conf").read_bytes() == b"[server]\nhost: 0.0.0.0\n"
+
 
 class TestConfig:
     def write(self, tmp_path, *extra, env=None):

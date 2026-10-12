@@ -136,7 +136,9 @@ def _read(path: Path) -> str:
 
 
 def _write(path: Path, text: str) -> None:
-    """Replaces the file in one step, keeping its permissions."""
+    """Replaces the file in one step, keeping its permissions. A symlink (a moonraker.conf kept
+    in a backup repo) stays one: its target is replaced, not the link."""
+    path = Path(os.path.realpath(str(path)))
     fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
