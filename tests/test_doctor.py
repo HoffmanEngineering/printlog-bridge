@@ -480,7 +480,7 @@ class TestSupportBundle:
         line = '{"t": 1.0, "dir": "recv", "msg": {"pad": "' + "x" * 80 + '"}}\n'
         for n, name in enumerate(["u1-20261010.jsonl", "u1-20261011.jsonl", "u1-20261012.jsonl"]):
             path = traces / name
-            path.write_text(line * 10, encoding="utf-8", newline="\n")  # about 1 KB each
+            path.write_bytes((line * 10).encode())  # about 1 KB each
             os.utime(path, (1_000_000 + n, 1_000_000 + n))
         config = tmp_path / "printlog-bridge.cfg"
         config.write_text("[printer u1]\n", encoding="utf-8")
