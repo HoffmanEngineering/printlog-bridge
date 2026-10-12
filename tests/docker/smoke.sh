@@ -17,7 +17,7 @@ mkdir -p "$DATA"
 
 cleanup() {
     docker rm -f "$NAME" >/dev/null 2>&1 || true
-    [ -n "${FAKES:-}" ] && kill "$FAKES" 2>/dev/null || true
+    if [ -n "${FAKES:-}" ]; then kill "$FAKES" 2>/dev/null || true; fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT
