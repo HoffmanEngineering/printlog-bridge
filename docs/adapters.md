@@ -6,7 +6,7 @@ An adapter watches one kind of printer and reports its jobs to the bridge. Moonr
 
 ```
 src/printlog_bridge/
-  core/            printer-agnostic: config, events, API client, doctor
+  core/            printer-agnostic: config, events, API client, outbox, doctor
   adapters/
     __init__.py    ADAPTERS: the registry, by config name
     moonraker/     the Klipper adapter
@@ -44,13 +44,13 @@ Adapters report jobs with the types in `printlog_bridge.core.events`, never with
 - `JobStarted(printer, job_id, file_name, started_at, estimated_duration_s, estimated_filament_mm, estimated_filament_g)`, the estimates from the slicer when the file has them.
 - `JobFinished(printer, job_id, outcome, finished_at, duration_s, filament_mm, note)`, where `outcome` is a `JobOutcome` (`COMPLETED`, `CANCELLED` or `FAILED`), `filament_mm` maps slot index to millimetres fed, and `note` says why a job failed in words for the print's notes ("Klipper shutdown").
 
-`job_id` must be stable for the job's lifetime and unique on that printer, such as Moonraker's history `job_id`. The sink (`core/lifecycle.py`) logs a job under `<instance>:<job_id>`, where the instance id is a UUID kept in the state directory per printer, and remembers each job it has logged, so a replayed event is recognised instead of logged twice. Replays are expected: emit a job's start again before its finish whenever you aren't sure the start was seen.
+`job_id` must be stable for the job's lifetime and unique on that printer, such as Moonraker's history `job_id`. The sink (`core/lifecycle.py`) writes each event to the outbox (`core/outbox.py`, SQLite in the state directory) and returns without waiting on the API, then sends it from there; so `emit` is quick even while 3D Print Log is unreachable. It logs a job under `<instance>:<job_id>`, where the instance id is a UUID kept in the state directory per printer, and remembers each job it has logged, so a replayed event is recognised instead of logged twice. Replays are expected: emit a job's start again before its finish whenever you aren't sure the start was seen.
 
 Use timezone-aware `datetime`s.
 
 ## Tests
 
-Test against a real local server rather than mocking your HTTP client, and make that server behave like the real printer, checked against one. `tests/fake_moonraker.py` speaks Moonraker's JSON-RPC over a WebSocket and over its Unix socket, including its authorization and its one-agent-per-name rule. `tests/test_moonraker_adapter.py` covers config parsing and each `check()` outcome; `tests/test_moonraker_session.py` covers the connection, reconnects and Klipper restarts; `tests/test_moonraker_jobs.py` covers turning history into events. `tests/fake_printlog_api.py` stands in for the 3D Print Log API with its rules for connectors (idempotent create, complete, patch), and `tests/test_job_lifecycle.py` runs the whole bridge between the two fakes.
+Test against a real local server rather than mocking your HTTP client, and make that server behave like the real printer, checked against one. `tests/fake_moonraker.py` speaks Moonraker's JSON-RPC over a WebSocket and over its Unix socket, including its authorization and its one-agent-per-name rule. `tests/test_moonraker_adapter.py` covers config parsing and each `check()` outcome; `tests/test_moonraker_session.py` covers the connection, reconnects and Klipper restarts; `tests/test_moonraker_jobs.py` covers turning history into events. `tests/fake_printlog_api.py` stands in for the 3D Print Log API with its rules for connectors (idempotent create, complete, patch), and `tests/test_job_lifecycle.py` runs the whole bridge between the two fakes, including a print made with the API unreachable (`api.offline = True` cuts every request off). `tests/test_outbox.py` covers the outbox on its own, and `tests/test_job_logger.py` covers sending from it: order per print, backoff, `Retry-After`, a power cut in the middle of a send, and the 30-day limit.
 
 A fake is only as good as its likeness, so `tests/integration/` checks it. `test_fake_matches_moonraker.py` sends the same raw JSON-RPC exchanges to the fake and to a real Moonraker in Docker and expects the same answers, and `test_real_moonraker.py` runs the bridge itself against the real one: auth, the extensions list, a second bridge, a Moonraker restart, and local mode inside the container. When you learn something new about Moonraker, add it to both the fake and the contract test.
 

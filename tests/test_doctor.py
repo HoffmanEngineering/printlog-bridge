@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import zipfile
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from printlog_bridge.cli.main import main
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult, Status
 from printlog_bridge.core.doctor import diagnose, format_report
+from printlog_bridge.core.outbox import Outbox
 from printlog_bridge.core.status import StatusBoard
 
 
@@ -315,6 +317,10 @@ class TestSupportBundle:
             encoding="utf-8",
         )
         monkeypatch.setenv("PRINTLOG_API_KEY", self.SECRETS[2])
+        outbox = Outbox.open(state)
+        outbox.add("voron", "00000A", "start", {"file_name": "benchy.gcode"})
+        outbox.failed(1, f"the API answered 503 (key {self.SECRETS[0]})")
+        outbox.close()
 
         async def scenario():
             server = serve_me(401)  # the env key is not the API's, which doesn't matter here
@@ -349,11 +355,16 @@ class TestSupportBundle:
             "printlog-bridge.cfg",
             "status.json",
             "bridge.log",
+            "outbox.json",
         }
         assert "3D Print Log API" in members["doctor.txt"]
         assert "printlog-bridge" in members["environment.txt"]
         assert "[printer voron]" in members["printlog-bridge.cfg"]
         assert "printer_id = 7" in members["printlog-bridge.cfg"]
+        [entry] = json.loads(members["outbox.json"])
+        assert entry["job_id"] == "00000A"
+        assert entry["payload"] == {"file_name": "benchy.gcode"}
+        assert entry["attempts"] == 1
 
     def test_the_bundle_contains_no_key_or_token(self, tmp_path, monkeypatch, capsys):
         bundle, _ = self.doctor(tmp_path, monkeypatch, capsys)

@@ -28,11 +28,11 @@ class JobRecord:
     started_at: str
     """ISO 8601, from the printer's clock."""
     start: dict[str, Any] = field(default_factory=dict)
-    """The start event's fields, to create the print later if the API was down."""
+    """The start event's fields, which the outbox's start entry creates the print from."""
     print_id: int | None = None
     finished: bool = False
     ended_at: str | None = None
-    """When the printer said the job ended, while that isn't logged yet: it's waiting on the API."""
+    """When the printer said the job ended, while that isn't logged yet (it's in the outbox)."""
 
 
 class PrinterState:
@@ -61,25 +61,6 @@ class PrinterState:
         state = cls(path, str(uuid.uuid4()), {})
         state.save()
         return state
-
-    @classmethod
-    def peek(cls, state_dir: Path, printer: str) -> PrinterState | None:
-        """The printer's state as it is on disk, for reading only: never creates or moves it."""
-        path = state_dir / "printers" / f"{_file_name(printer)}.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            jobs = {job_id: JobRecord(**job) for job_id, job in data["jobs"].items()}
-            return cls(path, data["instance_id"], jobs)
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-
-    def waiting(self) -> int:
-        """Jobs the API hasn't heard about yet: never created, or ended and not completed."""
-        return sum(
-            1
-            for j in self.jobs.values()
-            if not j.finished and (j.print_id is None or j.ended_at is not None)
-        )
 
     def resume_after(self) -> datetime | None:
         unfinished = [j.started_at for j in self.jobs.values() if not j.finished]

@@ -45,8 +45,10 @@ class FakePrintLogApi:
         self.connections: dict[str, dict[str, Any]] = {}
         self.heartbeats: list[tuple[str, dict[str, Any]]] = []
         """Every PUT /api/Connections body received, by instance id."""
+        self.offline = False
+        """While True, every request is cut off before an answer, as with the internet down."""
         self._ids = itertools.count(1)
-        self._failures: list[int] = []
+        self._failures: list[tuple[int, dict[str, str]]] = []
         self._server: TestServer | None = None
 
     # -- serving -------------------------------------------------------------------------------
@@ -71,18 +73,25 @@ class FakePrintLogApi:
 
     @web.middleware
     async def _middleware(self, request: web.Request, handler):
+        if self.offline:
+            if request.transport is not None:
+                request.transport.close()
+            raise web.HTTPServiceUnavailable()  # never reaches the bridge: the line is cut
         self.requests.append((request.method, request.path))
         if self._failures:
-            return web.Response(status=self._failures.pop(0))
+            status, headers = self._failures.pop(0)
+            return web.Response(status=status, headers=headers)
         if request.headers.get("X-Api-Key") != self.api_key:
             return web.Response(status=401)
         return await handler(request)
 
     # -- driving it from a test ----------------------------------------------------------------
 
-    def fail_next(self, count: int, status: int = 503) -> None:
-        """The next `count` requests fail with `status`, as an outage would."""
-        self._failures.extend([status] * count)
+    def fail_next(
+        self, count: int, status: int = 503, headers: dict[str, str] | None = None
+    ) -> None:
+        """The next `count` requests fail with `status` (and `headers`), as an outage would."""
+        self._failures.extend([(status, headers or {})] * count)
 
     def user_edits(self, print_id: int, **fields: Any) -> None:
         """What the user changes in the app while the print runs."""

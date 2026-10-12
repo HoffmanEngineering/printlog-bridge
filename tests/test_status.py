@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from printlog_bridge import __version__
 from printlog_bridge.cli.main import main
 from printlog_bridge.core.config import BridgeConfig, PrinterConfig
+from printlog_bridge.core.outbox import Outbox
 from printlog_bridge.core.state import JobRecord, PrinterState
 from printlog_bridge.core.status import StatusBoard, format_status, read_status
 
@@ -253,18 +254,44 @@ def test_status_shows_why_the_printer_is_disconnected(tmp_path):
     assert "Connection: disconnected for 1m 30s: can't reach Moonraker at http://voron:7125" in text
 
 
-def test_status_counts_the_jobs_waiting_to_be_logged(tmp_path):
+def test_status_counts_the_jobs_waiting_in_the_outbox(tmp_path):
+    board(tmp_path).start(["voron"])
+    outbox = Outbox.open(tmp_path, clock=lambda: NOW - timedelta(minutes=12))
+    outbox.add("voron", "1", "start", {})
+    outbox.add("voron", "1", "finish", {})  # the same print: one job
+    outbox.add("voron", "2", "finish", {})
+    outbox.add("u1", "3", "start", {})  # another printer's
+    outbox.failed(outbox.heads()[0].seq, "the API answered 503 for /api/Prints")
+    outbox.close()
+
+    text, _ = report(tmp_path, NOW)
+
+    assert (
+        "Outbox: 2 jobs waiting to be logged, the oldest for 12m; last try: the API answered "
+        "503 for /api/Prints" in text
+    )
+
+
+def test_status_counts_one_waiting_job(tmp_path):
+    board(tmp_path).start(["voron"])
+    outbox = Outbox.open(tmp_path, clock=lambda: NOW - timedelta(seconds=5))
+    outbox.add("voron", "1", "start", {})
+    outbox.close()
+
+    text, _ = report(tmp_path, NOW)
+
+    assert "Outbox: 1 job waiting to be logged, for 5s\n" in text
+
+
+def test_status_ignores_jobs_the_state_file_alone_says_are_waiting(tmp_path):
     board(tmp_path).start(["voron"])
     state = PrinterState.load(tmp_path, "voron")
-    state.jobs["1"] = JobRecord(started_at=NOW.isoformat())  # never created
-    state.jobs["2"] = JobRecord(started_at=NOW.isoformat(), print_id=5)  # printing
-    state.jobs["3"] = JobRecord(started_at=NOW.isoformat(), print_id=6, ended_at=NOW.isoformat())
-    state.jobs["4"] = JobRecord(started_at=NOW.isoformat(), print_id=7, finished=True)
+    state.jobs["1"] = JobRecord(started_at=NOW.isoformat())  # the outbox has nothing for it
     state.save()
 
     text, _ = report(tmp_path, NOW)
 
-    assert "Outbox: 2 jobs waiting to be logged" in text
+    assert "Outbox: empty" in text
 
 
 def test_status_does_not_create_a_state_file(tmp_path):

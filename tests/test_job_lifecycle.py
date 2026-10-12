@@ -15,6 +15,9 @@ from bridge_helpers import write_config
 from fake_moonraker import FakeMoonraker, eventually
 from fake_printlog_api import FakePrintLogApi
 
+from printlog_bridge.core.api_client import REQUEST_TIMEOUT_S
+from printlog_bridge.core.lifecycle import BACKOFF_S
+
 METADATA = {"estimated_time": 3900.0, "filament_total": 4400.0, "filament_weight_total": 13.2}
 
 
@@ -30,11 +33,12 @@ async def fakes():
 
 
 @contextlib.asynccontextmanager
-async def bridge(config_path: Path, moonraker: FakeMoonraker):
+async def bridge(config_path: Path, moonraker: FakeMoonraker, **options):
     async with helpers.bridge(
         config_path,
         connected=lambda: moonraker.client_count == 1,
         disconnected=lambda: moonraker.client_count == 0,
+        **options,
     ) as task:
         yield task
 
@@ -133,3 +137,63 @@ def test_a_print_links_to_the_connection_that_logged_it(tmp_path):
     assert connection["displayName"] == "printlog-bridge (voron)"
     assert connection["kind"] == "moonraker"
     assert connection["printerId"] == 42
+
+
+def test_a_print_made_with_the_internet_unplugged_is_logged_once_it_is_back(tmp_path):
+    """#9's acceptance criterion: the whole print offline, then logged soon after reconnecting.
+
+    The backoff is scaled down from 2 s .. 60 s to 0.05 s .. 0.5 s, so "within 2 minutes" is
+    "within 1 s" here; test_the_backoff_cap_keeps_a_print_within_2_minutes covers the real one.
+    """
+
+    async def scenario():
+        async with fakes() as (moonraker, moonraker_url, api, api_url):
+            config = write_config(tmp_path, moonraker_url, api_url)
+            api.offline = True
+            async with bridge(config, moonraker, backoff=(0.05, 0.5)):
+                job = await moonraker.start_job("benchy.gcode", METADATA)
+                await asyncio.sleep(0.3)
+                await moonraker.finish_job(job, filament_used=4321.5, print_duration=3725.0)
+                await asyncio.sleep(1.0)  # retries pile up into the backoff
+                assert api.prints == {}
+                api.offline = False
+                loop = asyncio.get_running_loop()
+                back = loop.time()
+                await eventually(lambda: api.prints and api.prints[1]["status"] == 3, timeout=3)
+                took = loop.time() - back
+            return api, took
+
+    api, took = asyncio.run(scenario())
+
+    assert took < 1.0
+    [print_] = api.prints.values()
+    assert print_["title"] == "Benchy"
+    assert print_["printTimeInSeconds"] == 3725
+    assert len(api.completions) == 1
+    [connection] = api.connections.values()
+    assert print_["connectionId"] == connection["id"]
+
+
+def test_the_backoff_cap_keeps_a_print_within_2_minutes():
+    assert BACKOFF_S[1] + 2 * REQUEST_TIMEOUT_S < 120
+
+
+def test_a_bridge_killed_while_offline_logs_the_print_after_it_restarts(tmp_path):
+    async def scenario():
+        async with fakes() as (moonraker, moonraker_url, api, api_url):
+            config = write_config(tmp_path, moonraker_url, api_url)
+            api.offline = True
+            async with bridge(config, moonraker, backoff=(0.05, 0.5)):
+                job = await moonraker.start_job("benchy.gcode", METADATA)
+                await moonraker.finish_job(job, filament_used=4321.5, print_duration=3725.0)
+                await asyncio.sleep(0.3)
+            api.offline = False
+            async with bridge(config, moonraker, backoff=(0.05, 0.5)):
+                await eventually(lambda: api.prints and api.prints[1]["status"] == 3)
+                await asyncio.sleep(0.2)
+            return api
+
+    api = asyncio.run(scenario())
+
+    assert len(api.prints) == 1
+    assert len(api.completions) == 1
