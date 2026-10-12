@@ -9,7 +9,7 @@ from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.config import API_KEY_ENV, BridgeConfig, ConfigError
 from printlog_bridge.core.connections import HEARTBEAT_INTERVAL_S, Connection, Heartbeat
 from printlog_bridge.core.doctor import API_KEYS_PAGE, PRINTERS_PAGE
-from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter
+from printlog_bridge.core.lifecycle import BACKOFF_S, JobLogger, LoggedPrinter
 from printlog_bridge.core.status import TOUCH_INTERVAL_S, StatusBoard
 
 log = logging.getLogger(__name__)
@@ -36,11 +36,13 @@ async def run_bridge(
     *,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_S,
     touch_interval: float = TOUCH_INTERVAL_S,
+    backoff: tuple[float, float] = BACKOFF_S,
 ) -> None:
     """Runs every printer's adapter until cancelled, logging their jobs to the API.
 
-    Registers each printer's connection and keeps it alive, and keeps `status.json` in the state
-    directory up to date for `printlog-bridge status`.
+    Each job event goes into the outbox in the state directory first, and the job logger sends
+    it from there. Registers each printer's connection and keeps it alive, and keeps
+    `status.json` in the state directory up to date for `printlog-bridge status`.
     """
     check_runnable(config)
     assert config.api_key is not None  # check_runnable made sure
@@ -57,6 +59,7 @@ async def run_bridge(
                     if p.printer_id is not None
                 },
                 config.state_dir,
+                backoff=backoff,
                 board=board,
             )
             heartbeat = Heartbeat(
@@ -80,11 +83,15 @@ async def run_bridge(
                     "[printer %s] watching: %s, logging to printer %s",
                     printer.name, printer.adapter.describe(), printer.printer_id,
                 )  # fmt: skip
-            await asyncio.gather(
-                heartbeat.run(),
-                _keep_touching(board, touch_interval),
-                *(p.adapter.run(sink, board.printer(p.name)) for p in config.printers),
-            )
+            try:
+                await asyncio.gather(
+                    sink.run(),
+                    heartbeat.run(),
+                    _keep_touching(board, touch_interval),
+                    *(p.adapter.run(sink, board.printer(p.name)) for p in config.printers),
+                )
+            finally:
+                sink.close()
     finally:
         board.stopped()
 

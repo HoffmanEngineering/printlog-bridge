@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from printlog_bridge import __version__
-from printlog_bridge.core.state import PrinterState
+from printlog_bridge.core.outbox import read_waiting
 
 if TYPE_CHECKING:  # config imports the adapter interface, which imports this module
     from printlog_bridge.core.config import BridgeConfig
@@ -257,12 +257,18 @@ def _printer_lines(printer, known, running: bool, config: BridgeConfig, now: dat
     else:
         lines.append(f"Heartbeat: {_ago(now, heartbeat)} ago")
 
-    state = PrinterState.peek(config.state_dir, printer.name)
-    waiting = state.waiting() if state is not None else 0
-    if waiting:
-        lines.append(f"Outbox: {waiting} job{'' if waiting == 1 else 's'} waiting to be logged")
-    else:
+    waiting = read_waiting(config.state_dir).get(printer.name)
+    if waiting is None:
         lines.append("Outbox: empty")
+    else:
+        jobs = f"{waiting.jobs} job{'' if waiting.jobs == 1 else 's'} waiting to be logged"
+        since = f"the oldest for {_ago(now, waiting.since.isoformat())}"
+        if waiting.jobs == 1:
+            since = f"for {_ago(now, waiting.since.isoformat())}"
+        line = f"Outbox: {jobs}, {since}"
+        if waiting.last_error:
+            line += f"; last try: {waiting.last_error}"
+        lines.append(line)
 
     warnings = list((known.get("warnings") or {}).values())
     if warnings:

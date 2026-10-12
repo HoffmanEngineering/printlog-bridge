@@ -3,20 +3,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted
-from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter
-from printlog_bridge.core.state import PrinterState
+from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter, backoff_delay
+from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, read_waiting
+from printlog_bridge.core.state import JobRecord, PrinterState
 from printlog_bridge.core.status import StatusBoard, read_status
 
 STARTED_AT = datetime(2026, 10, 10, 9, 30, tzinfo=timezone.utc)
-FAST_RETRIES = (0.01, 0.01)
+FAST_BACKOFF = (0.01, 0.04)
 
 
 def started(job_id: str = "00000A", printer: str = "voron", **kwargs) -> JobStarted:
@@ -36,7 +39,9 @@ def finished(
 
 
 @contextlib.asynccontextmanager
-async def logging_to(api: FakePrintLogApi, state_dir: Path, **printers: int):
+async def logging_to(
+    api: FakePrintLogApi, state_dir: Path, *, clock=None, backoff=FAST_BACKOFF, **printers: int
+):
     base = await api.start()
     try:
         async with ApiClient(base, api.api_key) as client:
@@ -47,22 +52,50 @@ async def logging_to(api: FakePrintLogApi, state_dir: Path, **printers: int):
                     for name, printer_id in (printers or {"voron": 42}).items()
                 },
                 state_dir,
-                retry_delays=FAST_RETRIES,
+                backoff=backoff,
+                **({"clock": clock} if clock else {}),
             )
     finally:
         await api.close()
 
 
-def run(api: FakePrintLogApi, state_dir: Path, *events, **printers: int):
-    """Emits `events` in order; a callable event is called with the API instead."""
+async def drain(logger: JobLogger, timeout: float = 1.0) -> None:
+    """Sends what the outbox holds, retrying, until it is empty or `timeout` runs out."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        wait = await logger.send_due()
+        if wait is None or loop.time() >= deadline:
+            return
+        await asyncio.sleep(min(wait, max(0.0, deadline - loop.time())))
+
+
+def run(
+    api: FakePrintLogApi,
+    state_dir: Path,
+    *events,
+    timeout: float = 1.0,
+    backoff=FAST_BACKOFF,
+    **printers: int,
+):
+    """Emits `events` in order, sending each before the next, as a restart of the bridge would.
+
+    A callable event is called with the API instead. The logger is closed at the end, like a
+    bridge that stops, and returned.
+    """
 
     async def scenario():
-        async with logging_to(api, state_dir, **printers) as logger:
-            for event in events:
-                if callable(event):
-                    event(api)
-                else:
-                    await logger.emit(event)
+        async with logging_to(api, state_dir, backoff=backoff, **printers) as logger:
+            try:
+                await drain(logger, timeout)  # what the last run left in the outbox
+                for event in events:
+                    if callable(event):
+                        event(api)
+                    else:
+                        await logger.emit(event)
+                        await drain(logger, timeout)
+            finally:
+                logger.close()
             return logger
 
     return asyncio.run(scenario())
@@ -265,9 +298,17 @@ class TestJobEnd:
 
     def test_creates_the_print_first_when_its_start_was_never_logged(self, tmp_path):
         api = FakePrintLogApi()
-        api.fail_next(3)  # the start's create, and both retries
 
-        run(api, tmp_path, started(), finished())
+        # A state file from before the outbox: the start was seen, and the API was down.
+        state = PrinterState.load(tmp_path, "voron")
+        start = started()
+        state.jobs[start.job_id] = JobRecord(
+            started_at=start.started_at.isoformat(),
+            start={**asdict(start), "started_at": start.started_at.isoformat()},
+        )
+        state.save()
+
+        run(api, tmp_path, finished())
 
         [print_] = api.prints.values()
         assert print_["status"] == 3
@@ -292,21 +333,106 @@ class TestWhenTheApiIsDown:
 
         assert len(api.prints) == 1
 
-    def test_gives_up_on_a_long_outage_and_logs_the_job_on_its_next_replay(self, tmp_path, caplog):
+    def test_a_print_made_while_offline_is_logged_once_the_api_is_back(self, tmp_path, caplog):
         api = FakePrintLogApi()
-        api.fail_next(3)
+        api.offline = True
 
         with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
-            run(api, tmp_path, started())
+            run(api, tmp_path, started(), finished(), timeout=0.1)
         assert api.prints == {}
-        assert "503" in caplog.text
+        assert "job 00000A" in caplog.text
 
-        run(api, tmp_path, started(), finished())
+        api.offline = False
+        run(api, tmp_path)  # the bridge restarts; the printer has nothing new to say
 
         [print_] = api.prints.values()
         assert print_["status"] == 3
+        assert print_["printTimeInSeconds"] == 3725
+        assert len(api.completions) == 1
 
-    def test_does_not_retry_a_revoked_key(self, tmp_path, caplog):
+    def test_a_print_is_created_before_it_is_completed(self, tmp_path):
+        api = FakePrintLogApi()
+        api.offline = True
+        run(api, tmp_path, started("1"), started("2"), finished("2"), finished("1"), timeout=0.1)
+        api.offline = False
+        api.requests.clear()
+
+        run(api, tmp_path)
+
+        writes = [(m, p) for m, p in api.requests if m == "POST"]
+        assert writes == [
+            ("POST", "/api/Prints"),
+            ("POST", "/api/Prints"),
+            ("POST", "/api/Prints/2/complete"),
+            ("POST", "/api/Prints/1/complete"),
+        ]
+        assert [p["status"] for p in api.prints.values()] == [3, 3]
+
+    def test_nothing_more_is_sent_for_a_print_while_its_start_waits_to_be_retried(self, tmp_path):
+        api = FakePrintLogApi()
+
+        async def scenario():
+            async with logging_to(api, tmp_path, backoff=(10, 10)) as logger:
+                try:
+                    api.fail_next(1)
+                    await logger.emit(started())
+                    await logger.emit(finished())
+                    await logger.send_due()
+                finally:
+                    logger.close()
+
+        asyncio.run(scenario())
+
+        assert api.requests == [("GET", "/api/Users/me/user-settings")]  # the start's, failed
+
+    def test_one_print_the_api_keeps_failing_does_not_hold_up_the_others(self, tmp_path):
+        api = FakePrintLogApi()
+        api.fail_next(1)  # only the first job's first try
+
+        run(api, tmp_path, started("1"), started("2"), timeout=0, backoff=(10, 10))
+
+        assert [p["externalId"].split(":")[1] for p in api.prints.values()] == ["2"]
+
+    def test_waits_as_long_as_the_api_asks(self, tmp_path):
+        api = FakePrintLogApi()
+
+        async def scenario():
+            async with logging_to(api, tmp_path) as logger:
+                try:
+                    api.fail_next(1, status=429, headers={"Retry-After": "30"})
+                    await logger.emit(started())
+                    wait = await logger.send_due()
+                    sent = len(api.requests)
+                    again = await logger.send_due()
+                    return wait, again, len(api.requests) - sent
+                finally:
+                    logger.close()
+
+        wait, again, sent_meanwhile = asyncio.run(scenario())
+
+        assert 29 < wait <= 30
+        assert 29 < again <= 30
+        assert sent_meanwhile == 0
+
+    @pytest.mark.parametrize("retry_after", ["0", "Thu, 01 Jan 1970 00:00:00 GMT"])
+    def test_a_retry_after_of_zero_still_backs_off(self, tmp_path, retry_after):
+        api = FakePrintLogApi()
+
+        async def scenario():
+            async with logging_to(api, tmp_path, backoff=(10, 10)) as logger:
+                try:
+                    api.fail_next(1, status=503, headers={"Retry-After": retry_after})
+                    await logger.emit(started())
+                    return await logger.send_due()
+                finally:
+                    logger.close()
+
+        wait = asyncio.run(scenario())
+
+        assert 9 < wait <= 10
+        assert api.requests == [("GET", "/api/Users/me/user-settings")]  # not sent again at once
+
+    def test_does_not_retry_a_revoked_key_but_keeps_the_job(self, tmp_path, caplog):
         api = FakePrintLogApi(api_key="the-real-key")
 
         async def scenario():
@@ -317,9 +443,13 @@ class TestWhenTheApiIsDown:
                         client,
                         {"voron": LoggedPrinter(42, "moonraker")},
                         tmp_path,
-                        retry_delays=FAST_RETRIES,
+                        backoff=FAST_BACKOFF,
                     )
-                    await logger.emit(started())
+                    try:
+                        await logger.emit(started())
+                        await drain(logger, 0.2)
+                    finally:
+                        logger.close()
             finally:
                 await api.close()
 
@@ -328,21 +458,145 @@ class TestWhenTheApiIsDown:
 
         assert len(api.requests) == 1
         assert "API key" in caplog.text
+        api.api_key = "revoked"  # say the user fixes the key, then restarts the bridge
+        run(api, tmp_path)
+        assert len(api.prints) == 1
 
-    def test_an_unexpected_answer_is_logged_and_the_job_retried_on_its_next_replay(
-        self, tmp_path, caplog
-    ):
+    def test_a_refused_job_leaves_the_outbox(self, tmp_path, caplog):
+        api = FakePrintLogApi(printers=(7,))
+
+        with caplog.at_level(logging.ERROR, logger="printlog_bridge"):
+            run(api, tmp_path, started())
+
+        assert "does not belong" in caplog.text
+        assert len(api.created) == 1
+        assert read_waiting(tmp_path) == {}
+
+    def test_an_unexpected_answer_is_logged_and_the_job_retried(self, tmp_path, caplog):
         api = FakePrintLogApi()
         api.settings = None  # the API answers null where a list belongs
 
         with caplog.at_level(logging.ERROR, logger="printlog_bridge"):
-            run(api, tmp_path, started())
+            run(api, tmp_path, started(), timeout=0.1)
         assert "job 00000A" in caplog.text
 
         api.settings = []
-        run(api, tmp_path, started())
+        run(api, tmp_path)
 
         assert len(api.prints) == 1
+
+
+def test_backoff_doubles_from_its_base_to_its_cap():
+    assert [backoff_delay(n, 2, 60) for n in range(1, 9)] == [2, 4, 8, 16, 32, 60, 60, 60]
+
+
+class TestOldEntries:
+    def test_an_entry_unsent_for_30_days_is_dropped_with_a_warning(self, tmp_path, caplog):
+        api = FakePrintLogApi()
+        api.offline = True
+        now = [STARTED_AT]
+
+        async def scenario():
+            async with logging_to(api, tmp_path, clock=lambda: now[0]) as logger:
+                try:
+                    await logger.emit(started())
+                    await logger.send_due()
+                    now[0] += MAX_AGE + timedelta(minutes=1)
+                    api.offline = False
+                    with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
+                        await logger.send_due()
+                    await logger.emit(started())  # the printer replays it
+                    await drain(logger, 0.1)
+                finally:
+                    logger.close()
+                return logger
+
+        logger = asyncio.run(scenario())
+
+        assert api.prints == {}
+        assert "30 days" in caplog.text
+        assert "00000A" in caplog.text
+        assert read_waiting(tmp_path) == {}
+        assert logger.state("voron").jobs["00000A"].finished  # so it is never replayed again
+
+
+class PowerCut(BaseException):
+    """The bridge's process dies on the spot."""
+
+
+def cut_power_after(monkeypatch, method: str) -> None:
+    """The API gets the call, and the power goes before the bridge hears the answer."""
+    original = getattr(ApiClient, method)
+
+    async def cut(self, *args, **kwargs):
+        await original(self, *args, **kwargs)
+        monkeypatch.setattr(ApiClient, method, original)
+        raise PowerCut
+
+    monkeypatch.setattr(ApiClient, method, cut)
+
+
+class TestPowerLoss:
+    def test_during_the_create_the_print_is_not_duplicated(self, tmp_path, monkeypatch):
+        api = FakePrintLogApi()
+        cut_power_after(monkeypatch, "create_print")
+
+        with pytest.raises(PowerCut):
+            run(api, tmp_path, started())
+        run(api, tmp_path)  # the bridge starts again
+
+        assert len(api.prints) == 1
+        assert len(api.created) == 2  # sent twice; the API recognised its external ID
+        assert read_waiting(tmp_path) == {}
+
+    def test_during_the_completion_it_is_completed_once_with_one_note(self, tmp_path, monkeypatch):
+        api = FakePrintLogApi()
+        run(api, tmp_path, started(estimated_filament_mm=4400.0))
+        cut_power_after(monkeypatch, "complete_print")
+
+        with pytest.raises(PowerCut):
+            run(api, tmp_path, finished(outcome=JobOutcome.FAILED, note="Klipper shutdown"))
+        run(api, tmp_path)
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 5
+        assert print_["notes"] == "Klipper shutdown"
+        [row] = print_["filamentUsage"]
+        assert row["lengthInM"] == 4.3215
+        assert read_waiting(tmp_path) == {}
+
+    def test_after_the_event_but_before_any_send_it_is_still_sent(self, tmp_path):
+        api = FakePrintLogApi()
+
+        async def scenario():
+            async with logging_to(api, tmp_path) as logger:
+                await logger.emit(started())
+                logger.close()  # and nothing else: no send
+
+        asyncio.run(scenario())
+        assert api.prints == {}
+
+        run(api, tmp_path)
+
+        assert len(api.prints) == 1
+
+    def test_a_state_file_from_before_the_outbox_still_logs_its_job_once(self, tmp_path):
+        api = FakePrintLogApi()
+        state = PrinterState.load(tmp_path, "voron")
+        state.jobs["00000A"] = JobRecord(
+            started_at=STARTED_AT.isoformat(),
+            start={**asdict(started()), "started_at": STARTED_AT.isoformat()},
+            print_id=None,
+            ended_at=finished().finished_at.isoformat(),
+        )
+        state.save()
+        assert not (tmp_path / OUTBOX_FILE).exists()
+
+        run(api, tmp_path, started(), finished(), started(), finished())  # the replay
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert len(api.completions) == 1
 
 
 class TestResumePoint:
@@ -395,15 +649,20 @@ def report_run(api: FakePrintLogApi, state_dir: Path, *events, register=None):
                     client,
                     {"voron": LoggedPrinter(42, "moonraker")},
                     state_dir,
-                    retry_delays=FAST_RETRIES,
+                    backoff=FAST_BACKOFF,
                     board=board,
                     before_create=hook,
                 )
-                for event in events:
-                    if callable(event):
-                        event(api)
-                    else:
-                        await logger.emit(event)
+                try:
+                    for event in events:
+                        if callable(event):
+                            event(api)
+                        else:
+                            await logger.emit(event)
+                            await drain(logger, 0.1)
+                    await drain(logger, 0.5)
+                finally:
+                    logger.close()
         finally:
             await api.close()
         return read_status(state_dir)["printers"]["voron"]
@@ -453,21 +712,20 @@ class TestStatusReport:
 
     def test_a_job_that_could_not_be_logged_is_a_warning_until_one_is(self, tmp_path):
         api = FakePrintLogApi()
-        api.fail_next(3)
+        api.offline = True
         seen = []
 
-        recovered = report_run(
-            api,
-            tmp_path,
-            started(),
-            lambda _api: seen.append(read_status(tmp_path)["printers"]["voron"]),
-            started(),  # the replay, once the API is back
-        )
+        def back_online(api):
+            seen.append(read_status(tmp_path)["printers"]["voron"])
+            api.offline = False
+
+        recovered = report_run(api, tmp_path, started(), back_online)
 
         [failed] = seen
 
         assert "job 00000A" in failed["warnings"]["api"]
-        assert "503" in failed["warnings"]["api"]
+        assert "can't reach" in failed["warnings"]["api"]
+        assert "tries again" in failed["warnings"]["api"]
         assert recovered["warnings"] == {}
 
     def test_a_refused_job_is_a_warning(self, tmp_path):
@@ -481,12 +739,11 @@ class TestStatusReport:
 class TestWaitingJobs:
     def test_a_job_that_ended_but_was_not_logged_is_marked_as_ended(self, tmp_path):
         api = FakePrintLogApi()
+        api.offline = True
 
-        def outage(api):
-            api.fail_next(3)
-
-        run(api, tmp_path, started(), outage, finished())
+        run(api, tmp_path, started(), finished(), timeout=0.05)
 
         [job] = PrinterState.load(tmp_path, "voron").jobs.values()
         assert not job.finished
         assert job.ended_at == finished().finished_at.isoformat()
+        assert read_waiting(tmp_path)["voron"].jobs == 1

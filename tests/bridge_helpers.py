@@ -49,10 +49,13 @@ async def bridge(
     connected: Condition,
     disconnected: Condition,
     timeout: float = 5.0,
+    **options,
 ):
-    """The bridge, running until the block ends. Waits for it to connect, and to let go."""
+    """The bridge, running until the block ends. Waits for it to connect, and to let go.
+
+    `options` go to `run_bridge`."""
     config = load_config(config_path, adapters=ADAPTERS, env={}, home=config_path.parent)
-    task = asyncio.ensure_future(run_bridge(config))
+    task = asyncio.ensure_future(run_bridge(config, **options))
     try:
         await until(connected, timeout)
         yield task

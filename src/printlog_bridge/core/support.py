@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import json
 import platform
 import re
 import zipfile
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict
 from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.core.config import API_KEY_ENV
+from printlog_bridge.core.outbox import read_entries
 from printlog_bridge.core.status import STATUS_FILE
 
 BUNDLE_NAME = "printlog-bridge-support.zip"
@@ -59,6 +62,11 @@ def write_support_bundle(
         text = _read(state)
         if text is not None:
             files[f"printers/{state.name}"] = text
+    entries = read_entries(state_dir)
+    if entries is not None:
+        files["outbox.json"] = json.dumps(
+            [{**asdict(e), "queued_at": e.queued_at.isoformat()} for e in entries], indent=1
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")

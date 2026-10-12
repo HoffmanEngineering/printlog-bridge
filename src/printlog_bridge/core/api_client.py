@@ -32,6 +32,11 @@ class AuthRejected(ApiError):
 class ApiUnavailable(ApiError):
     """The API could not be reached or failed. Worth retrying later."""
 
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+        """Seconds the API asked the bridge to wait (`Retry-After`), when it said."""
+
 
 class ApiRejected(ApiError):
     """The API refused this request (400 or 403). Sending it again won't change the answer."""
@@ -155,7 +160,10 @@ class ApiClient:
                         + (f": {reason}" if reason else "")
                     )
                 if response.status >= 400:
-                    raise ApiUnavailable(f"the API answered {response.status} for {path}")
+                    raise ApiUnavailable(
+                        f"the API answered {response.status} for {path}",
+                        _retry_after(response.headers.get("Retry-After"), self.server_time),
+                    )
                 return response.status, await response.json()
         except aiohttp.ClientError as e:
             raise ApiUnavailable(f"can't reach {self.base_url}: {e}") from e
@@ -163,6 +171,19 @@ class ApiClient:
             raise ApiUnavailable(
                 f"{self.base_url} did not answer within {REQUEST_TIMEOUT_S}s"
             ) from e
+
+
+def _retry_after(header: str | None, server_time: datetime | None) -> float | None:
+    """`Retry-After` in seconds: either a number of seconds or an HTTP date (RFC 9110)."""
+    if not header:
+        return None
+    header = header.strip()
+    if header.isdigit():
+        return float(header)
+    when = _date(header)
+    if when is None:
+        return None
+    return max(0.0, (when - (server_time or datetime.now(timezone.utc))).total_seconds())
 
 
 def _date(header: str | None) -> datetime | None:

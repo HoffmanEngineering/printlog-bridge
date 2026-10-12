@@ -176,6 +176,38 @@ class TestPrints:
         with pytest.raises(ApiUnavailable, match=str(status)):
             serve([("POST", "/api/Prints", busy)], lambda c: c.create_print({}))
 
+    @pytest.mark.parametrize(
+        ("header", "expected"),
+        [
+            ("30", 30.0),
+            ("0", 0.0),
+            ("Sat, 10 Oct 2026 09:31:00 GMT", 60.0),  # an HTTP date, against the API's Date
+            ("soon", None),
+            (None, None),
+        ],
+    )
+    def test_throttling_says_when_to_try_again(self, header, expected):
+        async def throttled(_request):
+            headers = {"Date": "Sat, 10 Oct 2026 09:30:00 GMT"}
+            if header is not None:
+                headers["Retry-After"] = header
+            return web.Response(status=429, headers=headers)
+
+        with pytest.raises(ApiUnavailable) as raised:
+            serve([("POST", "/api/Prints", throttled)], lambda c: c.create_print({}))
+
+        assert raised.value.retry_after == expected
+
+    def test_an_unreachable_api_has_no_retry_after(self):
+        async def scenario():
+            async with ApiClient("http://127.0.0.1:9", api_key="k") as client:
+                await client.create_print({})
+
+        with pytest.raises(ApiUnavailable) as raised:
+            asyncio.run(scenario())
+
+        assert raised.value.retry_after is None
+
     def test_a_revoked_key_raises_auth_rejected_from_any_call(self):
         async def revoked(_request):
             return web.Response(status=401)

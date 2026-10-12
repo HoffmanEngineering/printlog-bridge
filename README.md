@@ -4,7 +4,7 @@ An open-source bridge agent that watches Klipper/Moonraker printers and logs eve
 
 It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1 and Creality K2.
 
-> Status: early development. `run` logs each print when it starts and completes it when it ends, with its outcome, duration and filament used. Per-tool usage, images and the offline outbox are still to come. See the [issues](https://github.com/HoffmanEngineering/printlog-bridge/issues) and milestones for the roadmap.
+> Status: early development. `run` logs each print when it starts and completes it when it ends, with its outcome, duration and filament used, and keeps what it can't send yet until 3D Print Log is reachable again. Per-tool usage and images are still to come. See the [issues](https://github.com/HoffmanEngineering/printlog-bridge/issues) and milestones for the roadmap.
 
 ## Requirements
 
@@ -52,6 +52,8 @@ Each print appears in 3D Print Log as Printing when the job starts, titled from 
 | `interrupted`, `server_exit` | Failed | "Moonraker stopped during the print" |
 
 What you change in the app while it prints is kept: the title, your notes (a note is added after them), the spool on a usage row, and a status you already chose, such as Partial success. A print you delete stays deleted.
+
+When 3D Print Log can't be reached (the internet is down, or the API is busy), nothing is lost. The bridge writes each job event to an outbox in its state directory (`outbox.sqlite3`) before it sends anything, and sends it from there, oldest first and each print's events in order. It retries with a wait that doubles from 2 seconds to a minute, or as long as the API asks, so a print shows up within a minute or two of the connection coming back, even if the bridge was restarted in between. A power cut in the middle of a send doesn't lose the event or log it twice. An event that still hasn't got through after 30 days is dropped, with a warning in the log. `status` shows how many jobs are waiting and why the last try failed.
 
 The bridge reads Moonraker's job history, so `[history]` must be in moonraker.conf (most installs have it; `run` logs how to add it when it's missing). It remembers what it has logged in its state directory, and on every start or reconnect it catches up on jobs that started or ended while it was away. On its very first run it picks up a print already running, but not older history.
 
