@@ -1,18 +1,21 @@
 """The Snapmaker U1's RFID reader, from Klipper's `filament_detect` object.
 
-Everything here comes from Snapmaker's published firmware (github.com/Snapmaker/u1-klipper,
-`klippy/extras/filament_detect.py` and `filament_protocol.py`), not from a printer: none was at
-hand. What it says, and what must still be checked on a real U1:
+Written from Snapmaker's published firmware (github.com/Snapmaker/u1-klipper,
+`klippy/extras/filament_detect.py` and `filament_protocol.py`), and checked against a real U1
+(Klipper 2.0.0.205, Moonraker 2.0.0; tests/fixtures/moonraker/u1, `test_real_captures.py`):
 
 - `filament_detect.info` is a list with one entry per channel, four on the U1, and channel `n`
-  feeds `extruder<n>` (T0-T3), so it is slot `n`.
+  feeds `extruder<n>` (T0-T3), so it is slot `n`. Moonraker lists `filament_detect` and its
+  status arrives through the subscription.
 - An entry is filled in only when a tag was read and its Snapmaker signature checked; a spool
   with no tag, or a tag that isn't Snapmaker's, reads as the empty entry: `VENDOR` is `NONE`.
 - `CARD_UID` is the tag's UID, as a list of byte values (block 0's first 4 bytes on the M1
-  tags Snapmaker uses), or 0 when no tag was read. The bridge writes those bytes as hex in
-  order, `04A23F11`, which should be how a phone's NFC app shows the same tag. Unverified.
-- `MAIN_TYPE` is the material (`PLA`, `PETG`, `PLA-CF`...), and `RGB_1` its first color as a
-  24-bit number.
+  tags Snapmaker uses, `[160, 93, 28, 63]`), or the number 0 when no tag was read. The bridge
+  writes those bytes as hex in order, `A05D1C3F`. Still unverified: that this is how a phone's
+  NFC app shows the same tag.
+- `MAIN_TYPE` is the material (`PLA`, `PETG`, `PLA-CF`...), `SUB_TYPE` its line (`SnapSpeed`),
+  and `RGB_1` its first color as a 24-bit number: on the real U1, the same color the slicer
+  has for that spool.
 
 Kept apart from the rest of the adapter so a firmware that reports something else only needs
 this file changed.

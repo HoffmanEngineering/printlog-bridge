@@ -113,11 +113,14 @@ def estimated_grams_by_slot(metadata: Mapping[str, Any]) -> dict[int, float]:
     """The slicer's grams per tool, from Moonraker's `filament_weights`, when it has them.
 
     PrusaSlicer and OrcaSlicer (and Snapmaker Orca) write `; filament used [g] = a, b, c` with
-    one value per filament, in tool order; Moonraker lists them as `filament_weights`. A file
+    one value per filament, in tool order; Moonraker lists them as `filament_weights`, and the
+    Snapmaker U1's Moonraker (2.0.0) as `filament_weight` (seen on a real U1). A file
     with one filament gives nothing here, so its estimate stays one row as before. So does a
     single-extruder MMU print (`mmu_print`), whose filaments are gates, not tools.
     """
     weights = metadata.get("filament_weights")
+    if not isinstance(weights, list):
+        weights = metadata.get("filament_weight")
     if metadata.get("mmu_print") or not isinstance(weights, list) or len(weights) < 2:
         return {}
     by_slot = {}

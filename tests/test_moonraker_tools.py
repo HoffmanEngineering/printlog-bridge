@@ -167,6 +167,12 @@ class TestEstimatedGramsBySlot:
     def test_a_multi_filament_file_using_one_tool_names_that_tool(self):
         assert estimated_grams_by_slot({"filament_weights": [0.0, 0.0, 8.2, 0.0]}) == {2: 8.2}
 
+    def test_the_snapmaker_u1s_moonraker_calls_them_filament_weight(self):
+        # Seen on a real U1 (Moonraker 2.0.0): tests/fixtures/moonraker/u1/history.json.
+        metadata = {"filament_weight": [54.22, 67.09, 20.69, 0.0], "filament_weight_total": 142.0}
+
+        assert estimated_grams_by_slot(metadata) == {0: 54.22, 1: 67.09, 2: 20.69}
+
     @pytest.mark.parametrize(
         "metadata",
         [

@@ -19,7 +19,8 @@ from printlog_bridge.core.events import SpoolCommand, SpoolReading
 # builds it (klippy/extras/filament_detect.py `get_status`, filament_protocol.py
 # `FILAMENT_INFO_STRUCT` and `m1_proto_data_parse`), with made-up values: channel 0 holds a
 # Snapmaker PLA spool whose tag was read and verified, channel 1 is empty, and channels 2 and 3
-# hold spools without a Snapmaker tag. To be checked against a real printer.
+# hold spools without a Snapmaker tag. A real U1's matches it field for field: see
+# tests/fixtures/moonraker/u1/status.json (REAL) and test_real_captures.py.
 EMPTY_CHANNEL = {
     "VERSION": 0,
     "VENDOR": "NONE",
