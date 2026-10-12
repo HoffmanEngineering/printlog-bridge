@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ CAPTURES = Path(__file__).resolve().parent / "fixtures" / "moonraker"
 U1, INFIMECH = "u1", "infimech"
 
 
-@lru_cache(maxsize=None)
+@cache
 def _load(printer: str, name: str) -> Any:
     text = (CAPTURES / printer / f"{name}.json").read_text(encoding="utf-8")
     return json.loads(text)["result"]
