@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck --version
-      - run: shellcheck install.sh uninstall.sh tests/install/smoke.sh
+      - run: shellcheck install.sh uninstall.sh tests/install/smoke.sh tests/docker/smoke.sh
 
   install-smoke:
     # A clean install from the source tree in the image people will run, without dev tools.

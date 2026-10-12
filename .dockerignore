@@ -1,0 +1,10 @@
+# The image needs only pyproject.toml, README.md, LICENSE, requirements.txt and src/.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!requirements.txt
+!src/
+**/__pycache__
+**/*.pyc
+**/*.egg-info
