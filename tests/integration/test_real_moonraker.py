@@ -157,8 +157,10 @@ def installed(shared_moonraker):
         "rm -rf /tmp/bridge && mkdir /tmp/bridge"
         " && tar -C /src --exclude=.venv --exclude=.git -cf - . | tar -C /tmp/bridge -xf -"
         " && /bridge-venv/bin/pip install -q --no-deps /tmp/bridge"
-        # run needs a key and a printer_id; nothing prints here, so the API is never called.
-        " && printf '[bridge]\\napi_key = k\\nstate_dir = /tmp/state\\n"
+        # run needs a key and a printer_id. Nothing prints here, and the heartbeat goes to a
+        # closed port rather than to the real API.
+        " && printf '[bridge]\\napi_url = http://127.0.0.1:9\\napi_key = k\\n"
+        "state_dir = /tmp/state\\n"
         "[printer local]\\nprinter_id = 1\\n'"
         "    > /root/printer_data/config/printlog-bridge.cfg",
     )
@@ -189,5 +191,12 @@ class TestLocalMode:
                 assert time.monotonic() < deadline, installed.exec("cat", "/tmp/run.log")
                 time.sleep(0.3)
             assert installed.agents()[0]["name"] == "printlog-bridge"
+
+            status = installed.exec(
+                "sh", "-c", "cd /root && /bridge-venv/bin/printlog-bridge status", check=False
+            )
+            assert "Bridge: running" in status, status
+            assert "Connection: connected" in status, status
+            assert "Printer state: disconnected" in status, status  # no Klipper in here
         finally:
             installed.exec("pkill", "-f", "bridge-venv/bin/printlog-bridge", check=False)

@@ -15,18 +15,20 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, TypeVar
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.core.status import NullReport, PrinterReport
 
 log = logging.getLogger(__name__)
 
 CLIENT_NAME = "printlog-bridge"
 REPO_URL = "https://github.com/HoffmanEngineering/printlog-bridge"
 REQUEST_TIMEOUT_S = 10
+WARNING_TOPIC = "moonraker"
 CONNECT_TIMEOUT_S = 10
 UNIX_READ_LIMIT = 4 * 1024 * 1024
 ETX = b"\x03"
@@ -41,6 +43,7 @@ OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "filament_detect": None,  # Snapmaker U1's RFID reader
 }
 
+T = TypeVar("T")
 RemoteMethod = Callable[[Mapping[str, Any]], Awaitable[None]]
 Call = Callable[[str, Optional[Mapping[str, Any]]], Awaitable[Any]]
 
@@ -165,6 +168,7 @@ class MoonrakerSession:
         api_key: str | None = None,
         remote_methods: Mapping[str, RemoteMethod] | None = None,
         backoff: Backoff | None = None,
+        report: PrinterReport | None = None,
     ) -> None:
         if (url is None) == (socket is None):
             raise ValueError("pass exactly one of url or socket")
@@ -175,6 +179,7 @@ class MoonrakerSession:
         self.api_key = api_key
         self.remote_methods = dict(remote_methods or {})
         self.backoff = backoff or Backoff()
+        self.report = report or NullReport()
         self.status: dict[str, dict[str, Any]] = {}
 
     @property
@@ -184,20 +189,27 @@ class MoonrakerSession:
     async def run(self) -> None:
         """Stays connected until cancelled, reconnecting with backoff whenever the link drops."""
         while True:
+            reason = f"Moonraker at {self.where} closed the connection"
             try:
                 transport = await self._open()
                 try:
                     await self._serve(_JsonRpc(transport))
                 finally:
                     await transport.close()
-            except MoonrakerAuthError as e:
-                log.error("[printer %s] %s", self.printer, e)
-            except AlreadyConnected as e:
-                log.warning("[printer %s] %s", self.printer, e)
+            except (MoonrakerAuthError, AlreadyConnected) as e:
+                reason = str(e)
+                if isinstance(e, MoonrakerAuthError):
+                    log.error("[printer %s] %s", self.printer, e)
+                else:
+                    log.warning("[printer %s] %s", self.printer, e)
+                self.report.warn(WARNING_TOPIC, reason)
             except (ConnectionLost, MoonrakerRpcError, aiohttp.ClientError, OSError) as e:
-                log.warning("[printer %s] Moonraker at %s: %s", self.printer, self.where, _why(e))
+                reason = f"Moonraker at {self.where}: {_why(e)}"
+                log.warning("[printer %s] %s", self.printer, reason)
             except asyncio.TimeoutError:
-                log.warning("[printer %s] Moonraker at %s didn't answer", self.printer, self.where)
+                reason = f"Moonraker at {self.where} didn't answer"
+                log.warning("[printer %s] %s", self.printer, reason)
+            self.report.disconnected(reason)
 
             delay = self.backoff.next()
             log.info("[printer %s] reconnecting in %gs", self.printer, delay)
@@ -231,6 +243,8 @@ class MoonrakerSession:
 
             log.info("[printer %s] connected to Moonraker at %s", self.printer, self.where)
             self.backoff.reset()
+            self.report.connected()
+            self.report.warn(WARNING_TOPIC, None)
 
             for name in self.remote_methods:
                 await rpc.call("connection.register_remote_method", {"method_name": name})
@@ -242,7 +256,7 @@ class MoonrakerSession:
             if klippy == "ready":
                 await self._subscribe(rpc)
             else:
-                await self.listener.on_klippy_state(klippy)
+                await self._klippy_state(klippy)
 
             async for method, params in rpc.notifications():
                 await self._notified(rpc, method, params)
@@ -260,7 +274,7 @@ class MoonrakerSession:
         elif method == "notify_klippy_ready":
             await self._subscribe(rpc)
         elif method in ("notify_klippy_shutdown", "notify_klippy_disconnected"):
-            await self.listener.on_klippy_state(method[len("notify_klippy_") :])
+            await self._klippy_state(method[len("notify_klippy_") :])
         elif method in self.remote_methods:
             await self.remote_methods[method](params or {})
 
@@ -276,8 +290,12 @@ class MoonrakerSession:
             return
 
         self.status = {name: dict(fields) for name, fields in result["status"].items()}
-        await self.listener.on_klippy_state("ready")
+        await self._klippy_state("ready")
         await self.listener.on_status(self.status, self.status)
+
+    async def _klippy_state(self, state: str) -> None:
+        self.report.printer_state(state)
+        await self.listener.on_klippy_state(state)
 
 
 class _JsonRpc:
@@ -302,7 +320,16 @@ class _JsonRpc:
             message["params"] = params
         try:
             await self._transport.send(message)
-            return await asyncio.wait_for(future, REQUEST_TIMEOUT_S)
+            # Not asyncio.wait_for: before Python 3.12 it returns the answer, and drops the
+            # cancellation, when both arrive in the same loop iteration (bpo-42130), so a bridge
+            # told to stop would carry on. Awaiting the future itself always honours a cancel.
+            timer = asyncio.get_running_loop().call_later(
+                REQUEST_TIMEOUT_S, _time_out, future, method
+            )
+            try:
+                return await future
+            finally:
+                timer.cancel()
         finally:
             self._pending.pop(request_id, None)
 
@@ -372,7 +399,7 @@ class _WebSocketTransport:
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
         headers = {"X-Api-Key": api_key} if api_key else {}
         try:
-            ws = await asyncio.wait_for(
+            ws = await bounded(
                 session.ws_connect(url, headers=headers, heartbeat=30), CONNECT_TIMEOUT_S
             )
         except aiohttp.WSServerHandshakeError as e:
@@ -413,7 +440,7 @@ class _UnixTransport:
 
     @classmethod
     async def open(cls, path: Path) -> _UnixTransport:
-        reader, writer = await asyncio.wait_for(
+        reader, writer = await bounded(
             asyncio.open_unix_connection(str(path), limit=UNIX_READ_LIMIT), CONNECT_TIMEOUT_S
         )
         return cls(reader, writer)
@@ -437,3 +464,31 @@ class _UnixTransport:
 
 def _why(error: BaseException) -> str:
     return str(error) or type(error).__name__
+
+
+async def bounded(awaitable: Awaitable[T], timeout: float) -> T:
+    """`asyncio.wait_for` for code that must stop when cancelled. Before Python 3.12, wait_for
+    returns the result and drops the cancel when both happen at once (bpo-42130). Awaiting the
+    task itself always honours a cancel."""
+    task = asyncio.ensure_future(awaitable)
+    timed_out = False
+
+    def time_out() -> None:
+        nonlocal timed_out
+        timed_out = True
+        task.cancel()
+
+    timer = asyncio.get_running_loop().call_later(timeout, time_out)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if timed_out:
+            raise asyncio.TimeoutError from None
+        raise
+    finally:
+        timer.cancel()
+
+
+def _time_out(future: asyncio.Future, method: str) -> None:
+    if not future.done():
+        future.set_exception(asyncio.TimeoutError(f"no answer to {method}"))

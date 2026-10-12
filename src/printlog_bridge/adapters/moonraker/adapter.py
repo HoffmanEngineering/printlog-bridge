@@ -19,6 +19,7 @@ from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import ConfigError
 from printlog_bridge.core.events import EventSink
+from printlog_bridge.core.status import PrinterReport
 
 from .jobs import JobTracker
 from .session import (
@@ -90,13 +91,14 @@ class MoonrakerAdapter(Adapter):
             return f"moonraker, remote {self.url}"
         return f"moonraker, local socket {self.socket}"
 
-    async def run(self, sink: EventSink) -> None:
+    async def run(self, sink: EventSink, report: PrinterReport) -> None:
         session = MoonrakerSession(
             self.printer,
-            listener=JobTracker(self.printer, sink),
+            listener=JobTracker(self.printer, sink, report),
             url=self.url,
             socket=self.socket,
             api_key=self.api_key,
+            report=report,
         )
         await session.run()
 

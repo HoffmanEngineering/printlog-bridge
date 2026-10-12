@@ -12,12 +12,14 @@ from typing import Any
 
 import pytest
 from fake_moonraker import FakeMoonraker, eventually
-from session_helpers import Recorder, running
+from session_helpers import Recorder, ReportRecorder, running
 
 from printlog_bridge import __version__
 from printlog_bridge.adapters.moonraker.session import (
     Backoff,
     MoonrakerSession,
+    _JsonRpc,
+    bounded,
     websocket_url,
 )
 
@@ -378,3 +380,171 @@ def test_a_good_connection_resets_the_backoff():
     backoff = asyncio.run(scenario())
 
     assert backoff.next() == 0.01
+
+
+class TestStatusReport:
+    def test_reports_connecting_and_klippers_state(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker(klippy_state="startup") as (fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: report.named("printer_state"))
+                fake.klippy_state = "ready"
+                await fake.notify("notify_klippy_ready")
+                await eventually(lambda: len(report.named("printer_state")) >= 2)
+                fake.klippy_state = "shutdown"
+                await fake.notify("notify_klippy_shutdown")
+                await eventually(lambda: len(report.named("printer_state")) >= 3)
+            return report
+
+        report = asyncio.run(scenario())
+
+        assert report.calls[0] == ("connected",)
+        assert report.named("printer_state") == [
+            ("printer_state", "startup"),
+            ("printer_state", "ready"),
+            ("printer_state", "shutdown"),
+        ]
+
+    def test_reports_a_dropped_connection_and_the_reconnect(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker() as (fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: fake.subscriptions)
+                await fake.drop()
+                await eventually(lambda: len(report.named("connected")) >= 2)
+            return report
+
+        report = asyncio.run(scenario())
+
+        [(_, reason)] = report.named("disconnected")
+        assert "Moonraker" in reason
+        assert report.calls[-1][0] in ("connected", "printer_state")
+
+    def test_a_refusal_is_a_warning_saying_what_to_do(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker(api_key="secret") as (_fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: report.warnings)
+            return report
+
+        report = asyncio.run(scenario())
+
+        assert "moonraker_api_key" in report.warnings["moonraker"]
+        assert report.named("disconnected")
+
+    def test_the_warning_clears_once_connected(self):
+        async def scenario():
+            async with fake_moonraker() as (fake, base):
+                first = session_for(base, Recorder())
+                async with running(first) as first_task:
+                    await eventually(lambda: fake.subscriptions)
+                    report = ReportRecorder()
+                    async with running(session_for(base, Recorder(), report=report)):
+                        await eventually(lambda: report.warnings)
+                        during = dict(report.warnings)
+                        first_task.cancel()
+                        await eventually(lambda: report.named("connected"))
+                        await eventually(lambda: not report.warnings)
+            return during
+
+        during = asyncio.run(scenario())
+
+        assert "another printlog-bridge" in during["moonraker"]
+
+
+class SilentTransport:
+    """A connection that sends nothing back unless the test says so."""
+
+    def __init__(self) -> None:
+        self.closed = asyncio.Event()
+
+    async def send(self, message) -> None:
+        pass
+
+    async def receive(self):
+        await self.closed.wait()
+        return None
+
+    async def close(self) -> None:
+        self.closed.set()
+
+
+def test_a_call_cancelled_as_its_answer_arrives_is_still_cancelled():
+    """`asyncio.wait_for` before 3.12 returns the answer instead (bpo-42130), so a bridge told
+    to stop mid-call would carry on, holding Moonraker's one agent slot."""
+
+    async def scenario():
+        transport = SilentTransport()
+        rpc = _JsonRpc(transport)
+        try:
+            task = asyncio.ensure_future(rpc.call("server.info"))
+            await asyncio.sleep(0)  # the call is sent and waiting for its answer
+            rpc._dispatch({"jsonrpc": "2.0", "id": 1, "result": {"klippy_state": "ready"}})
+            task.cancel()  # in the same loop iteration as the answer
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            await rpc.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_call_with_no_answer_times_out(monkeypatch):
+    monkeypatch.setattr("printlog_bridge.adapters.moonraker.session.REQUEST_TIMEOUT_S", 0.05)
+
+    async def scenario():
+        rpc = _JsonRpc(SilentTransport())
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await rpc.call("server.info")
+            assert rpc._pending == {}
+        finally:
+            await rpc.close()
+
+    asyncio.run(scenario())
+
+
+class TestBounded:
+    def test_returns_the_result(self):
+        async def answer():
+            return 42
+
+        assert asyncio.run(bounded(answer(), 5)) == 42
+
+    def test_times_out(self):
+        async def never():
+            await asyncio.Event().wait()
+
+        async def scenario():
+            with pytest.raises(asyncio.TimeoutError):
+                await bounded(never(), 0.05)
+
+        asyncio.run(scenario())
+
+    def test_a_cancel_as_it_completes_is_still_a_cancel(self):
+        """Where `asyncio.wait_for` before 3.12 returns the result and drops the cancel."""
+
+        async def scenario():
+            gate = asyncio.get_running_loop().create_future()
+
+            async def connect():
+                return await gate
+
+            task = asyncio.ensure_future(bounded(connect(), 5))
+            await asyncio.sleep(0)  # connecting
+            gate.set_result("connection")
+            await asyncio.sleep(0)  # connected, but the caller hasn't been told yet
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())

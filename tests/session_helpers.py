@@ -35,6 +35,32 @@ class Recorder:
         self.history.append((action, job))
 
 
+class ReportRecorder:
+    """A PrinterReport that keeps everything it's told, in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.warnings: dict[str, str] = {}
+
+    def connected(self) -> None:
+        self.calls.append(("connected",))
+
+    def disconnected(self, reason: str) -> None:
+        self.calls.append(("disconnected", reason))
+
+    def printer_state(self, state: str) -> None:
+        self.calls.append(("printer_state", state))
+
+    def warn(self, topic: str, message: str | None) -> None:
+        if message is None:
+            self.warnings.pop(topic, None)
+        else:
+            self.warnings[topic] = message
+
+    def named(self, name: str) -> list[tuple[str, ...]]:
+        return [c for c in self.calls if c[0] == name]
+
+
 @contextlib.asynccontextmanager
 async def running(session: MoonrakerSession):
     task = asyncio.ensure_future(session.run())

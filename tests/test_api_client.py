@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 from aiohttp import web
@@ -191,3 +192,48 @@ class TestPrints:
         )
 
         assert listed == [{"userSettingTypeId": 1, "value": "Public"}]
+
+
+class TestConnections:
+    def test_put_connection_registers_under_the_instance_id(self):
+        seen = []
+
+        async def put(request):
+            seen.append((request.match_info["instance"], await request.json()))
+            return web.json_response({"instanceId": request.match_info["instance"]}, status=201)
+
+        body = {"kind": "moonraker", "displayName": "printlog-bridge (voron)", "printerId": 42}
+        answer = serve(
+            [("PUT", "/api/Connections/{instance}", put)],
+            lambda c: c.put_connection("abc-123", body),
+        )
+
+        assert seen == [("abc-123", body)]
+        assert answer == {"instanceId": "abc-123"}
+
+
+class TestServerClock:
+    def test_remembers_the_apis_clock_from_its_last_answer(self):
+        async def me(_request):
+            return web.json_response({"id": 7}, headers={"Date": "Sat, 10 Oct 2026 09:30:00 GMT"})
+
+        async def ask(client):
+            assert client.server_time is None
+            await client.current_user()
+            return client.server_time
+
+        assert serve([("GET", "/api/Users/me", me)], ask) == datetime(
+            2026, 10, 10, 9, 30, tzinfo=timezone.utc
+        )
+
+    def test_an_answer_without_a_date_leaves_it_unknown(self):
+        async def me(_request):
+            response = web.json_response({"id": 7})
+            response.headers["Date"] = "not a date"
+            return response
+
+        async def ask(client):
+            await client.current_user()
+            return client.server_time
+
+        assert serve([("GET", "/api/Users/me", me)], ask) is None

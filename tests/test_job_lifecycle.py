@@ -116,3 +116,20 @@ def test_a_print_cut_short_by_a_moonraker_restart_is_failed_with_a_note(tmp_path
 
     assert print_["status"] == 5
     assert print_["notes"] == "Moonraker stopped during the print"
+
+
+def test_a_print_links_to_the_connection_that_logged_it(tmp_path):
+    async def scenario():
+        async with fakes() as (moonraker, moonraker_url, api, api_url):
+            async with bridge(write_config(tmp_path, moonraker_url, api_url), moonraker):
+                await moonraker.start_job("benchy.gcode", METADATA)
+                await eventually(lambda: api.prints)
+            return api.prints[1], api.connections
+
+    print_, connections = asyncio.run(scenario())
+
+    [connection] = connections.values()
+    assert print_["connectionId"] == connection["id"]
+    assert connection["displayName"] == "printlog-bridge (voron)"
+    assert connection["kind"] == "moonraker"
+    assert connection["printerId"] == 42

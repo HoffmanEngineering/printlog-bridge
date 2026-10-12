@@ -7,8 +7,10 @@ import logging
 
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.config import API_KEY_ENV, BridgeConfig, ConfigError
+from printlog_bridge.core.connections import HEARTBEAT_INTERVAL_S, Connection, Heartbeat
 from printlog_bridge.core.doctor import API_KEYS_PAGE, PRINTERS_PAGE
 from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter
+from printlog_bridge.core.status import TOUCH_INTERVAL_S, StatusBoard
 
 log = logging.getLogger(__name__)
 
@@ -29,24 +31,66 @@ def check_runnable(config: BridgeConfig) -> None:
             )
 
 
-async def run_bridge(config: BridgeConfig) -> None:
-    """Runs every printer's adapter until cancelled, logging their jobs to the API."""
+async def run_bridge(
+    config: BridgeConfig,
+    *,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL_S,
+    touch_interval: float = TOUCH_INTERVAL_S,
+) -> None:
+    """Runs every printer's adapter until cancelled, logging their jobs to the API.
+
+    Registers each printer's connection and keeps it alive, and keeps `status.json` in the state
+    directory up to date for `printlog-bridge status`.
+    """
     check_runnable(config)
     assert config.api_key is not None  # check_runnable made sure
 
-    async with ApiClient(config.api_url, config.api_key) as api:
-        sink = JobLogger(
-            api,
-            {
-                p.name: LoggedPrinter(printer_id=p.printer_id, source=p.adapter.name)
-                for p in config.printers
-                if p.printer_id is not None
-            },
-            config.state_dir,
-        )
-        for printer in config.printers:
-            log.info(
-                "[printer %s] watching: %s, logging to printer %s",
-                printer.name, printer.adapter.describe(), printer.printer_id,
-            )  # fmt: skip
-        await asyncio.gather(*(printer.adapter.run(sink) for printer in config.printers))
+    board = StatusBoard(config.state_dir)
+    board.start([p.name for p in config.printers])
+    try:
+        async with ApiClient(config.api_url, config.api_key) as api:
+            sink = JobLogger(
+                api,
+                {
+                    p.name: LoggedPrinter(printer_id=p.printer_id, source=p.adapter.name)
+                    for p in config.printers
+                    if p.printer_id is not None
+                },
+                config.state_dir,
+                board=board,
+            )
+            heartbeat = Heartbeat(
+                api,
+                [
+                    Connection(
+                        printer=p.name,
+                        instance_id=sink.state(p.name).instance_id,
+                        kind=p.adapter.name,
+                        printer_id=p.printer_id,
+                    )
+                    for p in config.printers
+                    if p.printer_id is not None
+                ],
+                board,
+                interval=heartbeat_interval,
+            )
+            sink.before_create = heartbeat.ensure_registered
+            for printer in config.printers:
+                log.info(
+                    "[printer %s] watching: %s, logging to printer %s",
+                    printer.name, printer.adapter.describe(), printer.printer_id,
+                )  # fmt: skip
+            await asyncio.gather(
+                heartbeat.run(),
+                _keep_touching(board, touch_interval),
+                *(p.adapter.run(sink, board.printer(p.name)) for p in config.printers),
+            )
+    finally:
+        board.stopped()
+
+
+async def _keep_touching(board: StatusBoard, interval: float) -> None:
+    """Rewrites the status file now and then, so `status` can tell the bridge is still up."""
+    while True:
+        await asyncio.sleep(interval)
+        board.touch()
