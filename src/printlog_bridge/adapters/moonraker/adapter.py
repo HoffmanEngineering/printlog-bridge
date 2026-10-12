@@ -1,7 +1,7 @@
 """Klipper printers, through Moonraker.
 
 Local mode talks to Moonraker's Unix socket on the printer's own host. Remote mode talks to it
-over the network, for locked-down printers (Snapmaker U1, Creality K2) where nothing can be
+over the network, for locked-down printers (such as the Snapmaker U1) where nothing can be
 installed on the printer itself.
 """
 

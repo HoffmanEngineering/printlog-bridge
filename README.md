@@ -2,7 +2,7 @@
 
 An open-source bridge agent that watches Klipper/Moonraker printers and logs every print to [3D Print Log](https://www.3dprintlog.com) automatically: real outcome, duration, per-spool filament usage and a picture, with no manual entry and no printer config edits.
 
-It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1 and Creality K2.
+It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1.
 
 > Status: early development. `run` logs each print when it starts and completes it when it ends, with its outcome, duration and filament used, adds the slicer's thumbnail and a webcam snapshot, and keeps what it can't send yet until 3D Print Log is reachable again. On a multi-tool printer the filament is split per tool. See the [issues](https://github.com/HoffmanEngineering/printlog-bridge/issues) and milestones for the roadmap.
 
@@ -42,6 +42,8 @@ One container watches every printer in its config over the network, through each
 | `latest`, `1.2`, `1.2.3` | releases |
 | `edge` | the newest commit on `main` |
 
+There's no release yet, so only `edge` exists for now; the examples below use it. Switch to `latest` once there is one.
+
 Everything the bridge keeps is in one folder, mounted at `/data`:
 
 | Path | What it is |
@@ -70,7 +72,7 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
    printer_id = 42
    url = http://192.168.1.51:7125
 
-   [printer k2]
+   [printer infimech]
    printer_id = 43
    url = http://192.168.1.52:7125
    ```
@@ -94,7 +96,7 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
    - Store it in the folder, where only that user can read it. Over SSH:
      ```sh
      sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
-       ghcr.io/hoffmanengineering/printlog-bridge store-key
+       ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
      ```
    - Or add `PRINTLOG_API_KEY: <key>` under `environment:`. That's simpler, but anyone who can manage containers on the NAS can read it in the container's settings.
 6. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge status`). Over SSH:
@@ -113,7 +115,7 @@ The same `docker-compose.yml` works after changing the folder (`/mnt/user/appdat
 ```sh
 docker run -d --name printlog-bridge --restart unless-stopped \
   -e TZ=Europe/Berlin -v "$PWD/printlog-bridge:/data" \
-  ghcr.io/hoffmanengineering/printlog-bridge
+  ghcr.io/hoffmanengineering/printlog-bridge:edge
 docker exec printlog-bridge printlog-bridge doctor
 ```
 
