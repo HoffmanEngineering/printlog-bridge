@@ -251,7 +251,7 @@ def test_status_of_a_running_bridge(tmp_path):
     assert "Printer voron (printer 42 in 3D Print Log)" in text
     assert "Connection: connected for 3m 40s (fake, remote http://voron:7125)" in text
     assert "Printer state: ready" in text
-    assert "Pairing: not paired; logging with the API key in [bridge]" in text
+    assert "Pairing: not paired; API key from api_key in [bridge] of " in text
     assert "Last event: job 00000A started: print 17, 'Benchy' (40s ago)" in text
     assert "Heartbeat: 3m 40s ago" in text
     assert "Outbox: empty" in text

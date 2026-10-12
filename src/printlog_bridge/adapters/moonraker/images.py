@@ -25,6 +25,8 @@ log = logging.getLogger(__name__)
 
 FETCH_TIMEOUT_S = 10.0
 MOONRAKER_PORT = 7125
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+"""Thumbnails are read only from files named as pictures, so no G-code is ever read."""
 THUMBNAILS_TRIED = 3
 """How many thumbnails to try, largest first, when one can't be read."""
 
@@ -83,6 +85,13 @@ class MoonrakerImages:
         problem: ImageUnavailable | None = None
         for candidate in largest_first(thumbnails or [])[:THUMBNAILS_TRIED]:
             path = _thumbnail_path(filename, str(candidate["relative_path"]))
+            if path is not None and not path.lower().endswith(IMAGE_EXTENSIONS):
+                # Never the G-code itself, or any other file: only pictures are read.
+                log.warning(
+                    "[printer %s] ignoring a thumbnail that isn't a picture: %r",
+                    self.printer, candidate["relative_path"],
+                )  # fmt: skip
+                continue
             if path is None:
                 log.warning(
                     "[printer %s] ignoring a thumbnail outside the gcodes folder: %r",

@@ -2,7 +2,7 @@
 
 ```ini
 [bridge]
-api_key = ...            ; or set PRINTLOG_API_KEY
+api_key = ...            ; better: `printlog-bridge store-key` (see below), or PRINTLOG_API_KEY
 api_url = https://api.3dprintlog.com
 state_dir = ~/.local/share/printlog-bridge
 
@@ -11,14 +11,25 @@ printer_id = 42          ; the printer in 3D Print Log (from its page's URL)
 adapter = moonraker      ; the default
 url = http://voron.local:7125
 ```
+
+The API key is looked up in this order: the `PRINTLOG_API_KEY` environment variable, the key
+file `<state_dir>/api_key` (which `printlog-bridge store-key` and install.sh write, mode 600),
+then `api_key` in `[bridge]`. In local mode the config sits in Klipper's config folder, which
+Moonraker serves to anyone who can open Mainsail or Fluidd, so the key file is the default.
 """
 
 from __future__ import annotations
 
 import configparser
+import contextlib
+import ipaddress
 import os
+import re
+import shutil
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -29,6 +40,8 @@ DEFAULT_ADAPTER = "moonraker"
 CONFIG_FILE_NAME = "printlog-bridge.cfg"
 
 API_KEY_ENV = "PRINTLOG_API_KEY"
+API_KEY_FILE = "api_key"
+"""The key file's name in the state directory."""
 CONFIG_PATH_ENV = "PRINTLOG_BRIDGE_CONFIG"
 
 PRINTER_PREFIX = "printer"
@@ -46,6 +59,12 @@ class PrinterConfig:
     """The printer's id in 3D Print Log, which its prints are logged to. Pairing will set it."""
 
 
+class ApiKeySource(Enum):
+    ENVIRONMENT = "environment"
+    KEY_FILE = "key file"
+    CONFIG = "config"
+
+
 @dataclass(frozen=True)
 class BridgeConfig:
     path: Path
@@ -53,6 +72,22 @@ class BridgeConfig:
     api_key: str | None
     state_dir: Path
     printers: Sequence[PrinterConfig]
+    api_key_source: ApiKeySource | None = None
+    """Where `api_key` came from, or None without one."""
+    config_api_key: str | None = None
+    """`api_key` in `[bridge]`, even when another source wins: doctor warns about it."""
+
+    @property
+    def api_key_file(self) -> Path:
+        return self.state_dir / API_KEY_FILE
+
+    def describe_api_key(self) -> str:
+        """Where the key in use came from, for `doctor` and `status`."""
+        if self.api_key_source is ApiKeySource.ENVIRONMENT:
+            return f"the {API_KEY_ENV} environment variable"
+        if self.api_key_source is ApiKeySource.KEY_FILE:
+            return str(self.api_key_file)
+        return f"api_key in [bridge] of {self.path}"
 
 
 def find_config(explicit: Path | None, env: Mapping[str, str], home: Path) -> Path:
@@ -91,11 +126,7 @@ def load_config(
 
     bridge = parser["bridge"] if parser.has_section("bridge") else {}
 
-    api_url = bridge.get("api_url", DEFAULT_API_URL).strip().rstrip("/")
-    if urlparse(api_url).scheme not in ("http", "https"):
-        raise ConfigError(f"[bridge] api_url must be an http(s) URL, not {api_url!r}")
-
-    api_key = (env.get(API_KEY_ENV) or bridge.get("api_key") or "").strip() or None
+    api_url = _api_url(bridge.get("api_url", DEFAULT_API_URL))
 
     state_dir_option = bridge.get("state_dir", "").strip()
     state_dir = (
@@ -103,6 +134,9 @@ def load_config(
         if state_dir_option
         else home / ".local" / "share" / "printlog-bridge"
     )
+
+    config_api_key = (bridge.get("api_key") or "").strip() or None
+    api_key, source = _api_key(env, state_dir / API_KEY_FILE, config_api_key)
 
     printers = [
         _load_printer(section, parser[section], adapters)
@@ -112,7 +146,69 @@ def load_config(
     if not printers:
         raise ConfigError(f"{path}: no [printer <name>] section, so there is nothing to watch")
 
-    return BridgeConfig(path, api_url, api_key, state_dir, printers)
+    return BridgeConfig(path, api_url, api_key, state_dir, printers, source, config_api_key)
+
+
+def _api_url(value: str) -> str:
+    """3D Print Log's address. Plain http is refused except to this computer itself (a test
+    server, or a proxy on the same host), so the key and the prints only ever travel over TLS."""
+    api_url = value.strip().rstrip("/")
+    parsed = urlparse(api_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ConfigError(f"[bridge] api_url must be an https URL, not {api_url!r}")
+    if parsed.scheme == "http" and not _is_loopback(parsed.hostname):
+        raise ConfigError(
+            f"[bridge] api_url must use https, not {api_url!r}: the API key and your prints "
+            "are never sent unencrypted. (Plain http is allowed only to this computer.)"
+        )
+    return api_url
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _api_key(
+    env: Mapping[str, str], key_file: Path, config_api_key: str | None
+) -> tuple[str | None, ApiKeySource | None]:
+    from_env = (env.get(API_KEY_ENV) or "").strip()
+    if from_env:
+        return from_env, ApiKeySource.ENVIRONMENT
+    from_file = read_key_file(key_file)
+    if from_file:
+        return from_file, ApiKeySource.KEY_FILE
+    if config_api_key:
+        return config_api_key, ApiKeySource.CONFIG
+    return None, None
+
+
+def read_key_file(path: Path) -> str | None:
+    """The key in a key file, or None when there is none."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None  # no state directory yet, or a broken one: doctor's own check says so
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"can't read the API key file {path} ({API_KEY_FILE}): {e}") from None
+    return text.strip() or None
+
+
+def write_key_file(path: Path, key: str) -> None:
+    """Writes the key file so only this user can read it (mode 600), replacing any earlier key in
+    one step. A state directory it has to make is made mode 700."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with contextlib.suppress(FileNotFoundError):
+        temporary.unlink()
+    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        f.write(key.strip() + "\n")
+    os.replace(str(temporary), str(path))
 
 
 def _load_printer(
@@ -156,3 +252,38 @@ def _expand(value: str, home: Path) -> Path:
     if value == "~" or value.startswith("~/"):
         return home / value[2:]
     return Path(os.path.expandvars(value))
+
+
+_SECTION = re.compile(r"^\s*\[([^\]]*)\]")
+_API_KEY_LINE = re.compile(r"^(\s*)api_key\s*[=:]", re.IGNORECASE)  # configparser ignores case
+
+
+def clear_config_api_key(path: Path) -> bool:
+    """Empties `api_key` in the config's `[bridge]` section, leaving every other line (and its
+    line ending) as it was. True when there was a line to empty."""
+    with path.open(encoding="utf-8", newline="") as f:
+        lines = f.readlines()
+    section = None
+    changed = False
+    for i, line in enumerate(lines):
+        header = _SECTION.match(line)
+        if header:
+            section = header.group(1).strip()
+            continue
+        match = _API_KEY_LINE.match(line) if section == "bridge" else None
+        if match:
+            ending = line[len(line.rstrip("\r\n")) :]
+            lines[i] = f"{match.group(1)}api_key ={ending}"
+            changed = True
+    if changed:
+        fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.writelines(lines)
+            shutil.copymode(str(path), temporary)
+            os.replace(temporary, str(path))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
+    return changed

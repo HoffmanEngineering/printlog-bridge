@@ -80,7 +80,8 @@ class Heartbeat:
         except AuthRejected:
             problem = (
                 "3D Print Log rejected the API key, so the printer shows as offline and its jobs "
-                "aren't logged. Check api_key in [bridge], then restart the bridge."
+                "aren't logged. Check the key with `printlog-bridge doctor` "
+                "(`printlog-bridge store-key` replaces it), then restart the bridge."
             )
             log.error("[printer %s] %s", printer, problem)
         except ApiRejected as e:

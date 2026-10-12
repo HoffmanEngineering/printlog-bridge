@@ -379,11 +379,11 @@ class JobLogger:
             else:
                 await self._send_finish(entry)
         except AuthRejected:
-            problem = "3D Print Log rejected the API key (api_key in [bridge])"
+            problem = "3D Print Log rejected the API key (printlog-bridge doctor checks it)"
             log.error(
                 "[printer %s] the 3D Print Log API rejected the API key, so job %s isn't "
-                "logged yet. It stays in the outbox: check api_key in [bridge], then restart "
-                "the bridge.",
+                "logged yet. It stays in the outbox: check the key with `printlog-bridge "
+                "doctor` (`printlog-bridge store-key` replaces it), then restart the bridge.",
                 entry.printer, entry.job_id,
             )  # fmt: skip
             self.outbox.failed(entry.seq, problem)

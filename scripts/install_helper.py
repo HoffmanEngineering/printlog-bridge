@@ -3,7 +3,8 @@ with the system's python3, after the bridge's virtualenv may be gone.
 
     install_helper.py moonraker-add --conf C --asvc A --record R --repo DIR --venv DIR --origin URL
     install_helper.py moonraker-remove --conf C --asvc A --record R
-    install_helper.py write-config --path P --printer-data DIR --name NAME [--printer-id N]
+    install_helper.py write-config --path P --printer-data DIR --name NAME --key-file F
+                                   [--printer-id N]
 
 `moonraker-add` appends an `[update_manager printlog-bridge]` section to moonraker.conf, between
 two marker comments, and `printlog-bridge` to moonraker.asvc, so Mainsail and Fluidd can update
@@ -12,7 +13,9 @@ that record to put both files back exactly as they were, byte for byte. Without 
 still removes the marked section and the service line.
 
 `write-config` writes a local-mode printlog-bridge.cfg, unless one exists. The API key comes from
-the PRINTLOG_API_KEY environment variable, never from the command line, where `ps` shows it.
+the PRINTLOG_API_KEY environment variable, never from the command line, where `ps` shows it, and
+goes to the key file (in the bridge's state directory, mode 600), never into printlog-bridge.cfg:
+Moonraker serves Klipper's config folder to anyone who can open Mainsail or Fluidd.
 """
 
 from __future__ import annotations
@@ -106,7 +109,7 @@ def printer_name(host: str) -> str:
     return name or "printer"
 
 
-def config_text(*, printer_data: str, name: str, api_key: str, printer_id: str) -> str:
+def config_text(*, printer_data: str, name: str, key_file: str, printer_id: str) -> str:
     return f"""\
 # printlog-bridge config, written by install.sh. Every option is in
 # https://github.com/HoffmanEngineering/printlog-bridge/blob/main/printlog-bridge.example.cfg
@@ -114,8 +117,9 @@ def config_text(*, printer_data: str, name: str, api_key: str, printer_id: str) 
 # or Fluidd, or: sudo systemctl restart printlog-bridge).
 
 [bridge]
-# A personal API key from https://www.3dprintlog.com/api-keys. Pairing will replace this.
-api_key = {api_key}
+# The API key isn't kept here: Moonraker lets anyone who can open Mainsail or Fluidd download
+# this file. It is in {key_file}, which only you can read.
+# To set or change it, run: ~/printlog-bridge-env/bin/printlog-bridge store-key
 
 # Local mode: the bridge runs on the printer's own host, next to Moonraker.
 [printer {name}]
@@ -217,16 +221,36 @@ def moonraker_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def write_key_file(path: Path, key: str) -> None:
+    """The bridge's key file: mode 600, in a folder made mode 700. As the bridge's own
+    `write_key_file`, which this can't import: it runs with the system's python3."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        os.chmod(temporary, 0o600)  # mkstemp makes it 600 already; this says so
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(key + "\n")
+        os.replace(temporary, str(path))
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+
+
 def write_config(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     path = Path(args.path)
     if path.exists():
+        # Its state_dir, and so its key file, may be elsewhere: `store-key` sets the key then.
         print("exists")
         return 0
+    key = env.get(API_KEY_ENV, "").strip()
+    if key:
+        write_key_file(Path(args.key_file), key)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = config_text(
         printer_data=args.printer_data,
         name=printer_name(args.name),
-        api_key=env.get(API_KEY_ENV, "").strip(),
+        key_file=args.key_file,
         printer_id=(args.printer_id or "").strip(),
     )
     _write(path, text)
@@ -250,6 +274,7 @@ def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None
     config.add_argument("--path", required=True)
     config.add_argument("--printer-data", required=True)
     config.add_argument("--name", required=True)
+    config.add_argument("--key-file", required=True)
     config.add_argument("--printer-id")
 
     args = parser.parse_args(argv)

@@ -8,6 +8,7 @@ import pytest
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.config import (
     DEFAULT_API_URL,
+    ApiKeySource,
     ConfigError,
     find_config,
     load_config,
@@ -222,3 +223,58 @@ def test_the_example_config_loads(tmp_path):
     assert [p.name for p in config.printers] == ["voron"]
     assert config.api_key is None
     assert config.api_url == DEFAULT_API_URL
+
+
+class TestApiKeyFile:
+    """The key can be kept in `<state_dir>/api_key`, out of the folder Moonraker serves."""
+
+    def write(self, tmp_path: Path, key_file: str | None, bridge: str = "") -> Path:
+        state = tmp_path / "state"
+        state.mkdir()
+        if key_file is not None:
+            (state / "api_key").write_text(key_file, encoding="utf-8")
+        return write(
+            tmp_path, f"[bridge]\nstate_dir = {state}\n{bridge}[printer voron]\nadapter = fake\n"
+        )
+
+    def test_is_read_from_the_state_directory(self, tmp_path):
+        config = load(self.write(tmp_path, "from-key-file\n"))
+
+        assert config.api_key == "from-key-file"
+        assert config.api_key_source is ApiKeySource.KEY_FILE
+        assert config.api_key_file == tmp_path / "state" / "api_key"
+
+    def test_wins_over_a_key_in_the_config(self, tmp_path):
+        config = load(self.write(tmp_path, "from-key-file", "api_key = inline\n"))
+
+        assert config.api_key == "from-key-file"
+
+    def test_the_environment_wins_over_it(self, tmp_path):
+        config = load(self.write(tmp_path, "from-key-file"), env={"PRINTLOG_API_KEY": "env"})
+
+        assert config.api_key == "env"
+        assert config.api_key_source is ApiKeySource.ENVIRONMENT
+
+    def test_a_key_in_the_config_still_works(self, tmp_path):
+        config = load(self.write(tmp_path, None, "api_key = inline\n"))
+
+        assert config.api_key == "inline"
+        assert config.api_key_source is ApiKeySource.CONFIG
+
+    def test_an_empty_key_file_counts_as_missing(self, tmp_path):
+        config = load(self.write(tmp_path, "\n", "api_key = inline\n"))
+
+        assert config.api_key == "inline"
+
+    def test_no_key_anywhere(self, tmp_path):
+        config = load(self.write(tmp_path, None))
+
+        assert config.api_key is None
+        assert config.api_key_source is None
+
+    def test_an_unreadable_key_file_is_a_config_error(self, tmp_path):
+        path = self.write(tmp_path, None)
+        (tmp_path / "state" / "api_key").mkdir()
+
+        with pytest.raises(ConfigError, match="api_key"):
+            load(path)

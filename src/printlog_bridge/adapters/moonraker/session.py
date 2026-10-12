@@ -21,6 +21,7 @@ from urllib.parse import urlparse, urlunparse
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.core.images import mask_url, scrub_url
 from printlog_bridge.core.status import NullReport, PrinterReport
 
 log = logging.getLogger(__name__)
@@ -104,7 +105,7 @@ async def fetch_server_info(
         return await rpc.call("server.info")
     except MoonrakerRpcError as e:
         if e.is_auth_failure:
-            raise rejection(printer, url or str(socket), e.message) from e
+            raise rejection(printer, where(url, socket), e.message) from e
         raise
     finally:
         await rpc.close()
@@ -116,10 +117,16 @@ async def _open_transport(
 ) -> _Transport:
     if socket is not None:
         return await _UnixTransport.open(socket)
-    target = url or ""
     return await _WebSocketTransport.open(
-        websocket_url(target), api_key, lambda detail: rejection(printer, target, detail)
+        websocket_url(url or ""),
+        api_key,
+        lambda detail: rejection(printer, where(url, None), detail),
     )
+
+
+def where(url: str | None, socket: Path | None) -> str:
+    """Moonraker's address as shown to the user: its URL without any password or token."""
+    return mask_url(url) if url is not None else str(socket)
 
 
 class ConnectionLost(Exception):
@@ -184,7 +191,7 @@ class MoonrakerSession:
 
     @property
     def where(self) -> str:
-        return self.url if self.url is not None else str(self.socket)
+        return where(self.url, self.socket)
 
     async def run(self) -> None:
         """Stays connected until cancelled, reconnecting with backoff whenever the link drops."""
@@ -204,7 +211,7 @@ class MoonrakerSession:
                     log.warning("[printer %s] %s", self.printer, e)
                 self.report.warn(WARNING_TOPIC, reason)
             except (ConnectionLost, MoonrakerRpcError, aiohttp.ClientError, OSError) as e:
-                reason = f"Moonraker at {self.where}: {_why(e)}"
+                reason = f"Moonraker at {self.where}: {scrub_url(e, self.url)}"
                 log.warning("[printer %s] %s", self.printer, reason)
             except asyncio.TimeoutError:
                 reason = f"Moonraker at {self.where} didn't answer"

@@ -46,7 +46,9 @@ Options:
   -y, --yes                 don't ask anything; fill in the config afterwards
   -h, --help                show this
 
-The API key is asked for, or taken from PRINTLOG_API_KEY. It is never taken from the command line.
+The API key is asked for, or taken from PRINTLOG_API_KEY. It is never taken from the command line,
+and is stored in ~/.local/share/printlog-bridge/api_key (mode 600), not in printlog-bridge.cfg,
+which Moonraker serves to anyone who can open Mainsail or Fluidd.
 EOF
 }
 
@@ -75,6 +77,9 @@ parse_args() {
     MOONRAKER_CONF="${PRINTER_DATA}/config/moonraker.conf"
     MOONRAKER_ASVC="${PRINTER_DATA}/moonraker.asvc"
     RECORD="${REPO_DIR}/.install-record.json"
+    # The API key goes here, not in printlog-bridge.cfg: Moonraker serves the config folder to
+    # anyone who can open Mainsail or Fluidd. The bridge's default state directory.
+    KEY_FILE="${HOME}/.local/share/printlog-bridge/api_key"
 }
 
 check_system() {
@@ -135,10 +140,13 @@ write_config() {
     result="$(
         "$PYTHON" "${REPO_DIR}/scripts/install_helper.py" write-config \
             --path "$CONFIG" --printer-data "$PRINTER_DATA" --name "$name" \
-            ${PRINTER_ID:+--printer-id "$PRINTER_ID"}
+            --key-file "$KEY_FILE" ${PRINTER_ID:+--printer-id "$PRINTER_ID"}
     )"
     if [ "$result" = created ]; then
         say "Wrote ${CONFIG}"
+        if [ -s "$KEY_FILE" ]; then
+            say "Stored the API key in ${KEY_FILE} (only you can read it)"
+        fi
     else
         say "Keeping ${CONFIG}"
     fi
@@ -207,20 +215,30 @@ start_service() {
 }
 
 finish() {
-    local bin="${VENV}/bin/printlog-bridge"
+    local bin="${VENV}/bin/printlog-bridge" has_key=0 has_printer=0
     echo
-    if grep -Eq '^api_key[[:space:]]*=[[:space:]]*[^[:space:]]' "$CONFIG" &&
-        grep -Eq '^printer_id[[:space:]]*=[[:space:]]*[0-9]' "$CONFIG"; then
+    # A key in the config (an older install) still works; doctor says how to move it.
+    if [ -s "$KEY_FILE" ] || grep -Eq '^api_key[[:space:]]*=[[:space:]]*[^[:space:]]' "$CONFIG"; then
+        has_key=1
+    fi
+    if grep -Eq '^printer_id[[:space:]]*=[[:space:]]*[0-9]' "$CONFIG"; then
+        has_printer=1
+    fi
+    if [ "$has_key" = 1 ] && [ "$has_printer" = 1 ]; then
         say "Checking the setup"
         "$bin" doctor --config "$CONFIG" || true
         echo
         say "printlog-bridge is installed and running. Its status: ${bin} status"
     else
         say "printlog-bridge is installed. To start logging prints:"
-        echo "  1. Edit ${CONFIG} (in Mainsail or Fluidd, under Machine):"
-        echo "     set api_key (from ${API_KEYS_PAGE}) and printer_id."
-        echo "  2. Restart printlog-bridge there, or: sudo systemctl restart ${SERVICE}"
-        echo "  3. Check it: ${bin} doctor"
+        if [ "$has_key" = 0 ]; then
+            echo "  - Store an API key from ${API_KEYS_PAGE}: ${bin} store-key"
+        fi
+        if [ "$has_printer" = 0 ]; then
+            echo "  - Set printer_id in ${CONFIG} (in Mainsail or Fluidd, under Machine)."
+        fi
+        echo "  Then restart printlog-bridge there, or: sudo systemctl restart ${SERVICE}"
+        echo "  Check it with: ${bin} doctor"
     fi
 }
 

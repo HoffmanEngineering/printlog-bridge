@@ -19,8 +19,8 @@ def check_runnable(config: BridgeConfig) -> None:
     """What `run` needs beyond a valid config. Raises ConfigError saying what to set."""
     if config.api_key is None:
         raise ConfigError(
-            f"no API key. Create one at {API_KEYS_PAGE}, then set api_key in [bridge] "
-            f"or the {API_KEY_ENV} environment variable."
+            f"no API key. Create one at {API_KEYS_PAGE}, then run `printlog-bridge store-key` "
+            f"to store it (or set the {API_KEY_ENV} environment variable)."
         )
     for printer in config.printers:
         if printer.printer_id is None:

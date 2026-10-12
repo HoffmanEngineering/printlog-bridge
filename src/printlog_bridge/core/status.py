@@ -259,7 +259,8 @@ def _printer_lines(printer, known, running: bool, config: BridgeConfig, now: dat
     lines = [f"Connection: {connection}"]
     if running and known.get("printer_state"):
         lines.append(f"Printer state: {known['printer_state']}")
-    lines.append("Pairing: not paired; logging with the API key in [bridge]")
+    key = f"API key from {config.describe_api_key()}" if config.api_key else "no API key"
+    lines.append(f"Pairing: not paired; {key}")
 
     if known.get("last_event"):
         lines.append(f"Last event: {known['last_event']} ({_ago(now, known['last_event_at'])} ago)")
