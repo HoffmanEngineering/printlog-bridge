@@ -197,7 +197,13 @@ def read_key_file(path: Path) -> str | None:
         return None  # no state directory yet, or a broken one: doctor's own check says so
     except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"can't read the API key file {path} ({API_KEY_FILE}): {e}") from None
-    return text.strip() or None
+    return clean_key(text) or None
+
+
+def clean_key(text: str) -> str:
+    """A key as typed, piped or saved, without surrounding whitespace or a leading UTF-8 byte
+    order mark (PowerShell can put one at the start of what it pipes; editors may save one)."""
+    return text.strip().removeprefix("﻿").strip()
 
 
 def write_key_file(path: Path, key: str) -> None:
@@ -209,7 +215,7 @@ def write_key_file(path: Path, key: str) -> None:
         temporary.unlink()
     fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        f.write(key.strip() + "\n")
+        f.write(clean_key(key) + "\n")
     os.replace(str(temporary), str(path))
 
 

@@ -21,7 +21,7 @@ RUN /opt/printlog-bridge/bin/pip install -r /src/requirements.txt
 COPY pyproject.toml README.md LICENSE /src/
 COPY src /src/src
 RUN /opt/printlog-bridge/bin/pip install --no-deps /src \
-    && /opt/printlog-bridge/bin/pip uninstall -y pip setuptools wheel || true
+    && { /opt/printlog-bridge/bin/pip uninstall -y pip setuptools wheel || true; }
 
 FROM python:${PYTHON_VERSION}-slim-bookworm
 LABEL org.opencontainers.image.title="printlog-bridge" \

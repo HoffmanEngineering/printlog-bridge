@@ -123,3 +123,37 @@ def test_says_so_when_the_key_line_can_not_be_found(tmp_path, monkeypatch, capsy
     assert main(["store-key", "--config", str(path)]) == 1
 
     assert "Delete it there yourself" in capsys.readouterr().err
+
+
+def test_a_byte_order_mark_piped_in_is_not_stored(tmp_path, monkeypatch):
+    # PowerShell can start what it pipes with a UTF-8 BOM, which the API would refuse.
+    path = write_config(tmp_path, "")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\ufeff k-new \r\n"))
+
+    assert main(["store-key", "--config", str(path)]) == 0
+
+    assert (tmp_path / "state" / "api_key").read_bytes() == b"k-new\n"
+    assert load(path).api_key == "k-new"
+
+
+def test_a_key_file_saved_with_a_byte_order_mark_still_works(tmp_path):
+    path = write_config(tmp_path, "")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "api_key").write_bytes(b"\xef\xbb\xbfk-saved\r\n")
+
+    assert load(path).api_key == "k-saved"
+
+
+def test_run_says_when_it_cant_write_the_state_directory(tmp_path, capsys):
+    (tmp_path / "taken").write_text("", encoding="utf-8")
+    path = tmp_path / "printlog-bridge.cfg"
+    path.write_text(
+        f"[bridge]\nstate_dir = {tmp_path / 'taken' / 'state'}\napi_key = k\n{PRINTERS}",
+        encoding="utf-8",
+    )
+
+    assert main(["run", "--config", str(path)]) == 2
+
+    err = capsys.readouterr().err
+    assert "can't write the state directory" in err
+    assert "/data" in err
