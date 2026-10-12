@@ -202,6 +202,9 @@ class JobLogger:
             if job is None:
                 start = asdict(event)
                 start["started_at"] = event.started_at.isoformat()
+                start["estimated_filament_g_by_slot"] = {
+                    str(slot): grams for slot, grams in event.estimated_filament_g_by_slot.items()
+                }  # as JSON keeps it
                 job = state.jobs[event.job_id] = JobRecord(
                     started_at=start["started_at"], start=start
                 )
@@ -580,9 +583,9 @@ class JobLogger:
             body["estimatedPrintTimeInSeconds"] = round(start["estimated_duration_s"])
         if start.get("estimated_filament_g"):
             body["estimatedFilamentUsageMg"] = round(start["estimated_filament_g"] * 1000)
-        row = _estimate_row(start)
-        if row:
-            body["filamentUsage"] = [row]
+        rows = _estimate_rows(start)
+        if rows:
+            body["filamentUsage"] = rows
 
         print_, _ = await self.api.create_print(body)
         job.print_id = int(print_["id"])
@@ -729,28 +732,68 @@ def _seconds(delay: float) -> str:
     return f"{delay:.0f}s" if delay >= 1 else f"{delay:.2f}s"
 
 
-def _estimate_row(start: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The slicer's estimate as a usage row for slot 0, which completing fills in."""
+def _estimate_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The slicer's estimate as usage rows, one per slot, which completing fills in.
+
+    A file with a weight per tool gets a row for each tool it uses, by weight. Otherwise (one
+    filament, or one tool used) the totals are one row, by length when the slicer gave one.
+    """
+    estimated = start.get("estimated_filament_g_by_slot") or {}
+    by_slot = {int(slot): grams for slot, grams in estimated.items()}
+    if len(by_slot) > 1:
+        return [
+            {"slot": slot, "estimatedAmountMg": round(grams * 1000), "estimatedSource": WEIGHT}
+            for slot, grams in sorted(by_slot.items())
+        ]
     mm, grams = start.get("estimated_filament_mm"), start.get("estimated_filament_g")
     if not mm and not grams:
-        return None
-    row: dict[str, Any] = {"slot": 0, "estimatedSource": LENGTH if mm else WEIGHT}
+        return []
+    row: dict[str, Any] = {
+        "slot": next(iter(by_slot), 0),
+        "estimatedSource": LENGTH if mm else WEIGHT,
+    }
     if mm:
         row["estimatedLengthInM"] = round(mm / 1000, 4)
     if grams:
         row["estimatedAmountMg"] = round(grams * 1000)
-    return row
+    return [row]
 
 
 def _usage_rows(event: JobFinished, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """One row per slot that fed filament, linked to the spool the user put on that slot's row."""
-    usage = []
+    """One row per slot that fed filament, linked to the spool in that slot when it's known.
+
+    A slot with no spool still gets its row, with its slot and no `filamentId`. The API takes
+    one row per spool, so a spool on two slots gets one row, on the first, with both lengths.
+    """
+    spools = _spools_by_slot(rows)
+    usage: list[dict[str, Any]] = []
+    mm_by_spool: dict[str, float] = {}
     for slot, mm in sorted(event.filament_mm.items()):
         if mm <= 0:
             continue
-        row: dict[str, Any] = {"slot": slot, "lengthInM": round(mm / 1000, 4), "source": LENGTH}
-        linked = next((r for r in rows if r.get("slot") == slot and r.get("filament")), None)
-        if linked is not None:
-            row["filamentId"] = linked["filament"]["id"]
+        spool = spools.get(slot)
+        if spool is not None and spool in mm_by_spool:
+            mm_by_spool[spool] += mm
+            row = next(r for r in usage if r.get("filamentId") == spool)
+            row["lengthInM"] = round(mm_by_spool[spool] / 1000, 4)
+            continue
+        row = {"slot": slot, "lengthInM": round(mm / 1000, 4), "source": LENGTH}
+        if spool is not None:
+            row["filamentId"] = spool
+            mm_by_spool[spool] = mm
         usage.append(row)
     return usage
+
+
+def _spools_by_slot(rows: Sequence[Mapping[str, Any]]) -> dict[int, str]:
+    """The spool (filament id) in each slot, as the user linked it on the print's usage rows.
+
+    The one place a slot's spool is decided: spool macros and the U1's RFID reader (#6) add the
+    spool loaded in each slot here, with the user's choice on the print still winning.
+    """
+    spools: dict[int, str] = {}
+    for row in rows:
+        slot, filament = row.get("slot"), row.get("filament")
+        if slot is not None and filament and slot not in spools:
+            spools[slot] = filament["id"]
+    return spools

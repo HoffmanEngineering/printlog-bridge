@@ -11,6 +11,7 @@ import contextlib
 from pathlib import Path
 
 import bridge_helpers as helpers
+import pytest
 from bridge_helpers import write_config
 from fake_moonraker import FakeMoonraker, eventually
 from fake_printlog_api import FakePrintLogApi
@@ -64,6 +65,47 @@ def test_a_print_is_logged_when_it_starts_and_completed_when_it_ends(tmp_path):
     [row] = done["filamentUsage"]
     assert abs(row["lengthInM"] * 1000 - 4321.5) <= 4321.5 * 0.02
     assert row["estimatedLengthInM"] == 4.4
+
+
+def test_a_four_tool_print_is_logged_per_tool_and_adds_up_to_the_total(tmp_path):
+    """#5's acceptance: per-slot totals within 1% of `filament_used`, unlinked tools kept."""
+    metadata = {**METADATA, "filament_weights": [30.2, 9.8, 3.6, 1.5]}
+    # (active extruder, filament_used so far), as Klipper reports them on a Snapmaker U1.
+    steps = [("extruder", 4000.0), ("extruder1", 6000.0), ("extruder2", 7000.0),
+             ("extruder3", 7500.0), ("extruder", 11500.0), ("extruder1", 12000.0)]  # fmt: skip
+
+    async def scenario():
+        async with fakes() as (moonraker, moonraker_url, api, api_url):
+            async with bridge(write_config(tmp_path, moonraker_url, api_url), moonraker):
+                job = await moonraker.start_job("u1/dragon.gcode", metadata)
+                await eventually(lambda: api.prints)
+                rows = api.prints[1]["filamentUsage"]
+                [tool_1] = [r for r in rows if r["slot"] == 1]
+                tool_1["filament"] = {"id": "spool-blue"}  # the user links tool 1's spool
+                await moonraker.set_status(
+                    print_stats={"state": "printing", "filename": "u1/dragon.gcode",
+                                 "filament_used": 0.0}
+                )  # fmt: skip
+                for tool, used in steps:
+                    await moonraker.set_status(
+                        toolhead={"extruder": tool}, print_stats={"filament_used": used}
+                    )
+                await asyncio.sleep(0.2)
+                await moonraker.finish_job(job, filament_used=12040.0)
+                await eventually(lambda: api.prints[1]["status"] != 2)
+            return api
+
+    api = asyncio.run(scenario())
+
+    rows = {r["slot"]: r for r in api.prints[1]["filamentUsage"]}
+    assert sorted(rows) == [0, 1, 2, 3]
+    assert abs(sum(r["lengthInM"] for r in rows.values()) * 1000 - 12040.0) <= 12040.0 * 0.01
+    assert rows[0]["lengthInM"] * 1000 == pytest.approx(8000.0, rel=0.01)
+    assert rows[1]["filament"] == {"id": "spool-blue"}
+    assert rows[1]["lengthInM"] * 1000 == pytest.approx(2500.0, rel=0.01)
+    assert rows[3]["filament"] is None  # no spool linked: recorded with its slot all the same
+    assert rows[3]["lengthInM"] * 1000 == pytest.approx(500.0, rel=0.01)
+    assert rows[3]["estimatedAmountMg"] == 1500
 
 
 def test_a_job_that_ends_while_the_bridge_is_stopped_is_still_completed_once(tmp_path):

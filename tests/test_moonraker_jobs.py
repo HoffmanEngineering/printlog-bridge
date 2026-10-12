@@ -305,3 +305,146 @@ class TestCatchingUp:
         report = asyncio.run(scenario())
 
         assert "[history]" in report.warnings["history"]
+
+
+async def feed(fake: FakeMoonraker, filename: str, steps) -> None:
+    """Klipper printing `filename`: (active extruder, filament_used so far) at each update.
+
+    Klipper loads the file first (`print_stats.reset()`: standby, nothing used), then prints.
+    """
+    await fake.set_status(
+        print_stats={"state": "standby", "filename": filename, "filament_used": 0.0}
+    )
+    await fake.set_status(print_stats={"state": "printing"})
+    for tool, used in steps:
+        await fake.set_status(toolhead={"extruder": tool}, print_stats={"filament_used": used})
+    last = steps[-1][1]
+    await eventually(lambda: fake.status["print_stats"]["filament_used"] == last)
+    await asyncio.sleep(0.05)  # the bridge has the last update too
+
+
+# A four-colour Snapmaker U1 print (Snapmaker Orca): T0 does most of it, T1 to T3 the details.
+U1_METADATA = {
+    "slicer": "SnapmakerOrca",
+    "filament_total": 15123.4,
+    "filament_weight_total": 45.1,
+    "filament_weights": [30.2, 9.8, 3.6, 1.5],
+    "filament_type": '["PLA", "PLA", "PLA", "PETG"]',
+}
+U1_STEPS = [
+    ("extruder", 4000.0),
+    ("extruder1", 6000.0),
+    ("extruder", 9000.0),
+    ("extruder2", 10000.0),
+    ("extruder3", 10500.0),
+    ("extruder", 14500.0),
+    ("extruder1", 15000.0),
+]
+
+
+class TestPerToolUsage:
+    def test_a_four_tool_print_is_split_by_the_tool_active_as_it_fed(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking(sink) as fake:
+                job = await fake.start_job("u1/dragon.gcode", U1_METADATA, start_time=T0)
+                await feed(fake, "u1/dragon.gcode", U1_STEPS)
+                # Moonraker's final figure includes the last moves the bridge never saw.
+                await fake.finish_job(job, filament_used=15060.0)
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        split = event.filament_mm
+        assert sorted(split) == [0, 1, 2, 3]
+        assert sum(split.values()) == pytest.approx(15060.0, rel=0.01)
+        assert split[0] == pytest.approx(11000.0, rel=0.01)  # 4000 + 3000 + 4000
+        assert split[1] == pytest.approx(2500.0, rel=0.01)
+        assert split[2] == pytest.approx(1000.0, rel=0.01)
+        assert split[3] == pytest.approx(500.0, rel=0.01)
+
+    def test_the_start_carries_the_slicers_grams_per_tool(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking(sink) as fake:
+                await fake.start_job("u1/dragon.gcode", U1_METADATA, start_time=T0)
+                await eventually(lambda: sink.events)
+            return sink
+
+        [event] = asyncio.run(scenario()).events
+
+        assert event.estimated_filament_g_by_slot == {0: 30.2, 1: 9.8, 2: 3.6, 3: 1.5}
+        assert event.estimated_filament_g == 45.1
+
+    def test_a_single_tool_print_keeps_one_slot(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking(sink) as fake:
+                job = await fake.start_job("benchy.gcode", {"filament_weights": [13.27]})
+                await feed(fake, "benchy.gcode", [("extruder", 2000.0), ("extruder", 4300.0)])
+                await fake.finish_job(job, filament_used=4321.5)
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        sink = asyncio.run(scenario())
+
+        assert sink.of(JobStarted)[0].estimated_filament_g_by_slot == {}
+        assert sink.of(JobFinished)[0].filament_mm == pytest.approx({0: 4321.5})
+
+    def test_a_job_that_ended_while_away_is_split_by_the_slicers_estimate(self):
+        async def scenario():
+            fake = FakeMoonraker()
+            job = await fake.start_job("u1/dragon.gcode", U1_METADATA, notify=False, start_time=T0)
+            await fake.finish_job(job, filament_used=15060.0, notify=False)
+            sink = RecordingSink(resume=at(T0))
+            async with tracking(sink, fake):
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert sum(event.filament_mm.values()) == pytest.approx(15060.0)
+        assert event.filament_mm[0] == pytest.approx(15060.0 * 30.2 / 45.1)
+        assert event.filament_mm[3] == pytest.approx(15060.0 * 1.5 / 45.1)
+
+    def test_what_was_seen_of_one_print_is_not_given_to_the_next(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking(sink) as fake:
+                first = await fake.start_job("cube.gcode")
+                await feed(fake, "cube.gcode", [("extruder1", 800.0)])
+                await fake.finish_job(first, filament_used=800.0)
+                await eventually(lambda: sink.of(JobFinished))
+                # The same file again, ending before the bridge saw any of it fed.
+                second = await fake.start_job("cube.gcode")
+                await fake.finish_job(second, filament_used=500.0)
+                await eventually(lambda: len(sink.of(JobFinished)) == 2)
+            return sink
+
+        first, second = asyncio.run(scenario()).of(JobFinished)
+
+        assert first.filament_mm == pytest.approx({1: 800.0})
+        assert second.filament_mm == {0: 500.0}
+
+    def test_an_earlier_job_replayed_on_a_reconnect_leaves_the_running_ones_usage(self):
+        async def scenario():
+            fake = FakeMoonraker()
+            earlier = await fake.start_job("cube.gcode", notify=False, start_time=T0 + 1)
+            await fake.finish_job(earlier, filament_used=700.0, notify=False)
+            running = await fake.start_job("cube.gcode", notify=False, start_time=T0 + 2000)
+            sink = RecordingSink(resume=at(T0))
+            async with tracking(sink, fake):
+                await eventually(lambda: len(sink.of(JobStarted)) == 2)
+                await feed(fake, "cube.gcode", [("extruder1", 300.0)])
+                await fake.drop()  # the earlier job is replayed on the reconnect
+                await eventually(lambda: len(sink.of(JobFinished)) == 2)
+                await eventually(lambda: fake.client_count == 1 and len(fake.subscriptions) == 2)
+                await fake.finish_job(running, filament_used=300.0)
+                await eventually(lambda: len(sink.of(JobFinished)) == 3)
+            return sink
+
+        last = asyncio.run(scenario()).of(JobFinished)[-1]
+
+        assert last.job_id == "000002"
+        assert last.filament_mm == pytest.approx({1: 300.0})

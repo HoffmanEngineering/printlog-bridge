@@ -12,9 +12,9 @@ The bridge sends 3D Print Log exactly these calls, and nothing else:
 | `GET /api/Printers/{id}` | `doctor` | nothing; checks `printer_id` |
 | `GET /api/Users/me/user-settings` | first print after a start | nothing; reads your default visibility and comment settings |
 | `PUT /api/Connections/{instance}` | at start, then every 5 minutes | `kind` (`moonraker`), `displayName` (`printlog-bridge (<printer name from your config>)`), `agentVersion`, `printerId` |
-| `POST /api/Prints` | a print starts | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id), the slicer's estimated print time and filament (length and weight), when the file has them |
+| `POST /api/Prints` | a print starts | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id), the slicer's estimated print time and filament (length and weight, and the weight per tool on a multi-tool file), when the file has them |
 | `GET /api/Prints/{id}` | a print ends | nothing; reads what you changed in the app |
-| `POST /api/Prints/{id}/complete` | a print ends | `status` (the outcome), `endedAt`, `printTimeInSeconds`, and per extruder the filament length Klipper fed (linked to the spool you chose in the app) |
+| `POST /api/Prints/{id}/complete` | a print ends | `status` (the outcome), `endedAt`, `printTimeInSeconds`, and per tool (`slot`) the filament length Klipper fed (linked to the spool you chose in the app) |
 | `PATCH /api/Prints/{id}` | a print fails or is cut short | `notes`: a line saying why, with Klipper's error message when there is one |
 | `POST /api/Prints/{id}/image` | a print starts, and when it ends | the slicer's thumbnail (at start), one webcam frame (at end, unless `snapshots = false`) |
 

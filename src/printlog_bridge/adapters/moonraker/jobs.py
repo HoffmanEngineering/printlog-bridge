@@ -30,6 +30,7 @@ from printlog_bridge.core.status import NullReport, PrinterReport
 
 from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
+from .tools import ToolUsage, estimated_grams_by_slot, per_slot
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ class JobTracker:
         self.images = images
         self._error_message: str | None = None
         self._call: Call | None = None
+        self._usage = ToolUsage()
 
     async def on_connected(self, call: Call) -> None:
         self._call = call
@@ -80,13 +82,15 @@ class JobTracker:
             self.report.warn(HISTORY_TOPIC, problem)
             return
         self.report.warn(HISTORY_TOPIC, None)
-        for job in jobs:
-            await self._report(job)
+        for n, job in enumerate(jobs, 1):
+            # Only the newest job can be the print Klipper ran last, whose usage was tracked.
+            await self._report(job, latest=n == len(jobs))
 
     async def on_klippy_state(self, state: str) -> None:
         pass
 
     async def on_status(self, status: Mapping[str, Any], changed: Mapping[str, Any]) -> None:
+        self._usage.update(status)
         if "print_stats" not in changed:
             return
         print_stats = status.get("print_stats") or {}
@@ -98,7 +102,7 @@ class JobTracker:
 
     async def on_history(self, action: str, job: Mapping[str, Any]) -> None:
         if action in ("added", "finished"):
-            await self._report(job, live=True)
+            await self._report(job, live=True, latest=True)
 
     async def _jobs_to_replay(self, call: Call) -> list[Mapping[str, Any]]:
         resume = await self.sink.resume_after(self.printer)
@@ -121,7 +125,9 @@ class JobTracker:
             if len(page["jobs"]) < PAGE_SIZE:
                 return jobs
 
-    async def _report(self, job: Mapping[str, Any], live: bool = False) -> None:
+    async def _report(
+        self, job: Mapping[str, Any], live: bool = False, latest: bool = False
+    ) -> None:
         start = started(self.printer, job)
         await self.sink.emit(start)
         images, call = self.images, self._call
@@ -136,7 +142,8 @@ class JobTracker:
             )
         if job.get("status", "in_progress") != "in_progress":
             message = self._error_message if live else None
-            await self.sink.emit(finished(self.printer, job, message))
+            tracked = self._usage.take(str(job.get("filename") or "")) if latest else {}
+            await self.sink.emit(finished(self.printer, job, message, tracked))
             if live and images is not None and images.snapshots and call is not None:
                 await self.sink.emit(
                     JobImage(
@@ -158,10 +165,17 @@ def started(printer: str, job: Mapping[str, Any]) -> JobStarted:
         estimated_duration_s=_positive(metadata.get("estimated_time")),
         estimated_filament_mm=_positive(metadata.get("filament_total")),
         estimated_filament_g=_positive(metadata.get("filament_weight_total")),
+        estimated_filament_g_by_slot=estimated_grams_by_slot(metadata),
     )
 
 
-def finished(printer: str, job: Mapping[str, Any], error_message: str | None = None) -> JobFinished:
+def finished(
+    printer: str,
+    job: Mapping[str, Any],
+    error_message: str | None = None,
+    tracked: Mapping[int, float] | None = None,
+) -> JobFinished:
+    """The job's end. `tracked` is what the bridge saw each slot feed (`tools.ToolUsage`)."""
     status = str(job.get("status"))
     outcome, note = OUTCOMES.get(
         status, (JobOutcome.FAILED, f"Moonraker ended the job as {status}")
@@ -169,15 +183,18 @@ def finished(printer: str, job: Mapping[str, Any], error_message: str | None = N
     if status == "error" and error_message:
         note = f"{note}: {error_message}"
     end_time = job.get("end_time") or job["start_time"] + (job.get("total_duration") or 0)
-    filament = job.get("filament_used") or 0
+    filament_mm = per_slot(
+        job.get("filament_used") or 0,
+        tracked or {},
+        estimated_grams_by_slot(job.get("metadata") or {}),
+    )
     return JobFinished(
         printer=printer,
         job_id=str(job["job_id"]),
         outcome=outcome,
         finished_at=_time(end_time),
         duration_s=job.get("print_duration"),
-        # One row on slot 0 until per-tool usage (printlog-bridge#5) splits it by extruder.
-        filament_mm={0: float(filament)},
+        filament_mm=filament_mm,
         note=note,
     )
 
