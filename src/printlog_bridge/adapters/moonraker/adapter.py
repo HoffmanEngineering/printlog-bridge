@@ -18,7 +18,7 @@ import aiohttp
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import ConfigError
-from printlog_bridge.core.events import EventSink
+from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.images import scrub_url
 from printlog_bridge.core.status import PrinterReport
 
@@ -26,12 +26,16 @@ from .images import MoonrakerImages
 from .jobs import JobTracker
 from .session import (
     ConnectionLost,
+    Listeners,
     MoonrakerAuthError,
+    MoonrakerListener,
     MoonrakerRpcError,
     MoonrakerSession,
     fetch_server_info,
     where,
 )
+from .spools import SpoolWatcher
+from .u1_rfid import U1RfidReader
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +67,7 @@ class MoonrakerAdapter(Adapter):
         self.api_key = api_key
         self.snapshots = snapshots
         """Whether a frame from the printer's webcam is added to each print when it ends."""
+        self.spools: SpoolSink | None = None
 
     @classmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> MoonrakerAdapter:
@@ -118,15 +123,24 @@ class MoonrakerAdapter(Adapter):
             api_key=self.api_key,
             snapshots=self.snapshots,
         )
+        listener: MoonrakerListener = JobTracker(self.printer, sink, report, images)
+        if self.spools is not None:
+            # The U1's reader only reports on a printer with `filament_detect`; elsewhere it
+            # never hears from it.
+            watcher = SpoolWatcher(self.printer, self.spools, U1RfidReader(self.printer))
+            listener = Listeners(listener, watcher)
         session = MoonrakerSession(
             self.printer,
-            listener=JobTracker(self.printer, sink, report, images),
+            listener=listener,
             url=self.url,
             socket=self.socket,
             api_key=self.api_key,
             report=report,
         )
         await session.run()
+
+    def use_spools(self, spools: SpoolSink) -> None:
+        self.spools = spools
 
     async def check(self) -> Sequence[CheckResult]:
         name = f"Printer {self.printer}"

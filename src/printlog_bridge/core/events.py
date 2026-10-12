@@ -1,4 +1,4 @@
-"""What an adapter reports about a printer's jobs.
+"""What an adapter reports about a printer's jobs, and about the spools in its slots.
 
 Adapters translate their printer's own vocabulary into these events, and everything downstream
 (the outbox, the API client) only ever sees these.
@@ -85,3 +85,47 @@ class EventSink(Protocol):
         job, so replaying every job that started at or after it misses nothing. None before the
         first job.
         """
+
+
+@dataclass(frozen=True)
+class SpoolCommand:
+    """The user assigns a spool to a slot on the printer (`PRINTLOG_SET_SPOOL`), or clears it.
+
+    Exactly one of `filament_id` and `tag` names the spool; with neither, the slot is cleared.
+    """
+
+    printer: str
+    slot: int
+    """The slot (tool index), 0-based: T0 is slot 0."""
+    filament_id: str | None = None
+    """The spool's id in 3D Print Log."""
+    tag: str | None = None
+    """The UID of an RFID/NFC tag on the spool, in any common format (`04:A2:3F:11`)."""
+    slot_count: int | None = None
+    """How many slots (tools) the printer has, when the adapter knows."""
+
+
+@dataclass(frozen=True)
+class SpoolReading:
+    """What a reader on the printer says is in a slot, such as the Snapmaker U1's RFID reader."""
+
+    printer: str
+    slot: int
+    tag: str | None = None
+    """The tag's UID as hex, when the reader read one."""
+    material: str | None = None
+    """The material the tag says, such as `PLA` or `PETG-CF`."""
+    color_hex: str | None = None
+    """The tag's color, as `#RRGGBB`."""
+    slot_count: int | None = None
+
+
+class SpoolSink(Protocol):
+    async def spool_command(self, command: SpoolCommand) -> str:
+        """Carries out the command. Returns what happened, in words for the printer's console.
+
+        Never raises: a command that fails says why in the answer.
+        """
+
+    async def spool_reading(self, reading: SpoolReading) -> None:
+        """Takes a reader's view of a slot. A tag a spool has assigns that spool to the slot."""

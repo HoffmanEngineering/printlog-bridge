@@ -9,14 +9,18 @@ The bridge sends 3D Print Log exactly these calls, and nothing else:
 | Call | When | What it carries |
 | --- | --- | --- |
 | `GET /api/Users/me` | `doctor` | nothing; checks the key |
-| `GET /api/Printers/{id}` | `doctor` | nothing; checks `printer_id` |
+| `GET /api/Printers/{id}` | `doctor`; at start and every 5 minutes; when a print starts and ends | nothing; checks `printer_id`, and reads which spool is loaded in each slot |
 | `GET /api/Users/me/user-settings` | first print after a start | nothing; reads your default visibility and comment settings |
 | `PUT /api/Connections/{instance}` | at start, then every 5 minutes | `kind` (`moonraker`), `displayName` (`printlog-bridge (<printer name from your config>)`), `agentVersion`, `printerId` |
-| `POST /api/Prints` | a print starts | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id), the slicer's estimated print time and filament (length and weight, and the weight per tool on a multi-tool file), when the file has them |
+| `POST /api/Prints` | a print starts | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id), the slicer's estimated print time and filament (length and weight, and the weight per tool on a multi-tool file), when the file has them, each tool's row linked to the spool loaded in its slot, and `notes` when the printer's RFID reader disagrees with a spool's material or color |
 | `GET /api/Prints/{id}` | a print ends | nothing; reads what you changed in the app |
 | `POST /api/Prints/{id}/complete` | a print ends | `status` (the outcome), `endedAt`, `printTimeInSeconds`, and per tool (`slot`) the filament length Klipper fed (linked to the spool you chose in the app) |
 | `PATCH /api/Prints/{id}` | a print fails or is cut short | `notes`: a line saying why, with Klipper's error message when there is one |
 | `POST /api/Prints/{id}/image` | a print starts, and when it ends | the slicer's thumbnail (at start), one webcam frame (at end, unless `snapshots = false`) |
+| `GET /api/Filaments/by-tag/{uid}` | `PRINTLOG_SET_SPOOL TAG=...`, or a Snapmaker U1 reads a spool's RFID tag | the tag's UID |
+| `PUT /api/Printers/{id}/slots/{slot}` | `PRINTLOG_SET_SPOOL`, or a U1 tag that matches one of your spools | `filamentId` (the spool), `slotLabel` (`T0`, `T1`...) |
+| `DELETE /api/Printers/{id}/slots/{slot}` | `PRINTLOG_CLEAR_SPOOL` | nothing |
+| `PUT /api/Printers/{id}` | a spool is assigned to a tool beyond the printer's slot count in 3D Print Log | the printer as 3D Print Log returned it, with only `slotCount` raised to the printer's tool count |
 
 Every request also carries the API key (`X-Api-Key`) and `User-Agent: printlog-bridge/<version>`.
 
@@ -27,7 +31,7 @@ That is all. In particular:
 - **No other printer data.** Temperatures, positions, macros, the rest of `printer.cfg` and the rest of Moonraker's history stay on the printer.
 - **The webcam is asked only when a print ends**, for one frame, and never when `snapshots = false` is set for the printer.
 
-Tests: `TestWhatIsSent` runs a whole print through the bridge and checks every call against this table and every field against these lists, that the only images uploaded are the thumbnail and the webcam frame, and that Moonraker was never asked for the G-code file. `TestGcodeIsNeverRead` points a thumbnail at the G-code file itself, and `test_with_snapshots_off_the_webcam_is_never_asked` does what it says.
+Tests: `TestSpoolCalls` assigns spools by tag and by id and checks each call and field, and that the printer is sent back as read. `TestWhatIsSent` runs a whole print through the bridge and checks every call against this table and every field against these lists, that the only images uploaded are the thumbnail and the webcam frame, and that Moonraker was never asked for the G-code file. `TestGcodeIsNeverRead` points a thumbnail at the G-code file itself, and `test_with_snapshots_off_the_webcam_is_never_asked` does what it says.
 
 ## Where it connects
 

@@ -1,0 +1,397 @@
+"""Which spool is in each of a printer's slots, as 3D Print Log knows it (#6).
+
+The bridge reads each printer's loaded spools from 3D Print Log when it starts, every five
+minutes after, and again when a print is created or completed, so a spool changed in the app
+between prints is on the next print's usage rows. `PRINTLOG_SET_SPOOL` assigns a spool from the
+printer's console (`spool_command`), and a reader in a slot, such as the Snapmaker U1's RFID
+reader, assigns the spool whose tag it reads (`spool_reading`).
+
+Assigning a spool is not queued like a print: it says at once whether it worked, and a command
+that couldn't reach 3D Print Log is run again by the user rather than applied hours later, when
+the spool may have moved. A tag the reader keeps reporting is retried with each refresh.
+
+What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration, its
+active spool and its usage reports are left alone.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import re
+import uuid
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+from printlog_bridge.core.api_client import (
+    ApiClient,
+    ApiError,
+    ApiRejected,
+    ApiUnavailable,
+    AuthRejected,
+)
+from printlog_bridge.core.events import SpoolCommand, SpoolReading
+from printlog_bridge.core.status import StatusBoard
+
+log = logging.getLogger(__name__)
+
+REFRESH_INTERVAL_S = 5 * 60
+MAX_SLOTS = 64
+"""The API's highest `slotCount`."""
+COLOR_TOLERANCE = 100.0
+"""How far apart (RGB distance, 0-441) two colors may be and still count as the same: a tag's
+"red" and the app's "red" are rarely the same hex."""
+TAG_SEPARATORS = re.compile(r"[:\-._\s]")
+HEX = re.compile(r"[0-9A-F]+")
+COLOR = re.compile(r"#?([0-9A-Fa-f]{6})")
+FORBIDDEN = 403
+PRINTER_FIELDS_NOT_SENT = frozenset({"images", "loadedFilaments", "category", "slotCount"})
+"""What `GET /api/Printers/{id}` returns that its `PUT` takes in another shape, or not at all."""
+
+
+def normalize_tag(uid: str) -> str | None:
+    """A tag UID as 3D Print Log stores it (the API's `TagUid.Normalize`): uppercase hex with no
+    separators. None for anything that isn't whole hex bytes, or is over 32 bytes."""
+    cleaned = TAG_SEPARATORS.sub("", uid).upper()
+    if not cleaned or len(cleaned) % 2 or len(cleaned) > 64 or not HEX.fullmatch(cleaned):
+        return None
+    return cleaned
+
+
+def color_distance(a: str | None, b: str | None) -> float | None:
+    """How far apart two `#RRGGBB` colors are (0-441), or None when either isn't one."""
+    rgb = [_rgb(a), _rgb(b)]
+    if rgb[0] is None or rgb[1] is None:
+        return None
+    return math.dist(rgb[0], rgb[1])
+
+
+def _rgb(color: str | None) -> tuple[int, int, int] | None:
+    match = COLOR.fullmatch((color or "").strip())
+    if match is None:
+        return None
+    value = int(match.group(1), 16)
+    return (value >> 16 & 0xFF, value >> 8 & 0xFF, value & 0xFF)
+
+
+def _hex(color: str | None) -> str | None:
+    rgb = _rgb(color)
+    return None if rgb is None else "#{:02X}{:02X}{:02X}".format(*rgb)
+
+
+def _material_key(material: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", material.upper())
+
+
+def _label(slot: int) -> str:
+    return f"T{slot}"
+
+
+def _name(filament: Mapping[str, Any]) -> str:
+    return str(filament.get("displayName") or filament.get("id"))
+
+
+class Spools:
+    """The spools loaded on each logged printer, kept in step with 3D Print Log. A SpoolSink."""
+
+    def __init__(
+        self,
+        api: ApiClient,
+        printers: Mapping[str, int],
+        board: StatusBoard | None = None,
+        interval: float = REFRESH_INTERVAL_S,
+    ) -> None:
+        """`printers` maps each `[printer <name>]` to its printer in 3D Print Log."""
+        self.api = api
+        self.printers = dict(printers)
+        self.board = board
+        self.interval = interval
+        self._loaded: dict[str, dict[int, dict[str, Any]]] = {}
+        """Each printer's spool (the API's filament summary) in each slot, as last read."""
+        self._slot_counts: dict[str, int] = {}
+        self._readings: dict[tuple[str, int], SpoolReading] = {}
+        """What each slot's reader last said."""
+        self._tags: dict[tuple[str, int], tuple[str, str | None]] = {}
+        """The tag each slot's reader reported that was looked up, and the spool it found."""
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._failing = False
+
+    # -- what's loaded -------------------------------------------------------------------------
+
+    def loaded(self, printer: str) -> dict[int, str]:
+        """The spool (filament id) in each slot, as last read. No request is made."""
+        return {slot: str(f["id"]) for slot, f in self._loaded.get(printer, {}).items()}
+
+    def slot_count(self, printer: str) -> int | None:
+        return self._slot_counts.get(printer)
+
+    async def current(self, printer: str) -> dict[int, str]:
+        """The spool in each slot, read again now; what was last read when that fails."""
+        try:
+            await self.refresh(printer)
+        except Exception as e:
+            log.debug("[printer %s] couldn't read its spools: %s", printer, e)
+        return self.loaded(printer)
+
+    async def refresh(self, printer: str) -> None:
+        """Reads the printer's slots and loaded spools. Raises ApiError when it can't."""
+        printer_id = self.printers.get(printer)
+        if printer_id is None:
+            return
+        detail = await self.api.get_printer(printer_id)
+        if detail is None:
+            return  # doctor and the heartbeat say why; nothing here can be assigned either
+        self._remember(printer, detail.get("loadedFilaments") or [], detail.get("slotCount"))
+
+    async def refresh_all(self) -> None:
+        """Reads every printer's spools, and retries any tag a reader reported that wasn't
+        looked up yet. Raises ApiError when a printer's can't be read."""
+        for printer in self.printers:
+            await self.refresh(printer)
+        for reading in list(self._readings.values()):
+            if self._tag_pending(reading):
+                await self.spool_reading(reading)
+
+    async def run(self) -> None:
+        """Reads every printer's spools now and every `interval` after, until cancelled."""
+        while True:
+            try:
+                await self.refresh_all()
+            except Exception as e:
+                level = logging.DEBUG if self._failing else logging.WARNING
+                log.log(level, "couldn't read the printers' spools from 3D Print Log: %s", e)
+                self._failing = True
+            else:
+                if self._failing:
+                    log.info("read the printers' spools from 3D Print Log again")
+                self._failing = False
+            await asyncio.sleep(self.interval)
+
+    def _remember(
+        self, printer: str, rows: Iterable[Mapping[str, Any]], slot_count: int | None = None
+    ) -> None:
+        if slot_count is not None:
+            self._slot_counts[printer] = int(slot_count)
+        count = self._slot_counts.get(printer, 1)
+        loaded: dict[int, dict[str, Any]] = {}
+        unslotted = []
+        for row in rows:
+            filament = row.get("filament") or {}
+            if not filament.get("id"):
+                continue
+            if row.get("slot") is None:
+                unslotted.append(filament)
+            else:
+                loaded.setdefault(int(row["slot"]), dict(filament))
+        if count <= 1 and 0 not in loaded and unslotted:
+            # A single-tool printer's spool loaded the old way, with no slot, is in slot 0.
+            loaded[0] = dict(unslotted[0])
+        self._loaded[printer] = loaded
+
+    # -- PRINTLOG_SET_SPOOL --------------------------------------------------------------------
+
+    async def spool_command(self, command: SpoolCommand) -> str:
+        printer_id = self.printers.get(command.printer)
+        if printer_id is None:
+            return f"printer {command.printer} isn't linked to a printer in 3D Print Log"
+        slot = _label(command.slot)
+        if not 0 <= command.slot < MAX_SLOTS:
+            return f"there is no T{command.slot}: tools are numbered 0 to {MAX_SLOTS - 1}"
+        try:
+            async with self._lock(command.printer):
+                answer = await self._carry_out(command, printer_id)
+        except AuthRejected:
+            answer = (
+                "3D Print Log rejected the bridge's API key; nothing changed. Check it with "
+                "`printlog-bridge doctor`."
+            )
+        except ApiRejected as e:
+            if e.status == FORBIDDEN:
+                answer = "that spool isn't one of yours in 3D Print Log; nothing changed"
+            else:
+                answer = f"3D Print Log refused it; nothing changed ({e})"
+        except ApiUnavailable as e:
+            answer = (
+                f"couldn't reach 3D Print Log ({e}); nothing changed. Run it again once the "
+                "bridge is back online."
+            )
+        except Exception:
+            log.exception("[printer %s] couldn't assign %s's spool", command.printer, slot)
+            answer = "an unexpected error; nothing changed. See the bridge's log."
+        log.info("[printer %s] %s: %s", command.printer, _describe(command), answer)
+        self._event(command.printer, f"{_describe(command)}: {answer}")
+        return answer
+
+    async def _carry_out(self, command: SpoolCommand, printer_id: int) -> str:
+        slot = _label(command.slot)
+        if command.filament_id is None and command.tag is None:
+            await self.api.unload_slot(printer_id, command.slot)
+            self._loaded.setdefault(command.printer, {}).pop(command.slot, None)
+            return f"{slot} has no spool in 3D Print Log now"
+        if command.tag is not None:
+            uid = normalize_tag(command.tag)
+            if uid is None:
+                return (
+                    f"{command.tag!r} isn't a tag UID; give its bytes in hex, like 04A23F11 or "
+                    "04:A2:3F:11"
+                )
+            spool = await self.api.filament_by_tag(uid)
+            if spool is None:
+                return (
+                    f"no spool in 3D Print Log has tag {uid}; nothing changed. Add the tag to "
+                    "the spool in the app, then run it again."
+                )
+            filament_id = str(spool["id"])
+        else:
+            filament_id = str(command.filament_id)
+            try:
+                uuid.UUID(filament_id)
+            except ValueError:
+                return (
+                    f"{filament_id!r} isn't a spool id; copy it from the spool's page in "
+                    "3D Print Log"
+                )
+        loaded = await self._load(
+            command.printer, printer_id, command.slot, filament_id, command.slot_count
+        )
+        return f"{slot} is now {_name(loaded)} in 3D Print Log"
+
+    async def _load(
+        self,
+        printer: str,
+        printer_id: int,
+        slot: int,
+        filament_id: str,
+        slot_count: int | None,
+    ) -> Mapping[str, Any]:
+        """Loads the spool into the slot, first adding slots to the printer if it needs them.
+        Returns the spool as loaded."""
+        if printer not in self._slot_counts:
+            await self.refresh(printer)
+        if slot >= self._slot_counts.get(printer, 1):
+            await self._grow(printer, printer_id, min(MAX_SLOTS, max(slot + 1, slot_count or 0)))
+        rows = await self.api.load_slot(printer_id, slot, filament_id, _label(slot))
+        self._remember(printer, rows)
+        return self._loaded.get(printer, {}).get(slot) or {"id": filament_id}
+
+    async def _grow(self, printer: str, printer_id: int, count: int) -> None:
+        """Sets the printer's `slotCount`, which the API only takes by replacing the printer:
+        everything else it has is sent back as read, and its loaded spools stay loaded."""
+        detail = await self.api.get_printer(printer_id)
+        if detail is None:
+            raise ApiRejected(f"printer {printer_id} isn't in 3D Print Log", status=404)
+        if int(detail.get("slotCount") or 1) >= count:
+            self._slot_counts[printer] = int(detail["slotCount"])
+            return
+        body = {k: v for k, v in detail.items() if k not in PRINTER_FIELDS_NOT_SENT}
+        body["id"] = printer_id
+        body["slotCount"] = count
+        category = detail.get("category")
+        if isinstance(category, Mapping) and category.get("nickname"):
+            body["category"] = category["nickname"]
+        body["loadedFilaments"] = [
+            {"id": row.get("id"), "filamentId": (row.get("filament") or {}).get("id")}
+            for row in detail.get("loadedFilaments") or []
+            if (row.get("filament") or {}).get("id")
+        ]
+        updated = await self.api.put_printer(printer_id, body)
+        log.info("[printer %s] set its slot count in 3D Print Log to %d", printer, count)
+        self._slot_counts[printer] = int((updated or {}).get("slotCount") or count)
+
+    # -- readers -------------------------------------------------------------------------------
+
+    async def spool_reading(self, reading: SpoolReading) -> None:
+        key = (reading.printer, reading.slot)
+        self._readings[key] = reading
+        printer_id = self.printers.get(reading.printer)
+        if printer_id is None or not self._tag_pending(reading):
+            return
+        uid = normalize_tag(reading.tag or "")
+        assert uid is not None  # _tag_pending made sure
+        slot = _label(reading.slot)
+        try:
+            async with self._lock(reading.printer):
+                spool = await self.api.filament_by_tag(uid)
+                if spool is None:
+                    self._tags[key] = (uid, None)
+                    log.info(
+                        "[printer %s] %s's reader sees tag %s, which no spool in 3D Print Log "
+                        "has; add it to the spool in the app to have it assigned",
+                        reading.printer, slot, uid,
+                    )  # fmt: skip
+                    return
+                filament_id = str(spool["id"])
+                if self.loaded(reading.printer).get(reading.slot) != filament_id:
+                    await self._load(
+                        reading.printer, printer_id, reading.slot, filament_id, reading.slot_count
+                    )
+                    what = f"{slot} is now {_name(spool)}, from its tag {uid}"
+                    log.info("[printer %s] %s", reading.printer, what)
+                    self._event(reading.printer, what)
+                self._tags[key] = (uid, filament_id)
+        except ApiError as e:
+            # Not marked as looked up, so the next refresh tries it again.
+            log.warning(
+                "[printer %s] couldn't assign the spool with tag %s to %s: %s",
+                reading.printer, uid, slot, e,
+            )  # fmt: skip
+
+    def _tag_pending(self, reading: SpoolReading) -> bool:
+        uid = normalize_tag(reading.tag or "")
+        if uid is None:
+            return False
+        looked_up = self._tags.get((reading.printer, reading.slot))
+        return looked_up is None or looked_up[0] != uid
+
+    def mismatches(self, printer: str, slots: Iterable[int]) -> list[str]:
+        """A note for each of `slots` whose reader saw a material or color other than its
+        spool's in 3D Print Log. A tag that found its spool is trusted over what it says."""
+        notes = []
+        for slot in sorted(set(slots)):
+            reading = self._readings.get((printer, slot))
+            spool = self._loaded.get(printer, {}).get(slot)
+            if reading is None or spool is None:
+                continue
+            uid = normalize_tag(reading.tag or "")
+            looked_up = self._tags.get((printer, slot))
+            if uid is not None and looked_up == (uid, str(spool["id"])):
+                continue
+            seen, assigned = [], []
+            material, spool_material = reading.material, spool.get("materialType")
+            if material and spool_material:
+                a, b = _material_key(material), _material_key(spool_material)
+                if a and b and not b.startswith(a):
+                    seen.append(material)
+                    assigned.append(spool_material)
+            distance = color_distance(reading.color_hex, spool.get("colorHex"))
+            if distance is not None and distance > COLOR_TOLERANCE:
+                seen.append(f"color {_hex(reading.color_hex)}")
+                assigned.append(f"color {_hex(spool.get('colorHex'))}")
+            if seen:
+                notes.append(
+                    f"Spool check: the printer's reader saw {' and '.join(seen)} in "
+                    f"{_label(slot)}, but its spool in 3D Print Log, {_name(spool)}, is "
+                    f"{' and '.join(assigned)}. Check which spool this print used."
+                )
+        return notes
+
+    # -- helpers -------------------------------------------------------------------------------
+
+    def _lock(self, printer: str) -> asyncio.Lock:
+        if printer not in self._locks:
+            self._locks[printer] = asyncio.Lock()
+        return self._locks[printer]
+
+    def _event(self, printer: str, what: str) -> None:
+        if self.board is not None:
+            self.board.printer(printer).event(what)
+
+
+def _describe(command: SpoolCommand) -> str:
+    slot = _label(command.slot)
+    if command.tag is not None:
+        return f"set {slot} to the spool with tag {command.tag}"
+    if command.filament_id is not None:
+        return f"set {slot} to spool {command.filament_id}"
+    return f"clear {slot}"

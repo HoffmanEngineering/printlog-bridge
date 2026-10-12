@@ -14,9 +14,17 @@ from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.connections import Connection, Heartbeat
-from printlog_bridge.core.events import ImageKind, JobFinished, JobImage, JobOutcome, JobStarted
+from printlog_bridge.core.events import (
+    ImageKind,
+    JobFinished,
+    JobImage,
+    JobOutcome,
+    JobStarted,
+    SpoolReading,
+)
 from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter, backoff_delay
 from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, Outbox, read_waiting
+from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState
 from printlog_bridge.core.status import StatusBoard, read_status
 
@@ -48,8 +56,10 @@ async def logging_to(
     clock=None,
     backoff=FAST_BACKOFF,
     image_timeout: float | None = None,
+    spools: bool = False,
     **printers: int,
 ):
+    """A JobLogger sending to `api`. With `spools`, it links each print to the loaded spools."""
     base = await api.start()
     options = {}
     if clock:
@@ -58,11 +68,14 @@ async def logging_to(
         options["image_timeout"] = image_timeout
     try:
         async with ApiClient(base, api.api_key) as client:
+            targets = printers or {"voron": 42}
+            if spools:
+                options["spools"] = Spools(client, targets)
             yield JobLogger(
                 client,
                 {
                     name: LoggedPrinter(printer_id=printer_id, source="moonraker")
-                    for name, printer_id in (printers or {"voron": 42}).items()
+                    for name, printer_id in targets.items()
                 },
                 state_dir,
                 backoff=backoff,
@@ -89,6 +102,7 @@ def run(
     *events,
     timeout: float = 1.0,
     backoff=FAST_BACKOFF,
+    spools: bool = False,
     **printers: int,
 ):
     """Emits `events` in order, sending each before the next, as a restart of the bridge would.
@@ -98,7 +112,7 @@ def run(
     """
 
     async def scenario():
-        async with logging_to(api, state_dir, backoff=backoff, **printers) as logger:
+        async with logging_to(api, state_dir, backoff=backoff, spools=spools, **printers) as logger:
             try:
                 await drain(logger, timeout)  # what the last run left in the outbox
                 for event in events:
@@ -1305,3 +1319,136 @@ class TestPerToolUsage:
 
         rows = by_slot(api.prints[1])
         assert [rows[s]["estimatedAmountMg"] for s in range(4)] == [30200, 9800, 3600, 1500]
+
+
+class TestLoadedSpools:
+    """The spools loaded on the printer in 3D Print Log go on its prints' usage rows (#6)."""
+
+    def test_the_spool_loaded_on_a_single_tool_printer_is_on_its_print(self, tmp_path):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, None, spool)
+
+        run(api, tmp_path, started(estimated_filament_mm=4400.0), finished(), spools=True)
+
+        [row] = api.prints[1]["filamentUsage"]
+        assert row["filament"] == {"id": spool}
+        assert row["lengthInM"] == 4.3215
+        assert api.slot_spools(42) == {None: spool}  # creating the print left it loaded
+
+    def test_a_print_with_no_estimate_still_keeps_the_spool_loaded(self, tmp_path):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, None, spool)
+
+        run(api, tmp_path, started(), spools=True)
+
+        assert api.slot_spools(42) == {None: spool}
+        [row] = api.prints[1]["filamentUsage"]
+        assert row["filament"] == {"id": spool}
+
+    def test_each_tool_gets_the_spool_in_its_slot(self, tmp_path):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        white, blue = api.add_spool("White"), api.add_spool("Blue")
+        api.user_loads(42, 0, white)
+        api.user_loads(42, 2, blue)
+
+        run(api, tmp_path, four_tool_start(), finished(filament_mm=FOUR_TOOL_USAGE), spools=True)
+
+        rows = by_slot(api.prints[1])
+        assert rows[0]["filament"] == {"id": white}
+        assert rows[2]["filament"] == {"id": blue}
+        assert rows[1]["filament"] is None
+        assert rows[2]["lengthInM"] == 1.16
+        assert api.slot_spools(42) == {0: white, 2: blue}  # a multi-tool printer's are kept
+
+    def test_a_spool_changed_in_the_app_between_prints_is_on_the_next_print(self, tmp_path):
+        api = FakePrintLogApi()
+        old, new = api.add_spool("Old"), api.add_spool("New")
+        api.user_loads(42, 0, old)
+
+        run(
+            api,
+            tmp_path,
+            started("00000A", estimated_filament_mm=4400.0),
+            finished("00000A"),
+            lambda api: api.user_loads(42, 0, new),
+            started("00000B", estimated_filament_mm=4400.0),
+            finished("00000B"),
+            spools=True,
+        )
+
+        assert [r["filament"] for r in api.prints[1]["filamentUsage"]] == [{"id": old}]
+        assert [r["filament"] for r in api.prints[2]["filamentUsage"]] == [{"id": new}]
+
+    def test_the_users_choice_on_the_print_wins(self, tmp_path):
+        api = FakePrintLogApi()
+        loaded, chosen = api.add_spool("Loaded"), api.add_spool("Chosen")
+        api.user_loads(42, 0, loaded)
+
+        def link_spool(api):
+            api.prints[1]["filamentUsage"][0]["filament"] = {"id": chosen}
+
+        run(
+            api,
+            tmp_path,
+            started(estimated_filament_mm=4400.0),
+            link_spool,
+            finished(),
+            spools=True,
+        )
+
+        [completion] = api.completions
+        assert [r.get("filamentId") for r in completion["filamentUsage"]] == [chosen]
+
+    def test_a_tool_the_estimate_missed_gets_its_slots_spool_at_the_end(self, tmp_path):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        white, blue = api.add_spool("White"), api.add_spool("Blue")
+        api.user_loads(42, 0, white)
+        api.user_loads(42, 1, blue)
+
+        run(
+            api,
+            tmp_path,
+            started(estimated_filament_mm=4400.0),
+            finished(filament_mm={0: 900.0, 1: 300.0}),
+            spools=True,
+        )
+
+        rows = by_slot(api.prints[1])
+        assert rows[1]["filament"] == {"id": blue}
+        assert rows[1]["lengthInM"] == 0.3
+
+    def test_spools_that_cant_be_read_dont_hold_up_the_print(self, tmp_path):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, 0, spool)
+        api.fail_next(1)  # the read of the printer's spools
+
+        run(api, tmp_path, started(estimated_filament_mm=4400.0), spools=True)
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 2
+
+    def test_a_reader_that_disagrees_with_the_spool_adds_a_note(self, tmp_path):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Basic PLA", material="PLA"))
+
+        async def scenario():
+            async with logging_to(api, tmp_path, spools=True) as logger:
+                await logger.spools.refresh_all()
+                await logger.spools.spool_reading(SpoolReading("voron", 0, material="PETG"))
+                await logger.emit(started(estimated_filament_mm=4400.0))
+                await drain(logger)
+                await logger.emit(finished())
+                await drain(logger)
+                logger.close()
+
+        asyncio.run(scenario())
+
+        [print_] = api.prints.values()
+        assert "PETG" in print_["notes"]
+        assert "Basic PLA" in print_["notes"]
+        assert print_["status"] == 3  # logged all the same

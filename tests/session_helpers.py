@@ -18,6 +18,7 @@ class Recorder:
         self.status: dict[str, dict[str, Any]] = {}
         self.changes: list[Mapping[str, Any]] = []
         self.history: list[tuple[str, Mapping[str, Any]]] = []
+        self.console: list[str] = []
         self.connected: list[Any] = []
         """For each connection, what `server.history.list` answered through the given call."""
 
@@ -33,6 +34,9 @@ class Recorder:
 
     async def on_history(self, action: str, job: Mapping[str, Any]) -> None:
         self.history.append((action, job))
+
+    async def on_gcode_response(self, line: str) -> None:
+        self.console.append(line)
 
 
 class ReportRecorder:

@@ -1,0 +1,381 @@
+"""Spool assignment (#6): PRINTLOG_SET_SPOOL's commands, and what a reader in a slot reports."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+
+import pytest
+from fake_moonraker import eventually
+from fake_printlog_api import FakePrintLogApi
+
+from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.events import SpoolCommand, SpoolReading
+from printlog_bridge.core.spools import Spools, color_distance, normalize_tag
+
+
+@contextlib.asynccontextmanager
+async def spools_for(api: FakePrintLogApi, **options):
+    base = await api.start()
+    try:
+        async with ApiClient(base, api.api_key) as client:
+            yield Spools(client, {"u1": 42}, **options)
+    finally:
+        await api.close()
+
+
+def run(api: FakePrintLogApi, scenario, **options):
+    async def main():
+        async with spools_for(api, **options) as spools:
+            return await scenario(spools)
+
+    return asyncio.run(main())
+
+
+def command(slot: int = 0, **kwargs) -> SpoolCommand:
+    return SpoolCommand("u1", slot, **kwargs)
+
+
+class TestNormalizeTag:
+    @pytest.mark.parametrize("uid", ["04A23F11", "04:a2:3f:11", "04-A2-3F-11", "04 a2 3f 11"])
+    def test_any_common_format_is_the_same_tag(self, uid):
+        assert normalize_tag(uid) == "04A23F11"
+
+    @pytest.mark.parametrize("uid", ["", "04A23F1", "0x04A23F11", "zz", "0" * 66])
+    def test_what_isnt_whole_hex_bytes_is_none(self, uid):
+        assert normalize_tag(uid) is None
+
+
+class TestSetSpool:
+    def test_loads_the_spool_by_its_id(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Galaxy Black PLA")
+
+        answer = run(api, lambda s: s.spool_command(command(0, filament_id=spool)))
+
+        assert api.slot_spools(42) == {0: spool}
+        assert "Galaxy Black PLA" in answer
+        assert "T0" in answer
+
+    def test_loads_the_spool_with_the_tag(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        spool = api.add_spool("Silk Gold", tags=("04A23F11",))
+
+        answer = run(api, lambda s: s.spool_command(command(2, tag="04:a2:3f:11")))
+
+        assert api.slot_spools(42) == {2: spool}
+        assert "Silk Gold" in answer
+        assert api.loaded[42][0]["slotLabel"] == "T2"
+
+    def test_a_tag_no_spool_has_changes_nothing(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Loaded")
+        api.user_loads(42, 0, spool)
+
+        answer = run(api, lambda s: s.spool_command(command(0, tag="DEADBEEF")))
+
+        assert api.slot_spools(42) == {0: spool}
+        assert "DEADBEEF" in answer
+        assert "no spool" in answer.lower()
+
+    def test_a_tag_that_isnt_hex_is_refused_without_asking_the_api(self):
+        api = FakePrintLogApi()
+
+        answer = run(api, lambda s: s.spool_command(command(0, tag="not-a-tag")))
+
+        assert ("GET", "/api/Filaments/by-tag/not-a-tag") not in api.requests
+        assert "not-a-tag" in answer
+
+    def test_an_id_that_isnt_a_spool_id_is_refused_without_asking_the_api(self):
+        api = FakePrintLogApi()
+
+        answer = run(api, lambda s: s.spool_command(command(0, filament_id="7")))
+
+        assert not [r for r in api.requests if "/slots/" in r[1]]
+        assert "7" in answer
+
+    def test_another_users_spool_is_refused(self):
+        api = FakePrintLogApi()
+
+        answer = run(
+            api,
+            lambda s: s.spool_command(
+                command(0, filament_id="0e9c1d8e-0000-4000-8000-000000000000")
+            ),
+        )
+
+        assert api.slot_spools(42) == {}
+        assert "isn't one of yours" in answer
+
+    def test_a_slot_beyond_the_printers_count_grows_it_first(self):
+        api = FakePrintLogApi()
+        kept = api.add_spool("Kept")
+        api.user_loads(42, 0, kept)
+        spool = api.add_spool("Orange PETG")
+
+        run(api, lambda s: s.spool_command(command(3, filament_id=spool, slot_count=4)))
+
+        assert api.slot_counts[42] == 4
+        assert api.slot_spools(42) == {0: kept, 3: spool}
+        [put] = api.printer_puts
+        assert put["make"] == "Snapmaker"
+        assert put["name"] == "Printer 42"
+        assert put["category"] == "FDM"
+
+    def test_without_the_printers_tool_count_it_grows_to_the_slot(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+
+        run(api, lambda s: s.spool_command(command(2, filament_id=spool)))
+
+        assert api.slot_counts[42] == 3
+        assert api.slot_spools(42) == {2: spool}
+
+    def test_a_slot_within_the_count_leaves_the_printer_alone(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        spool = api.add_spool()
+
+        run(api, lambda s: s.spool_command(command(1, filament_id=spool, slot_count=4)))
+
+        assert api.printer_puts == []
+
+    def test_clearing_unloads_the_slot(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        a, b = api.add_spool("A"), api.add_spool("B")
+        api.user_loads(42, 0, a)
+        api.user_loads(42, 1, b)
+
+        answer = run(api, lambda s: s.spool_command(command(1)))
+
+        assert api.slot_spools(42) == {0: a}
+        assert "T1" in answer
+
+    def test_with_the_api_down_nothing_changes_and_it_says_so(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.offline = True
+
+        answer = run(api, lambda s: s.spool_command(command(0, filament_id=spool)))
+
+        assert "couldn't reach" in answer.lower()
+        assert "again" in answer
+
+    def test_an_unknown_printer_is_refused(self):
+        api = FakePrintLogApi()
+
+        answer = run(api, lambda s: s.spool_command(SpoolCommand("ender", 0, tag="04A23F11")))
+
+        assert "ender" in answer
+        assert api.requests == []
+
+
+class TestLoaded:
+    def test_current_reads_each_slots_spool(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        a, b = api.add_spool("A"), api.add_spool("B")
+        api.user_loads(42, 0, a)
+        api.user_loads(42, 3, b)
+
+        assert run(api, lambda s: s.current("u1")) == {0: a, 3: b}
+
+    def test_a_spool_loaded_without_a_slot_is_slot_0_on_a_single_tool_printer(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, None, spool)
+
+        assert run(api, lambda s: s.current("u1")) == {0: spool}
+
+    def test_a_spool_loaded_without_a_slot_is_in_no_slot_on_a_multi_tool_printer(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        spool = api.add_spool()
+        api.user_loads(42, None, spool)
+
+        assert run(api, lambda s: s.current("u1")) == {}
+
+    def test_with_the_api_down_current_is_what_was_last_read(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, 0, spool)
+
+        async def scenario(spools):
+            await spools.refresh_all()
+            api.offline = True
+            return await spools.current("u1")
+
+        assert run(api, scenario) == {0: spool}
+
+    def test_run_reads_again_every_interval(self):
+        api = FakePrintLogApi()
+        a, b = api.add_spool("A"), api.add_spool("B")
+        api.user_loads(42, 0, a)
+
+        async def scenario(spools):
+            task = asyncio.ensure_future(spools.run())
+            try:
+                await eventually(lambda: spools.loaded("u1") == {0: a})
+                api.user_loads(42, 0, b)  # changed in the app
+                await eventually(lambda: spools.loaded("u1") == {0: b})
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        run(api, scenario, interval=0.05)
+
+    def test_a_failed_read_is_logged_once_and_running_goes_on(self, caplog):
+        api = FakePrintLogApi()
+        api.offline = True
+
+        async def scenario(spools):
+            task = asyncio.ensure_future(spools.run())
+            try:
+                await asyncio.sleep(0.3)
+                assert not task.done()
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        with caplog.at_level(logging.DEBUG, logger="printlog_bridge"):
+            run(api, scenario, interval=0.05)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+
+
+def reading(slot: int = 0, **kwargs) -> SpoolReading:
+    return SpoolReading("u1", slot, **kwargs)
+
+
+class TestReadings:
+    def test_a_tag_a_spool_has_assigns_it_to_the_slot(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        spool = api.add_spool("Snapmaker PLA Red", tags=("04A23F11",))
+
+        run(api, lambda s: s.spool_reading(reading(1, tag="04A23F11", material="PLA")))
+
+        assert api.slot_spools(42) == {1: spool}
+
+    def test_the_same_tag_again_asks_nothing(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        api.add_spool(tags=("04A23F11",))
+
+        async def scenario(spools):
+            await spools.spool_reading(reading(1, tag="04A23F11"))
+            before = len(api.requests)
+            await spools.spool_reading(reading(1, tag="04A23F11"))
+            return len(api.requests) - before
+
+        assert run(api, scenario) == 0
+
+    def test_a_spool_already_in_the_slot_isnt_loaded_again(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        spool = api.add_spool(tags=("04A23F11",))
+        api.user_loads(42, 1, spool)
+
+        async def scenario(spools):
+            await spools.refresh_all()
+            await spools.spool_reading(reading(1, tag="04A23F11"))
+
+        run(api, scenario)
+
+        assert not [r for r in api.requests if "/slots/" in r[1]]
+
+    def test_a_tag_no_spool_has_leaves_the_slot_alone(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, 0, spool)
+
+        run(api, lambda s: s.spool_reading(reading(0, tag="DEADBEEF", material="PLA")))
+
+        assert api.slot_spools(42) == {0: spool}
+
+    def test_a_reader_that_cant_reach_the_api_tries_the_tag_again_next_time(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool(tags=("04A23F11",))
+
+        async def scenario(spools):
+            api.offline = True
+            await spools.spool_reading(reading(0, tag="04A23F11"))
+            api.offline = False
+            await spools.spool_reading(reading(0, tag="04A23F11"))
+
+        run(api, scenario)
+
+        assert api.slot_spools(42) == {0: spool}
+
+
+class TestMismatch:
+    def scenario(self, api: FakePrintLogApi, seen: SpoolReading, slots=(0,)):
+        async def main(spools):
+            await spools.refresh_all()
+            await spools.spool_reading(seen)
+            return spools.mismatches("u1", slots)
+
+        return run(api, main)
+
+    def test_another_material_is_a_note(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Basic PLA", material="PLA", color_hex="#FF0000"))
+
+        [note] = self.scenario(api, reading(0, material="PETG", color_hex="#FF0000"))
+
+        assert "PETG" in note
+        assert "PLA" in note
+        assert "Basic PLA" in note
+        assert "T0" in note
+
+    def test_another_color_is_a_note(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Red", material="PLA", color_hex="#FF0000"))
+
+        [note] = self.scenario(api, reading(0, material="PLA", color_hex="#0000FF"))
+
+        assert "#0000FF" in note
+        assert "#FF0000" in note
+
+    def test_the_same_material_and_a_close_color_is_no_note(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool(material="PLA+", color_hex="ff0000"))
+
+        assert self.scenario(api, reading(0, material="PLA", color_hex="#F80808")) == []
+
+    def test_a_variant_of_the_spools_material_is_no_note(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool(material="PETG-CF"))
+
+        assert self.scenario(api, reading(0, material="PETG")) == []
+
+    def test_a_slot_the_print_doesnt_use_is_no_note(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 4
+        api.user_loads(42, 2, api.add_spool(material="PLA"))
+
+        assert self.scenario(api, reading(2, material="TPU"), slots=(0,)) == []
+
+    def test_a_slot_with_no_spool_is_no_note(self):
+        api = FakePrintLogApi()
+
+        assert self.scenario(api, reading(0, material="TPU")) == []
+
+    def test_a_tag_that_assigned_its_spool_is_no_note(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Old", material="PLA"))
+        api.add_spool("New", material="TPU", tags=("04A23F11",))
+
+        assert self.scenario(api, reading(0, tag="04A23F11", material="TPU")) == []
+
+
+def test_color_distance_is_zero_for_the_same_color_in_any_format():
+    assert color_distance("#ff0000", "FF0000") == 0
+    assert color_distance("#FF0000", "#00FF00") > 300
+    assert color_distance("#FF0000", "not a color") is None
