@@ -269,3 +269,78 @@ class TestServerClock:
             return client.server_time
 
         assert serve([("GET", "/api/Users/me", me)], ask) is None
+
+
+class TestImages:
+    def test_upload_posts_the_image_as_a_form_and_says_whether_it_is_the_default(self):
+        seen = {}
+
+        async def upload(request):
+            form = await request.post()
+            image = form["image"]
+            seen.update(
+                data=image.file.read(),
+                content_type=image.content_type,
+                filename=image.filename,
+                is_default=form["isDefault"],
+                api_key=request.headers.get("X-Api-Key"),
+            )
+            return web.json_response({"id": 3, "isDefault": True, "displayOrder": 0}, status=201)
+
+        result = serve(
+            [("POST", "/api/Prints/9/image", upload)],
+            lambda c: c.upload_print_image(9, b"\x89PNG-data", "image/png", "thumbnail.png", True),
+        )
+
+        assert result == {"id": 3, "isDefault": True, "displayOrder": 0}
+        assert seen == {
+            "data": b"\x89PNG-data",
+            "content_type": "image/png",
+            "filename": "thumbnail.png",
+            "is_default": "true",
+            "api_key": "key-123",
+        }
+
+    def test_an_upload_to_a_print_that_is_gone_is_none(self):
+        async def gone(_request):
+            return web.Response(status=404)
+
+        result = serve(
+            [("POST", "/api/Prints/9/image", gone)],
+            lambda c: c.upload_print_image(9, b"x", "image/png", "t.png", False),
+        )
+
+        assert result is None
+
+    @pytest.mark.parametrize("status", [413, 415])
+    def test_an_image_too_large_or_of_the_wrong_kind_is_rejected(self, status):
+        async def refuse(_request):
+            return web.Response(status=status)
+
+        with pytest.raises(ApiRejected, match=str(status)):
+            serve(
+                [("POST", "/api/Prints/9/image", refuse)],
+                lambda c: c.upload_print_image(9, b"x", "image/png", "t.png", False),
+            )
+
+    def test_a_server_error_says_the_api_answered(self):
+        async def fail(_request):
+            return web.Response(status=500)
+
+        with pytest.raises(ApiUnavailable) as e:
+            serve(
+                [("POST", "/api/Prints/9/image", fail)],
+                lambda c: c.upload_print_image(9, b"x", "image/png", "t.png", False),
+            )
+
+        assert e.value.status == 500
+
+    def test_an_unreachable_api_has_no_status(self):
+        async def scenario():
+            async with ApiClient("http://127.0.0.1:9", api_key="k") as client:
+                await client.upload_print_image(9, b"x", "image/png", "t.png", False)
+
+        with pytest.raises(ApiUnavailable) as e:
+            asyncio.run(scenario())
+
+        assert e.value.status is None

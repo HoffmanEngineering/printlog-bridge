@@ -12,7 +12,7 @@ from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.connections import Connection, Heartbeat
-from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted
+from printlog_bridge.core.events import ImageKind, JobFinished, JobImage, JobOutcome, JobStarted
 from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter, backoff_delay
 from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, read_waiting
 from printlog_bridge.core.state import JobRecord, PrinterState
@@ -40,9 +40,20 @@ def finished(
 
 @contextlib.asynccontextmanager
 async def logging_to(
-    api: FakePrintLogApi, state_dir: Path, *, clock=None, backoff=FAST_BACKOFF, **printers: int
+    api: FakePrintLogApi,
+    state_dir: Path,
+    *,
+    clock=None,
+    backoff=FAST_BACKOFF,
+    image_timeout: float | None = None,
+    **printers: int,
 ):
     base = await api.start()
+    options = {}
+    if clock:
+        options["clock"] = clock
+    if image_timeout is not None:
+        options["image_timeout"] = image_timeout
     try:
         async with ApiClient(base, api.api_key) as client:
             yield JobLogger(
@@ -53,7 +64,7 @@ async def logging_to(
                 },
                 state_dir,
                 backoff=backoff,
-                **({"clock": clock} if clock else {}),
+                **options,
             )
     finally:
         await api.close()
@@ -747,3 +758,255 @@ class TestWaitingJobs:
         assert not job.finished
         assert job.ended_at == finished().finished_at.isoformat()
         assert read_waiting(tmp_path)["voron"].jobs == 1
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"thumbnail" * 8
+JPEG = b"\xff\xd8\xff\xe0" + b"snapshot" * 8
+
+
+def image(
+    kind: ImageKind = ImageKind.THUMBNAIL,
+    data: bytes | None = PNG,
+    job_id: str = "00000A",
+    fetched: list | None = None,
+    error: BaseException | None = None,
+    hang: float = 0.0,
+) -> JobImage:
+    async def fetch():
+        if fetched is not None:
+            fetched.append(kind)
+        if hang:
+            await asyncio.sleep(hang)
+        if error is not None:
+            raise error
+        return data
+
+    return JobImage("voron", job_id, kind, fetch)
+
+
+def snapshot(data: bytes | None = JPEG, **kwargs) -> JobImage:
+    return image(ImageKind.SNAPSHOT, data, **kwargs)
+
+
+class TestImages:
+    def test_the_thumbnail_is_added_to_the_print_as_its_default_image(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), image())
+
+        [print_] = api.prints.values()
+        [added] = print_["images"]
+        assert added["isDefault"]
+        assert added["contentType"] == "image/png"
+        assert api.default_image(print_["id"]) == PNG
+
+    def test_a_failed_prints_snapshot_becomes_its_default_image(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), image(), finished(outcome=JobOutcome.FAILED), snapshot())
+
+        [print_] = api.prints.values()
+        assert len(print_["images"]) == 2
+        assert print_["images"][1]["contentType"] == "image/jpeg"
+        assert api.default_image(print_["id"]) == JPEG
+
+    @pytest.mark.parametrize("outcome", [JobOutcome.COMPLETED, JobOutcome.CANCELLED])
+    def test_otherwise_the_thumbnail_stays_the_default(self, tmp_path, outcome):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), image(), finished(outcome=outcome), snapshot())
+
+        [print_] = api.prints.values()
+        assert len(print_["images"]) == 2
+        assert api.default_image(print_["id"]) == PNG
+
+    def test_without_a_thumbnail_the_snapshot_is_the_default(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), image(data=None), finished(), snapshot())
+
+        [print_] = api.prints.values()
+        assert api.default_image(print_["id"]) == JPEG
+
+    def test_an_image_is_fetched_and_added_once_however_often_it_is_replayed(self, tmp_path):
+        api = FakePrintLogApi()
+        fetched: list = []
+
+        run(api, tmp_path, started(), image(fetched=fetched), image(fetched=fetched))
+        run(api, tmp_path, started(), image(fetched=fetched))  # after a restart
+
+        [print_] = api.prints.values()
+        assert len(print_["images"]) == 1
+        assert fetched == [ImageKind.THUMBNAIL]
+
+    def test_a_job_that_was_logged_before_is_not_given_a_thumbnail_now(self, tmp_path):
+        api = FakePrintLogApi()
+        fetched: list = []
+
+        run(api, tmp_path, started(), finished())
+        run(api, tmp_path, started(), image(fetched=fetched), finished())  # history replayed
+
+        assert fetched == []
+
+    def test_an_image_for_a_job_never_seen_is_not_fetched(self, tmp_path):
+        api = FakePrintLogApi()
+        fetched: list = []
+
+        run(api, tmp_path, image(fetched=fetched))
+
+        assert fetched == []
+        assert api.prints == {}
+
+    @pytest.mark.parametrize(
+        "failing",
+        [
+            image(data=None),
+            image(data=b"qoif not a format the API takes"),
+            image(error=RuntimeError("the adapter has a bug")),
+            image(error=OSError("disk gone")),
+        ],
+        ids=["none", "not-an-image", "bug", "os-error"],
+    )
+    def test_an_image_that_cannot_be_had_never_stops_the_print(self, tmp_path, failing):
+        api = FakePrintLogApi()
+
+        logger = run(api, tmp_path, started(), failing, finished())
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert print_["images"] == []
+        assert read_waiting(tmp_path) == {}
+        assert logger.state("voron").jobs["00000A"].finished
+
+    def test_a_fetch_that_hangs_is_given_up_on(self, tmp_path):
+        api = FakePrintLogApi()
+
+        async def scenario():
+            async with logging_to(api, tmp_path, image_timeout=0.2) as logger:
+                try:
+                    loop = asyncio.get_running_loop()
+                    began = loop.time()
+                    await logger.emit(started())
+                    await logger.emit(image(hang=30))
+                    took = loop.time() - began
+                    await logger.emit(finished())
+                    await drain(logger)
+                finally:
+                    logger.close()
+            return took
+
+        took = asyncio.run(scenario())
+
+        assert took < 2
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert print_["images"] == []
+
+    def test_an_image_the_api_refuses_is_dropped_and_the_print_still_completes(
+        self, tmp_path, caplog
+    ):
+        api = FakePrintLogApi()
+        api.max_images = 0
+
+        with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
+            run(api, tmp_path, started(), image(), finished())
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert read_waiting(tmp_path) == {}
+        assert "Maximum of 0 images" in caplog.text
+        assert not list((tmp_path / "images").iterdir())
+
+    def test_an_upload_that_keeps_failing_is_given_up_so_the_print_completes(self, tmp_path):
+        api = FakePrintLogApi()
+        api.image_status = 500
+
+        run(api, tmp_path, started(), image(), finished(), timeout=3)
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert read_waiting(tmp_path) == {}
+
+    def test_a_rate_limited_upload_waits_rather_than_being_given_up(self, tmp_path):
+        api = FakePrintLogApi()
+        api.image_status = 429
+
+        run(api, tmp_path, started(), image(), finished(), timeout=3)
+        assert read_waiting(tmp_path)["voron"].jobs == 1  # the image, and the finish behind it
+        api.image_status = None
+        run(api, tmp_path)
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert len(print_["images"]) == 1
+
+    def test_an_image_waits_in_the_outbox_while_the_api_is_down(self, tmp_path):
+        api = FakePrintLogApi()
+        api.offline = True
+
+        run(api, tmp_path, started(), image(), finished(), snapshot(), timeout=0.05)
+        assert read_waiting(tmp_path)["voron"].jobs == 1
+        api.offline = False
+        run(api, tmp_path)  # the bridge starts again, with the internet back
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert [i["contentType"] for i in print_["images"]] == ["image/png", "image/jpeg"]
+        posts = [path for method, path in api.requests if method == "POST"]
+        assert posts == [
+            "/api/Prints",
+            f"/api/Prints/{print_['id']}/image",
+            f"/api/Prints/{print_['id']}/complete",
+            f"/api/Prints/{print_['id']}/image",
+        ]
+        assert not list((tmp_path / "images").iterdir())
+
+    def test_an_image_for_a_print_the_user_deleted_is_dropped(self, tmp_path):
+        api = FakePrintLogApi()
+
+        def delete(api):
+            api.prints.clear()
+
+        run(api, tmp_path, started(), delete, image(), finished())
+
+        assert api.prints == {}
+        assert read_waiting(tmp_path) == {}
+
+    def test_an_image_file_gone_from_the_state_directory_is_skipped(self, tmp_path):
+        api = FakePrintLogApi()
+        api.offline = True
+        run(api, tmp_path, started(), image(), timeout=0.05)
+        for leftover in (tmp_path / "images").iterdir():
+            leftover.unlink()
+        api.offline = False
+
+        run(api, tmp_path, finished())
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert print_["images"] == []
+
+    def test_an_expired_image_does_not_stop_the_print_from_completing(self, tmp_path):
+        api = FakePrintLogApi()
+        now = [STARTED_AT]
+
+        async def scenario():
+            async with logging_to(api, tmp_path, clock=lambda: now[0]) as logger:
+                try:
+                    await logger.emit(started())
+                    await drain(logger)
+                    api.offline = True
+                    await logger.emit(image())
+                    await logger.send_due()
+                    now[0] += MAX_AGE + timedelta(minutes=1)
+                    await logger.emit(finished())
+                    api.offline = False
+                    await drain(logger)
+                finally:
+                    logger.close()
+
+        asyncio.run(scenario())
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert print_["images"] == []

@@ -21,6 +21,7 @@ from printlog_bridge.core.config import ConfigError
 from printlog_bridge.core.events import EventSink
 from printlog_bridge.core.status import PrinterReport
 
+from .images import MoonrakerImages
 from .jobs import JobTracker
 from .session import (
     ConnectionLost,
@@ -33,7 +34,11 @@ from .session import (
 log = logging.getLogger(__name__)
 
 DEFAULT_SOCKET = "~/printer_data/comms/moonraker.sock"
-OPTIONS = frozenset({"url", "socket", "moonraker_api_key"})
+OPTIONS = frozenset({"url", "socket", "moonraker_api_key", "snapshots"})
+BOOLEANS = {
+    "true": True, "yes": True, "on": True, "1": True,
+    "false": False, "no": False, "off": False, "0": False,
+}  # fmt: skip
 CHECK_TIMEOUT_S = 5
 
 URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
@@ -43,12 +48,19 @@ class MoonrakerAdapter(Adapter):
     name = "moonraker"
 
     def __init__(
-        self, printer: str, url: str | None, socket: Path | None, api_key: str | None = None
+        self,
+        printer: str,
+        url: str | None,
+        socket: Path | None,
+        api_key: str | None = None,
+        snapshots: bool = True,
     ) -> None:
         self.printer = printer
         self.url = url
         self.socket = socket
         self.api_key = api_key
+        self.snapshots = snapshots
+        """Whether a frame from the printer's webcam is added to each print when it ends."""
 
     @classmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> MoonrakerAdapter:
@@ -66,6 +78,11 @@ class MoonrakerAdapter(Adapter):
             )
 
         api_key = options.get("moonraker_api_key", "").strip() or None
+        snapshots = BOOLEANS.get(options.get("snapshots", "true").strip().lower())
+        if snapshots is None:
+            raise ConfigError(
+                f"[printer {printer}] snapshots must be true or false, not {options['snapshots']!r}"
+            )
 
         if "url" in options:
             url = options["url"].strip().rstrip("/")
@@ -75,7 +92,7 @@ class MoonrakerAdapter(Adapter):
                     f"[printer {printer}] url must look like http://printer.local:7125, "
                     f"not {options['url']!r}"
                 )
-            return cls(printer, url=url, socket=None, api_key=api_key)
+            return cls(printer, url=url, socket=None, api_key=api_key, snapshots=snapshots)
 
         if api_key is not None:
             raise ConfigError(
@@ -84,7 +101,7 @@ class MoonrakerAdapter(Adapter):
             )
 
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
-        return cls(printer, url=None, socket=socket)
+        return cls(printer, url=None, socket=socket, snapshots=snapshots)
 
     def describe(self) -> str:
         if self.url is not None:
@@ -92,9 +109,16 @@ class MoonrakerAdapter(Adapter):
         return f"moonraker, local socket {self.socket}"
 
     async def run(self, sink: EventSink, report: PrinterReport) -> None:
+        images = MoonrakerImages(
+            self.printer,
+            url=self.url,
+            socket=self.socket,
+            api_key=self.api_key,
+            snapshots=self.snapshots,
+        )
         session = MoonrakerSession(
             self.printer,
-            listener=JobTracker(self.printer, sink, report),
+            listener=JobTracker(self.printer, sink, report, images),
             url=self.url,
             socket=self.socket,
             api_key=self.api_key,

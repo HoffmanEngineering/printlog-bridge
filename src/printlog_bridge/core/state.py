@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,9 @@ class JobRecord:
     finished: bool = False
     ended_at: str | None = None
     """When the printer said the job ended, while that isn't logged yet (it's in the outbox)."""
+    images: dict[str, bool] = field(default_factory=dict)
+    """Each picture already fetched for the job (`thumbnail`, `snapshot`), and whether there
+    was one to add, so a replayed job isn't fetched again."""
 
 
 class PrinterState:
@@ -43,10 +46,15 @@ class PrinterState:
 
     @classmethod
     def load(cls, state_dir: Path, printer: str) -> PrinterState:
-        path = state_dir / "printers" / f"{_file_name(printer)}.json"
+        path = state_dir / "printers" / f"{safe_file_name(printer)}.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            jobs = {job_id: JobRecord(**job) for job_id, job in data["jobs"].items()}
+            known = {f.name for f in fields(JobRecord)}
+            # Fields a newer bridge added are left out, so going back a version still works.
+            jobs = {
+                job_id: JobRecord(**{k: v for k, v in job.items() if k in known})
+                for job_id, job in data["jobs"].items()
+            }
             return cls(path, data["instance_id"], jobs)
         except FileNotFoundError:
             pass
@@ -88,5 +96,6 @@ class PrinterState:
         os.replace(temporary, self.path)
 
 
-def _file_name(printer: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "_", printer)
+def safe_file_name(name: str) -> str:
+    """`name` with anything a file name shouldn't hold replaced by `_`."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)

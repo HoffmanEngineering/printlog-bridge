@@ -6,7 +6,7 @@ Adapters translate their printer's own vocabulary into these events, and everyth
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -46,7 +46,29 @@ class JobFinished:
     """Why it failed, in words for the print's notes, such as "Klipper shutdown"."""
 
 
-JobEvent = Union[JobStarted, JobFinished]
+class ImageKind(Enum):
+    THUMBNAIL = "thumbnail"
+    """The slicer's preview, from the job's file, reported when the job starts."""
+    SNAPSHOT = "snapshot"
+    """One frame from the printer's webcam, reported when the job ends."""
+
+
+@dataclass(frozen=True)
+class JobImage:
+    """A picture of the job. The sink calls `fetch` only when it still wants this one.
+
+    `fetch` returns the image's bytes, or None when there is none to be had (no thumbnail in
+    the file, no webcam). It should give up on its own after about 10 s; the sink stops waiting
+    after `IMAGE_TIMEOUT_S` regardless, and treats anything it raises as no image.
+    """
+
+    printer: str
+    job_id: str
+    kind: ImageKind
+    fetch: Callable[[], Awaitable[bytes | None]] = field(compare=False, repr=False)
+
+
+JobEvent = Union[JobStarted, JobFinished, JobImage]
 
 
 class EventSink(Protocol):

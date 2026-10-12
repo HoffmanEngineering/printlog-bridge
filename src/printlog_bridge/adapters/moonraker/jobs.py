@@ -4,18 +4,31 @@ History is the authoritative record of a job: Moonraker adds an entry when a pri
 finishes it with a status, timings and `filament_used`, and announces both. On every connect the
 tracker also reads the history since the sink's resume point, so a job that started or ended
 while the bridge (or its connection) was down is still reported. The sink recognises replays.
+
+With `images`, each start is followed by the job's thumbnail, and each end seen as it happens
+by a webcam snapshot (when snapshots are on). A job that ended while the bridge was away gets
+no snapshot: the camera would show the bed as it is now, not as the job left it.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
-from printlog_bridge.core.events import EventSink, JobFinished, JobOutcome, JobStarted
+from printlog_bridge.core.events import (
+    EventSink,
+    ImageKind,
+    JobFinished,
+    JobImage,
+    JobOutcome,
+    JobStarted,
+)
 from printlog_bridge.core.status import NullReport, PrinterReport
 
+from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
 
 log = logging.getLogger(__name__)
@@ -38,13 +51,22 @@ OUTCOMES: Mapping[str, tuple[JobOutcome, str | None]] = {
 class JobTracker:
     """A MoonrakerListener that reports each job in history to an EventSink."""
 
-    def __init__(self, printer: str, sink: EventSink, report: PrinterReport | None = None) -> None:
+    def __init__(
+        self,
+        printer: str,
+        sink: EventSink,
+        report: PrinterReport | None = None,
+        images: MoonrakerImages | None = None,
+    ) -> None:
         self.printer = printer
         self.sink = sink
         self.report = report or NullReport()
+        self.images = images
         self._error_message: str | None = None
+        self._call: Call | None = None
 
     async def on_connected(self, call: Call) -> None:
+        self._call = call
         try:
             jobs = await self._jobs_to_replay(call)
         except MoonrakerRpcError as e:
@@ -100,10 +122,30 @@ class JobTracker:
                 return jobs
 
     async def _report(self, job: Mapping[str, Any], live: bool = False) -> None:
-        await self.sink.emit(started(self.printer, job))
+        start = started(self.printer, job)
+        await self.sink.emit(start)
+        images, call = self.images, self._call
+        if images is not None and call is not None:
+            await self.sink.emit(
+                JobImage(
+                    self.printer,
+                    start.job_id,
+                    ImageKind.THUMBNAIL,
+                    functools.partial(images.thumbnail, call, job),
+                )
+            )
         if job.get("status", "in_progress") != "in_progress":
             message = self._error_message if live else None
             await self.sink.emit(finished(self.printer, job, message))
+            if live and images is not None and images.snapshots and call is not None:
+                await self.sink.emit(
+                    JobImage(
+                        self.printer,
+                        start.job_id,
+                        ImageKind.SNAPSHOT,
+                        functools.partial(images.snapshot, call),
+                    )
+                )
 
 
 def started(printer: str, job: Mapping[str, Any]) -> JobStarted:

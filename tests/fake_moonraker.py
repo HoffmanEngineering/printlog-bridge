@@ -1,13 +1,16 @@
 """A small stand-in for Moonraker's JSON-RPC API, over a WebSocket or a Unix socket.
 
 It speaks just enough of the protocol for the bridge: identify, server.info,
-printer.objects.list/subscribe, connection.register_remote_method and server.history.list, plus
-pushing notifications and dropping every client to simulate a restart. `start_job` and
-`finish_job` drive a print the way Moonraker's history component reports one.
+printer.objects.list/subscribe, connection.register_remote_method, server.history.list,
+server.files.roots, server.files.metadata and server.webcams.list, plus pushing notifications
+and dropping every client to simulate a restart. `start_job` and `finish_job` drive a print the
+way Moonraker's history component reports one. Over HTTP it serves the gcodes root's files
+(`GET /server/files/gcodes/<path>`), which is how a remote bridge gets a thumbnail.
 
 Authorization copies real Moonraker (checked against v0.9): the WebSocket upgrade always
 succeeds, the Unix socket is trusted, and a WebSocket is authorized by an `X-Api-Key` header on
-the upgrade or an `api_key` in identify. Until then every method fails with -32602.
+the upgrade or an `api_key` in identify. Until then every method fails with -32602. A file
+download needs the `X-Api-Key` header (401 without it) whenever an API key is set.
 """
 
 from __future__ import annotations
@@ -60,6 +63,16 @@ class FakeMoonraker:
             "virtual_sdcard": {"progress": 0.0, "is_active": False},
             "filament_detect": {"info": []},
         }
+        self.files: dict[str, bytes] = {}
+        """Files under the gcodes root, by path relative to it (`.thumbs/x-300x300.png`)."""
+        self.file_metadata: dict[str, dict[str, Any]] = {}
+        """What server.files.metadata answers, by file name."""
+        self.gcodes_root = "/home/pi/printer_data/gcodes"
+        self.webcams: list[dict[str, Any]] = []
+        """moonraker.conf's [webcam] sections, as server.webcams.list lists them."""
+        self.calls: list[str] = []
+        """Every method called, in order."""
+        self.downloads: list[str] = []
         self.identified: list[dict] = []
         self.subscriptions: list[dict] = []
         self.registered: list[str] = []
@@ -76,6 +89,7 @@ class FakeMoonraker:
         """Serves over HTTP; returns the base URL (http://127.0.0.1:port)."""
         app = web.Application()
         app.router.add_get("/websocket", self._websocket)
+        app.router.add_get("/server/files/gcodes/{path:.+}", self._download)
         self._server = TestServer(app)
         await self._server.start_server()
         return str(self._server.make_url("")).rstrip("/")
@@ -114,6 +128,15 @@ class FakeMoonraker:
             self._clients.pop(send, None)
             self._agents.discard(conn.get("agent"))
         return ws
+
+    async def _download(self, request: web.Request) -> web.Response:
+        path = request.match_info["path"]
+        self.downloads.append(path)
+        if self.api_key is not None and request.headers.get("X-Api-Key") != self.api_key:
+            return web.Response(status=401)
+        if path not in self.files:
+            return web.Response(status=404)
+        return web.Response(body=self.files[path], content_type="image/png")
 
     async def _unix_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -158,6 +181,7 @@ class FakeMoonraker:
         await send({"jsonrpc": "2.0", "result": result, "id": request.get("id")})
 
     def _dispatch(self, method: str, params: dict, conn: dict) -> Any:
+        self.calls.append(method)
         if method == "server.connection.identify":
             if "api_key" in params:
                 if params["api_key"] != self.api_key:
@@ -197,6 +221,18 @@ class FakeMoonraker:
             return {"eventtime": 1.0, "status": status}
         if method == "server.history.list":
             return self._history_list(params)
+        if method == "server.files.roots":
+            return [
+                {"name": "config", "path": "/home/pi/printer_data/config", "permissions": "rw"},
+                {"name": "gcodes", "path": self.gcodes_root, "permissions": "rw"},
+            ]
+        if method == "server.files.metadata":
+            filename = params.get("filename")
+            if filename not in self.file_metadata:
+                raise _RpcError(404, f"Metadata not available for <{filename}>")
+            return {"filename": filename, **self.file_metadata[filename]}
+        if method == "server.webcams.list":
+            return {"webcams": [dict(w) for w in self.webcams]}
         if method == "connection.register_remote_method":
             self.registered.append(params["method_name"])
             return "ok"

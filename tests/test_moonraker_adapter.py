@@ -54,6 +54,25 @@ def test_websocket_url_is_accepted_and_kept():
     assert adapter.url == "ws://u1.local:7125/websocket"
 
 
+def test_snapshots_are_on_unless_turned_off():
+    assert MoonrakerAdapter.from_config("u1", {"url": "http://u1.local"}).snapshots is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("false", False), ("no", False), ("off", False), ("0", False), ("True", True), ("yes", True)],
+)
+def test_snapshots_can_be_turned_off(value, expected):
+    options = {"url": "http://u1.local", "snapshots": value}
+
+    assert MoonrakerAdapter.from_config("u1", options).snapshots is expected
+
+
+def test_snapshots_must_be_yes_or_no():
+    with pytest.raises(ConfigError, match=r"\[printer u1\] snapshots must be true or false"):
+        MoonrakerAdapter.from_config("u1", {"url": "http://u1.local", "snapshots": "maybe"})
+
+
 def test_unknown_option_is_an_error_so_typos_surface():
     with pytest.raises(ConfigError, match=r"\[printer u1\].*unknown option 'ulr'"):
         MoonrakerAdapter.from_config("u1", {"ulr": "http://x"})

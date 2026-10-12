@@ -19,6 +19,8 @@ import aiohttp
 from printlog_bridge import __version__
 
 REQUEST_TIMEOUT_S = 15
+UPLOAD_TIMEOUT_S = 30
+"""An image upload carries up to 10 MB, so it gets longer than other requests."""
 
 
 class ApiError(Exception):
@@ -32,14 +34,18 @@ class AuthRejected(ApiError):
 class ApiUnavailable(ApiError):
     """The API could not be reached or failed. Worth retrying later."""
 
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self, message: str, retry_after: float | None = None, status: int | None = None
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
         """Seconds the API asked the bridge to wait (`Retry-After`), when it said."""
+        self.status = status
+        """The HTTP status the API answered with, or None when it couldn't be reached."""
 
 
 class ApiRejected(ApiError):
-    """The API refused this request (400 or 403). Sending it again won't change the answer."""
+    """The API refused this request (400, 403, 413, 415). Sending it again won't change that."""
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,24 @@ class ApiClient:
     async def patch_print(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
         return await self._request("PATCH", f"/api/Prints/{print_id}", json=body, missing_ok=True)
 
+    async def upload_print_image(
+        self, print_id: int, data: bytes, content_type: str, file_name: str, is_default: bool
+    ) -> dict[str, Any] | None:
+        """Adds an image to the print (`isDefault` makes it the one shown for the print).
+
+        None when the print is gone."""
+        form = aiohttp.FormData()
+        form.add_field("image", data, content_type=content_type, filename=file_name)
+        form.add_field("isDefault", "true" if is_default else "false")
+        status, body = await self._send(
+            "POST",
+            f"/api/Prints/{print_id}/image",
+            data=form,
+            missing_ok=True,
+            timeout=UPLOAD_TIMEOUT_S,
+        )
+        return None if status == 404 else body
+
     async def put_connection(self, instance_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Registers the connection, or sends its heartbeat. Each call replaces every field."""
         return await self._request("PUT", f"/api/Connections/{instance_id}", json=body)
@@ -140,20 +164,27 @@ class ApiClient:
         params: Mapping[str, str] | None = None,
         *,
         missing_ok: bool = False,
+        data: aiohttp.FormData | None = None,
+        timeout: float = REQUEST_TIMEOUT_S,
     ) -> tuple[int, Any]:
         if self._session is None:
             raise RuntimeError("use ApiClient as `async with ApiClient(...) as client`")
 
         try:
             async with self._session.request(
-                method, self.base_url + path, json=json, params=params
+                method,
+                self.base_url + path,
+                json=json,
+                params=params,
+                data=data,
+                timeout=aiohttp.ClientTimeout(total=timeout),
             ) as response:
                 self.server_time = _date(response.headers.get("Date")) or self.server_time
                 if response.status == 401:
                     raise AuthRejected(f"the API rejected the key ({response.status})")
                 if response.status == 404 and missing_ok:
                     return 404, None
-                if response.status in (400, 403):
+                if response.status in (400, 403, 413, 415):
                     reason = (await response.text()).strip()[:300]
                     raise ApiRejected(
                         f"the API refused {method} {path} ({response.status})"
@@ -163,14 +194,13 @@ class ApiClient:
                     raise ApiUnavailable(
                         f"the API answered {response.status} for {path}",
                         _retry_after(response.headers.get("Retry-After"), self.server_time),
+                        status=response.status,
                     )
                 return response.status, await response.json()
         except aiohttp.ClientError as e:
             raise ApiUnavailable(f"can't reach {self.base_url}: {e}") from e
         except asyncio.TimeoutError as e:
-            raise ApiUnavailable(
-                f"{self.base_url} did not answer within {REQUEST_TIMEOUT_S}s"
-            ) from e
+            raise ApiUnavailable(f"{self.base_url} did not answer within {timeout:g}s") from e
 
 
 def _retry_after(header: str | None, server_time: datetime | None) -> float | None:

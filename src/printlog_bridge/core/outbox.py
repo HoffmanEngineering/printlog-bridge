@@ -54,7 +54,7 @@ class Entry:
     printer: str
     job_id: str
     kind: str
-    """`start` or `finish`."""
+    """`start`, `finish`, or a picture to add: `thumbnail` or `snapshot`."""
     payload: dict[str, Any]
     queued_at: datetime
     attempts: int
@@ -114,6 +114,11 @@ class Outbox:
         ).fetchall()
         return [_entry(row) for row in rows]
 
+    def entries(self) -> list[Entry]:
+        """Every entry, oldest first."""
+        rows = self._db.execute(f"SELECT {_COLUMNS} FROM entries ORDER BY seq").fetchall()
+        return [_entry(row) for row in rows]
+
     def remove(self, seq: int) -> None:
         with self._db:
             self._db.execute("DELETE FROM entries WHERE seq = ?", (seq,))
@@ -128,13 +133,7 @@ class Outbox:
     def drop_expired(self) -> list[Entry]:
         """Removes and returns the entries queued more than `MAX_AGE` ago."""
         cutoff = self.clock() - MAX_AGE
-        expired = [
-            e
-            for e in map(
-                _entry, self._db.execute(f"SELECT {_COLUMNS} FROM entries ORDER BY seq").fetchall()
-            )
-            if e.queued_at < cutoff
-        ]
+        expired = [e for e in self.entries() if e.queued_at < cutoff]
         if expired:
             with self._db:
                 self._db.executemany(
