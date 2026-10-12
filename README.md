@@ -130,11 +130,12 @@ cp printlog-bridge.example.cfg ~/printer_data/config/printlog-bridge.cfg   # the
 
 `doctor` checks the config, the state directory, the API key, this computer's clock and each printer, and says what to fix. `printlog-bridge run` then watches every printer until stopped (Ctrl-C, or SIGTERM from systemd), and shows up in Moonraker's extensions list (Mainsail and Fluidd show it too).
 
-`printlog-bridge status` shows what the running bridge is doing. For each printer it lists the connection, the printer's state, the last job event, the last heartbeat, how many jobs are waiting to reach 3D Print Log, and anything you need to fix:
+`printlog-bridge status` shows what the running bridge is doing. For each printer it lists the connection, the printer's state, the last job event, the last heartbeat, how many jobs are waiting to reach 3D Print Log, and anything you need to fix (the `Trace` line shows only with `trace = true`):
 
 ```
 printlog-bridge 0.1.0 status
 Bridge: running since 2026-10-10 09:30 UTC (version 0.1.0, pid 812)
+Trace: on, recording every Moonraker message in /home/pi/.local/share/printlog-bridge/traces
 Printer voron (printer 42 in 3D Print Log)
   Connection: connected for 3h 12m (moonraker, local socket /home/pi/printer_data/comms/moonraker.sock)
   Printer state: ready
@@ -147,7 +148,7 @@ Printer voron (printer 42 in 3D Print Log)
 
 It exits 0 while the bridge runs and 1 when it doesn't, so scripts can check it. Each printer shows up in 3D Print Log as a connection, with a heartbeat every 5 minutes; the app shows it as offline after 15 minutes without one.
 
-When you need help, run `doctor` and attach the support bundle it writes (`printlog-bridge-support.zip` in the state directory). It holds the doctor report, your config, the bridge's status, its state and its recent log (`bridge.log`), with every API key, token and password removed.
+When you need help, run `doctor` and attach the support bundle it writes (`printlog-bridge-support.zip` in the state directory). It holds the doctor report, your config, the bridge's status, its state, its recent log (`bridge.log`) and, with `trace = true`, the latest traces (see [Recording a trace](#recording-a-trace)), with every API key, token and password removed.
 
 Each print appears in 3D Print Log as Printing when the job starts, titled from its file name, with the slicer's estimates. When it ends, the bridge records the outcome, the print time and the filament Klipper fed:
 
@@ -176,7 +177,7 @@ PRINTLOG_CLEAR_SPOOL TOOL=1              ; T1 has no spool
 
 `TOOL` is 0 for T0 or a single-tool printer; without it, it's the active tool. A tag is the UID stored on the spool in 3D Print Log, in any common format (`04:a2:3f:11` is `04A23F11`). The bridge answers on the console within a second or two, and adds slots to the printer in 3D Print Log when it has fewer than its tools. The macros only print a line for the bridge to read, so they never fail and never stop a print, even with the bridge offline: if no answer comes, run it again once the bridge is back. Assign spools before a print starts; a print keeps the spools it started with, and you can change them on the print in the app. The bridge never touches Moonraker's Spoolman integration, its active spool or what it reports.
 
-On a Snapmaker U1, when the RFID reader reads a Snapmaker spool's tag in a slot, the bridge assigns the spool in your 3D Print Log inventory that has that tag. When none has it, and the tag's material or color doesn't match the spool assigned to that slot, the print gets a note saying so; it's logged all the same. The U1 support follows Snapmaker's published firmware and hasn't been tried on a printer yet.
+On a Snapmaker U1, when the RFID reader reads a Snapmaker spool's tag in a slot, the bridge assigns the spool in your 3D Print Log inventory that has that tag. When none has it, and the tag's material or color doesn't match the spool assigned to that slot, the print gets a note saying so; it's logged all the same. The U1 support follows Snapmaker's published firmware, and its reader's data has been checked against a real U1; a whole print on one hasn't been recorded yet.
 
 What you change in the app while it prints is kept: the title, your notes (a note is added after them), the spool on a usage row, and a status you already chose, such as Partial success. A print you delete stays deleted.
 
@@ -200,6 +201,14 @@ In remote mode, if Moonraker has `[authorization]` enabled and the bridge's host
 
 Each print gets the largest thumbnail the slicer embedded in its file (OrcaSlicer, PrusaSlicer, Cura and SuperSlicer all embed one) as its picture when it starts. When it ends, the bridge also adds one frame from the printer's first webcam (its `snapshot_url` in Mainsail or Fluidd); for a failed print that frame becomes the picture shown. Set `snapshots = false` in the printer's section to never ask the webcam for anything. Pictures wait in the outbox with the print's other events (the image files in `images/` in the state directory), and never hold up logging the print: one that takes longer than 10 seconds, is over 10 MB or that 3D Print Log refuses (a print holds 5 pictures on the free plan) is skipped. A Moonraker or webcam address with a password or token in it is shown with them hidden, in the log, `status` and `doctor`.
 
+### Recording a trace
+
+To report a problem with a printer, or to turn one of its prints into a test, set `trace = true` in `[bridge]` (in Docker, set the environment variable `PRINTLOG_BRIDGE_TRACE=1` instead) and restart the bridge. It then records every message it sends to and receives from each printer's Moonraker, one JSON line each with the time and the direction, in `traces/<printer>-<YYYYMMDD>.jsonl` in the state directory. `status` shows `Trace: on` while it records.
+
+A trace holds what Moonraker tells the bridge: the printer's state as it changes (print progress, the active tool, filament used, the RFID reader's tags), its job history with file names and the slicer's metadata, its webcam list and console lines. It never holds G-code, and every API key, Moonraker key, oneshot token and password (in URLs too) is removed before it is written. Traces stay on this computer; nothing sends them anywhere. `doctor`'s support bundle includes the latest 20 MB, for you to attach.
+
+Tracing never slows the bridge down: messages are written by a thread of their own, and dropped rather than queued when the disk can't keep up. Each printer's traces are kept under 50 MB in all, in files of up to 10 MB, the oldest deleted first; a full or read-only disk only pauses them. Set `trace = false` (or remove the line) and restart to stop.
+
 ## Development
 
 ```sh
@@ -212,6 +221,8 @@ python -m venv .venv
 CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`.
 
 The Docker workflow builds the image for amd64 and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run` and `status` inside the container, as a non-root user, against three fake Moonrakers and a fake 3D Print Log API on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. It then builds all three platforms, and pushes them to GHCR from `main` (`edge`) and from `v*` tags. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev`.
+
+`tests/fixtures/moonraker/` holds REAL answers from a Snapmaker U1 and an Infimech EX, which `tests/test_real_captures.py` runs the adapter against. `tests/trace_replay.py` replays a trace as Moonraker, so a recorded print becomes a regression test: see `tests/test_trace_replay.py`, which replays a SYNTHETIC U1 print from `tests/fixtures/traces/`.
 
 `pytest -m integration` runs the bridge against a real Moonraker, built from source in Docker (set `MOONRAKER_REF` to pick a tag or commit; the default is `v0.9.3`). The first run builds the image, which takes a minute or two. CI runs it against the last release and a pinned recent commit. To support another kind of printer, see [docs/adapters.md](docs/adapters.md).
 

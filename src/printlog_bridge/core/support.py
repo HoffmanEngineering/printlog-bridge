@@ -4,7 +4,8 @@ Secrets are removed twice. The config file is redacted option by option (any opt
 key, token, secret or password, and passwords in URLs), and then every known secret value, from
 the config, the key file and the environment, is replaced wherever it appears in any file of
 the bundle, in case one was ever written to the log or the status file. The key file itself
-(`<state_dir>/api_key`) is never bundled.
+(`<state_dir>/api_key`) is never bundled. With `trace = true`, the newest traces are bundled
+too, up to `TRACE_BYTES`; they were scrubbed when written, and are scrubbed again here.
 """
 
 from __future__ import annotations
@@ -15,22 +16,24 @@ import json
 import platform
 import re
 import zipfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.core.config import API_KEY_ENV, API_KEY_FILE
 from printlog_bridge.core.outbox import read_entries
+from printlog_bridge.core.secrets import REDACTED, URL_USERINFO, scrub
 from printlog_bridge.core.status import STATUS_FILE
+from printlog_bridge.core.trace import TRACE_DIR, trace_files
 
 BUNDLE_NAME = "printlog-bridge-support.zip"
 LOG_FILES = ("bridge.log", "bridge.log.1")
-REDACTED = "<redacted>"
+TRACE_BYTES = 20 * 1024 * 1024
+"""How much of the newest traces (`trace = true`) goes into the bundle, before compression."""
 
 _SECRET_OPTION = re.compile(r"(key|token|secret|password)", re.IGNORECASE)
 _OPTION_LINE = re.compile(r"^(\s*)([^=:\s\[;#][^=:]*?)(\s*[=:]\s*)(.*)$")
-_URL_USERINFO = re.compile(r"(\w+://)[^/@\s]+@")
 _SECRET_ENV = (API_KEY_ENV,)
 MIN_SECRET_LENGTH = 4
 """Shorter values aren't scrubbed everywhere: replacing every "abc" would garble the bundle."""
@@ -43,14 +46,10 @@ def write_support_bundle(
     config_path: Path,
     state_dir: Path,
     env: Mapping[str, str],
+    trace_bytes: int = TRACE_BYTES,
 ) -> Path:
     config_text = _read(config_path)
-    found = _secrets(config_text or "", env)
-    key_file = (_read(state_dir / API_KEY_FILE) or "").strip()  # never bundled itself
-    if len(key_file) >= MIN_SECRET_LENGTH:
-        found.add(key_file)
-    secrets = sorted(found, key=len, reverse=True)
-    # longest first, so a secret containing another is replaced whole
+    secrets = known_secrets(config_path, state_dir, env)
 
     files: dict[str, str] = {
         "doctor.txt": report,
@@ -71,12 +70,13 @@ def write_support_bundle(
         files["outbox.json"] = json.dumps(
             [{**asdict(e), "queued_at": e.queued_at.isoformat()} for e in entries], indent=1
         )
+    files.update(_latest_traces(state_dir, trace_bytes))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for name, text in files.items():
-            bundle.writestr(name, _scrub(text, secrets))
+            bundle.writestr(name, scrub(text, secrets))
     temporary.replace(path)
     return path
 
@@ -87,8 +87,19 @@ def redact_config(text: str) -> str:
         match = _OPTION_LINE.match(line)
         if match and _SECRET_OPTION.search(match.group(2)) and match.group(4).strip():
             line = f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}"
-        lines.append(_URL_USERINFO.sub(rf"\1{REDACTED}@", line))
+        lines.append(URL_USERINFO.sub(rf"\1{REDACTED}@", line))
     return "\n".join(lines) + "\n"
+
+
+def known_secrets(config_path: Path, state_dir: Path, env: Mapping[str, str]) -> list[str]:
+    """Every secret the bridge knows of: the config's keys, tokens and passwords (URL passwords
+    among them), the API key from the environment and from the key file. Longest first, so a
+    secret containing another is replaced whole."""
+    found = _secrets(_read(config_path) or "", env)
+    key_file = (_read(state_dir / API_KEY_FILE) or "").strip()
+    if len(key_file) >= MIN_SECRET_LENGTH:
+        found.add(key_file)
+    return sorted(found, key=len, reverse=True)
 
 
 def _secrets(config_text: str, env: Mapping[str, str]) -> set[str]:
@@ -104,10 +115,26 @@ def _secrets(config_text: str, env: Mapping[str, str]) -> set[str]:
     return {s for s in found if len(s) >= MIN_SECRET_LENGTH}
 
 
-def _scrub(text: str, secrets: Iterable[str]) -> str:
-    for secret in secrets:
-        text = text.replace(secret, REDACTED)
-    return _URL_USERINFO.sub(rf"\1{REDACTED}@", text)
+def _latest_traces(state_dir: Path, budget: int) -> dict[str, str]:
+    """The newest trace files (every printer's), up to `budget` bytes in all. The oldest one
+    that fits only in part is cut to its newest whole lines."""
+    found: dict[str, str] = {}
+    for path in reversed(trace_files(state_dir)):
+        if budget <= 0:
+            break
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as f:
+                if size > budget:
+                    f.seek(size - budget)
+                    f.readline()  # the rest of a line cut in two
+                data = f.read(budget)
+        except OSError:
+            continue
+        budget -= len(data)
+        if data:
+            found[f"{TRACE_DIR}/{path.name}"] = data.decode("utf-8", errors="replace")
+    return dict(reversed(list(found.items())))
 
 
 def _environment(config_path: Path, state_dir: Path) -> str:

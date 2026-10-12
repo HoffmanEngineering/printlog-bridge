@@ -18,10 +18,13 @@ from printlog_bridge.core.config import load_config
 Condition = Callable[[], Union[bool, Awaitable[bool]]]
 
 
-def write_config(tmp_path: Path, moonraker_url: str, api_url: str, printer_id: int = 42) -> Path:
+def write_config(
+    tmp_path: Path, moonraker_url: str, api_url: str, printer_id: int = 42, trace: bool = False
+) -> Path:
     path = tmp_path / "printlog-bridge.cfg"
     path.write_text(
         f"[bridge]\napi_url = {api_url}\napi_key = key-123\nstate_dir = {tmp_path / 'state'}\n"
+        f"trace = {'true' if trace else 'false'}\n"
         f"[printer voron]\nprinter_id = {printer_id}\nurl = {moonraker_url}\n",
         encoding="utf-8",
     )

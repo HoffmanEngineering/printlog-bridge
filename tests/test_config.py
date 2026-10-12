@@ -328,3 +328,40 @@ class TestApiKeyFile:
 
         with pytest.raises(ConfigError, match="api_key"):
             load(path)
+
+
+class TestTrace:
+    def config(self, tmp_path, option: str = "", env=None):
+        path = write(tmp_path, f"[bridge]\n{option}\n[printer voron]\nadapter = fake\n")
+        return load(path, env)
+
+    def test_is_off_by_default(self, tmp_path):
+        assert self.config(tmp_path).trace is False
+
+    @pytest.mark.parametrize("value", ["true", "yes", "on", "1", "True"])
+    def test_trace_in_the_bridge_section_turns_it_on(self, tmp_path, value):
+        assert self.config(tmp_path, f"trace = {value}").trace is True
+
+    def test_trace_false_leaves_it_off(self, tmp_path):
+        assert self.config(tmp_path, "trace = false").trace is False
+
+    def test_the_environment_turns_it_on(self, tmp_path):
+        assert self.config(tmp_path, env={"PRINTLOG_BRIDGE_TRACE": "1"}).trace is True
+
+    def test_the_environment_wins_over_the_config(self, tmp_path):
+        config = self.config(tmp_path, "trace = true", env={"PRINTLOG_BRIDGE_TRACE": "0"})
+
+        assert config.trace is False
+
+    def test_a_blank_variable_is_ignored(self, tmp_path):
+        config = self.config(tmp_path, "trace = true", env={"PRINTLOG_BRIDGE_TRACE": " "})
+
+        assert config.trace is True
+
+    def test_anything_else_is_a_config_error(self, tmp_path):
+        with pytest.raises(ConfigError, match=r"\[bridge\] trace must be true or false"):
+            self.config(tmp_path, "trace = sometimes")
+
+    def test_a_bad_variable_is_a_config_error(self, tmp_path):
+        with pytest.raises(ConfigError, match="PRINTLOG_BRIDGE_TRACE must be"):
+            self.config(tmp_path, env={"PRINTLOG_BRIDGE_TRACE": "maybe"})

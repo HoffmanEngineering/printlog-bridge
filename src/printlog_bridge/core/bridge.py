@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.config import API_KEY_ENV, BridgeConfig, ConfigError
@@ -12,6 +13,8 @@ from printlog_bridge.core.doctor import API_KEYS_PAGE, PRINTERS_PAGE
 from printlog_bridge.core.lifecycle import BACKOFF_S, JobLogger, LoggedPrinter
 from printlog_bridge.core.spools import REFRESH_INTERVAL_S, Spools
 from printlog_bridge.core.status import TOUCH_INTERVAL_S, StatusBoard
+from printlog_bridge.core.support import known_secrets
+from printlog_bridge.core.trace import Trace, trace_dir
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +53,8 @@ async def run_bridge(
     assert config.api_key is not None  # check_runnable made sure
 
     board = StatusBoard(config.state_dir)
-    board.start([p.name for p in config.printers])
+    board.start([p.name for p in config.printers], trace=config.trace)
+    traces = _start_tracing(config)
     try:
         async with ApiClient(config.api_url, config.api_key) as api:
             spools = Spools(
@@ -104,7 +108,28 @@ async def run_bridge(
             finally:
                 sink.close()
     finally:
+        for trace in traces:
+            trace.close()
         board.stopped()
+
+
+def _start_tracing(config: BridgeConfig) -> list[Trace]:
+    """With `trace = true`, a trace for each printer, handed to its adapter."""
+    if not config.trace:
+        return []
+    secrets = known_secrets(config.path, config.state_dir, os.environ)
+    if config.api_key:
+        secrets.append(config.api_key)
+    traces = []
+    for printer in config.printers:
+        trace = Trace(config.state_dir, printer.name, secrets=secrets)
+        printer.adapter.use_trace(trace)
+        traces.append(trace)
+    log.info(
+        "tracing is on: every message to and from each printer is recorded in %s",
+        trace_dir(config.state_dir),
+    )
+    return traces
 
 
 async def _keep_touching(board: StatusBoard, interval: float) -> None:

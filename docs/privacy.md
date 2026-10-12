@@ -59,13 +59,30 @@ The bridge holds up to three secrets: your 3D Print Log API key, Moonraker's API
 
 `moonraker_api_key` stays in the config. It is only for remote mode, where the bridge usually runs on another computer, away from any folder Moonraker serves; `doctor` doesn't check where it is.
 
-**Secrets never reach the log, the status file, `status`, `doctor` or the support bundle.** URLs are shown with their user, password and secret-looking query values (`token`, `key`, `pass`, `auth`, `sig`, `user`, ...) replaced by `***`, in `bridge.log`, `status.json`, `status`, `doctor`, and every error message. The support bundle `doctor` writes removes every key, token and password it knows of (from the config, the key file and the environment) from every file in it, and never includes the key file.
+**Secrets never reach the log, the status file, `status`, `doctor`, a trace or the support bundle.** URLs are shown with their user, password and secret-looking query values (`token`, `key`, `pass`, `auth`, `sig`, `user`, ...) replaced by `***`, in `bridge.log`, `status.json`, `status`, `doctor`, and every error message. The support bundle `doctor` writes removes every key, token and password it knows of (from the config, the key file and the environment) from every file in it, as well as passwords in URLs and secret-looking query values, and never includes the key file.
 
-Tests: `test_no_secret_reaches_the_log`, `..._the_state_directory` and `..._status` run a print with every kind of secret set and look for each in everything the bridge wrote. `TestMoonrakerUrlsAreMasked` covers `doctor`'s messages, `TestSupportBundle` here and in `tests/test_doctor.py` the bundle, `tests/test_install_helper.py` and `tests/install/smoke.sh` where install.sh puts the key, and `TestApiKeyStorage` in `tests/test_doctor.py` the warnings.
+Tests: `test_no_secret_reaches_the_log`, `..._the_state_directory` and `..._status` run a print, traced, with every kind of secret set and look for each in everything the bridge wrote, the trace included. `TestMoonrakerUrlsAreMasked` covers `doctor`'s messages, `TestSupportBundle` here and in `tests/test_doctor.py` the bundle, `tests/test_install_helper.py` and `tests/install/smoke.sh` where install.sh puts the key, and `TestApiKeyStorage` in `tests/test_doctor.py` the warnings.
 
 ## What it keeps on the printer
 
-In the state directory (`~/.local/share/printlog-bridge` by default): the key file, which job it logged as which print (`printers/`), the outbox of events and pictures not yet sent (`outbox.sqlite3`, `images/`), `status.json` and `bridge.log`. An event still unsent after 30 days is dropped. `uninstall.sh --purge` removes all of it.
+In the state directory (`~/.local/share/printlog-bridge` by default): the key file, which job it logged as which print (`printers/`), the outbox of events and pictures not yet sent (`outbox.sqlite3`, `images/`), `status.json` and `bridge.log`, and with `trace = true`, the traces (`traces/`). An event still unsent after 30 days is dropped. `uninstall.sh --purge` removes all of it.
+
+### Traces
+
+Tracing is off unless you set `trace = true` in `[bridge]` (or `PRINTLOG_BRIDGE_TRACE=1`). Then the bridge records every message it sends to and receives from each printer's Moonraker in `traces/<printer>-<YYYYMMDD>.jsonl`. **Traces stay on this computer**: the bridge never sends them anywhere. The only way one leaves is in the support bundle `doctor` writes (the latest 20 MB), which you choose to attach.
+
+What a trace holds is what Moonraker tells the bridge, and what the bridge asks it:
+
+- the printer's state as it changes: print progress, the active tool, filament used, Klipper's state, and on a U1 its RFID reader's tags;
+- Moonraker's job history: file names (with their folders), times, outcomes and the slicer's metadata;
+- the printer's list of objects, its webcams (their URLs, scrubbed), and lines printed to the console;
+- the bridge's own requests, such as which objects it subscribes to.
+
+It holds no G-code. Before a line is written, every secret the support bundle removes is removed from it: your 3D Print Log API key, Moonraker's API key, passwords in URLs and secret-looking query values (a webcam's `?token=`), any field named like a key, token, secret or password, and Moonraker's answer to a request for a oneshot token or API key. The support bundle scrubs traces a second time.
+
+Each printer's traces stay under 50 MB, the oldest deleted first. Recording never slows the bridge, and a disk error never stops it. Turn tracing off and delete `traces/` whenever you like.
+
+Tests: `tests/test_trace.py` (each kind of secret, the size cap, a stuck or failing disk), `TestWhatIsSent` (a traced print, checked for every secret), and `TestSupportBundle` in `tests/test_doctor.py`.
 
 ## Not covered yet
 

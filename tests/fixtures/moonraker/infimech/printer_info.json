@@ -1,0 +1,1 @@
+{"result":{"state":"ready","state_message":"Printer is ready","hostname":"rocksystemr-R1-0000","klipper_path":"/usr/share","python_path":"/usr/bin/python3","process_id":1507,"user_id":0,"group_id":0,"log_file":"/usr/data/printer_data/logs/klippy.log","config_file":"/usr/data/printer_data/config/printer.cfg","software_version":"9.9.9","cpu_info":"2 core ?"}}

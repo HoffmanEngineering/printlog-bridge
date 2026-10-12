@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import zipfile
 from collections.abc import Mapping
@@ -18,6 +19,7 @@ from printlog_bridge.core.checks import CheckResult, Status
 from printlog_bridge.core.doctor import diagnose, format_report
 from printlog_bridge.core.outbox import Outbox
 from printlog_bridge.core.status import StatusBoard
+from printlog_bridge.core.support import write_support_bundle
 
 
 class FakeAdapter(Adapter):
@@ -406,6 +408,12 @@ class TestSupportBundle:
         outbox.add("voron", "00000A", "start", {"file_name": "benchy.gcode"})
         outbox.failed(1, f"the API answered 503 (key {self.SECRETS[0]})")
         outbox.close()
+        # A trace, should one ever hold a secret its own scrubbing missed.
+        (state / "traces").mkdir()
+        (state / "traces" / "voron-20261012.jsonl").write_text(
+            f'{{"t": 1.0, "dir": "send", "msg": {{"note": "{self.SECRETS[1]}"}}}}\n',
+            encoding="utf-8",
+        )
 
         async def scenario():
             server = serve_me(401)  # the env key is not the API's, which doesn't matter here
@@ -450,6 +458,7 @@ class TestSupportBundle:
         assert entry["job_id"] == "00000A"
         assert entry["payload"] == {"file_name": "benchy.gcode"}
         assert entry["attempts"] == 1
+        assert '"dir": "send"' in members["traces/voron-20261012.jsonl"]
 
     def test_the_bundle_contains_no_key_or_token(self, tmp_path, monkeypatch, capsys):
         bundle, _ = self.doctor(tmp_path, monkeypatch, capsys)
@@ -463,6 +472,36 @@ class TestSupportBundle:
         assert "api_key = <redacted>" in members["printlog-bridge.cfg"]
         assert "moonraker_api_key = <redacted>" in members["printlog-bridge.cfg"]
         assert "http://<redacted>@u1:7125" in members["printlog-bridge.cfg"]
+
+    def test_only_the_latest_traces_are_bundled(self, tmp_path):
+        state = tmp_path / "state"
+        traces = state / "traces"
+        traces.mkdir(parents=True)
+        line = '{"t": 1.0, "dir": "recv", "msg": {"pad": "' + "x" * 80 + '"}}\n'
+        for n, name in enumerate(["u1-20261010.jsonl", "u1-20261011.jsonl", "u1-20261012.jsonl"]):
+            path = traces / name
+            path.write_bytes((line * 10).encode())  # about 1 KB each
+            os.utime(path, (1_000_000 + n, 1_000_000 + n))
+        config = tmp_path / "printlog-bridge.cfg"
+        config.write_text("[printer u1]\n", encoding="utf-8")
+
+        bundle = write_support_bundle(
+            state / "bundle.zip",
+            report="",
+            config_path=config,
+            state_dir=state,
+            env={},
+            trace_bytes=1500,
+        )
+
+        members = self.members(bundle)
+        traced = sorted(name for name in members if name.startswith("traces/"))
+        assert traced == ["traces/u1-20261011.jsonl", "traces/u1-20261012.jsonl"]
+        older = members["traces/u1-20261011.jsonl"]
+        assert len(older) < len(line * 10)  # its newest lines only, whole
+        assert older.endswith("\n")
+        assert all(json.loads(each) for each in older.splitlines())
+        assert len(members["traces/u1-20261012.jsonl"]) == len(line * 10)
 
     def test_no_bundle_without_a_config(self, tmp_path, capsys):
         main(["doctor", "--config", str(tmp_path / "missing.cfg")])

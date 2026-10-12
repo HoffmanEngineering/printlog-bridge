@@ -206,7 +206,7 @@ class FakeAdapter:
         return "fake, remote http://voron:7125"
 
 
-def config(tmp_path, *printers) -> BridgeConfig:
+def config(tmp_path, *printers, trace: bool = False) -> BridgeConfig:
     return BridgeConfig(
         path=tmp_path / "printlog-bridge.cfg",
         api_url="https://api.example.test",
@@ -216,11 +216,44 @@ def config(tmp_path, *printers) -> BridgeConfig:
             PrinterConfig(name, FakeAdapter(), printer_id=printer_id)
             for name, printer_id in printers or [("voron", 42)]
         ],
+        trace=trace,
     )
 
 
-def report(tmp_path, at: datetime, *printers):
-    return format_status(config(tmp_path, *printers), now=at)
+def report(tmp_path, at: datetime, *printers, trace: bool = False):
+    return format_status(config(tmp_path, *printers, trace=trace), now=at)
+
+
+class TestTrace:
+    def test_a_running_bridge_that_traces_says_so_and_where(self, tmp_path):
+        board(tmp_path).start(["voron"], trace=True)
+
+        text, _ = report(tmp_path, NOW, trace=True)
+
+        assert f"Trace: on, recording every Moonraker message in {tmp_path / 'traces'}" in text
+
+    def test_nothing_is_said_when_it_is_off(self, tmp_path):
+        board(tmp_path).start(["voron"])
+
+        text, _ = report(tmp_path, NOW)
+
+        assert "Trace" not in text
+
+    def test_turned_on_since_the_bridge_started_says_to_restart_it(self, tmp_path):
+        board(tmp_path).start(["voron"])
+
+        text, _ = report(tmp_path, NOW, trace=True)
+
+        assert "Trace: on in the config, but the running bridge started without it" in text
+
+    def test_a_stopped_bridge_traces_when_it_next_runs(self, tmp_path):
+        b = board(tmp_path)
+        b.start(["voron"])
+        b.stopped()
+
+        text, _ = report(tmp_path, NOW, trace=True)
+
+        assert "Trace: on; the bridge records every Moonraker message while it runs" in text
 
 
 def test_status_before_the_first_run_says_how_to_start(tmp_path):
