@@ -298,7 +298,7 @@ def macros_add(args: argparse.Namespace) -> int:
     if dest.exists():
         current = dest.read_bytes()
         if current == new:
-            record["macros"] = sha256(new)
+            pass  # ours only if an install wrote it: a copy the user made is theirs to keep
         elif sha256(current) == record.get("macros"):
             _write_bytes(dest, new)  # the one an earlier install put there, unchanged: update
             record["macros"] = sha256(new)
@@ -333,15 +333,21 @@ def macros_remove(args: argparse.Namespace) -> int:
     printer_cfg, record_path = Path(args.printer_cfg), Path(args.record)
     record = _load_record(record_path) if record_path.is_file() else None
     changed = False
+    still_included = False
     if printer_cfg.is_file():
         before = _read(printer_cfg)
         after = remove_include(before, record.get("include") if record else None)
         if after != before:
             _write(printer_cfg, after)
             changed = True
+        # An include this didn't add, or couldn't find between its markers: deleting the file
+        # it names would stop Klipper from starting.
+        still_included = INCLUDED.search(after) is not None
     dest = printer_cfg.parent / MACROS_FILE
     installed = record.get("macros") if record else None
-    if dest.is_file() and installed and sha256(dest.read_bytes()) == installed:
+    if still_included and dest.is_file():
+        print(f"{printer_cfg} still includes {dest}, so it is kept.", file=sys.stderr)
+    elif dest.is_file() and installed and sha256(dest.read_bytes()) == installed:
         dest.unlink()
         changed = True
     elif dest.exists() and installed:

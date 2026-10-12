@@ -476,3 +476,27 @@ class TestMacroCommands:
         helper.main(["macros-remove", *args])
         assert (tmp_path / "printer.cfg").is_symlink()
         assert (backup / "printer.cfg").read_bytes() == b"[printer]\nkinematics: corexy\n"
+
+    def test_a_copy_the_user_included_themselves_survives_uninstall(self, tmp_path, capsys):
+        # They followed printlog.cfg's own instructions, then ran install.sh and uninstall.sh.
+        printer_cfg = "[include printlog.cfg]\n[printer]\nkinematics: corexy\n"
+        args = self.args(tmp_path, printer_cfg)
+        (tmp_path / "printlog.cfg").write_bytes(self.SOURCE.read_bytes())
+
+        self.add(args)
+        helper.main(["macros-remove", *args])
+
+        assert (tmp_path / "printer.cfg").read_text() == printer_cfg
+        assert (tmp_path / "printlog.cfg").exists()  # else Klipper won't start
+
+    def test_an_include_left_in_printer_cfg_keeps_its_file(self, tmp_path, capsys):
+        args = self.args(tmp_path)
+        self.add(args)
+        # The markers were lost (the file was saved with CRLF line ends), the include kept.
+        text = (tmp_path / "printer.cfg").read_text().replace("\n", "\r\n")
+        (tmp_path / "printer.cfg").write_bytes(text.encode())
+
+        helper.main(["macros-remove", *args])
+
+        assert b"[include printlog.cfg]" in (tmp_path / "printer.cfg").read_bytes()
+        assert (tmp_path / "printlog.cfg").exists()
