@@ -90,6 +90,49 @@ def test_bridge_section_is_optional_and_has_defaults(tmp_path):
     assert config.state_dir == tmp_path / ".local" / "share" / "printlog-bridge"
 
 
+class TestStateDirFromTheEnvironment:
+    """The Docker image sets PRINTLOG_BRIDGE_STATE_DIR, so state lands in the mounted volume
+    even when the config doesn't name a state_dir."""
+
+    def test_is_the_default_without_state_dir_in_the_config(self, tmp_path):
+        config = load(
+            write(tmp_path, "[printer voron]\nadapter = fake\n"),
+            env={"PRINTLOG_BRIDGE_STATE_DIR": "/data/state"},
+        )
+
+        assert config.state_dir == Path("/data/state")
+        assert config.api_key_file == Path("/data/state/api_key")
+
+    def test_state_dir_in_the_config_wins(self, tmp_path):
+        config = load(
+            write(tmp_path, "[bridge]\nstate_dir = /srv/bridge\n[printer voron]\nadapter = fake\n"),
+            env={"PRINTLOG_BRIDGE_STATE_DIR": "/data/state"},
+        )
+
+        assert config.state_dir == Path("/srv/bridge")
+
+    def test_a_blank_variable_is_ignored(self, tmp_path):
+        config = load(
+            write(tmp_path, "[printer voron]\nadapter = fake\n"),
+            env={"PRINTLOG_BRIDGE_STATE_DIR": "  "},
+        )
+
+        assert config.state_dir == tmp_path / ".local" / "share" / "printlog-bridge"
+
+    def test_the_key_file_is_read_from_it(self, tmp_path):
+        state = tmp_path / "volume" / "state"
+        state.mkdir(parents=True)
+        (state / "api_key").write_text("from-the-volume\n", encoding="utf-8")
+
+        config = load(
+            write(tmp_path, "[printer voron]\nadapter = fake\n"),
+            env={"PRINTLOG_BRIDGE_STATE_DIR": str(state)},
+        )
+
+        assert config.api_key == "from-the-volume"
+        assert config.api_key_source is ApiKeySource.KEY_FILE
+
+
 def test_adapter_defaults_to_moonraker(tmp_path):
     path = write(tmp_path, "[printer voron]\n")
 
