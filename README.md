@@ -117,7 +117,7 @@ docker run -d --name printlog-bridge --restart unless-stopped \
 docker exec printlog-bridge printlog-bridge doctor
 ```
 
-Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
+Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`. Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
 
 ## Try it
 
