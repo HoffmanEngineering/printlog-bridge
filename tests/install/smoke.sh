@@ -74,7 +74,7 @@ check "the config uses the local socket" \
     grep -qx "socket = ${DATA}/comms/moonraker.sock" "$CONFIG"
 check "the command is in the virtualenv" "${VENV}/bin/printlog-bridge" --version
 # What systemd would run, with the unit's environment.
-pythonpath="$(sed -n 's/^Environment=PYTHONPATH=//p' "$UNIT")"
+pythonpath="$(sed -n 's/^Environment="PYTHONPATH=\(.*\)"$//p' "$UNIT")"
 check "the service's command runs" env PYTHONPATH="$pythonpath" "${VENV}/bin/python" -m printlog_bridge --version
 # The config loads; doctor fails only on what CI can't reach (the API and Moonraker).
 "${VENV}/bin/printlog-bridge" doctor --config "$CONFIG" >"${WORK}/doctor.txt" || true
