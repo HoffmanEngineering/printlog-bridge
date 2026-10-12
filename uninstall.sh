@@ -94,10 +94,14 @@ remove_from_moonraker() {
 }
 
 remove_venv() {
-    if [ -d "$VENV" ]; then
-        say "Removing ${VENV}"
-        rm -rf "$VENV"
+    [ -d "$VENV" ] || return 0
+    # Only ever delete a virtualenv: a mistyped --venv (such as ~) must not take a folder with it.
+    if [ ! -f "${VENV}/pyvenv.cfg" ]; then
+        say "Not removing ${VENV}: it isn't a Python virtualenv (no pyvenv.cfg)."
+        return 0
     fi
+    say "Removing ${VENV}"
+    rm -rf "$VENV"
 }
 
 purge() {

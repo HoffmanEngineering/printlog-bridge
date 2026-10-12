@@ -55,7 +55,7 @@ VENV="${HOME}/printlog-bridge-env"
 CONFIG="${DATA}/config/printlog-bridge.cfg"
 check "the unit file is installed" test -f "$UNIT"
 check "the unit runs the bridge from the virtualenv" \
-    grep -qx "ExecStart=${VENV}/bin/python -m printlog_bridge run --config ${CONFIG}" "$UNIT"
+    grep -qxF "ExecStart=\"${VENV}/bin/python\" -m printlog_bridge run --config \"${CONFIG}\"" "$UNIT"
 check "the unit runs as this user" grep -qx "User=$(id -un)" "$UNIT"
 check "systemd reloaded" called "daemon-reload"
 check "the service is enabled" called "enable printlog-bridge"
@@ -89,6 +89,20 @@ check "a second install leaves moonraker.conf alone" \
     cmp -s "${DATA}/config/moonraker.conf" "${WORK}/moonraker.conf.installed"
 check "a second install doesn't restart Moonraker" sh -c "! grep -qx 'restart moonraker' '${WORK}/systemctl.log'"
 check "a second install keeps the config" grep -qx 'printer_id = 42' "$CONFIG"
+
+echo "== install.sh for a second printer_data folder"
+mkdir -p "${WORK}/other_data/config"
+cp "${UNIT}" "${WORK}/unit.before"
+check "a second Klipper instance is refused"     sh -c "! '${REPO}/install.sh' --yes --printer-data '${WORK}/other_data' </dev/null"
+check "the refused install left the unit alone" cmp -s "$UNIT" "${WORK}/unit.before"
+
+echo "== uninstall.sh with a --venv that isn't a virtualenv"
+mkdir -p "${WORK}/not-a-venv"
+touch "${WORK}/not-a-venv/keep-me"
+"${REPO}/uninstall.sh" --venv "${WORK}/not-a-venv" </dev/null >/dev/null 2>&1 || true
+check "uninstall never deletes a folder that isn't a virtualenv" test -f "${WORK}/not-a-venv/keep-me"
+# Put the service back for the real uninstall below.
+"${REPO}/install.sh" --yes </dev/null >/dev/null
 
 echo "== uninstall.sh"
 : >"${WORK}/systemctl.log"

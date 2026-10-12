@@ -82,6 +82,12 @@ check_system() {
         fail "run this as the user Klipper and Moonraker run as (such as pi), not as root."
     fi
     command -v "$PYTHON" >/dev/null || fail "$PYTHON not found. Install it: sudo apt install python3"
+    # One service serves one Klipper instance for now. Installing for a second printer_data folder
+    # would silently repoint the service and overwrite the install record the uninstaller relies on.
+    existing="${SYSTEMD_DIR}/${SERVICE}.service"
+    if [ -f "$existing" ] && ! grep -qF -- "--config \"${CONFIG}\"" "$existing"         && ! grep -qF -- "--config ${CONFIG}" "$existing"; then
+        fail "printlog-bridge is already installed for another printer_data folder ($(grep -o -- '--config .*' "$existing")). Only one Klipper instance is supported for now; run uninstall.sh for that one first."
+    fi
     "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 9))' ||
         fail "printlog-bridge needs Python 3.9 or newer; this is $("$PYTHON" -V 2>&1)."
     [ -f "$MOONRAKER_CONF" ] ||
@@ -154,8 +160,8 @@ Type=simple
 User=$(id -un)
 WorkingDirectory=${REPO_DIR}
 # The code from the git checkout Moonraker updates, so a rebuilt virtualenv still runs it.
-Environment=PYTHONPATH=${REPO_DIR}/src
-ExecStart=${VENV}/bin/python -m printlog_bridge run --config ${CONFIG}
+Environment="PYTHONPATH=${REPO_DIR}/src"
+ExecStart="${VENV}/bin/python" -m printlog_bridge run --config "${CONFIG}"
 Restart=always
 RestartSec=10
 # Exit status 2 is a config to fix (no API key, no printer_id): restarting won't help, and
