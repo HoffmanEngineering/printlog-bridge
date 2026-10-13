@@ -53,8 +53,11 @@ class PrinterState:
         instance_id: str,
         jobs: dict[str, JobRecord],
         discovery: dict[str, Any] | None = None,
+        *,
+        read_only: bool = False,
     ) -> None:
         self.path = path
+        self.read_only = read_only
         self.instance_id = instance_id
         self.jobs = jobs
         self.discovery: dict[str, Any] = discovery or {}
@@ -89,6 +92,28 @@ class PrinterState:
         state.save()
         return state
 
+    @classmethod
+    def peek(cls, state_dir: Path, printer: str) -> PrinterState | None:
+        """The printer's state as it is on disk, or None when there isn't a readable one.
+
+        Unlike `load`, this never writes: a missing file isn't created and a broken one isn't
+        moved aside, so `doctor` can look while the bridge is running. It holds only
+        `instance_id` and `discovery`, and `save()` refuses it.
+        """
+        path = state_dir / "printers" / f"{safe_file_name(printer)}.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            discovery = data.get("discovery")
+            return cls(
+                path,
+                data["instance_id"],
+                {},  # not read: saving it back would lose them, so it can't be saved
+                discovery if isinstance(discovery, dict) else {},
+                read_only=True,
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
     def resume_after(self) -> datetime | None:
         unfinished = [j.started_at for j in self.jobs.values() if not j.finished]
         candidates = unfinished or [j.started_at for j in self.jobs.values()]
@@ -97,6 +122,8 @@ class PrinterState:
         return datetime.fromisoformat(min(candidates) if unfinished else max(candidates))
 
     def save(self) -> None:
+        if self.read_only:
+            raise RuntimeError(f"{self.path} was read with peek(), which can't be saved")
         finished = sorted(
             (job_id for job_id, j in self.jobs.items() if j.finished),
             key=lambda job_id: self.jobs[job_id].started_at,

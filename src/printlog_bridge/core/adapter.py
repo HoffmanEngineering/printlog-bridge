@@ -60,7 +60,8 @@ class Adapter(ABC):
     def use_state(self, state: PrinterState) -> None:  # noqa: B027 - optional, does nothing
         """Called before `run` with the printer's state file, for an adapter that remembers
         something of its own between runs in `state.discovery` (and calls `state.save()`), such
-        as where it last found the printer. Optional."""
+        as where it last found the printer. `doctor` also calls it before `check`, with the
+        state read-only (`PrinterState.peek`): its `save()` raises. Optional."""
 
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:
