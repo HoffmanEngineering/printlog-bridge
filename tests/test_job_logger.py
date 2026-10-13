@@ -417,7 +417,7 @@ class TestWhenTheApiIsDown:
 
         asyncio.run(scenario())
 
-        assert api.requests == [("GET", "/api/Prints")]  # the start's lookup, failed
+        assert api.requests == [("GET", "/api/Prints/claimable")]  # the start's lookup, failed
 
     def test_one_print_the_api_keeps_failing_does_not_hold_up_the_others(self, tmp_path):
         api = FakePrintLogApi()
@@ -464,7 +464,7 @@ class TestWhenTheApiIsDown:
         wait = asyncio.run(scenario())
 
         assert 9 < wait <= 10
-        assert api.requests == [("GET", "/api/Prints")]  # not sent again at once
+        assert api.requests == [("GET", "/api/Prints/claimable")]  # not sent again at once
 
     def test_does_not_retry_a_revoked_key_but_keeps_the_job(self, tmp_path, caplog):
         api = FakePrintLogApi(api_key="the-real-key")

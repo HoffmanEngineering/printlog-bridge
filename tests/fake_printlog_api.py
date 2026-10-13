@@ -14,12 +14,14 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
   sent twice among rows with no `filamentId`, and a row with no measurement (or a `source`
   naming one it didn't send). Every other field is left alone.
 - `PATCH /api/Prints/{id}` changes only the fields sent.
-- `GET /api/Prints?printerId=&status=Printing&unclaimed=true&createdAfter=` lists the user's
-  prints on the printer in Printing with no `externalId`, created after the time (api#165, as
-  proposed there: the API doesn't have it yet). `POST /api/Prints/{id}/claim` sets a print's
-  `externalSource`, `externalId` and connection: 404 for an unknown print, 400 for one not in
-  Printing, 409 for one claimed under another `externalId`; the same `externalId` again
-  returns the print. `lookup = False` answers the lookup 404, as an API without it would.
+- `GET /api/Prints/claimable?printerId=&createdAfter=` lists the user's prints on the printer
+  in Printing with no external pair, created after the time, newest first, as
+  `ClaimablePrintDto` (no `externalId` or `images`). `POST /api/Prints/{id}/claim` sets the
+  pair, the connection and a missing `startDate`. The same pair again returns the print, before
+  any status check. 409 (problem+json) for a print with another pair or not in Printing, and
+  for a pair already on another print, whose id is `printId` in the body (api#165, PR for
+  3d-print-log-api#165). `lookup = False` answers the lookup 400, as an API without it does
+  (the path falls through to `GET /api/Prints/{id}`).
 - `POST /api/Prints/{id}/image` adds an image from a multipart form (`image`, `isDefault`):
   jpeg, png, gif, webp or bmp by the part's content type, under 10 MB, at most 5 per print
   (the free plan; 20 with Pro), each refused with 400. `isDefault` makes it the only default.
@@ -110,7 +112,7 @@ class FakePrintLogApi:
         self._ids = itertools.count(1)
         self._image_ids = itertools.count(1)
         self.lookup = True
-        """False answers the lookup for prints to adopt 404, as an API without it does."""
+        """False answers the lookup for prints to adopt 400, as an API without it does."""
         self.lookups: list[dict[str, str]] = []
         """Every lookup's query."""
         self.claims: list[tuple[int, dict[str, Any]]] = []
@@ -131,7 +133,7 @@ class FakePrintLogApi:
         app.router.add_delete("/api/Printers/{id}/slots/{slot}", self._unload_slot)
         app.router.add_get("/api/Filaments/by-tag/{uid}", self._by_tag)
         app.router.add_post("/api/Prints", self._create)
-        app.router.add_get("/api/Prints", self._unclaimed)
+        app.router.add_get("/api/Prints/claimable", self._claimable)
         app.router.add_post("/api/Prints/{id}/claim", self._claim)
         app.router.add_get("/api/Prints/{id}", self._get)
         app.router.add_patch("/api/Prints/{id}", self._patch)
@@ -535,22 +537,44 @@ class FakePrintLogApi:
                 return self.images[image["id"]]
         return None
 
-    async def _unclaimed(self, request: web.Request) -> web.Response:
+    async def _claimable(self, request: web.Request) -> web.Response:
         if not self.lookup:
-            return web.Response(status=404)
+            return web.Response(status=400, text="The value 'claimable' is not valid.")
         query = dict(request.query)
         self.lookups.append(query)
         printer_id = int(query["printerId"])
-        after = datetime.fromisoformat(query["createdAfter"])
+        after = datetime.fromisoformat(query["createdAfter"]) if "createdAfter" in query else None
         found = [
             p
             for p in self.prints.values()
             if p["printerId"] == printer_id
             and p["status"] == PRINTING
+            and not p["externalSource"]
             and not p["externalId"]
-            and datetime.fromisoformat(p["createdDate"]) >= after
+            and (after is None or datetime.fromisoformat(p["createdDate"]) > after)
         ]
-        return web.json_response(found)
+        found.sort(key=lambda p: (p["createdDate"], p["id"]), reverse=True)
+        return web.json_response(
+            [
+                {
+                    "id": p["id"],
+                    "title": p["title"],
+                    "printerId": p["printerId"],
+                    "status": p["status"],
+                    "source": p.get("source", 0),
+                    "fileName": p["fileName"],
+                    "fileHash": p.get("fileHash"),
+                    "createdDate": p["createdDate"],
+                    "startDate": p["startDate"],
+                    "hasSlicerSettings": bool(p.get("slicer")),
+                    "filamentUsage": sorted(
+                        p["filamentUsage"],
+                        key=lambda r: r["slot"] if r["slot"] is not None else 1 << 31,
+                    ),
+                }
+                for p in found[: int(query.get("limit", 20))]
+            ]
+        )
 
     async def _claim(self, request: web.Request) -> web.Response:
         found = self.prints.get(int(request.match_info["id"]))
@@ -558,18 +582,31 @@ class FakePrintLogApi:
             return web.Response(status=404)
         body = await request.json()
         self.claims.append((found["id"], body))
-        if found["externalId"]:
-            if found["externalId"] == body["externalId"]:
-                return web.json_response(found)
-            return web.Response(status=409, text="The print was claimed by another connector.")
+        source, external_id = body.get("externalSource"), body.get("externalId")
+        if not (source or "").strip() or not (external_id or "").strip():
+            return web.Response(status=400, text="externalSource and externalId are both required")
+        if found["externalSource"] == source and found["externalId"] == external_id:
+            return web.json_response(found)  # a replay, before the status is checked
+        if found["externalSource"] or found["externalId"]:
+            return _conflict("The print is already linked to another job.")
         if found["status"] != PRINTING:
-            return web.Response(status=400, text="Only a print in Printing can be claimed.")
-        found["externalSource"] = body["externalSource"]
-        found["externalId"] = body["externalId"]
-        found["connectionInstanceId"] = body.get("connectionInstanceId")
-        found["connectionId"] = (
-            self.connections.get(body.get("connectionInstanceId") or "") or {}
-        ).get("id")
+            return _conflict("Only a print that is Printing can be claimed.")
+        holder = next(
+            (
+                p["id"]
+                for p in self.prints.values()
+                if p["externalSource"] == source and p["externalId"] == external_id
+            ),
+            None,
+        )
+        if holder is not None:
+            return _conflict("The job is already logged as another print.", holder)
+        found["externalSource"] = source
+        found["externalId"] = external_id
+        connection = self.connections.get((body.get("connectionInstanceId") or "").strip())
+        if connection is not None:
+            found["connectionInstanceId"] = body["connectionInstanceId"]
+            found["connectionId"] = connection.get("id")
         found["startDate"] = found["startDate"] or body.get("startDate")
         return web.json_response(found)
 
@@ -602,34 +639,68 @@ class FakePrintLogApi:
         found["status"] = body["status"]
         if body.get("printTimeInSeconds") is not None:
             found["printTimeInSeconds"] = body["printTimeInSeconds"]
-        rows = found["filamentUsage"]
-        unlinked = [r for r in rows if r["filament"] is None]
-        # Rows that name a slot claim theirs first, so an in-order match can't take it.
-        by_slot = {}
-        for incoming in usage:
-            if not incoming.get("filamentId") and incoming.get("slot") is not None:
-                match = next((r for r in unlinked if r["slot"] == incoming["slot"]), None)
-                if match is not None:
-                    unlinked.remove(match)
-                by_slot[incoming["slot"]] = match
-        for incoming in usage:
-            if incoming.get("filamentId"):
-                match = next(
-                    (r for r in rows if (r["filament"] or {}).get("id") == incoming["filamentId"]),
-                    None,
-                )
-            elif incoming.get("slot") is not None:
-                match = by_slot[incoming["slot"]]
-            else:
-                match = unlinked.pop(0) if unlinked else None
-            if match is None:
-                rows.append(_row(incoming, incoming.get("filamentId")))
-            else:
-                # All three values are replaced, so an earlier completion's can't outlive it.
-                match["source"] = _source(incoming)
-                for field in ("amountMg", "lengthInM", "volumeMl"):
-                    match[field] = incoming.get(field)
+        single_slot = self.slot_counts.get(found["printerId"], 1) <= 1
+        _merge_actual_usage(found["filamentUsage"], usage, single_slot)
         return web.json_response(found)
+
+
+def _merge_actual_usage(
+    rows: list[dict[str, Any]], usage: list[dict[str, Any]], single_slot: bool
+) -> None:
+    """`PrintService.MergeActualUsage`: by filament first. A filament no row has yet, on a slot,
+    takes that slot's unlinked row and links it (#162). A row with no filament takes the unlinked
+    row for its slot, else the next unlinked row in order. Slot-only rows claim theirs first.
+
+    On a printer with one slot, an unlinked row with no slot counts as slot 0 in both slot
+    passes, and gets slot 0 when matched (agreed for 3d-print-log-api#168)."""
+    unlinked = [r for r in rows if r["filament"] is None]
+
+    def on_slot(row: dict[str, Any], slot: int) -> bool:
+        return row["slot"] == slot or (single_slot and slot == 0 and row["slot"] is None)
+
+    matches: dict[int, dict[str, Any] | None] = {}
+    for n, incoming in enumerate(usage):
+        if not incoming.get("filamentId") and incoming.get("slot") is not None:
+            match = next((r for r in unlinked if on_slot(r, incoming["slot"])), None)
+            if match is not None:
+                unlinked.remove(match)
+            matches[n] = match
+    for n, incoming in enumerate(usage):
+        if incoming.get("filamentId") and incoming.get("slot") is not None:
+            if any((r["filament"] or {}).get("id") == incoming["filamentId"] for r in rows):
+                continue
+            match = next((r for r in unlinked if on_slot(r, incoming["slot"])), None)
+            if match is not None:
+                unlinked.remove(match)
+            matches[n] = match
+    for n, incoming in enumerate(usage):
+        if incoming.get("filamentId"):
+            match = next(
+                (r for r in rows if (r["filament"] or {}).get("id") == incoming["filamentId"]),
+                None,
+            ) or matches.get(n)
+            if match is not None:
+                match["filament"] = {"id": incoming["filamentId"]}
+        elif incoming.get("slot") is not None:
+            match = matches[n]
+        else:
+            match = unlinked.pop(0) if unlinked else None
+        if match is None:
+            rows.append(_row(incoming, incoming.get("filamentId")))
+        else:
+            if match["slot"] is None and incoming.get("slot") == 0 and single_slot:
+                match["slot"] = 0
+            # All three values are replaced, so an earlier completion's can't outlive it.
+            match["source"] = _source(incoming)
+            for field in ("amountMg", "lengthInM", "volumeMl"):
+                match[field] = incoming.get(field)
+
+
+def _conflict(detail: str, print_id: int | None = None) -> web.Response:
+    problem: dict[str, Any] = {"status": 409, "title": "Print cannot be claimed", "detail": detail}
+    if print_id is not None:
+        problem["printId"] = print_id
+    return web.json_response(problem, status=409, content_type="application/problem+json")
 
 
 TAG_SEPARATORS = re.compile(r"[:\-._\s]")

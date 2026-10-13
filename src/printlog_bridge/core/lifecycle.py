@@ -35,7 +35,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
+from printlog_bridge.core.api_client import (
+    ApiClient,
+    ApiRejected,
+    ApiUnavailable,
+    AuthRejected,
+    ClaimConflict,
+)
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
     ImageKind,
@@ -90,8 +96,9 @@ an uplink too slow for the file). A rate limited upload, or one made while the A
 reached at all, waits like any event: then nothing behind it could be sent either. Tries are
 counted for this run of the bridge; a restart starts the count over."""
 TOO_MANY_REQUESTS = 429
-NO_LOOKUP = (404, 405, 501)
-"""What an API without the lookup for prints to adopt (api#165) answers it with."""
+NO_LOOKUP = (400, 404, 405, 501)
+"""What an API without the lookup for prints to adopt (api#165) answers it with: 400 when
+`/api/Prints/claimable` falls through to `/api/Prints/{id}`."""
 
 
 @dataclass(frozen=True)
@@ -648,9 +655,9 @@ class JobLogger:
         }
         if job.claiming is not None:
             # Claimed before, and the answer was lost: the same claim again returns the print.
-            claimed = await self._claim(job.claiming, claim)
+            claimed = await self._claim(state, printer, job_id, job, job.claiming, claim)
             if claimed is not None:
-                return self._adopted(state, printer, job_id, job, claimed)
+                return claimed
             job.claiming = None
             state.save()
 
@@ -659,8 +666,8 @@ class JobLogger:
             started_at = started_at.replace(tzinfo=timezone.utc)
         since = started_at - timedelta(seconds=target.adoption.window_s)
         try:
-            found = await self.api.unclaimed_prints(target.printer_id, since)
-        except ApiUnavailable as e:
+            found = await self.api.claimable_prints(target.printer_id, since)
+        except (ApiUnavailable, ApiRejected) as e:
             if e.status not in NO_LOOKUP:
                 raise
             if not self._no_lookup_logged:
@@ -684,9 +691,9 @@ class JobLogger:
         for candidate in candidates:
             job.claiming = int(candidate["id"])
             state.save()
-            claimed = await self._claim(job.claiming, claim)
+            claimed = await self._claim(state, printer, job_id, job, job.claiming, claim)
             if claimed is not None:
-                return self._adopted(state, printer, job_id, job, claimed)
+                return claimed
             log.info(
                 "[printer %s] job %s: print %s was claimed, finished or deleted meanwhile",
                 printer, job_id, candidate["id"],
@@ -695,14 +702,37 @@ class JobLogger:
             state.save()
         return None
 
-    async def _claim(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
-        """The claimed print, or None when it can't be claimed: gone, claimed by another
-        connector, or no longer in Printing (400), so the next candidate is tried."""
+    async def _claim(
+        self,
+        state: PrinterState,
+        printer: str,
+        job_id: str,
+        job: JobRecord,
+        print_id: int,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """The job's print once `print_id` is claimed for it, or None when it can't be (gone,
+        claimed by another job, no longer in Printing), so the next candidate is tried.
+
+        When the job is already logged as a print of its own (created before a power cut lost
+        its id), that print is the job's, and nothing is adopted."""
         try:
-            return await self.api.claim_print(print_id, body)
+            claimed = await self.api.claim_print(print_id, body)
+        except ClaimConflict as e:
+            if e.print_id is None:
+                return None
+            own = await self.api.get_print(e.print_id)
+            if own is not None:
+                job.print_id = int(own["id"])
+                job.claiming = None
+                state.save()
+            return own
         except ApiRejected as e:
-            log.info("couldn't claim print %s: %s", print_id, e)
+            log.info(
+                "[printer %s] job %s: couldn't claim print %s: %s", printer, job_id, print_id, e
+            )
             return None
+        return self._adopted(state, printer, job_id, job, claimed) if claimed else None
 
     def _adopted(
         self, state: PrinterState, printer: str, job_id: str, job: JobRecord, print_: dict
@@ -953,15 +983,10 @@ def _usage_rows(
     A slot with no spool still gets its row, with its slot and no `filamentId`. The API takes
     one row per spool, so a spool on two slots gets one row, on the first, with both lengths.
 
-    On a single-tool printer a row with no slot (an uploader's) is slot 0's. When it has no
-    spool either, slot 0's row is sent without its slot, so the API fills that row in order
-    rather than adding one: it matches a slot only against rows that have one.
+    On a single-tool printer a row with no slot (an uploader's) is slot 0's, so the spool the
+    user linked on it wins. The API's completion fills that row from slot 0's in the same way
+    (on a printer with one slot, a row with no slot counts as slot 0, 3d-print-log-api#168).
     """
-    fill_unslotted = (
-        single_tool
-        and any(row.get("slot") is None and not row.get("filament") for row in rows)
-        and not any(row.get("slot") == 0 for row in rows)
-    )
     if single_tool:
         rows = [{**row, "slot": 0} if row.get("slot") is None else row for row in rows]
     spools = _spools_by_slot(rows, loaded or {})
@@ -980,8 +1005,6 @@ def _usage_rows(
         if spool is not None:
             row["filamentId"] = spool
             mm_by_spool[spool] = mm
-        elif fill_unslotted and slot == 0:
-            del row["slot"]
         usage.append(row)
     return usage
 

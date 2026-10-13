@@ -66,7 +66,7 @@ API_CALLS = [
     ("PUT", r"/api/Connections/[\w-]+"),
     ("POST", r"/api/Prints"),
     # Adopting a print the user made themselves (#43).
-    ("GET", r"/api/Prints"),
+    ("GET", r"/api/Prints/claimable"),
     ("POST", r"/api/Prints/\d+/claim"),
     ("GET", r"/api/Prints/\d+"),
     ("PATCH", r"/api/Prints/\d+"),
@@ -88,7 +88,7 @@ USAGE_FIELDS = {
     "slot", "lengthInM", "source", "filamentId", "estimatedSource", "estimatedLengthInM",
     "estimatedAmountMg",
 }  # fmt: skip
-LOOKUP_FIELDS = {"printerId", "status", "unclaimed", "createdAfter"}
+LOOKUP_FIELDS = {"printerId", "createdAfter"}
 CLAIM_FIELDS = {"externalSource", "externalId", "connectionInstanceId", "startDate"}
 CONNECTION_FIELDS = {"kind", "displayName", "agentVersion", "printerId"}
 SLOT_FIELDS = {"filamentId", "slotLabel"}

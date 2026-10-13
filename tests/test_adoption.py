@@ -75,6 +75,19 @@ class TestAdopting:
         assert row["estimatedAmountMg"] == 13000
         assert row["lengthInM"] == 4.3215
 
+    def test_an_unslotted_row_takes_the_loaded_spool_and_is_filled(self, tmp_path):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, 0, spool)
+        print_id = uploaded(api)
+
+        run(api, tmp_path, started(), finished(), spools=True)
+
+        [row] = api.prints[print_id]["filamentUsage"]
+        assert row["filament"] == {"id": spool}
+        assert row["estimatedAmountMg"] == 13000
+        assert row["lengthInM"] == 4.3215
+
     def test_a_multi_tool_print_fills_its_rows_by_slot(self, tmp_path):
         api = FakePrintLogApi()
         api.slot_counts[42] = 4
@@ -110,14 +123,14 @@ class TestAdopting:
         api = FakePrintLogApi()
         older = uploaded(api, created="2026-10-10T08:00:00+00:00")
         newer = uploaded(api, created="2026-10-10T09:15:00+00:00")
-        real_unclaimed = api._unclaimed
+        real_claimable = api._claimable
 
         async def racing(request):
-            answer = await real_unclaimed(request)
+            answer = await real_claimable(request)
             api.prints[newer]["externalId"] = "octoprint:other"  # claimed before our claim
             return answer
 
-        api._unclaimed = racing
+        api._claimable = racing
 
         run(api, tmp_path, started(), finished())
 
@@ -128,14 +141,14 @@ class TestAdopting:
         api = FakePrintLogApi()
         older = uploaded(api, created="2026-10-10T08:00:00+00:00")
         newer = uploaded(api, created="2026-10-10T09:15:00+00:00")
-        real_unclaimed = api._unclaimed
+        real_claimable = api._claimable
 
         async def racing(request):
-            answer = await real_unclaimed(request)
+            answer = await real_claimable(request)
             api.prints[newer]["status"] = 3  # the user marked it done before our claim
             return answer
 
-        api._unclaimed = racing
+        api._claimable = racing
 
         run(api, tmp_path, started(), finished())
 
@@ -172,6 +185,22 @@ class TestAdopting:
 
         assert list(api.prints) == [print_id]
         assert api.prints[print_id]["status"] == 3
+
+    def test_a_job_already_logged_as_its_own_print_keeps_it(self, tmp_path):
+        api = FakePrintLogApi()
+        run(api, tmp_path, started())  # the bridge creates print 1 for the job
+        [own] = api.prints
+        theirs = uploaded(api, created="2026-10-10T09:20:00+00:00")
+        # The power went before the print's id reached the state file.
+        state = PrinterState.load(tmp_path, "voron")
+        state.jobs["00000A"].print_id = None
+        state.save()
+
+        run(api, tmp_path, finished())
+
+        assert api.prints[own]["status"] == 3
+        assert api.prints[theirs]["status"] == PRINTING
+        assert api.prints[theirs]["externalId"] is None
 
     def test_a_job_that_finished_while_the_bridge_was_away_adopts_too(self, tmp_path):
         api = FakePrintLogApi()
