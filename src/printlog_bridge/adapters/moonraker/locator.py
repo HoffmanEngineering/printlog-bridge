@@ -79,8 +79,7 @@ class Locator:
         self._searched_at: float | None = None
         self._unidentifiable = False
 
-        # A hash, so a password in the url never reaches the state file.
-        config = hashlib.sha256(configured_url.encode()).hexdigest()[:16]
+        config = config_key(configured_url)
         if self.state.discovery.get("config") != config:
             # A new url in the config: trust it, and learn who is there afresh.
             self.state.discovery = {"config": config}
@@ -242,6 +241,23 @@ class Locator:
         self.report.moved(old, new, at)
         if self.on_moved is not None:
             self.on_moved(new_url)
+
+
+def config_key(configured_url: str) -> str:
+    """What the state file remembers of the configured url, to notice when it changes: a
+    hash, so a password in the url never reaches the state file."""
+    return hashlib.sha256(configured_url.encode()).hexdigest()[:16]
+
+
+def last_found(state: PrinterState, configured_url: str) -> str | None:
+    """The address the printer was last found at, when that isn't the configured one. Reads
+    `state` without changing it, so `doctor` can use it too."""
+    if state.discovery.get("config") != config_key(configured_url):
+        return None  # the url changed since: the Locator starts afresh from it
+    address = state.discovery.get("address")
+    if not isinstance(address, str) or not address:
+        return None
+    return None if address == discovery.host_of(configured_url) else address
 
 
 def _matching(known: Fingerprint) -> Callable[[Found], bool]:

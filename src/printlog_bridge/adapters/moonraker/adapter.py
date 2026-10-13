@@ -12,6 +12,7 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
@@ -28,7 +29,7 @@ from printlog_bridge.core.trace import Trace
 from . import discovery as lan
 from .images import MoonrakerImages
 from .jobs import JobTracker
-from .locator import Locator
+from .locator import Locator, last_found
 from .session import (
     ConnectionLost,
     Listeners,
@@ -60,6 +61,14 @@ MIN_DISCOVERY_INTERVAL_S = 30
 """Searches no more often than this, so a network isn't swept over and over."""
 MAX_DISCOVERY_NETWORKS = 16
 CHECK_TIMEOUT_S = 5
+CHECK_ERRORS = (
+    ConnectionLost,
+    MoonrakerRpcError,
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    OSError,
+)
+"""What `check` reports as Moonraker being out of reach."""
 
 URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
@@ -213,44 +222,68 @@ class MoonrakerAdapter(Adapter):
                 )
             ]
 
+        found_at = self._last_found()
+        if found_at is not None:
+            # Where `run` connects: the address the printer was last found at.
+            assert self.url is not None
+            configured = lan.host_of(self.url)
+            found_url = lan.with_host(self.url, found_at)
+            try:
+                info = await self._server_info(found_url)
+            except MoonrakerAuthError as e:
+                return [CheckResult.fail(name, str(e))]
+            except CHECK_ERRORS:
+                pass  # it may be back at the configured address
+            else:
+                moved = (
+                    f"found at {found_at} (the config says {configured}); a DHCP reservation "
+                    "keeps it in one place"
+                )
+                return [CheckResult.warn(name, f"{self._detail(info)}, {moved}")]
+
         try:
-            info = await asyncio.wait_for(
-                fetch_server_info(
-                    self.printer, url=self.url, socket=self.socket, api_key=self.api_key
-                ),
-                CHECK_TIMEOUT_S,
-            )
+            info = await self._server_info(self.url)
         except MoonrakerAuthError as e:
             return [CheckResult.fail(name, str(e))]
-        except (
-            ConnectionLost,
-            MoonrakerRpcError,
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            OSError,
-        ) as e:
+        except CHECK_ERRORS as e:
+            also = f", nor at {found_at} where it was last found" if found_at else ""
             return [
                 CheckResult.fail(
                     name,
                     f"can't reach Moonraker at {where(self.url, self.socket)}: "
-                    f"{_reason(e, self.url)}",
+                    f"{_reason(e, self.url)}{also}",
                 )
             ]
 
-        klippy = info.get("klippy_state", "unknown")
+        detail = self._detail(info)
+        if info.get("klippy_state", "unknown") != "ready":
+            return [CheckResult.warn(name, detail)]
+        return [CheckResult.ok(name, detail)]
+
+    def _last_found(self) -> str | None:
+        """For `doctor`: where discovery last found the printer, from the state file it was
+        given read-only, when that isn't the configured address."""
+        if not self.discovery or self.url is None or self.state is None:
+            return None
+        return last_found(self.state, self.url)
+
+    async def _server_info(self, url: str | None) -> Mapping[str, Any]:
+        return await asyncio.wait_for(
+            fetch_server_info(self.printer, url=url, socket=self.socket, api_key=self.api_key),
+            CHECK_TIMEOUT_S,
+        )
+
+    def _detail(self, info: Mapping[str, Any]) -> str:
         version = info.get("moonraker_version")
-        detail = ", ".join(
+        return ", ".join(
             part
             for part in (
                 self.describe(),
                 f"Moonraker {version}" if version else "",
-                f"Klipper {klippy}",
+                f"Klipper {info.get('klippy_state', 'unknown')}",
             )
             if part
         )
-        if klippy != "ready":
-            return [CheckResult.warn(name, detail)]
-        return [CheckResult.ok(name, detail)]
 
 
 def _discovery_options(printer: str, options: Mapping[str, str]) -> dict[str, object]:

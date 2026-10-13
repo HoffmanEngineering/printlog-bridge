@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sys
 import zipfile
 from collections.abc import Mapping
@@ -12,12 +13,16 @@ from pathlib import Path
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from fake_moonraker import FakeMoonraker
 
+from printlog_bridge.adapters.moonraker import MoonrakerAdapter
+from printlog_bridge.adapters.moonraker.locator import config_key
 from printlog_bridge.cli.main import main
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult, Status
 from printlog_bridge.core.doctor import diagnose, format_report
 from printlog_bridge.core.outbox import Outbox
+from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import StatusBoard
 from printlog_bridge.core.support import write_support_bundle
 
@@ -507,3 +512,174 @@ class TestSupportBundle:
         main(["doctor", "--config", str(tmp_path / "missing.cfg")])
 
         assert "Support bundle" not in capsys.readouterr().out
+
+
+# -- a remote printer found at another address (#32) ------------------------------------------
+
+OLD = "127.0.0.87"
+NEW = "127.0.0.91"
+"""The fake Moonraker serves on NEW, as a printer DHCP moved; the config still names OLD."""
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class TestMovedPrinter:
+    """`run` connects where discovery last found the printer, so doctor checks there too."""
+
+    @pytest.fixture
+    def port(self):
+        return free_port()
+
+    @staticmethod
+    def url(port: int, host: str = OLD) -> str:
+        return f"http://{host}:{port}"
+
+    @staticmethod
+    def state_file(tmp_path: Path) -> Path:
+        return tmp_path / "state" / "printers" / "u1.json"
+
+    def remember(self, tmp_path: Path, configured_url: str, address: str) -> Path:
+        """Writes the state file as the Locator leaves it after finding the printer at `address`."""
+        path = self.state_file(tmp_path)
+        path.parent.mkdir(parents=True)
+        discovery = {
+            "config": config_key(configured_url),
+            "address": address,
+            "moved": {"from": OLD, "to": address, "at": "2026-10-13T12:00:00+00:00"},
+        }
+        path.write_text(
+            json.dumps(
+                {"instance_id": "abc", "jobs": {"j1": {"started_at": "x"}}, "discovery": discovery}
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def check(self, tmp_path: Path, port: int, serve_on: str | None, options: str = ""):
+        """Runs doctor against a moonraker printer configured at OLD, with the fake Moonraker on
+        `serve_on` (or nowhere), and returns the printer's check."""
+
+        async def scenario():
+            fake = FakeMoonraker()
+            if serve_on is not None:
+                await fake.start(host=serve_on, port=port)
+            server = serve_me()
+            await server.start_server()
+            try:
+                printers = f"[printer u1]\nadapter = moonraker\nurl = {self.url(port)}\n{options}"
+                path = write_config(
+                    tmp_path, str(server.make_url("")).rstrip("/"), printers=printers
+                )
+                return await diagnose(
+                    path, adapters={"moonraker": MoonrakerAdapter}, env={}, home=tmp_path
+                )
+            finally:
+                await server.close()
+                await fake.close()
+
+        return by_name(asyncio.run(scenario()))["Printer u1"]
+
+    def test_says_where_the_printer_was_found_and_how_to_keep_it_there(self, tmp_path, port):
+        self.remember(tmp_path, self.url(port), NEW)
+
+        result = self.check(tmp_path, port, serve_on=NEW)
+
+        assert result.status is Status.WARN
+        assert f"found at {NEW} (the config says {OLD})" in result.detail
+        assert "a DHCP reservation keeps it in one place" in result.detail
+        assert "Klipper ready" in result.detail
+
+    def test_without_a_state_file_only_the_configured_url_is_checked(self, tmp_path, port):
+        result = self.check(tmp_path, port, serve_on=NEW)
+
+        assert result.status is Status.FAIL
+        assert f"can't reach Moonraker at {self.url(port)}" in result.detail
+        assert "last found" not in result.detail
+
+    def test_never_creates_the_state_file(self, tmp_path, port):
+        self.check(tmp_path, port, serve_on=NEW)
+
+        assert not self.state_file(tmp_path).exists()
+
+    def test_never_changes_the_state_file(self, tmp_path, port):
+        path = self.remember(tmp_path, self.url(port), NEW)
+        before = path.read_bytes()
+
+        self.check(tmp_path, port, serve_on=NEW)
+
+        assert path.read_bytes() == before
+        assert sorted(p.name for p in path.parent.iterdir()) == ["u1.json"]
+
+    def test_a_broken_state_file_is_left_where_it_is(self, tmp_path, port):
+        path = self.state_file(tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text("{not json", encoding="utf-8")
+
+        result = self.check(tmp_path, port, serve_on=NEW)
+
+        assert result.status is Status.FAIL
+        assert path.read_text(encoding="utf-8") == "{not json"
+        assert not path.with_suffix(".broken").exists()
+
+    def test_back_at_the_configured_address_is_fine(self, tmp_path, port):
+        self.remember(tmp_path, self.url(port), NEW)
+
+        result = self.check(tmp_path, port, serve_on=OLD)
+
+        assert result.status is Status.OK
+        assert "found at" not in result.detail
+
+    def test_at_neither_address_names_both(self, tmp_path, port):
+        self.remember(tmp_path, self.url(port), NEW)
+
+        result = self.check(tmp_path, port, serve_on=None)
+
+        assert result.status is Status.FAIL
+        assert f"can't reach Moonraker at {self.url(port)}" in result.detail
+        assert f"nor at {NEW} where it was last found" in result.detail
+
+    def test_discovery_off_checks_only_the_configured_url(self, tmp_path, port):
+        self.remember(tmp_path, self.url(port), NEW)
+
+        result = self.check(tmp_path, port, serve_on=NEW, options="discovery = false\n")
+
+        assert result.status is Status.FAIL
+        assert "found at" not in result.detail
+
+    def test_an_address_found_for_an_earlier_url_is_ignored(self, tmp_path, port):
+        # The url in the config changed since, so `run` starts afresh from it too.
+        self.remember(tmp_path, self.url(port, "127.0.0.50"), NEW)
+
+        result = self.check(tmp_path, port, serve_on=NEW)
+
+        assert result.status is Status.FAIL
+        assert "found at" not in result.detail
+
+
+class TestPeek:
+    def test_reads_the_discovery_section(self, tmp_path):
+        state = PrinterState.load(tmp_path, "u1")
+        state.discovery = {"address": NEW}
+        state.save()
+
+        peeked = PrinterState.peek(tmp_path, "u1")
+
+        assert peeked is not None
+        assert peeked.instance_id == state.instance_id
+        assert peeked.discovery == {"address": NEW}
+
+    def test_a_missing_file_is_none_and_stays_missing(self, tmp_path):
+        assert PrinterState.peek(tmp_path, "u1") is None
+        assert not (tmp_path / "printers").exists()
+
+    def test_cannot_be_saved_so_jobs_it_didnt_read_are_never_lost(self, tmp_path):
+        PrinterState.load(tmp_path, "u1").save()
+        peeked = PrinterState.peek(tmp_path, "u1")
+        assert peeked is not None
+
+        with pytest.raises(RuntimeError, match="peek"):
+            peeked.save()

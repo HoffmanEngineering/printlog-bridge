@@ -20,6 +20,7 @@ from printlog_bridge.core.config import (
     PrinterConfig,
     load_config,
 )
+from printlog_bridge.core.state import PrinterState
 
 API_KEYS_PAGE = "https://www.3dprintlog.com/api-keys"
 PRINTERS_PAGE = "https://www.3dprintlog.com/printers/"
@@ -62,6 +63,10 @@ async def diagnose(
         results.append(_check_clock(server_time, clock()))
 
     for printer in config.printers:
+        # Read-only, for an adapter that remembers where it last found the printer.
+        state = PrinterState.peek(config.state_dir, printer.name)
+        if state is not None:
+            printer.adapter.use_state(state)
         try:
             results.extend(await printer.adapter.check())
         except Exception as e:  # an adapter bug must not hide every other check
