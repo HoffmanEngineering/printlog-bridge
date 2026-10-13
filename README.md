@@ -163,6 +163,8 @@ Each print appears in 3D Print Log as Printing when the job starts, titled from 
 | `klippy_disconnect` | Failed | "Lost connection to Klipper" |
 | `interrupted`, `server_exit` | Failed | "Moonraker stopped during the print" |
 
+When you cancel objects mid-print with Klipper's [`[exclude_object]`](https://www.klipper3d.org/Exclude_Object.html), the print also gets a note naming them, such as "2 of 6 objects were cancelled: PART_3, PART_5" (Klipper keeps the slicer's object names in capitals), so the filament it used below the estimate has a reason. The bridge has to be running during the print to see them.
+
 On a printer with more than one tool (a toolchanger, an IDEX, a Snapmaker U1), each tool gets its own usage row, numbered from 0 the way Klipper numbers its extruders (`extruder` is tool 0, `extruder1` tool 1). The bridge watches which extruder is active while Klipper's filament count grows, and scales what it saw to Moonraker's total for the job, so the rows always add up to it. When the slicer listed a weight per filament (PrusaSlicer, OrcaSlicer, Snapmaker Orca), the print starts with an estimate on each tool's row, and a job that ran while the bridge was away is split in those proportions. Not covered yet: a multi-material unit on one extruder (ERCF, Happy Hare, AFC), where everything is counted on tool 0, and IDEX copy or mirror mode, where Klipper counts what two heads print once.
 
 ### Spools

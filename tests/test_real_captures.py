@@ -85,7 +85,8 @@ class TestObjects:
         objects, status = self.subscribed(U1)
 
         assert set(objects) == {
-            "print_stats", "toolhead", "virtual_sdcard", "webhooks", "filament_detect"
+            "print_stats", "toolhead", "virtual_sdcard", "webhooks", "filament_detect",
+            "exclude_object",
         }  # fmt: skip
         assert len(status["filament_detect"]["info"]) == 4
         assert status["toolhead"]["extruder"] == "extruder"
@@ -93,7 +94,9 @@ class TestObjects:
     def test_the_infimechs_filament_manager_is_left_alone(self):
         objects, status = self.subscribed(INFIMECH)
 
-        assert set(objects) == {"print_stats", "toolhead", "virtual_sdcard", "webhooks"}
+        assert set(objects) == {
+            "print_stats", "toolhead", "virtual_sdcard", "webhooks", "exclude_object"
+        }  # fmt: skip
         assert "filament_manager" not in status
 
     @pytest.mark.parametrize(("printer", "tools"), [(U1, 4), (INFIMECH, 1)])

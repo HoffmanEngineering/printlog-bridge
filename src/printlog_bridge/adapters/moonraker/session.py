@@ -43,6 +43,7 @@ SUBSCRIPTION: Mapping[str, list[str] | None] = {
 }
 OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "filament_detect": None,  # Snapmaker U1's RFID reader
+    "exclude_object": ["objects", "excluded_objects"],  # objects cancelled mid-print
 }
 
 T = TypeVar("T")

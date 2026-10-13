@@ -448,3 +448,134 @@ class TestPerToolUsage:
 
         assert last.job_id == "000002"
         assert last.filament_mm == pytest.approx({1: 300.0})
+
+
+def exclude_object_status(names, excluded=()):
+    """`exclude_object` as Klipper reports it, for a file that defines `names`."""
+    return {
+        "objects": [{"name": n, "center": [100.0, 100.0], "polygon": []} for n in names],
+        "excluded_objects": list(excluded),
+        "current_object": None,
+    }
+
+
+SIX_PARTS = [f"PART_{n}" for n in range(1, 7)]
+
+
+@contextlib.asynccontextmanager
+async def tracking_objects(sink: RecordingSink):
+    fake = FakeMoonraker(objects=(*FakeMoonraker().objects, "exclude_object"))
+    fake.status["exclude_object"] = exclude_object_status([])
+    async with tracking(sink, fake):
+        yield fake
+
+
+async def print_with_exclusions(fake: FakeMoonraker, filename: str, *exclusions) -> None:
+    """Klipper prints `filename` with six objects, cancelling each of `exclusions` in turn."""
+    await fake.set_status(print_stats={"state": "standby", "filename": filename})
+    await fake.set_status(
+        print_stats={"state": "printing"}, exclude_object=exclude_object_status(SIX_PARTS)
+    )
+    excluded: list[str] = []
+    for name in exclusions:
+        excluded.append(name)
+        await fake.set_status(exclude_object={"excluded_objects": list(excluded)})
+    await asyncio.sleep(0.05)  # the bridge has the last update too
+
+
+class TestCancelledObjects:
+    def test_subscribes_to_exclude_object_when_the_printer_has_it(self):
+        async def scenario():
+            async with tracking_objects(RecordingSink()) as fake:
+                return fake.subscriptions[0]
+
+        objects = asyncio.run(scenario())
+
+        assert objects["exclude_object"] == ["objects", "excluded_objects"]
+
+    def test_a_job_with_cancelled_objects_ends_with_a_note_naming_them(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking_objects(sink) as fake:
+                job = await fake.start_job("plate.gcode")
+                await print_with_exclusions(fake, "plate.gcode", "PART_3", "PART_5")
+                await fake.set_status(print_stats={"state": "complete"})
+                await fake.finish_job(job)
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert event.outcome is JobOutcome.COMPLETED
+        assert event.note == "2 of 6 objects were cancelled: PART_3, PART_5"
+
+    def test_a_job_without_cancelled_objects_gets_no_note(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking_objects(sink) as fake:
+                job = await fake.start_job("plate.gcode")
+                await print_with_exclusions(fake, "plate.gcode")
+                await fake.set_status(print_stats={"state": "complete"})
+                await fake.finish_job(job)
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert event.note is None
+
+    def test_the_note_survives_a_cancel_macro_that_resets_the_file(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking_objects(sink) as fake:
+                job = await fake.start_job("plate.gcode")
+                await print_with_exclusions(fake, "plate.gcode", "PART_2")
+                # CANCEL_PRINT, then SDCARD_RESET_FILE: Klipper forgets the objects.
+                await fake.set_status(
+                    print_stats={"state": "cancelled"}, exclude_object=exclude_object_status([])
+                )
+                await fake.set_status(print_stats={"state": "standby", "filename": ""})
+                await fake.finish_job(job, "cancelled")
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert event.outcome is JobOutcome.CANCELLED
+        assert event.note == "1 of 6 objects was cancelled: PART_2"
+
+    def test_a_failure_keeps_its_reason_ahead_of_the_cancelled_objects(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking_objects(sink) as fake:
+                job = await fake.start_job("plate.gcode")
+                await print_with_exclusions(fake, "plate.gcode", "PART_1")
+                await fake.set_status(print_stats={"state": "error", "message": "MCU shutdown"})
+                await fake.finish_job(job, "error")
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert event.note == "Klipper error: MCU shutdown\n\n1 of 6 objects was cancelled: PART_1"
+
+    def test_the_cancelled_objects_of_one_print_are_not_given_to_the_next(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking_objects(sink) as fake:
+                first = await fake.start_job("plate.gcode")
+                await print_with_exclusions(fake, "plate.gcode", "PART_4")
+                await fake.set_status(print_stats={"state": "complete"})
+                await fake.finish_job(first)
+                await eventually(lambda: sink.of(JobFinished))
+                second = await fake.start_job("plate.gcode")
+                await print_with_exclusions(fake, "plate.gcode")
+                await fake.set_status(print_stats={"state": "complete"})
+                await fake.finish_job(second)
+                await eventually(lambda: len(sink.of(JobFinished)) == 2)
+            return sink
+
+        first, second = asyncio.run(scenario()).of(JobFinished)
+
+        assert first.note == "1 of 6 objects was cancelled: PART_4"
+        assert second.note is None
