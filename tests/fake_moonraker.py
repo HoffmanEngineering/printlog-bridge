@@ -6,7 +6,10 @@ server.history.list, server.files.roots, server.files.metadata and server.webcam
 pushing notifications (console lines among them)
 and dropping every client to simulate a restart. `start_job` and `finish_job` drive a print the
 way Moonraker's history component reports one. Over HTTP it serves the gcodes root's files
-(`GET /server/files/gcodes/<path>`), which is how a remote bridge gets a thumbnail.
+(`GET /server/files/gcodes/<path>`), which is how a remote bridge gets a thumbnail, and
+`/server/info`, `/machine/system_info`, `/printer/info` and `/printer/objects/list`, which is how
+discovery recognises it. `start(host=..., port=...)` serves it at a chosen address, so a test
+can move it from 127.0.0.87 to 127.0.0.91, as a printer given a new address by DHCP.
 
 Authorization copies real Moonraker (checked against v0.9): the WebSocket upgrade always
 succeeds, the Unix socket is trusted, and a WebSocket is authorized by an `X-Api-Key` header on
@@ -47,6 +50,9 @@ class FakeMoonraker:
         api_key: str | None = None,
         reject_upgrade: bool = False,
         history: bool = True,
+        mac: str | None = "2c:cf:67:00:00:01",
+        instance_id: str | None = "6f1c1b5e-0000-4000-8000-000000000001",
+        hostname: str = "voron",
     ) -> None:
         self.klippy_state = klippy_state
         self.objects = list(objects)
@@ -55,6 +61,12 @@ class FakeMoonraker:
         """Answer the upgrade with 401, as a reverse proxy with its own auth would."""
         self.history_enabled = history
         """False is a moonraker.conf without [history]: its methods don't exist."""
+        self.mac = mac
+        self.instance_id = instance_id
+        """With `mac`, who this printer is (`machine.system_info`); None leaves it out."""
+        self.hostname = hostname
+        self.http_requests: list[str] = []
+        """Every plain HTTP path asked for, other than the WebSocket."""
         self.jobs: list[dict[str, Any]] = []
         """Moonraker's job history, oldest first."""
         self.status: dict[str, dict[str, Any]] = {
@@ -88,14 +100,22 @@ class FakeMoonraker:
 
     # -- serving -------------------------------------------------------------------------------
 
-    async def start(self) -> str:
+    async def start(self, host: str = "127.0.0.1", port: int | None = None) -> str:
         """Serves over HTTP; returns the base URL (http://127.0.0.1:port)."""
         app = web.Application()
         app.router.add_get("/websocket", self._websocket)
         app.router.add_get("/server/files/gcodes/{path:.+}", self._download)
-        self._server = TestServer(app)
+        for path in ("/server/info", "/machine/system_info", "/printer/info",
+                     "/printer/objects/list"):  # fmt: skip
+            app.router.add_get(path, self._http_get)
+        self._server = TestServer(app, host=host, port=port)
         await self._server.start_server()
         return str(self._server.make_url("")).rstrip("/")
+
+    async def stop(self) -> None:
+        """Stops serving, as a printer that went away; `start` serves again."""
+        await self.close()
+        self._server = None
 
     async def start_unix(self, path: str) -> None:
         self._unix = await asyncio.start_unix_server(self._unix_client, path=path)
@@ -140,6 +160,22 @@ class FakeMoonraker:
         if path not in self.files:
             return web.Response(status=404)
         return web.Response(body=self.files[path], content_type="image/png")
+
+    async def _http_get(self, request: web.Request) -> web.Response:
+        self.http_requests.append(request.path)
+        if self.api_key is not None and request.headers.get("X-Api-Key") != self.api_key:
+            return web.json_response(
+                {"error": {"code": 401, "message": "Unauthorized"}}, status=401
+            )
+        method = request.path.strip("/").replace("/", ".")
+        try:
+            result = self._dispatch(method, {}, {"authorized": True})
+        except _RpcError as e:
+            return web.json_response(
+                {"error": {"code": e.code, "message": e.message}},
+                status=e.code if 400 <= e.code < 600 else 500,
+            )
+        return web.json_response({"result": result})
 
     async def _unix_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -206,6 +242,11 @@ class FakeMoonraker:
             raise _RpcError(-32602, "Unauthorized")
         if method == "server.info":
             return self._server_info()
+        if method == "machine.system_info":
+            return {"system_info": self._system_info()}
+        if method == "printer.info":
+            return {"state": self.klippy_state, "hostname": self.hostname,
+                    "software_version": "v0.12.0-fake"}  # fmt: skip
         if method == "printer.objects.list":
             self._require_klippy()
             return {"objects": list(self.objects)}
@@ -268,6 +309,24 @@ class FakeMoonraker:
 
     def _server_info(self) -> dict:
         return {"klippy_state": self.klippy_state, "moonraker_version": "v0.9.3-fake"}
+
+    def _system_info(self) -> dict:
+        info: dict[str, Any] = {
+            "cpu_info": {"model": "fake"},
+            "network": {"lo": {"mac_address": "00:00:00:00:00:00", "ip_addresses": []}},
+        }
+        if self.mac is not None:
+            address = self._server.host if self._server is not None else "127.0.0.1"
+            info["network"]["wlan0"] = {
+                "mac_address": self.mac,
+                "ip_addresses": [
+                    {"family": "ipv4", "address": address, "is_link_local": False},
+                    {"family": "ipv6", "address": "fe80::1", "is_link_local": True},
+                ],
+            }
+        if self.instance_id is not None:
+            info["instance_ids"] = {"moonraker": self.instance_id, "klipper": "k-1"}
+        return info
 
     # -- driving it from a test ----------------------------------------------------------------
 

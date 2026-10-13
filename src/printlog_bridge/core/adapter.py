@@ -11,6 +11,7 @@ from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.status import PrinterReport
 
 if TYPE_CHECKING:
+    from printlog_bridge.core.state import PrinterState
     from printlog_bridge.core.trace import Trace
 
 
@@ -55,6 +56,11 @@ class Adapter(ABC):
         """Called before `run` when `trace = true`: record every message to and from the
         printer with `trace.record(SEND | RECEIVE, raw)`, and connections with `trace.mark`.
         Optional; an adapter without it simply isn't traced."""
+
+    def use_state(self, state: PrinterState) -> None:  # noqa: B027 - optional, does nothing
+        """Called before `run` with the printer's state file, for an adapter that remembers
+        something of its own between runs in `state.discovery` (and calls `state.save()`), such
+        as where it last found the printer. Optional."""
 
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:

@@ -17,6 +17,8 @@ from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
+from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
+from printlog_bridge.cli.discover import discover, format_found, subnets_to_scan
 from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import (
@@ -54,7 +56,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep the API key in the state directory, where Moonraker can't serve it: moves "
         "api_key out of the config, or asks for a key",
     )
-    for command in (doctor, run, status, store_key):
+    discover = commands.add_parser(
+        "discover",
+        help="list the Moonraker printers on the local network, with a [printer] section for each",
+    )
+    discover.add_argument(
+        "--subnet",
+        action="append",
+        default=[],
+        metavar="NETWORK",
+        help="a private /24 (or smaller) to scan, such as 192.168.1.0/24; repeat for more "
+        "(default: the networks of the configured printers and of this host)",
+    )
+    discover.add_argument(
+        "--port", type=int, default=DEFAULT_PORT, help=f"Moonraker's port (default {DEFAULT_PORT})"
+    )
+    discover.add_argument(
+        "--no-zeroconf", action="store_true", help="only scan; don't ask over mDNS"
+    )
+    for command in (doctor, run, status, store_key, discover):
         command.add_argument(
             "--config",
             type=Path,
@@ -77,6 +97,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _status(args.config)
     if args.command == "store-key":
         return _store_key(args.config)
+    if args.command == "discover":
+        return _discover(args)
 
     parser.print_usage(sys.stderr)
     return 2
@@ -128,6 +150,29 @@ def _status(explicit_config: Path | None) -> int:
     print(f"printlog-bridge {__version__} status")
     print(text)
     return code
+
+
+def _discover(args: argparse.Namespace) -> int:
+    """Lists every Moonraker that answers on the local network. Works without a config; with
+    one, also scans the configured printers' networks and marks those already set up."""
+    try:
+        subnets = [parse_subnet(s) for s in args.subnet]
+    except ValueError as e:
+        print(f"printlog-bridge: --subnet: {e}", file=sys.stderr)
+        return 2
+    env = dict(os.environ)
+    home = Path.home()
+    config = None
+    with contextlib.suppress(ConfigError):
+        config = load_config(
+            find_config(args.config, env=env, home=home), adapters=ADAPTERS, env=env, home=home
+        )
+    networks = subnets_to_scan(subnets, config)
+    zeroconf = not args.no_zeroconf
+    print(f"printlog-bridge {__version__} discover")
+    found = asyncio.run(discover(networks, port=args.port, zeroconf=zeroconf))
+    print(format_found(found, networks, config, zeroconf=zeroconf))
+    return 0 if found else 1
 
 
 def _store_key(explicit_config: Path | None) -> int:

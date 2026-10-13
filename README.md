@@ -119,6 +119,8 @@ docker run -d --name printlog-bridge --restart unless-stopped \
 docker exec printlog-bridge printlog-bridge doctor
 ```
 
+To find your printers' addresses for the config, run `docker run --rm <image> discover --subnet 192.168.1.0/24` with your LAN's network: with Docker's default (bridge) networking the container sees its own network, not your LAN's, so it needs telling which one to scan. Finding a printer again after its address changes works with bridge networking too; only the zeroconf shortcut needs host networking (`network_mode: host`), and the scan covers for it.
+
 Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`. Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
 
 ## Try it
@@ -193,7 +195,7 @@ Until pairing lands, the bridge signs in with a personal API key from [3dprintlo
 
 ## Privacy and security
 
-The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail and, unless you turn snapshots off, one webcam frame when it ends. It never reads or uploads G-code. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS, and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
+The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail and, unless you turn snapshots off, one webcam frame when it ends. It never reads or uploads G-code. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
 
 ## Config
 
@@ -204,6 +206,24 @@ Each printer is a `[printer <name>]` section, so one bridge can watch several. S
 In remote mode, if Moonraker has `[authorization]` enabled and the bridge's host isn't in `trusted_clients`, set `moonraker_api_key` in the printer's section to Moonraker's API key. The local socket is always trusted, so local mode never needs one. Moonraker accepts one bridge per printer; a second one waits until the first stops.
 
 Each print gets the largest thumbnail the slicer embedded in its file (OrcaSlicer, PrusaSlicer, Cura and SuperSlicer all embed one) as its picture when it starts. When it ends, the bridge also adds one frame from the printer's first webcam (its `snapshot_url` in Mainsail or Fluidd); for a failed print that frame becomes the picture shown. Set `snapshots = false` in the printer's section to never ask the webcam for anything. Pictures wait in the outbox with the print's other events (the image files in `images/` in the state directory), and never hold up logging the print: one that takes longer than 10 seconds, is over 10 MB or that 3D Print Log refuses (a print holds 5 pictures on the free plan) is skipped. A Moonraker or webcam address with a password or token in it is shown with them hidden, in the log, `status` and `doctor`.
+
+### When a printer's address changes
+
+Most printers get their IP address from the router (DHCP), and it can change, after a power cut say. In remote mode the bridge finds the printer again without you editing the config. The first time it connects, it remembers who the printer is: the MAC addresses Moonraker reports and Moonraker's instance id, in the printer's state file. When the printer can't be reached for 3 minutes, the bridge looks for that same printer on its last known network (the /24 around its last address): first over zeroconf, when Moonraker has `[zeroconf]` set up, then by asking each address on Moonraker's port for `/server/info`, at most once every 10 minutes. When it answers somewhere new, the bridge carries on there and remembers the new address in its state; `status` and the log say where it moved (`moved from 192.168.1.87 to 192.168.1.91`). Your config is never changed, and changing `url` in it starts afresh.
+
+A different printer at the old address is never used: if another printer answers there, the bridge says so in `status`, logs nothing from it and looks for the right one. Set `discovery = false` in a printer's section to turn all of this off, or tune it there:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `discovery_after` | `3m` | how long the printer must be unreachable before the bridge looks for it |
+| `discovery_interval` | `10m` | the least time between two searches (at least `30s`) |
+| `discovery_timeout` | `2s` | how long to wait for each address to answer; raise it on a slow Wi-Fi network |
+| `discovery_zeroconf` | `true` | ask over zeroconf (mDNS) before scanning |
+| `discovery_networks` | the /24 around the printer's last address | where to look instead, such as a printer VLAN: private networks of a /24 or smaller, up to 16, separated by commas |
+
+Times take `90`, `90s`, `3m` or `1h`.
+
+The surest fix is still a DHCP reservation on the router, which keeps the printer at one address. To list the Moonraker printers on your network, with a `[printer]` section for each ready to paste into the config, run `printlog-bridge discover` (`--subnet 192.168.1.0/24` picks the network to scan; by default it scans the configured printers' networks and this computer's own).
 
 ### Prints you made yourself
 

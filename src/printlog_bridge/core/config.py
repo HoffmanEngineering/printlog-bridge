@@ -57,6 +57,8 @@ BOOLEANS = {
 }  # fmt: skip
 
 PRINTER_PREFIX = "printer"
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*(s|m|h)?$")
+_UNITS = {None: 1, "s": 1, "m": 60, "h": 3600}
 ADOPTION_OPTIONS = ("adopt_prints", "create_prints", "adopt_window")
 DEFAULT_ADOPT_WINDOW_S = 12 * 60 * 60
 _WINDOW = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$")
@@ -208,6 +210,14 @@ def _trace(option: str | None, variable: str | None) -> bool:
     if value is None:
         raise ConfigError(f"[bridge] trace must be true or false, not {option.strip()!r}")
     return value
+
+
+def parse_duration(text: str) -> float | None:
+    """Seconds from `90`, `90s`, `3m` or `1h`, or None when `text` isn't one."""
+    match = _DURATION.match(text.strip().lower())
+    if match is None:
+        return None
+    return float(match.group(1)) * _UNITS[match.group(2)]
 
 
 def _api_url(value: str, allow_http_on_lan: bool = False) -> str:

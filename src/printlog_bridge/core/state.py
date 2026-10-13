@@ -2,7 +2,8 @@
 
 One JSON file per printer holds its connection's instance id, which makes every job's external
 ID unique to this bridge and printer, and the jobs it has seen, so a replayed event is
-recognised and a restart picks up where the last run stopped.
+recognised and a restart picks up where the last run stopped. An adapter that can find its
+printer again after an address change keeps what it needs for that in `discovery`.
 """
 
 from __future__ import annotations
@@ -46,10 +47,18 @@ class JobRecord:
 
 
 class PrinterState:
-    def __init__(self, path: Path, instance_id: str, jobs: dict[str, JobRecord]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        instance_id: str,
+        jobs: dict[str, JobRecord],
+        discovery: dict[str, Any] | None = None,
+    ) -> None:
         self.path = path
         self.instance_id = instance_id
         self.jobs = jobs
+        self.discovery: dict[str, Any] = discovery or {}
+        """The printer's identity and where it was last found, for the adapter's own use."""
 
     @classmethod
     def load(cls, state_dir: Path, printer: str) -> PrinterState:
@@ -62,7 +71,10 @@ class PrinterState:
                 job_id: JobRecord(**{k: v for k, v in job.items() if k in known})
                 for job_id, job in data["jobs"].items()
             }
-            return cls(path, data["instance_id"], jobs)
+            discovery = data.get("discovery")
+            return cls(
+                path, data["instance_id"], jobs, discovery if isinstance(discovery, dict) else {}
+            )
         except FileNotFoundError:
             pass
         except (ValueError, KeyError, TypeError) as e:
@@ -97,6 +109,8 @@ class PrinterState:
             "instance_id": self.instance_id,
             "jobs": {job_id: asdict(job) for job_id, job in self.jobs.items()},
         }
+        if self.discovery:
+            data["discovery"] = self.discovery
         # Write then rename, so a power cut leaves the old file or the new one, never half.
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(data, indent=1), encoding="utf-8")
