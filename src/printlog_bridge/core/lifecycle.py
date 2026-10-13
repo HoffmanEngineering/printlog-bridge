@@ -15,6 +15,12 @@ outbox too, in the print's order, so one is only added once its print exists. Th
 kept in `images/` in the state directory until it is sent. A picture never holds up its print:
 one that can't be fetched in time is skipped, and one the API refuses, or keeps failing to take,
 is dropped so the print's completion behind it goes through.
+
+A print the user made themselves (the Slic3r uploader, the Cura plugin, or by hand) is adopted
+rather than duplicated: before creating one, the bridge looks for an unclaimed print in Printing
+on the same printer, made within `adopt_window`, for the same file, claims the newest, and logs
+the job to it. In finish-only mode (`create_prints = false`) a job with nothing to adopt isn't
+logged. See `_adopt`.
 """
 
 from __future__ import annotations
@@ -25,11 +31,12 @@ import os
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
+from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
     ImageKind,
     JobEvent,
@@ -43,7 +50,7 @@ from printlog_bridge.core.outbox import Entry, Outbox, utc_now
 from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState, safe_file_name
 from printlog_bridge.core.status import BoardReport, StatusBoard
-from printlog_bridge.core.titles import title_from_file_name
+from printlog_bridge.core.titles import same_file, title_from_file_name
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +90,8 @@ an uplink too slow for the file). A rate limited upload, or one made while the A
 reached at all, waits like any event: then nothing behind it could be sent either. Tries are
 counted for this run of the bridge; a restart starts the count over."""
 TOO_MANY_REQUESTS = 429
+NO_LOOKUP = (404, 405, 501)
+"""What an API without the lookup for prints to adopt (api#165) answers it with."""
 
 
 @dataclass(frozen=True)
@@ -91,6 +100,8 @@ class LoggedPrinter:
     """The printer in 3D Print Log."""
     source: str
     """The API's `externalSource`: the adapter's name, such as `moonraker`."""
+    adoption: Adoption = Adoption()
+    """Whether to adopt the user's own print for a job, and whether to create one otherwise."""
 
 
 def backoff_delay(attempts: int, base: float, cap: float) -> float:
@@ -143,6 +154,7 @@ class JobLogger:
         """Job events the outbox couldn't take (a full disk), in order, until it can."""
         self._storage_failures = 0
         """Writes to the state directory that failed in a row."""
+        self._no_lookup_logged = False
 
     def close(self) -> None:
         self.outbox.close()
@@ -513,10 +525,17 @@ class JobLogger:
         print_ = await self._create(
             self.printers[entry.printer], state, entry.printer, entry.job_id, job
         )
-        self._logged(
-            entry.printer,
-            f"job {entry.job_id} started: print {print_['id']}, {print_.get('title')!r}",
-        )
+        if print_ is None:
+            self._logged(
+                entry.printer,
+                f"job {entry.job_id} started: no print of yours to adopt, so it isn't logged "
+                "(create_prints = false). The bridge looks again when it ends.",
+            )
+        elif not job.adopted:
+            self._logged(
+                entry.printer,
+                f"job {entry.job_id} started: print {print_['id']}, {print_.get('title')!r}",
+            )
 
     async def _send_image(self, entry: Entry) -> None:
         where = f"[printer {entry.printer}] job {entry.job_id}'s {entry.kind}"
@@ -536,7 +555,8 @@ class JobLogger:
             data,
             content_type,
             entry.kind + EXTENSIONS.get(content_type, ""),
-            bool(payload.get("default")),
+            # The picture the user gave their own print stays the one shown.
+            bool(payload.get("default")) and not job.had_picture,
         )
         if added is None:
             log.info("%s: print %s was deleted in 3D Print Log", where, job.print_id)
@@ -563,13 +583,21 @@ class JobLogger:
 
     async def _create(
         self, target: LoggedPrinter, state: PrinterState, printer: str, job_id: str, job: JobRecord
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        """The job's print: one of the user's adopted, else a new one. None in finish-only mode
+        when there's none to adopt."""
         start = job.start
         if self.before_create is not None:
             try:
                 await self.before_create(printer)
             except Exception:  # the print matters more than its link to the connection
                 log.exception("[printer %s] couldn't register the connection", printer)
+        if target.adoption.adopt or job.claiming is not None:
+            adopted = await self._adopt(target, state, printer, job_id, job)
+            if adopted is not None:
+                return adopted
+        if not target.adoption.create:
+            return None
         view_status, allow_comments = await self._account_defaults()
         body: dict[str, Any] = {
             "printerId": target.printer_id,
@@ -602,6 +630,92 @@ class JobLogger:
         state.save()
         return print_
 
+    async def _adopt(
+        self, target: LoggedPrinter, state: PrinterState, printer: str, job_id: str, job: JobRecord
+    ) -> dict[str, Any] | None:
+        """Claims the user's print for the job, when there's one to adopt, and returns it.
+
+        A candidate is on the same printer, in Printing, claimed by no connector, created within
+        `adopt_window` before the job started, and for the same file (`same_file`). The newest
+        wins. The API filters on all but the file; they're checked again here all the same.
+        """
+        start = job.start
+        claim = {
+            "externalSource": target.source,
+            "externalId": f"{state.instance_id}:{job_id}",
+            "connectionInstanceId": state.instance_id,
+            "startDate": start["started_at"],
+        }
+        if job.claiming is not None:
+            # Claimed before, and the answer was lost: the same claim again returns the print.
+            claimed = await self._claim(job.claiming, claim)
+            if claimed is not None:
+                return self._adopted(state, printer, job_id, job, claimed)
+            job.claiming = None
+            state.save()
+
+        started_at = datetime.fromisoformat(start["started_at"])
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        since = started_at - timedelta(seconds=target.adoption.window_s)
+        try:
+            found = await self.api.unclaimed_prints(target.printer_id, since)
+        except ApiUnavailable as e:
+            if e.status not in NO_LOOKUP:
+                raise
+            if not self._no_lookup_logged:
+                self._no_lookup_logged = True
+                log.warning(
+                    "[printer %s] 3D Print Log can't look up prints to adopt yet (%s), so "
+                    "jobs get a print of their own",
+                    printer, e,
+                )  # fmt: skip
+            return None
+        candidates = sorted(
+            (p for p in found if _adoptable(p, target.printer_id, since, start["file_name"])),
+            key=_created,
+            reverse=True,
+        )
+        if len(candidates) > 1:
+            log.info(
+                "[printer %s] job %s: %d prints could be adopted (%s); taking the newest",
+                printer, job_id, len(candidates), ", ".join(str(p["id"]) for p in candidates),
+            )  # fmt: skip
+        for candidate in candidates:
+            job.claiming = int(candidate["id"])
+            state.save()
+            claimed = await self._claim(job.claiming, claim)
+            if claimed is not None:
+                return self._adopted(state, printer, job_id, job, claimed)
+            log.info(
+                "[printer %s] job %s: print %s was claimed, finished or deleted meanwhile",
+                printer, job_id, candidate["id"],
+            )  # fmt: skip
+            job.claiming = None
+            state.save()
+        return None
+
+    async def _claim(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The claimed print, or None when it can't be claimed: gone, claimed by another
+        connector, or no longer in Printing (400), so the next candidate is tried."""
+        try:
+            return await self.api.claim_print(print_id, body)
+        except ApiRejected as e:
+            log.info("couldn't claim print %s: %s", print_id, e)
+            return None
+
+    def _adopted(
+        self, state: PrinterState, printer: str, job_id: str, job: JobRecord, print_: dict
+    ) -> dict[str, Any]:
+        job.print_id = int(print_["id"])
+        job.claiming = None
+        job.adopted = True
+        job.had_picture = bool(print_.get("images"))
+        state.save()
+        title = print_.get("title")
+        self._logged(printer, f"job {job_id}: adopted print {print_['id']} ({title!r})")
+        return print_
+
     async def _account_defaults(self) -> tuple[int, bool]:
         if self._defaults is None:
             settings = {
@@ -624,6 +738,15 @@ class JobLogger:
             print_: dict[str, Any] | None = await self._create(
                 target, state, event.printer, event.job_id, job
             )
+            if print_ is None:
+                job.finished = True
+                state.save()
+                self._logged(
+                    event.printer,
+                    f"job {event.job_id} {event.outcome.value}: no print of yours to adopt, so "
+                    "it isn't logged (create_prints = false)",
+                )
+                return
         else:
             print_ = await self.api.get_print(job.print_id)
         if print_ is None:
@@ -639,7 +762,9 @@ class JobLogger:
         if event.duration_s is not None:
             body["printTimeInSeconds"] = round(event.duration_s)
         loaded = await self.spools.current(event.printer) if self.spools is not None else {}
-        rows = _usage_rows(event, print_.get("filamentUsage") or [], loaded)
+        slot_count = self.spools.slot_count(event.printer) if self.spools is not None else None
+        single_tool = (slot_count or 1) <= 1 and all(slot == 0 for slot in event.filament_mm)
+        rows = _usage_rows(event, print_.get("filamentUsage") or [], loaded, single_tool)
         if rows:
             body["filamentUsage"] = rows
 
@@ -705,6 +830,33 @@ class JobLogger:
         report = self._report(entry.printer)
         if report is not None:
             report.warn(API_TOPIC, f"job {entry.job_id} isn't logged yet: {problem}")
+
+
+def _adoptable(print_: Mapping[str, Any], printer_id: int, since: datetime, file_name: str) -> bool:
+    """Whether the job for `file_name` may adopt the print. A print with no `fileName` (made by
+    hand) matches on its title, which is what a person would have typed for the file."""
+    if print_.get("id") is None or print_.get("printerId") != printer_id:
+        return False
+    if print_.get("status") != PRINTING or print_.get("externalId"):
+        return False
+    created = _created(print_)
+    if created is not None and created < since:
+        return False
+    return same_file(print_.get("fileName") or print_.get("title") or "", file_name)
+
+
+def _created(print_: Mapping[str, Any]) -> datetime | None:
+    """When the print was made in 3D Print Log, or its start date when that isn't given."""
+    for key in ("createdDate", "createdAt", "dateCreated", "startDate"):
+        value = print_.get(key)
+        if not value:
+            continue
+        try:
+            when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+    return None
 
 
 def _finish_payload(event: JobFinished) -> dict[str, Any]:
@@ -794,12 +946,24 @@ def _usage_rows(
     event: JobFinished,
     rows: Sequence[Mapping[str, Any]],
     loaded: Mapping[int, str] | None = None,
+    single_tool: bool = False,
 ) -> list[dict[str, Any]]:
     """One row per slot that fed filament, linked to the spool in that slot when it's known.
 
     A slot with no spool still gets its row, with its slot and no `filamentId`. The API takes
     one row per spool, so a spool on two slots gets one row, on the first, with both lengths.
+
+    On a single-tool printer a row with no slot (an uploader's) is slot 0's. When it has no
+    spool either, slot 0's row is sent without its slot, so the API fills that row in order
+    rather than adding one: it matches a slot only against rows that have one.
     """
+    fill_unslotted = (
+        single_tool
+        and any(row.get("slot") is None and not row.get("filament") for row in rows)
+        and not any(row.get("slot") == 0 for row in rows)
+    )
+    if single_tool:
+        rows = [{**row, "slot": 0} if row.get("slot") is None else row for row in rows]
     spools = _spools_by_slot(rows, loaded or {})
     usage: list[dict[str, Any]] = []
     mm_by_spool: dict[str, float] = {}
@@ -816,6 +980,8 @@ def _usage_rows(
         if spool is not None:
             row["filamentId"] = spool
             mm_by_spool[spool] = mm
+        elif fill_unslotted and slot == 0:
+            del row["slot"]
         usage.append(row)
     return usage
 

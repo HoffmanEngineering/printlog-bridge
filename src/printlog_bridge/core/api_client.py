@@ -138,6 +138,35 @@ class ApiClient:
         status, print_ = await self._send("POST", "/api/Prints", body)
         return print_, status == 201
 
+    async def unclaimed_prints(
+        self, printer_id: int, created_after: datetime
+    ) -> list[dict[str, Any]]:
+        """The key owner's prints on the printer still in Printing that no connector has claimed
+        (no `externalId`), created after `created_after` (api#165)."""
+        body = await self._request(
+            "GET",
+            "/api/Prints",
+            params={
+                "printerId": str(printer_id),
+                "status": "Printing",
+                "unclaimed": "true",
+                "createdAfter": created_after.isoformat(),
+            },
+        )
+        if isinstance(body, Mapping):  # a paged answer
+            body = body.get("items") or body.get("data") or []
+        return [p for p in body or [] if isinstance(p, Mapping)]
+
+    async def claim_print(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Claims the print for this connector: sets its `externalSource`, `externalId` and
+        connection (api#165). Claiming it again with the same `externalId` returns it.
+
+        None when it's gone, or another connector claimed it first (409)."""
+        status, print_ = await self._send(
+            "POST", f"/api/Prints/{print_id}/claim", body, missing_ok=True, conflict_ok=True
+        )
+        return None if status in (404, 409) else print_
+
     async def get_print(self, print_id: int) -> dict[str, Any] | None:
         return await self._request("GET", f"/api/Prints/{print_id}", missing_ok=True)
 
@@ -197,6 +226,7 @@ class ApiClient:
         params: Mapping[str, str] | None = None,
         *,
         missing_ok: bool = False,
+        conflict_ok: bool = False,
         data: aiohttp.FormData | None = None,
         timeout: float = REQUEST_TIMEOUT_S,
     ) -> tuple[int, Any]:
@@ -217,6 +247,8 @@ class ApiClient:
                     raise AuthRejected(f"the API rejected the key ({response.status})")
                 if response.status == 404 and missing_ok:
                     return 404, None
+                if response.status == 409 and conflict_ok:
+                    return 409, None
                 if response.status in (400, 403, 413, 415):
                     reason = (await response.text()).strip()[:300]
                     raise ApiRejected(

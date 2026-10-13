@@ -14,6 +14,12 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
   sent twice among rows with no `filamentId`, and a row with no measurement (or a `source`
   naming one it didn't send). Every other field is left alone.
 - `PATCH /api/Prints/{id}` changes only the fields sent.
+- `GET /api/Prints?printerId=&status=Printing&unclaimed=true&createdAfter=` lists the user's
+  prints on the printer in Printing with no `externalId`, created after the time (api#165, as
+  proposed there: the API doesn't have it yet). `POST /api/Prints/{id}/claim` sets a print's
+  `externalSource`, `externalId` and connection: 404 for an unknown print, 400 for one not in
+  Printing, 409 for one claimed under another `externalId`; the same `externalId` again
+  returns the print. `lookup = False` answers the lookup 404, as an API without it would.
 - `POST /api/Prints/{id}/image` adds an image from a multipart form (`image`, `isDefault`):
   jpeg, png, gif, webp or bmp by the part's content type, under 10 MB, at most 5 per print
   (the free plan; 20 with Pro), each refused with 400. `isDefault` makes it the only default.
@@ -47,6 +53,7 @@ from __future__ import annotations
 import itertools
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from aiohttp import web
@@ -102,6 +109,12 @@ class FakePrintLogApi:
         """What the last PUT /api/Printers/{id} set, beyond slots and spools."""
         self._ids = itertools.count(1)
         self._image_ids = itertools.count(1)
+        self.lookup = True
+        """False answers the lookup for prints to adopt 404, as an API without it does."""
+        self.lookups: list[dict[str, str]] = []
+        """Every lookup's query."""
+        self.claims: list[tuple[int, dict[str, Any]]] = []
+        """Every claim body received, by print id."""
         self._failures: list[tuple[int, dict[str, str]]] = []
         self._server: TestServer | None = None
 
@@ -118,6 +131,8 @@ class FakePrintLogApi:
         app.router.add_delete("/api/Printers/{id}/slots/{slot}", self._unload_slot)
         app.router.add_get("/api/Filaments/by-tag/{uid}", self._by_tag)
         app.router.add_post("/api/Prints", self._create)
+        app.router.add_get("/api/Prints", self._unclaimed)
+        app.router.add_post("/api/Prints/{id}/claim", self._claim)
         app.router.add_get("/api/Prints/{id}", self._get)
         app.router.add_patch("/api/Prints/{id}", self._patch)
         app.router.add_post("/api/Prints/{id}/complete", self._complete)
@@ -186,6 +201,44 @@ class FakePrintLogApi:
     def slot_spools(self, printer_id: int) -> dict[int | None, str]:
         """What's loaded on the printer: filament id by slot."""
         return {r["slot"]: r["filamentId"] for r in self.loaded[printer_id]}
+
+    def user_creates(
+        self,
+        title: str,
+        *,
+        file_name: str | None = None,
+        printer_id: int = 42,
+        created: str = "2026-10-10T09:00:00+00:00",
+        status: int = PRINTING,
+        usage: list[dict[str, Any]] | None = None,
+        **fields: Any,
+    ) -> int:
+        """A print the user made themselves (the Slic3r uploader, or by hand). Returns its id.
+
+        `usage` rows are given as a create sends them (`filament: {id}`, no slot by default)."""
+        print_id = next(self._ids)
+        self.prints[print_id] = {
+            "id": print_id,
+            "printerId": printer_id,
+            "title": title,
+            "fileName": file_name,
+            "status": status,
+            "startDate": None,
+            "createdDate": created,
+            "notes": None,
+            "externalSource": None,
+            "externalId": None,
+            "connectionInstanceId": None,
+            "connectionId": None,
+            "printTimeInSeconds": None,
+            "estimatedPrintTimeInSeconds": None,
+            "filamentUsageMg": None,
+            "estimatedFilamentUsageMg": None,
+            "filamentUsage": [_row(r, _spool(r)) for r in usage or []],
+            "images": [],
+            **fields,
+        }
+        return print_id
 
     def by_external_id(self, external_id: str) -> dict[str, Any]:
         [found] = [p for p in self.prints.values() if p["externalId"] == external_id]
@@ -387,6 +440,7 @@ class FakePrintLogApi:
             "fileName": body.get("fileName"),
             "status": body.get("status", 1),
             "startDate": body.get("startDate"),
+            "createdDate": datetime.now(timezone.utc).isoformat(),
             "notes": body.get("notes"),
             "viewStatus": body.get("viewStatus"),
             "allowComments": body.get("allowComments", False),
@@ -480,6 +534,44 @@ class FakePrintLogApi:
             if image["isDefault"]:
                 return self.images[image["id"]]
         return None
+
+    async def _unclaimed(self, request: web.Request) -> web.Response:
+        if not self.lookup:
+            return web.Response(status=404)
+        query = dict(request.query)
+        self.lookups.append(query)
+        printer_id = int(query["printerId"])
+        after = datetime.fromisoformat(query["createdAfter"])
+        found = [
+            p
+            for p in self.prints.values()
+            if p["printerId"] == printer_id
+            and p["status"] == PRINTING
+            and not p["externalId"]
+            and datetime.fromisoformat(p["createdDate"]) >= after
+        ]
+        return web.json_response(found)
+
+    async def _claim(self, request: web.Request) -> web.Response:
+        found = self.prints.get(int(request.match_info["id"]))
+        if found is None:
+            return web.Response(status=404)
+        body = await request.json()
+        self.claims.append((found["id"], body))
+        if found["externalId"]:
+            if found["externalId"] == body["externalId"]:
+                return web.json_response(found)
+            return web.Response(status=409, text="The print was claimed by another connector.")
+        if found["status"] != PRINTING:
+            return web.Response(status=400, text="Only a print in Printing can be claimed.")
+        found["externalSource"] = body["externalSource"]
+        found["externalId"] = body["externalId"]
+        found["connectionInstanceId"] = body.get("connectionInstanceId")
+        found["connectionId"] = (
+            self.connections.get(body.get("connectionInstanceId") or "") or {}
+        ).get("id")
+        found["startDate"] = found["startDate"] or body.get("startDate")
+        return web.json_response(found)
 
     async def _get(self, request: web.Request) -> web.Response:
         found = self.prints.get(int(request.match_info["id"]))

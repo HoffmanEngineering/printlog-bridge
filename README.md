@@ -203,6 +203,27 @@ In remote mode, if Moonraker has `[authorization]` enabled and the bridge's host
 
 Each print gets the largest thumbnail the slicer embedded in its file (OrcaSlicer, PrusaSlicer, Cura and SuperSlicer all embed one) as its picture when it starts. When it ends, the bridge also adds one frame from the printer's first webcam (its `snapshot_url` in Mainsail or Fluidd); for a failed print that frame becomes the picture shown. Set `snapshots = false` in the printer's section to never ask the webcam for anything. Pictures wait in the outbox with the print's other events (the image files in `images/` in the state directory), and never hold up logging the print: one that takes longer than 10 seconds, is over 10 MB or that 3D Print Log refuses (a print holds 5 pictures on the free plan) is skipped. A Moonraker or webcam address with a password or token in it is shown with them hidden, in the log, `status` and `doctor`.
 
+### Prints you made yourself
+
+If you create the print yourself, with the [Slic3r uploader](https://github.com/HoffmanEngineering/Slic3rPostProcessingUploader), the Cura plugin or by hand, the bridge logs the job to that print instead of creating a second one. When a job starts it looks for one of your prints that is:
+
+- on the same printer, and still in Printing;
+- not claimed by any connector yet;
+- made within `adopt_window` before the job started (12 hours by default);
+- for the same file: the names match once folders, the extension (`.gcode`, `.bgcode`, `.gcode.3mf`), and the suffix PrusaSlicer and OrcaSlicer add (`_0.2mm_PLA_MK4_1h2m`) are left out, ignoring case. A print with no file name matches on its title.
+
+If there are several, it takes the newest. It claims the print, adds the slicer's thumbnail (as the picture shown only when the print has none yet), and completes it when the job ends, as it would a print it made. Your title, notes, estimate and the spool on your usage row are kept; the actual time and filament are filled in, into your rows rather than new ones. The log says `job 00001F: adopted print 110210 ('Benchy')`.
+
+Set these in `[bridge]` for every printer, or in a printer's section for that one:
+
+```ini
+adopt_prints = true    ; the default: adopt a matching print, else create one
+create_prints = false  ; finish-only: never create a print; a job with no match isn't logged
+adopt_window = 12h     ; 90m, 2d; a bare number is hours
+```
+
+Finish-only mode is for uploader users who only want the bridge to report how each print ended. The bridge looks for a print to adopt again when the job ends, so a print uploaded after the job started is still found. Without a match, the job is skipped with a line in the log.
+
 ### Recording a trace
 
 To report a problem with a printer, or to turn one of its prints into a test, set `trace = true` in `[bridge]` (in Docker, set the environment variable `PRINTLOG_BRIDGE_TRACE=1` instead) and restart the bridge. It then records every message it sends to and receives from each printer's Moonraker, one JSON line each with the time and the direction, in `traces/<printer>-<YYYYMMDD>.jsonl` in the state directory. `status` shows `Trace: on` while it records.

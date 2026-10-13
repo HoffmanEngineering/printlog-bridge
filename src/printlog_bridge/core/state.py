@@ -36,6 +36,13 @@ class JobRecord:
     images: dict[str, bool] = field(default_factory=dict)
     """Each picture already fetched for the job (`thumbnail`, `snapshot`), and whether there
     was one to add, so a replayed job isn't fetched again."""
+    claiming: int | None = None
+    """The print being adopted, from just before the claim is sent until `print_id` is set, so
+    a claim whose answer was lost is sent again rather than a second print created."""
+    adopted: bool = False
+    """The print was the user's (an uploader's), adopted rather than created by the bridge."""
+    had_picture: bool = False
+    """The adopted print already had a picture, which the thumbnail mustn't replace."""
 
 
 class PrinterState:
