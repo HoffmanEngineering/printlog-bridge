@@ -20,11 +20,13 @@ from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.images import scrub_url
+from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import PrinterReport
 from printlog_bridge.core.trace import Trace
 
 from .images import MoonrakerImages
 from .jobs import JobTracker
+from .locator import Locator
 from .session import (
     ConnectionLost,
     Listeners,
@@ -41,7 +43,7 @@ from .u1_rfid import U1RfidReader
 log = logging.getLogger(__name__)
 
 DEFAULT_SOCKET = "~/printer_data/comms/moonraker.sock"
-OPTIONS = frozenset({"url", "socket", "moonraker_api_key", "snapshots"})
+OPTIONS = frozenset({"url", "socket", "moonraker_api_key", "snapshots", "discovery"})
 CHECK_TIMEOUT_S = 5
 
 URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
@@ -57,6 +59,7 @@ class MoonrakerAdapter(Adapter):
         socket: Path | None,
         api_key: str | None = None,
         snapshots: bool = True,
+        discovery: bool = True,
     ) -> None:
         self.printer = printer
         self.url = url
@@ -64,8 +67,13 @@ class MoonrakerAdapter(Adapter):
         self.api_key = api_key
         self.snapshots = snapshots
         """Whether a frame from the printer's webcam is added to each print when it ends."""
+        self.discovery = discovery and url is not None
+        """In remote mode, whether to find the printer again when its address changes."""
         self.spools: SpoolSink | None = None
         self.trace: Trace | None = None
+        self.state: PrinterState | None = None
+        self.locator_options: dict = {}
+        """Passed on to the Locator; tests use it to shorten its waits."""
 
     @classmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> MoonrakerAdapter:
@@ -83,11 +91,8 @@ class MoonrakerAdapter(Adapter):
             )
 
         api_key = options.get("moonraker_api_key", "").strip() or None
-        snapshots = BOOLEANS.get(options.get("snapshots", "true").strip().lower())
-        if snapshots is None:
-            raise ConfigError(
-                f"[printer {printer}] snapshots must be true or false, not {options['snapshots']!r}"
-            )
+        snapshots = _boolean(printer, options, "snapshots")
+        discovery = _boolean(printer, options, "discovery")
 
         if "url" in options:
             url = options["url"].strip().rstrip("/")
@@ -97,12 +102,24 @@ class MoonrakerAdapter(Adapter):
                     f"[printer {printer}] url must look like http://printer.local:7125, "
                     f"not {options['url']!r}"
                 )
-            return cls(printer, url=url, socket=None, api_key=api_key, snapshots=snapshots)
+            return cls(
+                printer,
+                url=url,
+                socket=None,
+                api_key=api_key,
+                snapshots=snapshots,
+                discovery=discovery,
+            )
 
         if api_key is not None:
             raise ConfigError(
                 f"[printer {printer}] moonraker_api_key is only for remote mode (url). "
                 "Moonraker trusts its local socket without one."
+            )
+        if "discovery" in options:
+            raise ConfigError(
+                f"[printer {printer}] discovery is only for remote mode (url): the local socket "
+                "doesn't change address."
             )
 
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
@@ -114,6 +131,23 @@ class MoonrakerAdapter(Adapter):
         return f"moonraker, local socket {self.socket}"
 
     async def run(self, sink: EventSink, report: PrinterReport) -> None:
+        locator = None
+        if self.discovery and self.url is not None and self.state is not None:
+
+            def moved(url: str) -> None:
+                self.url = images.url = url
+
+            locator = Locator(
+                self.printer,
+                configured_url=self.url,
+                state=self.state,
+                api_key=self.api_key,
+                report=report,
+                on_moved=moved,
+                **self.locator_options,
+            )
+            locator.started()
+            self.url = locator.url
         images = MoonrakerImages(
             self.printer,
             url=self.url,
@@ -135,6 +169,7 @@ class MoonrakerAdapter(Adapter):
             api_key=self.api_key,
             report=report,
             trace=self.trace,
+            locator=locator,
         )
         await session.run()
 
@@ -143,6 +178,9 @@ class MoonrakerAdapter(Adapter):
 
     def use_trace(self, trace: Trace) -> None:
         self.trace = trace
+
+    def use_state(self, state: PrinterState) -> None:
+        self.state = state
 
     async def check(self) -> Sequence[CheckResult]:
         name = f"Printer {self.printer}"
@@ -194,6 +232,15 @@ class MoonrakerAdapter(Adapter):
         if klippy != "ready":
             return [CheckResult.warn(name, detail)]
         return [CheckResult.ok(name, detail)]
+
+
+def _boolean(printer: str, options: Mapping[str, str], option: str) -> bool:
+    value = BOOLEANS.get(options.get(option, "true").strip().lower())
+    if value is None:
+        raise ConfigError(
+            f"[printer {printer}] {option} must be true or false, not {options[option]!r}"
+        )
+    return value
 
 
 def _reason(error: BaseException, url: str | None) -> str:

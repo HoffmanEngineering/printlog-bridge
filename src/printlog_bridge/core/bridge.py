@@ -93,6 +93,8 @@ async def run_bridge(
             sink.before_create = heartbeat.ensure_registered
             for printer in config.printers:
                 printer.adapter.use_spools(spools)
+                if printer.printer_id is not None:
+                    printer.adapter.use_state(sink.state(printer.name))
                 log.info(
                     "[printer %s] watching: %s, logging to printer %s",
                     printer.name, printer.adapter.describe(), printer.printer_id,

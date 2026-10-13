@@ -362,12 +362,14 @@ class TestOnlyOutboundConnections:
         ]
         assert found == []
 
-    def test_only_three_modules_open_connections(self):
+    def test_only_four_modules_open_connections(self):
         """3D Print Log's API client, the image fetcher (Moonraker's thumbnails and its webcam),
-        and the Moonraker session. docs/privacy.md lists what each connects to."""
+        the Moonraker session, and discovery (finding Moonraker on the local network).
+        docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
-            r"urllib\.request|http\.client|import requests|import httpx"
+            r"create_datagram_endpoint|urllib\.request|http\.client|import requests|"
+            r"import httpx"
         )
         found = {
             path.relative_to(SRC).as_posix()
@@ -378,6 +380,7 @@ class TestOnlyOutboundConnections:
             "core/api_client.py",
             "core/images.py",
             "adapters/moonraker/session.py",
+            "adapters/moonraker/discovery.py",
         }
 
     @pytest.mark.parametrize(

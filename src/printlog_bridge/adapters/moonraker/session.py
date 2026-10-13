@@ -31,6 +31,7 @@ CLIENT_NAME = "printlog-bridge"
 REPO_URL = "https://github.com/HoffmanEngineering/printlog-bridge"
 REQUEST_TIMEOUT_S = 10
 WARNING_TOPIC = "moonraker"
+DISCOVERY_TOPIC = "discovery"
 CONNECT_TIMEOUT_S = 10
 UNIX_READ_LIMIT = 4 * 1024 * 1024
 ETX = b"\x03"
@@ -169,6 +170,23 @@ class ConnectionLost(Exception):
     pass
 
 
+class WrongPrinter(Exception):
+    """A different printer answered at the address: the bridge won't log its jobs."""
+
+
+class Locator(Protocol):
+    """Recognises the printer on connect, and finds it again when it moves (locator.py)."""
+
+    async def verify(self, call: Call) -> None:
+        """Raises WrongPrinter when the printer connected to isn't this one."""
+
+    def due(self, down_for: float, wrong: bool) -> bool:
+        """Whether to search for the printer now."""
+
+    async def relocate(self) -> str | None:
+        """The printer's new URL, or None."""
+
+
 class AlreadyConnected(Exception):
     """Moonraker allows one agent per name, and another bridge holds it."""
 
@@ -213,6 +231,7 @@ class MoonrakerSession:
         backoff: Backoff | None = None,
         report: PrinterReport | None = None,
         trace: Trace | None = None,
+        locator: Locator | None = None,
     ) -> None:
         if (url is None) == (socket is None):
             raise ValueError("pass exactly one of url or socket")
@@ -226,7 +245,10 @@ class MoonrakerSession:
         self.report = report or NullReport()
         self.trace = trace
         """Where every message sent and received is recorded, with `trace = true`."""
+        self.locator = locator
+        """Finds the printer again when its address changes, in remote mode with discovery."""
         self.status: dict[str, dict[str, Any]] = {}
+        self._down_since: float | None = None
 
     @property
     def where(self) -> str:
@@ -236,6 +258,7 @@ class MoonrakerSession:
         """Stays connected until cancelled, reconnecting with backoff whenever the link drops."""
         while True:
             reason = f"Moonraker at {self.where} closed the connection"
+            wrong = False
             try:
                 transport = await self._open()
                 if self.trace is not None:
@@ -259,11 +282,38 @@ class MoonrakerSession:
             except asyncio.TimeoutError:
                 reason = f"Moonraker at {self.where} didn't answer"
                 log.warning("[printer %s] %s", self.printer, reason)
+            except WrongPrinter as e:
+                reason = str(e)
+                wrong = True
+                log.error("[printer %s] %s", self.printer, e)
+                self.report.warn(DISCOVERY_TOPIC, reason)
             self.report.disconnected(reason)
+            if await self._relocated(wrong):
+                continue
 
             delay = self.backoff.next()
             log.info("[printer %s] reconnecting in %gs", self.printer, delay)
             await asyncio.sleep(delay)
+
+    async def _relocated(self, wrong: bool) -> bool:
+        """Looks for the printer at another address when it's due. True when it was found."""
+        if self.locator is None:
+            return False
+        now = asyncio.get_running_loop().time()
+        if self._down_since is None:
+            self._down_since = now
+        try:
+            if not self.locator.due(now - self._down_since, wrong):
+                return False
+            url = await self.locator.relocate()
+        except Exception:  # finding it again is a bonus; reconnecting carries on regardless
+            log.exception("[printer %s] couldn't look for the printer", self.printer)
+            return False
+        if url is None:
+            return False
+        self.url = url
+        self.backoff.reset()
+        return True
 
     async def _open(self) -> _Transport:
         return await _open_transport(self.printer, self.url, self.socket, self.api_key, self.trace)
@@ -290,6 +340,10 @@ class MoonrakerSession:
                         "(check other hosts and Docker) and this one takes over."
                     ) from e
                 raise
+
+            if self.locator is not None:
+                await self.locator.verify(rpc.call)
+            self._down_since = None
 
             log.info("[printer %s] connected to Moonraker at %s", self.printer, self.where)
             self.backoff.reset()
