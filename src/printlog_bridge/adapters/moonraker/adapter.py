@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,13 +18,14 @@ import aiohttp
 
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.checks import CheckResult
-from printlog_bridge.core.config import BOOLEANS, ConfigError
+from printlog_bridge.core.config import BOOLEANS, ConfigError, parse_duration
 from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.images import scrub_url
 from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import PrinterReport
 from printlog_bridge.core.trace import Trace
 
+from . import discovery as lan
 from .images import MoonrakerImages
 from .jobs import JobTracker
 from .locator import Locator
@@ -43,7 +45,20 @@ from .u1_rfid import U1RfidReader
 log = logging.getLogger(__name__)
 
 DEFAULT_SOCKET = "~/printer_data/comms/moonraker.sock"
-OPTIONS = frozenset({"url", "socket", "moonraker_api_key", "snapshots", "discovery"})
+DISCOVERY_OPTIONS = frozenset(
+    {
+        "discovery",
+        "discovery_after",
+        "discovery_interval",
+        "discovery_timeout",
+        "discovery_zeroconf",
+        "discovery_networks",
+    }
+)
+OPTIONS = frozenset({"url", "socket", "moonraker_api_key", "snapshots"}) | DISCOVERY_OPTIONS
+MIN_DISCOVERY_INTERVAL_S = 30
+"""Searches no more often than this, so a network isn't swept over and over."""
+MAX_DISCOVERY_NETWORKS = 16
 CHECK_TIMEOUT_S = 5
 
 URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
@@ -60,6 +75,7 @@ class MoonrakerAdapter(Adapter):
         api_key: str | None = None,
         snapshots: bool = True,
         discovery: bool = True,
+        discovery_options: Mapping[str, object] | None = None,
     ) -> None:
         self.printer = printer
         self.url = url
@@ -72,8 +88,8 @@ class MoonrakerAdapter(Adapter):
         self.spools: SpoolSink | None = None
         self.trace: Trace | None = None
         self.state: PrinterState | None = None
-        self.locator_options: dict = {}
-        """Passed on to the Locator; tests use it to shorten its waits."""
+        self.locator_options: dict = dict(discovery_options or {})
+        """Passed on to the Locator: `after`, `interval`, `timeout`, `zeroconf`, `networks`."""
 
     @classmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> MoonrakerAdapter:
@@ -93,6 +109,7 @@ class MoonrakerAdapter(Adapter):
         api_key = options.get("moonraker_api_key", "").strip() or None
         snapshots = _boolean(printer, options, "snapshots")
         discovery = _boolean(printer, options, "discovery")
+        discovery_options = _discovery_options(printer, options)
 
         if "url" in options:
             url = options["url"].strip().rstrip("/")
@@ -109,6 +126,7 @@ class MoonrakerAdapter(Adapter):
                 api_key=api_key,
                 snapshots=snapshots,
                 discovery=discovery,
+                discovery_options=discovery_options,
             )
 
         if api_key is not None:
@@ -116,10 +134,11 @@ class MoonrakerAdapter(Adapter):
                 f"[printer {printer}] moonraker_api_key is only for remote mode (url). "
                 "Moonraker trusts its local socket without one."
             )
-        if "discovery" in options:
+        local_only = sorted(DISCOVERY_OPTIONS & set(options))
+        if local_only:
             raise ConfigError(
-                f"[printer {printer}] discovery is only for remote mode (url): the local socket "
-                "doesn't change address."
+                f"[printer {printer}] {local_only[0]} is only for remote mode (url): the local "
+                "socket doesn't change address."
             )
 
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
@@ -232,6 +251,46 @@ class MoonrakerAdapter(Adapter):
         if klippy != "ready":
             return [CheckResult.warn(name, detail)]
         return [CheckResult.ok(name, detail)]
+
+
+def _discovery_options(printer: str, options: Mapping[str, str]) -> dict[str, object]:
+    """The Locator's settings from the `discovery_*` options; defaults for those not set."""
+    out: dict[str, object] = {}
+    for option, key, least in (
+        ("discovery_after", "after", 0),
+        ("discovery_interval", "interval", MIN_DISCOVERY_INTERVAL_S),
+        ("discovery_timeout", "timeout", 0.1),
+    ):
+        if not options.get(option, "").strip():
+            continue
+        seconds = parse_duration(options[option])
+        if seconds is None or seconds < least:
+            raise ConfigError(
+                f"[printer {printer}] {option} must be a time such as 90s, 3m or 1h"
+                f"{f' (at least {least:g}s)' if least >= 1 else ''}, not {options[option]!r}"
+            )
+        out[key] = seconds
+    if options.get("discovery_zeroconf", "").strip():
+        out["zeroconf"] = _boolean(printer, options, "discovery_zeroconf")
+    text = options.get("discovery_networks", "").strip()
+    if text:
+        networks = []
+        for item in re.split(r"[\s,]+", text):
+            try:
+                networks.append(lan.parse_subnet(item))
+            except ValueError as e:
+                raise ConfigError(
+                    f"[printer {printer}] discovery_networks: {e}. List private networks of a "
+                    "/24 or smaller, such as 192.168.1.0/24, 192.168.2.0/24."
+                ) from None
+        networks = list(dict.fromkeys(networks))
+        if len(networks) > MAX_DISCOVERY_NETWORKS:
+            raise ConfigError(
+                f"[printer {printer}] discovery_networks lists {len(networks)} networks; "
+                f"at most {MAX_DISCOVERY_NETWORKS}"
+            )
+        out["networks"] = networks
+    return out
 
 
 def _boolean(printer: str, options: Mapping[str, str], option: str) -> bool:

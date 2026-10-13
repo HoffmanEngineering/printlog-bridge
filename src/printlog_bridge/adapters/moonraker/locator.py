@@ -16,7 +16,7 @@ import hashlib
 import ipaddress
 import logging
 import time
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -35,6 +35,7 @@ DISCOVERY_AFTER_S = 3 * 60
 SCAN_INTERVAL_S = 10 * 60
 """The least time between two searches for the same printer."""
 MAX_NETWORKS = 4
+"""Automatic search covers at most this many /24s; `networks` in the config can name more."""
 
 Scan = Callable[..., Awaitable[list[Found]]]
 Browse = Callable[[], Awaitable[list[tuple[str, int]]]]
@@ -52,6 +53,8 @@ class Locator:
         after: float = DISCOVERY_AFTER_S,
         interval: float = SCAN_INTERVAL_S,
         zeroconf: bool = True,
+        networks: Sequence[ipaddress.IPv4Network] = (),
+        timeout: float = discovery.PROBE_TIMEOUT_S,
         on_moved: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         scan: Scan = discovery.scan,
@@ -65,6 +68,10 @@ class Locator:
         self.after = after
         self.interval = interval
         self.zeroconf = zeroconf
+        self.configured_networks = list(networks)
+        """Where to search instead of the printer's last known networks, when given."""
+        self.timeout = timeout
+        """How long to wait for each address to answer."""
         self.on_moved = on_moved
         self.clock = clock
         self._scan = scan
@@ -175,6 +182,7 @@ class Locator:
                 networks,
                 lambda address: discovery.http_base(discovery.with_host(current, address)),
                 api_key=self.api_key,
+                timeout=self.timeout,
                 wanted=wanted,
             )
             found = matches[0] if matches else None
@@ -189,7 +197,10 @@ class Locator:
         return new_url
 
     def networks(self) -> list[ipaddress.IPv4Network]:
-        """The /24s to search: the current address's, then those the printer reported."""
+        """The networks to search: those in the config, or else the /24 of the current address
+        and of each address the printer reported."""
+        if self.configured_networks:
+            return list(self.configured_networks)
         hosts = [discovery.host_of(self.url)]
         known = self.fingerprint
         if known is not None:
@@ -211,7 +222,7 @@ class Locator:
             if not any(ipaddress.ip_address(address) in n for n in networks):
                 continue
             base = discovery.http_base(discovery.with_host(current, address))
-            found = await discovery.probe(base, api_key=self.api_key)
+            found = await discovery.probe(base, api_key=self.api_key, timeout=self.timeout)
             if found is not None and wanted(found):
                 return found
         return None

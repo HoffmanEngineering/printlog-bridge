@@ -418,3 +418,103 @@ def test_discover_says_when_nothing_answers(capsys, tmp_path, monkeypatch):
 
     assert main(args) == 1
     assert "No Moonraker answered." in capsys.readouterr().out
+
+
+class TestSettings:
+    URL = {"url": "http://192.168.1.87:7125"}
+
+    def test_defaults_leave_the_locator_to_its_own(self):
+        assert MoonrakerAdapter.from_config("u1", self.URL).locator_options == {}
+
+    def test_each_can_be_set(self):
+        options = {
+            **self.URL,
+            "discovery_after": "90s",
+            "discovery_interval": "1h",
+            "discovery_timeout": "5",
+            "discovery_zeroconf": "no",
+            "discovery_networks": "192.168.1.0/24, 10.0.5.0/25",
+        }
+
+        settings = MoonrakerAdapter.from_config("u1", options).locator_options
+
+        assert settings == {
+            "after": 90,
+            "interval": 3600,
+            "timeout": 5,
+            "zeroconf": False,
+            "networks": [
+                ipaddress.ip_network("192.168.1.0/24"),
+                ipaddress.ip_network("10.0.5.0/25"),
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        ("option", "value", "message"),
+        [
+            ("discovery_after", "soon", "discovery_after must be a time"),
+            ("discovery_interval", "10s", r"at least 30s"),
+            ("discovery_timeout", "0", "discovery_timeout must be a time"),
+            ("discovery_zeroconf", "perhaps", "discovery_zeroconf must be true or false"),
+            ("discovery_networks", "192.168.0.0/16", "larger than a /24"),
+            ("discovery_networks", "8.8.8.0/24", "isn't a private"),
+        ],
+    )
+    def test_bad_values_say_what_to_write(self, option, value, message):
+        with pytest.raises(ConfigError, match=message):
+            MoonrakerAdapter.from_config("u1", {**self.URL, option: value})
+
+    def test_are_refused_in_local_mode(self):
+        with pytest.raises(ConfigError, match="discovery_after is only for remote mode"):
+            MoonrakerAdapter.from_config("u1", {"discovery_after": "3m"})
+
+    def test_networks_in_the_config_replace_the_automatic_choice(self, tmp_path):
+        state = state_of(tmp_path)
+        state.discovery = {"fingerprint": Fingerprint("a", addresses=("10.0.0.5",)).to_json()}
+        network = ipaddress.ip_network("192.168.7.0/24")
+
+        automatic = Locator("u1", configured_url="http://192.168.1.87:7125", state=state)
+        configured = Locator(
+            "u1", configured_url="http://192.168.1.87:7125", state=state, networks=[network]
+        )
+
+        assert [str(n) for n in automatic.networks()] == ["192.168.1.0/24"]
+        assert configured.networks() == [network]
+
+    def test_a_printer_on_another_network_is_found_with_discovery_networks(self, tmp_path):
+        port = free_port()
+
+        async def scenario():
+            api = FakePrintLogApi()
+            printer = FakeMoonraker(**ALICE)
+            config_path = write_config(
+                tmp_path,
+                f"http://{OLD}:{port}",
+                await api.start(),
+                "discovery_after = 0\ndiscovery_zeroconf = false\n"
+                "discovery_networks = 127.0.9.0/24\n",
+            )
+            await printer.start(OLD, port)
+            try:
+                config = load_config(config_path, adapters=ADAPTERS, env={}, home=tmp_path)
+                task = asyncio.ensure_future(run_bridge(config))
+                try:
+                    await eventually(lambda: printer.subscriptions, timeout=10)
+                    # Up at its new address (a different /24) before the old one goes, so the
+                    # first search finds it whenever it runs.
+                    moved = FakeMoonraker(**ALICE)
+                    await moved.start("127.0.9.5", port)
+                    await printer.stop()
+                    await eventually(lambda: moved.subscriptions, timeout=20)
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    await moved.close()
+            finally:
+                await printer.close()
+                await api.close()
+
+        asyncio.run(scenario())
+
+        assert state_of(tmp_path).discovery["address"] == "127.0.9.5"
