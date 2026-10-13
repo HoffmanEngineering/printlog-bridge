@@ -13,6 +13,7 @@ from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import (
     ImageKind,
@@ -57,6 +58,7 @@ async def logging_to(
     backoff=FAST_BACKOFF,
     image_timeout: float | None = None,
     spools: bool = False,
+    adoption: Adoption | None = None,
     **printers: int,
 ):
     """A JobLogger sending to `api`. With `spools`, it links each print to the loaded spools."""
@@ -74,7 +76,9 @@ async def logging_to(
             yield JobLogger(
                 client,
                 {
-                    name: LoggedPrinter(printer_id=printer_id, source="moonraker")
+                    name: LoggedPrinter(
+                        printer_id=printer_id, source="moonraker", adoption=adoption or Adoption()
+                    )
                     for name, printer_id in targets.items()
                 },
                 state_dir,
@@ -103,6 +107,7 @@ def run(
     timeout: float = 1.0,
     backoff=FAST_BACKOFF,
     spools: bool = False,
+    adoption: Adoption | None = None,
     **printers: int,
 ):
     """Emits `events` in order, sending each before the next, as a restart of the bridge would.
@@ -112,7 +117,9 @@ def run(
     """
 
     async def scenario():
-        async with logging_to(api, state_dir, backoff=backoff, spools=spools, **printers) as logger:
+        async with logging_to(
+            api, state_dir, backoff=backoff, spools=spools, adoption=adoption, **printers
+        ) as logger:
             try:
                 await drain(logger, timeout)  # what the last run left in the outbox
                 for event in events:
@@ -410,7 +417,7 @@ class TestWhenTheApiIsDown:
 
         asyncio.run(scenario())
 
-        assert api.requests == [("GET", "/api/Users/me/user-settings")]  # the start's, failed
+        assert api.requests == [("GET", "/api/Prints/claimable")]  # the start's lookup, failed
 
     def test_one_print_the_api_keeps_failing_does_not_hold_up_the_others(self, tmp_path):
         api = FakePrintLogApi()
@@ -457,7 +464,7 @@ class TestWhenTheApiIsDown:
         wait = asyncio.run(scenario())
 
         assert 9 < wait <= 10
-        assert api.requests == [("GET", "/api/Users/me/user-settings")]  # not sent again at once
+        assert api.requests == [("GET", "/api/Prints/claimable")]  # not sent again at once
 
     def test_does_not_retry_a_revoked_key_but_keeps_the_job(self, tmp_path, caplog):
         api = FakePrintLogApi(api_key="the-real-key")
