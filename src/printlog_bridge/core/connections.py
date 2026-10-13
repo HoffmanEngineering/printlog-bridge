@@ -3,8 +3,9 @@
 A bridge watching three printers registers three connections, each under its printer's instance
 id (kept in the state directory). The API links a print to its connection only if the connection
 was registered before the print was created, so the bridge registers on start and again right
-before creating a print if that first attempt failed. The app shows a connection as stale after
-15 minutes without a heartbeat.
+before creating a print if that first attempt failed; while the API is out of reach, the print
+waits for its connection rather than being created unlinked. The app shows a connection as
+stale after 15 minutes without a heartbeat.
 """
 
 from __future__ import annotations
@@ -62,11 +63,21 @@ class Heartbeat:
             await self.beat(printer)
 
     async def ensure_registered(self, printer: str) -> None:
-        """Registers the printer's connection if no heartbeat has got through yet. Never raises."""
+        """Registers the printer's connection if no heartbeat has got through yet.
+
+        Raises ApiUnavailable only when the API couldn't be reached at all, so the print is sent
+        again later instead of being created unlinked if the line comes back between the two
+        requests. Any other failure only costs the link, so it doesn't stop the print."""
         if printer in self.connections and printer not in self._registered:
-            await self.beat(printer)
+            error = await self._beat(printer)
+            if isinstance(error, ApiUnavailable) and error.status is None:
+                raise error
 
     async def beat(self, printer: str) -> bool:
+        return await self._beat(printer) is None
+
+    async def _beat(self, printer: str) -> Exception | None:
+        """Sends one heartbeat, and returns why it didn't get through, if it didn't."""
         connection = self.connections[printer]
         report = self.board.printer(printer)
         body = {
@@ -77,31 +88,35 @@ class Heartbeat:
         }
         try:
             await self.api.put_connection(connection.instance_id, body)
-        except AuthRejected:
+        except AuthRejected as e:
             problem = (
                 "3D Print Log rejected the API key, so the printer shows as offline and its jobs "
                 "aren't logged. Check the key with `printlog-bridge doctor` "
                 "(`printlog-bridge store-key` replaces it), then restart the bridge."
             )
             log.error("[printer %s] %s", printer, problem)
+            error: Exception = e
         except ApiRejected as e:
             problem = (
                 f"3D Print Log refused the connection ({e}). Check printer_id in "
                 f"[printer {printer}]."
             )
             log.error("[printer %s] %s", printer, problem)
+            error = e
         except ApiUnavailable as e:
             problem = f"couldn't send the heartbeat: {e}. It is sent again in a few minutes."
             log.warning("[printer %s] %s", printer, problem)
+            error = e
         except Exception as e:  # a heartbeat must never take the bridge down
             problem = f"couldn't send the heartbeat: {e!r}"
             log.exception("[printer %s] couldn't send the heartbeat", printer)
+            error = e
         else:
             if printer not in self._registered:
                 log.info("[printer %s] registered with 3D Print Log", printer)
             self._registered.add(printer)
             report.heartbeat()
             report.warn(TOPIC, None)
-            return True
+            return None
         report.warn(TOPIC, problem)
-        return False
+        return error

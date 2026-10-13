@@ -114,8 +114,10 @@ class JobLogger:
         spools: Spools | None = None,
     ) -> None:
         """`before_create(printer)` runs before each print is created. The bridge registers the
-        printer's connection there, so the print links to it. With `spools`, each print's usage
-        rows are linked to the spools loaded in their slots."""
+        printer's connection there, so the print links to it. Only ApiUnavailable from it stops
+        the create, which is then sent again later; anything else is logged and the print is
+        created anyway. With `spools`, each print's usage rows are linked to the spools loaded
+        in their slots."""
         self.api = api
         self.spools = spools
         self.printers = dict(printers)
@@ -568,6 +570,8 @@ class JobLogger:
         if self.before_create is not None:
             try:
                 await self.before_create(printer)
+            except ApiUnavailable:
+                raise  # out of reach: the create would be cut off too, or land unlinked
             except Exception:  # the print matters more than its link to the connection
                 log.exception("[printer %s] couldn't register the connection", printer)
         view_status, allow_comments = await self._account_defaults()

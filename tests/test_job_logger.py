@@ -713,6 +713,29 @@ class TestConnection:
         [print_] = api.prints.values()
         assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
 
+    def test_a_print_waits_for_its_connection_when_the_line_comes_back_mid_attempt(self, tmp_path):
+        api = FakePrintLogApi()
+        api.offline = True
+
+        def register(client, board):
+            instance_id = PrinterState.load(tmp_path, "voron").instance_id
+            heartbeat = Heartbeat(
+                client, [Connection("voron", instance_id, "moonraker", 42)], board
+            )
+
+            async def register_then_reconnect(printer):
+                try:
+                    await heartbeat.ensure_registered(printer)
+                finally:
+                    api.offline = False  # back between the heartbeat and the create
+
+            return register_then_reconnect
+
+        report_run(api, tmp_path, started(), register=register)
+
+        [print_] = api.prints.values()
+        assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
+
     def test_a_failed_registration_still_logs_the_print(self, tmp_path):
         api = FakePrintLogApi()
 
