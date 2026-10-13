@@ -28,6 +28,7 @@ from printlog_bridge.core.events import (
 )
 from printlog_bridge.core.status import NullReport, PrinterReport
 
+from .excluded import ExcludedObjects
 from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
 from .tools import ToolUsage, estimated_grams_by_slot, per_slot
@@ -66,6 +67,7 @@ class JobTracker:
         self._error_message: str | None = None
         self._call: Call | None = None
         self._usage = ToolUsage()
+        self._excluded = ExcludedObjects()
 
     async def on_connected(self, call: Call) -> None:
         self._call = call
@@ -91,6 +93,7 @@ class JobTracker:
 
     async def on_status(self, status: Mapping[str, Any], changed: Mapping[str, Any]) -> None:
         self._usage.update(status)
+        self._excluded.update(status)
         if "print_stats" not in changed:
             return
         print_stats = status.get("print_stats") or {}
@@ -145,8 +148,10 @@ class JobTracker:
             )
         if job.get("status", "in_progress") != "in_progress":
             message = self._error_message if live else None
-            tracked = self._usage.take(str(job.get("filename") or "")) if latest else {}
-            await self.sink.emit(finished(self.printer, job, message, tracked))
+            filename = str(job.get("filename") or "")
+            tracked = self._usage.take(filename) if latest else {}
+            excluded = self._excluded.take(filename) if latest else None
+            await self.sink.emit(finished(self.printer, job, message, tracked, excluded))
             if live and images is not None and images.snapshots and call is not None:
                 await self.sink.emit(
                     JobImage(
@@ -177,14 +182,17 @@ def finished(
     job: Mapping[str, Any],
     error_message: str | None = None,
     tracked: Mapping[int, float] | None = None,
+    excluded: str | None = None,
 ) -> JobFinished:
-    """The job's end. `tracked` is what the bridge saw each slot feed (`tools.ToolUsage`)."""
+    """The job's end. `tracked` is what the bridge saw each slot feed (`tools.ToolUsage`), and
+    `excluded` its note on the objects cancelled mid-print (`excluded.ExcludedObjects`)."""
     status = str(job.get("status"))
     outcome, note = OUTCOMES.get(
         status, (JobOutcome.FAILED, f"Moonraker ended the job as {status}")
     )
     if status == "error" and error_message:
         note = f"{note}: {error_message}"
+    note = "\n\n".join(part for part in (note, excluded) if part) or None
     end_time = job.get("end_time") or job["start_time"] + (job.get("total_duration") or 0)
     filament_mm = per_slot(
         job.get("filament_used") or 0,

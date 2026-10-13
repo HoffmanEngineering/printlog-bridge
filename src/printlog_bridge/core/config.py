@@ -12,6 +12,9 @@ adapter = moonraker      ; the default
 url = http://voron.local:7125
 ```
 
+`adopt_prints`, `create_prints` and `adopt_window` go in `[bridge]` for every printer, or in a
+`[printer]` section for that one (see `Adoption`).
+
 The API key is looked up in this order: the `PRINTLOG_API_KEY` environment variable, the key
 file `<state_dir>/api_key` (which `printlog-bridge store-key` and install.sh write, mode 600),
 then `api_key` in `[bridge]`. In local mode the config sits in Klipper's config folder, which
@@ -28,7 +31,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
@@ -56,10 +59,29 @@ BOOLEANS = {
 PRINTER_PREFIX = "printer"
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*(s|m|h)?$")
 _UNITS = {None: 1, "s": 1, "m": 60, "h": 3600}
+ADOPTION_OPTIONS = ("adopt_prints", "create_prints", "adopt_window")
+DEFAULT_ADOPT_WINDOW_S = 12 * 60 * 60
+_WINDOW = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$")
+_WINDOW_UNITS = {"s": 1, "m": 60, "h": 60 * 60, "d": 24 * 60 * 60, "": 60 * 60}
 
 
 class ConfigError(Exception):
     """The config file is missing or invalid. The message is shown to the user as is."""
+
+
+@dataclass(frozen=True)
+class Adoption:
+    """What the bridge does when a job starts and the user already made its print (the Slic3r
+    uploader, the Cura plugin, or by hand)."""
+
+    adopt: bool = True
+    """`adopt_prints`: log the job to a matching print in Printing instead of a new one."""
+    create: bool = True
+    """`create_prints`: create a print when there's none to adopt. False is finish-only mode,
+    where a job with no print to adopt isn't logged."""
+    window_s: float = DEFAULT_ADOPT_WINDOW_S
+    """`adopt_window`: how recently the print must have been created (`12h`, `90m`, `2d`; a
+    bare number is hours)."""
 
 
 @dataclass(frozen=True)
@@ -68,6 +90,7 @@ class PrinterConfig:
     adapter: Adapter
     printer_id: int | None = None
     """The printer's id in 3D Print Log, which its prints are logged to. Pairing will set it."""
+    adoption: Adoption = field(default_factory=Adoption)
 
 
 class ApiKeySource(Enum):
@@ -154,8 +177,9 @@ def load_config(
     config_api_key = (bridge.get("api_key") or "").strip() or None
     api_key, source = _api_key(env, state_dir / API_KEY_FILE, config_api_key)
 
+    adoption = _adoption("[bridge]", bridge, Adoption())
     printers = [
-        _load_printer(section, parser[section], adapters)
+        _load_printer(section, parser[section], adapters, adoption)
         for section in parser.sections()
         if section != "bridge"
     ]
@@ -298,6 +322,7 @@ def _load_printer(
     section: str,
     options: configparser.SectionProxy,
     adapters: Mapping[str, type[Adapter]],
+    adoption: Adoption | None = None,
 ) -> PrinterConfig:
     kind, _, name = section.partition(" ")
     if kind != PRINTER_PREFIX:
@@ -308,6 +333,9 @@ def _load_printer(
 
     values = dict(options)
     printer_id = _printer_id(name, values.pop("printer_id", None))
+    adoption = _adoption(f"[printer {name}]", values, adoption or Adoption())
+    for option in ADOPTION_OPTIONS:
+        values.pop(option, None)
     adapter_name = values.pop("adapter", DEFAULT_ADAPTER).strip()
     adapter_type = adapters.get(adapter_name)
     if adapter_type is None:
@@ -316,7 +344,41 @@ def _load_printer(
             f"[printer {name}]: unknown adapter {adapter_name!r} (available: {known})"
         )
 
-    return PrinterConfig(name, adapter_type.from_config(name, values), printer_id)
+    return PrinterConfig(name, adapter_type.from_config(name, values), printer_id, adoption)
+
+
+def _adoption(where: str, options: Mapping[str, str], base: Adoption) -> Adoption:
+    """`base` with what `options` sets of `adopt_prints`, `create_prints` and `adopt_window`."""
+
+    def flag(option: str, default: bool) -> bool:
+        text = (options.get(option) or "").strip()
+        if not text:
+            return default
+        value = BOOLEANS.get(text.lower())
+        if value is None:
+            raise ConfigError(f"{where} {option} must be true or false, not {text!r}")
+        return value
+
+    window = (options.get("adopt_window") or "").strip()
+    window_s = base.window_s
+    if window:
+        match = _WINDOW.match(window.lower())
+        if match is None or float(match.group(1)) <= 0:
+            raise ConfigError(
+                f"{where} adopt_window must be a time such as 12h, 90m or 2d, not {window!r}"
+            )
+        window_s = float(match.group(1)) * _WINDOW_UNITS[match.group(2)]
+    adoption = Adoption(
+        adopt=flag("adopt_prints", base.adopt),
+        create=flag("create_prints", base.create),
+        window_s=window_s,
+    )
+    if not adoption.adopt and not adoption.create:
+        raise ConfigError(
+            f"{where} sets adopt_prints and create_prints both to false, so no print would ever "
+            "be logged. Finish-only mode is create_prints = false with adopt_prints = true."
+        )
+    return adoption
 
 
 def _printer_id(printer: str, value: str | None) -> int | None:

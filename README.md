@@ -165,6 +165,8 @@ Each print appears in 3D Print Log as Printing when the job starts, titled from 
 | `klippy_disconnect` | Failed | "Lost connection to Klipper" |
 | `interrupted`, `server_exit` | Failed | "Moonraker stopped during the print" |
 
+When you cancel objects mid-print with Klipper's [`[exclude_object]`](https://www.klipper3d.org/Exclude_Object.html), the print also gets a note naming them, such as "2 of 6 objects were cancelled: PART_3, PART_5" (Klipper keeps the slicer's object names in capitals), so the filament it used below the estimate has a reason. The bridge has to be running during the print to see them.
+
 On a printer with more than one tool (a toolchanger, an IDEX, a Snapmaker U1), each tool gets its own usage row, numbered from 0 the way Klipper numbers its extruders (`extruder` is tool 0, `extruder1` tool 1). The bridge watches which extruder is active while Klipper's filament count grows, and scales what it saw to Moonraker's total for the job, so the rows always add up to it. When the slicer listed a weight per filament (PrusaSlicer, OrcaSlicer, Snapmaker Orca), the print starts with an estimate on each tool's row, and a job that ran while the bridge was away is split in those proportions. Not covered yet: a multi-material unit on one extruder (ERCF, Happy Hare, AFC), where everything is counted on tool 0, and IDEX copy or mirror mode, where Klipper counts what two heads print once.
 
 ### Spools
@@ -222,6 +224,27 @@ A different printer at the old address is never used: if another printer answers
 Times take `90`, `90s`, `3m` or `1h`.
 
 The surest fix is still a DHCP reservation on the router, which keeps the printer at one address. To list the Moonraker printers on your network, with a `[printer]` section for each ready to paste into the config, run `printlog-bridge discover` (`--subnet 192.168.1.0/24` picks the network to scan; by default it scans the configured printers' networks and this computer's own).
+
+### Prints you made yourself
+
+If you create the print yourself, with the [Slic3r uploader](https://github.com/HoffmanEngineering/Slic3rPostProcessingUploader), the Cura plugin or by hand, the bridge logs the job to that print instead of creating a second one. When a job starts it looks for one of your prints that is:
+
+- on the same printer, and still in Printing;
+- not claimed by any connector yet;
+- made within `adopt_window` before the job started (12 hours by default);
+- for the same file: the names match once folders, the extension (`.gcode`, `.bgcode`, `.gcode.3mf`), and the suffix PrusaSlicer and OrcaSlicer add (`_0.2mm_PLA_MK4_1h2m`) are left out, ignoring case. A print with no file name matches on its title.
+
+If there are several, it takes the newest. It claims the print, adds the slicer's thumbnail (as the picture shown only when the print has none yet), and completes it when the job ends, as it would a print it made. Your title, notes, estimate and the spool on your usage row are kept; the actual time and filament are filled in, into your rows rather than new ones. The log says `job 00001F: adopted print 110210 ('Benchy')`.
+
+Set these in `[bridge]` for every printer, or in a printer's section for that one:
+
+```ini
+adopt_prints = true    ; the default: adopt a matching print, else create one
+create_prints = false  ; finish-only: never create a print; a job with no match isn't logged
+adopt_window = 12h     ; 90m, 2d; a bare number is hours
+```
+
+Finish-only mode is for uploader users who only want the bridge to report how each print ended. The bridge looks for a print to adopt again when the job ends, so a print uploaded after the job started is still found. Without a match, the job is skipped with a line in the log.
 
 ### Recording a trace
 

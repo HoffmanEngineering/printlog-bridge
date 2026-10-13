@@ -65,6 +65,9 @@ API_CALLS = [
     ("GET", r"/api/Printers/\d+"),
     ("PUT", r"/api/Connections/[\w-]+"),
     ("POST", r"/api/Prints"),
+    # Adopting a print the user made themselves (#43).
+    ("GET", r"/api/Prints/claimable"),
+    ("POST", r"/api/Prints/\d+/claim"),
     ("GET", r"/api/Prints/\d+"),
     ("PATCH", r"/api/Prints/\d+"),
     ("POST", r"/api/Prints/\d+/complete"),
@@ -85,6 +88,8 @@ USAGE_FIELDS = {
     "slot", "lengthInM", "source", "filamentId", "estimatedSource", "estimatedLengthInM",
     "estimatedAmountMg",
 }  # fmt: skip
+LOOKUP_FIELDS = {"printerId", "createdAfter"}
+CLAIM_FIELDS = {"externalSource", "externalId", "connectionInstanceId", "startDate"}
 CONNECTION_FIELDS = {"kind", "displayName", "agentVersion", "printerId"}
 SLOT_FIELDS = {"filamentId", "slotLabel"}
 
@@ -540,3 +545,26 @@ class TestSpoolCalls:
             if field not in ("slotCount", "category", "loadedFilaments"):
                 assert before[field] == value, field
         assert put["category"] == before["category"]["nickname"]
+
+
+class TestAdoptionCalls:
+    """Adopting a print the user made themselves (#43) sends only what docs/privacy.md lists."""
+
+    def test_the_lookup_and_the_claim_carry_only_the_listed_fields(self, tmp_path):
+        from test_job_logger import finished, run, started
+
+        api = FakePrintLogApi()
+        print_id = api.user_creates("Benchy", file_name="benchy.gcode")
+
+        run(api, tmp_path, started(file_name="parts/benchy.gcode"), finished())
+
+        for method, path in api.requests:
+            assert any(method == m and re.fullmatch(pattern, path) for m, pattern in API_CALLS), (
+                f"{method} {path} isn't in docs/privacy.md"
+            )
+        [lookup] = api.lookups
+        assert set(lookup) == LOOKUP_FIELDS
+        [(claimed, body)] = api.claims
+        assert claimed == print_id
+        assert set(body) <= CLAIM_FIELDS
+        assert "benchy" not in json.dumps(lookup).lower()  # the file name stays on the bridge

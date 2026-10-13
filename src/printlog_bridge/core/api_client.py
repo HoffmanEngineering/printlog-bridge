@@ -53,6 +53,19 @@ class ApiRejected(ApiError):
         """The HTTP status the API refused it with."""
 
 
+class ClaimConflict(ApiError):
+    """The print can't be claimed (409): it's linked to another job or no longer in Printing,
+    or this job is already logged as another print, `print_id`."""
+
+    def __init__(self, claimed: int, print_id: int | None) -> None:
+        super().__init__(
+            f"print {claimed} can't be claimed"
+            + (f": the job is already print {print_id}" if print_id is not None else "")
+        )
+        self.print_id = print_id
+        """The print this job is already logged as, when that's why."""
+
+
 @dataclass(frozen=True)
 class CurrentUser:
     id: int
@@ -138,6 +151,32 @@ class ApiClient:
         status, print_ = await self._send("POST", "/api/Prints", body)
         return print_, status == 201
 
+    async def claimable_prints(
+        self, printer_id: int, created_after: datetime
+    ) -> list[dict[str, Any]]:
+        """The key owner's prints on the printer a connector could claim (api#165): in Printing,
+        linked to no job, created after `created_after`. Newest first."""
+        body = await self._request(
+            "GET",
+            "/api/Prints/claimable",
+            params={"printerId": str(printer_id), "createdAfter": created_after.isoformat()},
+        )
+        return [p for p in body or [] if isinstance(p, Mapping)]
+
+    async def claim_print(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Claims the print for this connector's job: sets its `externalSource`, `externalId`,
+        connection, and `startDate` when it has none (api#165). Claiming it again with the same
+        pair returns it, also once it's finished.
+
+        None when it's gone. Raises ClaimConflict when it can't be claimed (409)."""
+        status, print_ = await self._send(
+            "POST", f"/api/Prints/{print_id}/claim", body, missing_ok=True, conflict_ok=True
+        )
+        if status == 409:
+            other = (print_ or {}).get("printId") if isinstance(print_, Mapping) else None
+            raise ClaimConflict(print_id, int(other) if other is not None else None)
+        return None if status == 404 else print_
+
     async def get_print(self, print_id: int) -> dict[str, Any] | None:
         return await self._request("GET", f"/api/Prints/{print_id}", missing_ok=True)
 
@@ -197,6 +236,7 @@ class ApiClient:
         params: Mapping[str, str] | None = None,
         *,
         missing_ok: bool = False,
+        conflict_ok: bool = False,
         data: aiohttp.FormData | None = None,
         timeout: float = REQUEST_TIMEOUT_S,
     ) -> tuple[int, Any]:
@@ -217,6 +257,11 @@ class ApiClient:
                     raise AuthRejected(f"the API rejected the key ({response.status})")
                 if response.status == 404 and missing_ok:
                     return 404, None
+                if response.status == 409 and conflict_ok:
+                    try:
+                        return 409, await response.json(content_type=None)
+                    except ValueError:
+                        return 409, None
                 if response.status in (400, 403, 413, 415):
                     reason = (await response.text()).strip()[:300]
                     raise ApiRejected(

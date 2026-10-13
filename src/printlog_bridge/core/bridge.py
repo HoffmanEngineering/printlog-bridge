@@ -66,7 +66,9 @@ async def run_bridge(
             sink = JobLogger(
                 api,
                 {
-                    p.name: LoggedPrinter(printer_id=p.printer_id, source=p.adapter.name)
+                    p.name: LoggedPrinter(
+                        printer_id=p.printer_id, source=p.adapter.name, adoption=p.adoption
+                    )
                     for p in config.printers
                     if p.printer_id is not None
                 },
