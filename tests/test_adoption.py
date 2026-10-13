@@ -87,6 +87,7 @@ class TestAdopting:
         assert row["filament"] == {"id": spool}
         assert row["estimatedAmountMg"] == 13000
         assert row["lengthInM"] == 4.3215
+        assert row["slot"] == 0  # stamped by the API's completion
 
     def test_a_multi_tool_print_fills_its_rows_by_slot(self, tmp_path):
         api = FakePrintLogApi()

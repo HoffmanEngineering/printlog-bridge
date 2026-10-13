@@ -652,27 +652,30 @@ def _merge_actual_usage(
     row for its slot, else the next unlinked row in order. Slot-only rows claim theirs first.
 
     On a printer with one slot, an unlinked row with no slot counts as slot 0 in both slot
-    passes, and gets slot 0 when matched (agreed for 3d-print-log-api#168)."""
+    passes, after any row already on slot 0, and is stamped slot 0 when taken (api#168,
+    708fb32)."""
     unlinked = [r for r in rows if r["filament"] is None]
 
-    def on_slot(row: dict[str, Any], slot: int) -> bool:
-        return row["slot"] == slot or (single_slot and slot == 0 and row["slot"] is None)
+    def take_on_slot(slot: int) -> dict[str, Any] | None:
+        """`TakeUnlinkedRowOnSlot`."""
+        row = next((r for r in unlinked if r["slot"] == slot), None)
+        if row is None and single_slot and slot == 0:
+            row = next((r for r in unlinked if r["slot"] is None), None)
+        if row is not None:
+            unlinked.remove(row)
+            if single_slot and row["slot"] is None:
+                row["slot"] = 0
+        return row
 
     matches: dict[int, dict[str, Any] | None] = {}
     for n, incoming in enumerate(usage):
         if not incoming.get("filamentId") and incoming.get("slot") is not None:
-            match = next((r for r in unlinked if on_slot(r, incoming["slot"])), None)
-            if match is not None:
-                unlinked.remove(match)
-            matches[n] = match
+            matches[n] = take_on_slot(incoming["slot"])
     for n, incoming in enumerate(usage):
         if incoming.get("filamentId") and incoming.get("slot") is not None:
             if any((r["filament"] or {}).get("id") == incoming["filamentId"] for r in rows):
                 continue
-            match = next((r for r in unlinked if on_slot(r, incoming["slot"])), None)
-            if match is not None:
-                unlinked.remove(match)
-            matches[n] = match
+            matches[n] = take_on_slot(incoming["slot"])
     for n, incoming in enumerate(usage):
         if incoming.get("filamentId"):
             match = next(
@@ -688,8 +691,6 @@ def _merge_actual_usage(
         if match is None:
             rows.append(_row(incoming, incoming.get("filamentId")))
         else:
-            if match["slot"] is None and incoming.get("slot") == 0 and single_slot:
-                match["slot"] = 0
             # All three values are replaced, so an earlier completion's can't outlive it.
             match["source"] = _source(incoming)
             for field in ("amountMg", "lengthInM", "volumeMl"):
