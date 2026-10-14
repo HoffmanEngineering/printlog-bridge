@@ -75,7 +75,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         env:
           # Put the description on the multi-arch index too, where GHCR's package page reads it.
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
