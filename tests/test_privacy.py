@@ -482,6 +482,13 @@ class TestPlainHttpOnTheLanIsWarnedAbout:
         assert self.LAN in warning
         assert "unencrypted" in warning
 
+    def test_hides_a_password_in_the_url(self, tmp_path):
+        config = self.config(tmp_path, "http://dev:hunter22@10.0.0.2:5000/?token=abc123")
+        text = config.api_url_warning()
+
+        assert "hunter22" not in text and "abc123" not in text
+        assert "10.0.0.2:5000" in text
+
     @pytest.mark.parametrize("url", ["https://api.3dprintlog.com", "http://127.0.0.1:5000"])
     def test_not_for_https_or_this_computer(self, tmp_path, url):
         assert self.config(tmp_path, url).api_url_warning() is None

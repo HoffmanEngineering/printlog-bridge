@@ -37,6 +37,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from printlog_bridge.core.adapter import Adapter
+from printlog_bridge.core.images import mask_url
 
 DEFAULT_API_URL = "https://api.3dprintlog.com"
 ALLOW_HTTP_ON_LAN_ENV = "PRINTLOG_ALLOW_HTTP_ON_LAN"
@@ -116,12 +117,13 @@ class BridgeConfig:
     def api_url_warning(self) -> str | None:
         """What to say, every time, when `api_url` is plain http to another computer, which
         only `allow_http_on_lan` allows."""
-        host = urlparse(self.api_url).hostname or ""
-        if urlparse(self.api_url).scheme != "http" or _is_loopback(host):
+        parsed = urlparse(self.api_url)
+        if parsed.scheme != "http" or _is_loopback(parsed.hostname or ""):
             return None
         return (
-            f"api_url is {self.api_url}, plain http (allow_http_on_lan): the API key and your "
-            "prints travel unencrypted on your network. Use it only for a development API."
+            f"api_url is {mask_url(self.api_url)}, plain http (allow_http_on_lan): the API key "
+            "and your prints travel unencrypted on your network. Use it only for a development "
+            "API."
         )
 
     @property
