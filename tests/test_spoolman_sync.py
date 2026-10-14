@@ -18,7 +18,7 @@ from printlog_bridge.adapters.moonraker.session import (
     Listeners,
     MoonrakerSession,
 )
-from printlog_bridge.adapters.moonraker.spoolman import SpoolmanSync
+from printlog_bridge.adapters.moonraker.spoolman import ANSWER_GRACE_S, SpoolmanSync
 from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolReading
 
 API_URL = "https://api.3dprintlog.com"
@@ -95,6 +95,18 @@ class TestEnabled:
 
         assert not sync.enabled
         assert "server.spoolman.get_spool_id" not in fake.calls
+
+    def test_sync_is_said_to_be_on_only_once_the_component_is_found(self, caplog):
+        without, with_it = FakeMoonraker(), FakeMoonraker()
+        without.config["spoolman"] = with_it.config["spoolman"] = PRINTLOG_SPOOLMAN
+        without.spoolman_loaded = False
+
+        with caplog.at_level(logging.DEBUG):
+            connected(without)
+            connected(with_it)
+
+        on = [r for r in caplog.records if "is 3D Print Log" in r.getMessage()]
+        assert [r.levelno for r in on] == [logging.INFO]  # the second connection's alone
 
     def test_the_secret_in_the_server_url_is_never_logged(self, caplog):
         fake = FakeMoonraker()
@@ -312,13 +324,16 @@ class TestPushes:
         fake, sink = FakeMoonraker(), Recorder()
         fake.config["spoolman"] = PRINTLOG_SPOOLMAN
         fake.spool_id = 4
+        now = [0.0]
 
         async def scenario():
-            async with syncing(fake, sink, loaded=slots(t0=4)) as sync:
+            async with syncing(fake, sink, loaded=slots(t0=4), clock=lambda: now[0]) as sync:
                 await settled()
                 fake.spool_id = 7  # set by another client while the bridge wasn't looking
                 sync.on_loaded(slots(t0=7))
                 await eventually(lambda: fake.posted_spools)
+                await settled()
+                now[0] += ANSWER_GRACE_S  # long past any announcement of the post
                 await fake.pick_spool(9)
                 await fake.pick_spool(7)
                 await eventually(lambda: len(sink.commands) == 2)
@@ -351,6 +366,101 @@ class TestPushes:
         assert fake.posted_spools == [9, 5]
         assert [c.spool_number for c in sink.commands] == [9]
         assert sync.moonraker_spool == 9
+
+    def test_a_pick_crossing_an_unannounced_post_is_carried_out(self):
+        # The bridge posts 7; Moonraker applies a pick of 12 first, then the post, which it
+        # announces only once the bridge has loaded 12. Moonraker must end on 12, the slot's.
+        fake, sink = HeldPosts(), Recorder()
+        fake.config["spoolman"] = PRINTLOG_SPOOLMAN
+        fake.spool_id = 4
+
+        async def scenario():
+            async with syncing(fake, sink, loaded=slots(t0=4)) as sync:
+                await settled()
+                sync.on_loaded(slots(t0=7))
+                await eventually(lambda: fake.held)
+                await fake.pick_spool(12)
+                await eventually(lambda: sink.commands)
+                sync.on_loaded(slots(t0=12))  # 3D Print Log loaded the pick
+                fake.release.set()
+                await eventually(lambda: len(fake.posted_spools) == 2)
+                await settled()
+                return sync
+
+        sync = asyncio.run(scenario())
+
+        assert fake.posted_spools == [7, 12]
+        assert fake.spool_id == sync.moonraker_spool == 12
+        assert [c.spool_number for c in sink.commands] == [12]
+
+    def test_a_late_announcement_of_an_answered_post_is_not_a_pick(self):
+        # Moonraker announces a post before answering it, but the serve loop may hear the
+        # answer first: a pick heard in between must not make the post's own echo a pick.
+        sink, now = Recorder(), [0.0]
+        sync = SpoolmanSync("u1", API_URL, sink, clock=lambda: now[0])
+
+        async def scenario():
+            await sync.on_connected(answering(spool_id=4))
+            sync.on_loaded(slots(t0=4))
+            await sync.on_status(
+                {"toolhead": {"extruder": "extruder"}, "print_stats": {"state": "standby"}}, {}
+            )
+            sync.on_loaded(slots(t0=9))
+            await settled()  # the post of 9 is answered
+            now[0] += ANSWER_GRACE_S / 2
+            await sync.on_active_spool(12)  # a pick
+            await sync.on_active_spool(9)  # the post's own announcement, heard late
+            await settled()
+
+        asyncio.run(scenario())
+
+        assert [c.spool_number for c in sink.commands] == [12]
+
+    def test_an_answered_post_is_not_waited_for_past_the_grace_period(self):
+        sink, now = Recorder(), [0.0]
+        sync = SpoolmanSync("u1", API_URL, sink, clock=lambda: now[0])
+
+        async def scenario():
+            await sync.on_connected(answering(spool_id=4))
+            sync.on_loaded(slots(t0=4))
+            await sync.on_status(
+                {"toolhead": {"extruder": "extruder"}, "print_stats": {"state": "standby"}}, {}
+            )
+            sync.on_loaded(slots(t0=9))
+            await settled()
+            now[0] += ANSWER_GRACE_S
+            await sync.on_active_spool(9)  # Moonraker never announced the post: this is a pick
+            await settled()
+
+        asyncio.run(scenario())
+
+        assert [c.spool_number for c in sink.commands] == [9]
+
+    def test_a_post_for_a_tool_change_is_logged_at_debug(self, caplog):
+        # A multi-colour print changes tools hundreds of times; a spool change is rarer.
+        fake, sink = FakeMoonraker(), Recorder()
+        fake.config["spoolman"] = PRINTLOG_SPOOLMAN
+        fake.spool_id = 4
+
+        async def scenario():
+            async with syncing(fake, sink, loaded=slots(t0=4, t2=9)) as sync:
+                await settled()
+                await fake.set_status(toolhead={"extruder": "extruder2"})
+                await eventually(lambda: fake.posted_spools == [9])
+                await settled()
+                sync.on_loaded(slots(t0=4, t2=5))
+                await eventually(lambda: fake.posted_spools == [9, 5])
+                await settled()
+
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(scenario())
+
+        posts = [
+            (r.levelno, r.getMessage().split("spool number ")[1].split(",")[0])
+            for r in caplog.records
+            if "set Moonraker's active spool" in r.getMessage()
+        ]
+        assert posts == [(logging.DEBUG, "9"), (logging.INFO, "5")]
 
     def test_no_post_while_moonraker_is_unreachable(self, caplog):
         sync = SpoolmanSync("u1", API_URL, Recorder())
@@ -488,6 +598,46 @@ class TestPushes:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         missing = [r for r in caplog.records if "no spoolman component" in r.getMessage()]
         assert [r.levelno for r in missing] == [logging.DEBUG]
+
+
+class HeldPosts(FakeMoonraker):
+    """A Moonraker that holds each `post_spool_id` until `release` is set, as if it were slow
+    to get to it, and answers other requests meanwhile."""
+
+    def __init__(self, **options) -> None:
+        super().__init__(**options)
+        self.release = asyncio.Event()
+        self.held = False
+        self._held: set[asyncio.Task] = set()
+
+    async def _handle(self, request, send, conn) -> None:
+        if request.get("method") != "server.spoolman.post_spool_id":
+            await super()._handle(request, send, conn)
+            return
+
+        async def later() -> None:
+            await self.release.wait()
+            await super(HeldPosts, self)._handle(request, send, conn)
+
+        self.held = True
+        task = asyncio.ensure_future(later())
+        self._held.add(task)
+        task.add_done_callback(self._held.discard)
+
+
+def answering(spool_id: int | None):
+    """A Moonraker `call` with 3D Print Log as its Spoolman server, that announces nothing."""
+
+    async def call(method, params):
+        if method == "server.config":
+            return {"config": {"spoolman": PRINTLOG_SPOOLMAN}}
+        if method == "server.spoolman.get_spool_id":
+            return {"spool_id": spool_id}
+        if method == "server.spoolman.post_spool_id":
+            return {"spool_id": params["spool_id"]}
+        return {}
+
+    return call
 
 
 @contextlib.asynccontextmanager

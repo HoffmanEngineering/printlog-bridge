@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -58,6 +59,9 @@ log = logging.getLogger(__name__)
 METHOD_NOT_FOUND = -32601
 """What Moonraker answers a `server.spoolman.*` call with when its spoolman component isn't
 loaded."""
+ANSWER_GRACE_S = 1.0
+"""How long after Moonraker answers a post the bridge still takes its announcement for the
+post's own (see `_echo`)."""
 BUSY = frozenset({"printing", "paused"})
 """`print_stats.state`s with a print under way, whose usage is on Moonraker's active spool."""
 
@@ -82,8 +86,9 @@ class _Post:
     """A spool number the bridge set Moonraker's active spool to, until Moonraker announces it."""
 
     number: int
-    answered: bool = False
-    """Whether Moonraker has answered the post (which says nothing of its announcement)."""
+    answered_at: float | None = None
+    """When Moonraker answered the post (the bridge's clock), or None until it has. An answer
+    says nothing of its announcement, which Moonraker sends first."""
 
 
 class SpoolmanSync(MoonrakerListener):
@@ -97,10 +102,12 @@ class SpoolmanSync(MoonrakerListener):
         api_url: str,
         spools: SpoolSink,
         point: Callable[[], JobPoint | None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.printer = printer
         self.api_host = host_of(api_url)
         self.spools = spools
+        self.clock = clock
         self.point = point or (lambda: None)
         """Where the running job is (the JobTracker's), so a pick mid-print is a swap."""
         self.enabled = False
@@ -136,6 +143,12 @@ class SpoolmanSync(MoonrakerListener):
         spool, loaded = await self._active_spool(call) if enabled else (None, False)
         self.moonraker_spool = spool
         self.enabled = enabled and loaded
+        if self.enabled:
+            log.info(
+                "[printer %s] Moonraker's Spoolman server is 3D Print Log: a spool picked on the "
+                "printer is loaded into the active tool's slot",
+                self.printer,
+            )
 
     async def on_klippy_state(self, state: str) -> None:
         if state == "ready":
@@ -150,7 +163,7 @@ class SpoolmanSync(MoonrakerListener):
             return
         tool_changed = slot != self.active_slot
         self.active_slot = slot
-        self._follow(tool_changed)
+        self._follow(tool_changed, by_tool=True)
 
     def on_loaded(self, loaded: Mapping[int, Mapping[str, Any]]) -> None:
         """What 3D Print Log has in the printer's slots changed (`Spools.watch_loaded`)."""
@@ -170,6 +183,11 @@ class SpoolmanSync(MoonrakerListener):
     async def on_active_spool(self, spool_id: int | None) -> None:
         if self._echo(spool_id):
             log.debug("[printer %s] Moonraker's active spool is now %s", self.printer, spool_id)
+            if not self._posted:
+                # A pick may have crossed the post (Moonraker set it, then the post): if the
+                # slot has the pick by now, Moonraker is set to it again. Else it's the post's
+                # number, and nothing is posted.
+                self._follow(True)
             return
         self.moonraker_spool = spool_id
         if not self.enabled:
@@ -199,8 +217,8 @@ class SpoolmanSync(MoonrakerListener):
         self._spawn(self._carry_out(command, self._call))
 
     async def _points_at_printlog(self, call: Call) -> bool:
-        """Whether moonraker.conf's `[spoolman]` server is 3D Print Log. Says so in the log,
-        once a connection, either way."""
+        """Whether moonraker.conf's `[spoolman]` server is 3D Print Log. Says so in the log
+        when it isn't; `on_connected` says so when it is, once the component is found."""
         try:
             config = (await call("server.config", None)).get("config") or {}
         except Exception as e:
@@ -227,11 +245,6 @@ class SpoolmanSync(MoonrakerListener):
                 self.printer, host or "unset", self.api_host,
             )  # fmt: skip
             return False
-        log.info(
-            "[printer %s] Moonraker's Spoolman server is 3D Print Log: a spool picked on the "
-            "printer is loaded into the active tool's slot",
-            self.printer,
-        )
         return True
 
     async def _active_spool(self, call: Call) -> tuple[int | None, bool]:
@@ -261,10 +274,15 @@ class SpoolmanSync(MoonrakerListener):
         Moonraker sets and announces posts in the order they were made, and announces only a
         change. So an announcement of a posted number answers the oldest such post, and the
         posts before it changed nothing and will never be announced: they're dropped too. An
-        announcement of any other number is someone's pick; posts already answered then can't
-        be announced any more (Moonraker held their number), so they're dropped, and one still
-        on its way stays pending.
+        announcement of any other number is someone's pick, and leaves the posts pending.
+
+        Moonraker announces a post before answering it, so a post answered and not announced
+        had Moonraker's number already, and never will be. But the serve loop may hear the
+        answer first, while the announcement waits behind a slow listener: so a post is dropped
+        as unannounced only `ANSWER_GRACE_S` after its answer.
         """
+        now = self.clock()
+        self._posted = deque(post for post in self._posted if not self._lapsed(post, now))
         for i, post in enumerate(self._posted):
             if post.number == spool_id:
                 for _ in range(i + 1):
@@ -273,17 +291,24 @@ class SpoolmanSync(MoonrakerListener):
                     self.moonraker_spool = spool_id
                 # Else it's the number of a later post already, which Moonraker will set.
                 return True
-        self._posted = deque(post for post in self._posted if not post.answered)
         return False
 
-    def _follow(self, changed: bool) -> None:
+    @staticmethod
+    def _lapsed(post: _Post, now: float) -> bool:
+        """Whether Moonraker answered the post long enough ago that it was never announced."""
+        return post.answered_at is not None and now - post.answered_at >= ANSWER_GRACE_S
+
+    def _follow(self, changed: bool, by_tool: bool = False) -> None:
         """Sets Moonraker's active spool to the active tool's when `changed` (the tool, or its
         spool in 3D Print Log), or for the connection's first sync, once all it needs is known.
+        `by_tool`: the change is a tool change, logged at debug (a multi-colour print makes
+        hundreds).
         """
         slot = self.active_slot
         if not self.enabled or self._call is None or slot is None or self._numbers is None:
             return
-        if not self._settled:
+        first = not self._settled
+        if first:
             if self._busy is None:
                 return
             self._settled = True
@@ -310,9 +335,12 @@ class SpoolmanSync(MoonrakerListener):
         post, previous = _Post(number), self.moonraker_spool
         self._posted.append(post)
         self.moonraker_spool = number
-        self._spawn(self._post(post, slot, previous, self._call))
+        level = logging.DEBUG if by_tool and not first else logging.INFO
+        self._spawn(self._post(post, slot, previous, self._call, level))
 
-    async def _post(self, post: _Post, slot: int, previous: int | None, call: Call) -> None:
+    async def _post(
+        self, post: _Post, slot: int, previous: int | None, call: Call, level: int
+    ) -> None:
         number = post.number
         if self._posts is None:
             self._posts = asyncio.Lock()  # made here, in the running loop (Python 3.9)
@@ -348,8 +376,9 @@ class SpoolmanSync(MoonrakerListener):
                     self.printer, number, slot, e,
                 )  # fmt: skip
                 return
-            post.answered = True
-        log.info(
+            post.answered_at = self.clock()
+        log.log(
+            level,
             "[printer %s] set Moonraker's active spool to spool number %d, T%d's in 3D Print Log",
             self.printer, number, slot,
         )  # fmt: skip
