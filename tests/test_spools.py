@@ -304,17 +304,19 @@ class TestReadings:
 
         assert api.slot_spools(42) == {0: spool}
 
-    def test_a_reader_that_cant_reach_the_api_tries_the_tag_again_next_time(self):
+    def test_a_reader_that_cant_reach_the_api_tries_the_tag_again_after_the_back_off(self):
         api = FakePrintLogApi()
         spool = api.add_spool(tags=("04A23F11",))
+        clock = FakeClock()
 
         async def scenario(spools):
             api.offline = True
             await spools.spool_reading(reading(0, tag="04A23F11"))
             api.offline = False
-            await spools.spool_reading(reading(0, tag="04A23F11"))
+            clock.now += UNKNOWN_TAG_RETRY_S
+            await spools.refresh_all()
 
-        run(api, scenario)
+        run(api, scenario, clock=clock)
 
         assert api.slot_spools(42) == {0: spool}
 
@@ -439,7 +441,144 @@ class TestUnknownTags:
 
         run(api, scenario, interval=60, retry_after=0.05)
 
-    def test_a_retry_that_cant_reach_the_api_waits_for_the_back_off(self):
+    def test_a_lookup_that_cant_reach_the_api_waits_for_the_back_off(self):
+        # The next try is scheduled before asking, so an error doesn't leave the tag due at once.
+        api = FakePrintLogApi()
+        clock = FakeClock()
+
+        async def scenario(spools):
+            api.fail_next(1000)  # 3D Print Log is down from the first lookup on
+            await spools.spool_reading(reading(0, tag="DEADBEEF"))
+            counts = [tag_lookups(api)]
+            await spools.spool_reading(reading(0, tag="DEADBEEF", material="PLA"))
+            await spools.retry_tags()
+            counts.append(tag_lookups(api))
+            clock.now += UNKNOWN_TAG_RETRY_S - 1
+            await spools.retry_tags()
+            counts.append(tag_lookups(api))
+            clock.now += 1
+            await spools.retry_tags()
+            await spools.retry_tags()
+            counts.append(tag_lookups(api))
+            await spools.spool_reading(reading(0, tag="04A23F11"))  # another spool: asked at once
+            counts.append(tag_lookups(api))
+            return counts
+
+        assert run(api, scenario, clock=clock) == [1, 1, 1, 2, 3]
+
+    def test_a_failed_retry_isnt_a_warning(self, caplog):
+        api = FakePrintLogApi()
+        clock = FakeClock()
+
+        async def scenario(spools):
+            await spools.spool_reading(reading(0, tag="DEADBEEF"))
+            api.fail_next(1000)
+            for _ in range(3):
+                clock.now += UNKNOWN_TAG_RETRY_S
+                await spools.retry_tags()
+
+        with caplog.at_level(logging.DEBUG, logger="printlog_bridge"):
+            run(api, scenario, clock=clock)
+
+        assert tag_lookups(api) == 4
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_spool_pulled_out_while_its_lookup_waits_isnt_looked_up(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool(tags=("DEADBEEF",))
+
+        async def scenario(spools):
+            async with spools._lock("u1"):  # another slot's lookup holds it
+                waiting = asyncio.ensure_future(spools.spool_reading(reading(0, tag="DEADBEEF")))
+                await asyncio.sleep(0.01)
+                await spools.spool_reading(reading(0))  # pulled out
+            await waiting
+            before = (tag_lookups(api), api.slot_spools(42))
+            await spools.spool_reading(reading(0, tag="DEADBEEF"))  # and put back
+            return before, tag_lookups(api), api.slot_spools(42)
+
+        assert run(api, scenario, clock=FakeClock()) == ((0, {}), 1, {0: spool})
+
+    def test_a_spool_pulled_out_during_its_lookup_isnt_assigned(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool(tags=("DEADBEEF",))
+
+        async def scenario(spools):
+            gate = asyncio.Event()
+            lookup = spools.api.filament_by_tag
+
+            async def slow(uid):
+                await gate.wait()
+                return await lookup(uid)
+
+            spools.api.filament_by_tag = slow
+            asking = asyncio.ensure_future(spools.spool_reading(reading(0, tag="DEADBEEF")))
+            await asyncio.sleep(0.01)
+            await spools.spool_reading(reading(0))  # pulled out while 3D Print Log answers
+            gate.set()
+            await asking
+            before = api.slot_spools(42)
+            await spools.spool_reading(reading(0, tag="DEADBEEF"))  # and put back
+            return before, tag_lookups(api), api.slot_spools(42)
+
+        assert run(api, scenario, clock=FakeClock()) == ({}, 2, {0: spool})
+
+    def test_a_retry_that_fell_due_isnt_dropped(self):
+        # As when the refresh it was due at failed before retrying, or another lookup was slow.
+        api = FakePrintLogApi()
+        clock = FakeClock()
+
+        async def scenario(spools):
+            await spools.spool_reading(reading(0, tag="DEADBEEF"))
+            clock.now += UNKNOWN_TAG_RETRY_S + 50
+            return spools._next_wake(clock.now + 100)
+
+        assert run(api, scenario, clock=clock) == clock.now
+
+    def test_a_failed_lookup_after_another_spools_tag_in_the_slot_isnt_dropped(self):
+        api = FakePrintLogApi()
+        api.add_spool(tags=("04A23F11",))
+        clock = FakeClock()
+
+        async def scenario(spools):
+            await spools.spool_reading(reading(0, tag="04A23F11"))
+            api.fail_next(1)
+            await spools.spool_reading(reading(0, tag="DEADBEEF"))  # swapped, with no gap
+            return spools._next_wake(clock.now + 2 * UNKNOWN_TAG_RETRY_S)
+
+        assert run(api, scenario, clock=clock) == clock.now + UNKNOWN_TAG_RETRY_S
+
+    def test_a_retry_for_a_tag_no_longer_in_its_slot_is_dropped(self):
+        api = FakePrintLogApi()
+        clock = FakeClock()
+
+        async def scenario(spools):
+            spools._retry_at[("u1", 0)] = ("DEADBEEF", clock.now - 1)  # no reading has it
+            return spools._next_wake(clock.now + 100), dict(spools._retry_at)
+
+        assert run(api, scenario, clock=clock) == (clock.now + 100, {})
+
+    def test_cancelling_run_as_a_retry_is_scheduled_stops_it(self):
+        # Before Python 3.12, wait_for swallowed a cancel that came with its inner wait's result,
+        # so the bridge never finished shutting down.
+        api = FakePrintLogApi()
+
+        async def scenario(spools):
+            task = asyncio.ensure_future(spools.run())
+            await eventually(lambda: len(api.requests) > 0)
+            await asyncio.sleep(0.05)  # waiting for its next refresh
+            spools._rescheduled.set()
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=1)
+            if not done:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            return bool(done) and task.cancelled()
+
+        assert run(api, scenario, interval=60)
+
+    def test_running_against_an_api_that_is_down_doesnt_ask_over_and_over(self):
         api = FakePrintLogApi()
 
         async def scenario(spools):
