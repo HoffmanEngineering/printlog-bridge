@@ -12,7 +12,12 @@ from fake_moonraker import DEFAULT_OBJECTS, FakeMoonraker, eventually
 from session_helpers import Recorder as SessionRecorder
 from session_helpers import running
 
-from printlog_bridge.adapters.moonraker.session import Backoff, Listeners, MoonrakerSession
+from printlog_bridge.adapters.moonraker.session import (
+    Backoff,
+    ConnectionLost,
+    Listeners,
+    MoonrakerSession,
+)
 from printlog_bridge.adapters.moonraker.spoolman import SpoolmanSync
 from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolReading
 
@@ -321,6 +326,58 @@ class TestPushes:
         asyncio.run(scenario())
 
         assert [c.spool_number for c in sink.commands] == [9, 7]
+
+    def test_posts_made_back_to_back_are_not_taken_for_picks(self):
+        # The second change comes before Moonraker has announced the first post.
+        fake, sink = FakeMoonraker(), Recorder()
+        fake.config["spoolman"] = PRINTLOG_SPOOLMAN
+        fake.spool_id = 4
+
+        async def scenario():
+            async with syncing(fake, sink, loaded=slots(t0=4)) as sync:
+                await settled()
+                sync.on_loaded(slots(t0=9))
+                sync.on_loaded(slots(t0=5))
+                await eventually(lambda: len(fake.posted_spools) == 2)
+                await settled()
+                assert sink.commands == []
+                # Once they're answered, a pick on the printer is carried out as ever.
+                await fake.pick_spool(9)
+                await eventually(lambda: sink.commands)
+                return sync
+
+        sync = asyncio.run(scenario())
+
+        assert fake.posted_spools == [9, 5]
+        assert [c.spool_number for c in sink.commands] == [9]
+        assert sync.moonraker_spool == 9
+
+    def test_no_post_while_moonraker_is_unreachable(self, caplog):
+        sync = SpoolmanSync("u1", API_URL, Recorder())
+        calls = []
+
+        async def call(method, params):
+            calls.append(method)
+            if method == "server.config":
+                return {"config": {"spoolman": PRINTLOG_SPOOLMAN}}
+            if method == "server.spoolman.get_spool_id":
+                return {"spool_id": 4}
+            raise ConnectionLost("Moonraker closed the connection")
+
+        async def scenario():
+            await sync.on_connected(call)
+            sync.on_loaded(slots(t0=4))
+            await sync.on_status(
+                {"toolhead": {"extruder": "extruder"}, "print_stats": {"state": "standby"}}, {}
+            )
+            sync.on_loaded(slots(t0=7))  # changed in the app while Moonraker restarts
+            await settled()
+
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(scenario())
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert sync.moonraker_spool == 4  # as Moonraker last said; a reconnect reads it again
 
     @pytest.mark.parametrize("state", ["printing", "paused"])
     def test_connect_while_printing_does_not_push(self, state):

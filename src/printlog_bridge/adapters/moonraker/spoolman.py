@@ -41,14 +41,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
 from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolSink
 
-from .session import Call, MoonrakerListener, MoonrakerRpcError
+from .session import Call, ConnectionLost, MoonrakerListener, MoonrakerRpcError
 from .spools import tool_count
 from .tools import slot_of
 
@@ -74,6 +75,15 @@ def host_of(url: object) -> str | None:
 def spool_number(filament: Mapping[str, Any]) -> int | None:
     number = filament.get("spoolNumber")
     return number if isinstance(number, int) and not isinstance(number, bool) else None
+
+
+@dataclass(eq=False)
+class _Post:
+    """A spool number the bridge set Moonraker's active spool to, until Moonraker announces it."""
+
+    number: int
+    answered: bool = False
+    """Whether Moonraker has answered the post (which says nothing of its announcement)."""
 
 
 class SpoolmanSync(MoonrakerListener):
@@ -110,8 +120,8 @@ class SpoolmanSync(MoonrakerListener):
         self._settled = False
         """Whether this connection's first sync is decided: set Moonraker's active spool, or,
         with a print under way, leave it."""
-        self._posted: int | None = None
-        """The spool number the bridge set Moonraker to, until Moonraker announces it."""
+        self._posted: deque[_Post] = deque()
+        """The bridge's posts Moonraker hasn't announced yet, oldest first (see `_echo`)."""
         self._posts: asyncio.Lock | None = None
 
     async def on_connected(self, call: Call) -> None:
@@ -120,7 +130,7 @@ class SpoolmanSync(MoonrakerListener):
         self.active_slot = None
         self._busy = None
         self._settled = False
-        self._posted = None
+        self._posted.clear()
         # Set once known, not reset first: what the last connection read stands until then.
         enabled = await self._points_at_printlog(call)
         spool, loaded = await self._active_spool(call) if enabled else (None, False)
@@ -158,13 +168,10 @@ class SpoolmanSync(MoonrakerListener):
         pass
 
     async def on_active_spool(self, spool_id: int | None) -> None:
-        self.moonraker_spool = spool_id
-        posted, self._posted = self._posted, None
-        if posted is not None and spool_id == posted:
-            # Moonraker telling every client what the bridge set it to: not a pick. Moonraker
-            # announces only a change, so whatever it announces next is someone's pick.
+        if self._echo(spool_id):
             log.debug("[printer %s] Moonraker's active spool is now %s", self.printer, spool_id)
             return
+        self.moonraker_spool = spool_id
         if not self.enabled:
             log.debug("[printer %s] Moonraker's active spool is now %s", self.printer, spool_id)
             return
@@ -248,6 +255,27 @@ class SpoolmanSync(MoonrakerListener):
             return spool_id, True
         return None, True
 
+    def _echo(self, spool_id: int | None) -> bool:
+        """Whether Moonraker's announcement answers one of the bridge's own posts, not a pick.
+
+        Moonraker sets and announces posts in the order they were made, and announces only a
+        change. So an announcement of a posted number answers the oldest such post, and the
+        posts before it changed nothing and will never be announced: they're dropped too. An
+        announcement of any other number is someone's pick; posts already answered then can't
+        be announced any more (Moonraker held their number), so they're dropped, and one still
+        on its way stays pending.
+        """
+        for i, post in enumerate(self._posted):
+            if post.number == spool_id:
+                for _ in range(i + 1):
+                    self._posted.popleft()
+                if not self._posted:
+                    self.moonraker_spool = spool_id
+                # Else it's the number of a later post already, which Moonraker will set.
+                return True
+        self._posted = deque(post for post in self._posted if not post.answered)
+        return False
+
     def _follow(self, changed: bool) -> None:
         """Sets Moonraker's active spool to the active tool's when `changed` (the tool, or its
         spool in 3D Print Log), or for the connection's first sync, once all it needs is known.
@@ -279,20 +307,34 @@ class SpoolmanSync(MoonrakerListener):
             return
         if number == self.moonraker_spool:
             return  # Moonraker has it already, as after a pick on the printer
-        previous, self.moonraker_spool, self._posted = self.moonraker_spool, number, number
-        self._spawn(self._post(number, slot, previous, self._call))
+        post, previous = _Post(number), self.moonraker_spool
+        self._posted.append(post)
+        self.moonraker_spool = number
+        self._spawn(self._post(post, slot, previous, self._call))
 
-    async def _post(self, number: int, slot: int, previous: int | None, call: Call) -> None:
+    async def _post(self, post: _Post, slot: int, previous: int | None, call: Call) -> None:
+        number = post.number
         if self._posts is None:
             self._posts = asyncio.Lock()  # made here, in the running loop (Python 3.9)
         async with self._posts:  # set in the order the tools and spools changed
             try:
                 await call("server.spoolman.post_spool_id", {"spool_id": number})
             except Exception as e:
-                if self._posted == number:
-                    self._posted = None
+                if call is not self._call:
+                    return  # a connection since gone; the one since read Moonraker's spool again
+                if post in self._posted:
+                    self._posted.remove(post)
                 if self.moonraker_spool == number:
                     self.moonraker_spool = previous
+                if isinstance(e, ConnectionLost):
+                    # Moonraker went away; on reconnect its active spool is read again, and set
+                    # to the active tool's when no print is under way.
+                    log.debug(
+                        "[printer %s] Moonraker is out of reach, so its active spool wasn't set "
+                        "to spool number %d: %s",
+                        self.printer, number, e,
+                    )  # fmt: skip
+                    return
                 if isinstance(e, MoonrakerRpcError) and e.code == METHOD_NOT_FOUND:
                     self.enabled = False  # the next connect looks again
                     log.debug(
@@ -306,6 +348,7 @@ class SpoolmanSync(MoonrakerListener):
                     self.printer, number, slot, e,
                 )  # fmt: skip
                 return
+            post.answered = True
         log.info(
             "[printer %s] set Moonraker's active spool to spool number %d, T%d's in 3D Print Log",
             self.printer, number, slot,
