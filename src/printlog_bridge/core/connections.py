@@ -3,8 +3,10 @@
 A bridge watching three printers registers three connections, each under its printer's instance
 id (kept in the state directory). The API links a print to its connection only if the connection
 was registered before the print was created, so the bridge registers on start and again right
-before creating a print if that first attempt failed. The app shows a connection as stale after
-15 minutes without a heartbeat.
+before creating a print if that first attempt failed. When that second attempt can't reach 3D
+Print Log either, the print waits and is tried again like any other request: created anyway, it
+would get through as soon as the API was back (the end of an outage) and never link. The app
+shows a connection as stale after 15 minutes without a heartbeat.
 """
 
 from __future__ import annotations
@@ -62,11 +64,13 @@ class Heartbeat:
             await self.beat(printer)
 
     async def ensure_registered(self, printer: str) -> None:
-        """Registers the printer's connection if no heartbeat has got through yet. Never raises."""
+        """Registers the printer's connection if no heartbeat has got through yet. Raises
+        ApiUnavailable when 3D Print Log couldn't be reached, so the print this runs before
+        waits for it; a refused connection doesn't raise, since trying again won't change it."""
         if printer in self.connections and printer not in self._registered:
-            await self.beat(printer)
+            await self.beat(printer, raise_unavailable=True)
 
-    async def beat(self, printer: str) -> bool:
+    async def beat(self, printer: str, raise_unavailable: bool = False) -> bool:
         connection = self.connections[printer]
         report = self.board.printer(printer)
         body = {
@@ -93,6 +97,9 @@ class Heartbeat:
         except ApiUnavailable as e:
             problem = f"couldn't send the heartbeat: {e}. It is sent again in a few minutes."
             log.warning("[printer %s] %s", printer, problem)
+            if raise_unavailable:
+                report.warn(TOPIC, problem)
+                raise
         except Exception as e:  # a heartbeat must never take the bridge down
             problem = f"couldn't send the heartbeat: {e!r}"
             log.exception("[printer %s] couldn't send the heartbeat", printer)

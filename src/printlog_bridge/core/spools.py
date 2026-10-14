@@ -8,7 +8,10 @@ reader, assigns the spool whose tag it reads (`spool_reading`).
 
 Assigning a spool is not queued like a print: it says at once whether it worked, and a command
 that couldn't reach 3D Print Log is run again by the user rather than applied hours later, when
-the spool may have moved. A tag the reader keeps reporting is retried with each refresh.
+the spool may have moved. A tag the reader keeps reporting that couldn't be looked up is
+retried with each refresh. One that no spool has is looked up again every
+`UNKNOWN_TAG_RETRY_S` while it stays in the slot, so adding it to a spool in the app takes
+effect without a restart, and at once when the spool is pulled out and put back (#35).
 
 A spool assigned to a slot while a job runs is a swap (#44): `on_swap` hears of it, with the
 point the job had reached, so the job's usage on that slot is split there.
@@ -23,6 +26,7 @@ import asyncio
 import logging
 import math
 import re
+import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
@@ -41,6 +45,9 @@ from printlog_bridge.core.swaps import SpoolSwap
 log = logging.getLogger(__name__)
 
 REFRESH_INTERVAL_S = 5 * 60
+UNKNOWN_TAG_RETRY_S = 5 * 60
+"""How long a tag no spool has waits before it's looked up again, for as long as it stays in
+the slot: at most one lookup per slot in that time, however many spools aren't tagged."""
 MAX_SLOTS = 64
 """The API's highest `slotCount`."""
 COLOR_TOLERANCE = 100.0
@@ -105,12 +112,16 @@ class Spools:
         printers: Mapping[str, int],
         board: StatusBoard | None = None,
         interval: float = REFRESH_INTERVAL_S,
+        retry_after: float = UNKNOWN_TAG_RETRY_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """`printers` maps each `[printer <name>]` to its printer in 3D Print Log."""
         self.api = api
         self.printers = dict(printers)
         self.board = board
         self.interval = interval
+        self.retry_after = retry_after
+        self.clock = clock
         self._loaded: dict[str, dict[int, dict[str, Any]]] = {}
         """Each printer's spool (the API's filament summary) in each slot, as last read."""
         self._slot_counts: dict[str, int] = {}
@@ -118,6 +129,12 @@ class Spools:
         """What each slot's reader last said."""
         self._tags: dict[tuple[str, int], tuple[str, str | None]] = {}
         """The tag each slot's reader reported that was looked up, and the spool it found."""
+        self._retry_at: dict[tuple[str, int], tuple[str, float]] = {}
+        """The tag each slot's reader reported that was last asked about, and when, on `clock`,
+        it may be asked about again: set before asking, so an answer that never came waits too.
+        """
+        self._rescheduled: asyncio.Event | None = None
+        """Set when a retry is scheduled, to wake `run` for it."""
         self._locks: dict[str, asyncio.Lock] = {}
         self._failing = False
         self.on_swap: Callable[[SpoolSwap], bool] | None = None
@@ -153,27 +170,72 @@ class Spools:
 
     async def refresh_all(self) -> None:
         """Reads every printer's spools, and retries any tag a reader reported that wasn't
-        looked up yet. Raises ApiError when a printer's can't be read."""
+        looked up yet, or is due again. Raises ApiError when a printer's can't be read."""
         for printer in self.printers:
             await self.refresh(printer)
+        await self.retry_tags()
+
+    async def retry_tags(self) -> None:
+        """Looks up each tag a reader reported that wasn't looked up yet, or is due again."""
         for reading in list(self._readings.values()):
             if self._tag_pending(reading):
                 await self.spool_reading(reading)
 
     async def run(self) -> None:
-        """Reads every printer's spools now and every `interval` after, until cancelled."""
+        """Reads every printer's spools now and every `interval` after, until cancelled. In
+        between, it wakes only when a tag no spool had is due to be looked up again: readings
+        arrive only when a reader's view changes, so a tag left in its slot sends none."""
+        self._rescheduled = asyncio.Event()  # made here, in the running loop (Python 3.9)
+        next_refresh = self.clock()
         while True:
-            try:
-                await self.refresh_all()
-            except Exception as e:
-                level = logging.DEBUG if self._failing else logging.WARNING
-                log.log(level, "couldn't read the printers' spools from 3D Print Log: %s", e)
-                self._failing = True
+            if self.clock() >= next_refresh:
+                try:
+                    await self.refresh_all()
+                except Exception as e:
+                    level = logging.DEBUG if self._failing else logging.WARNING
+                    log.log(level, "couldn't read the printers' spools from 3D Print Log: %s", e)
+                    self._failing = True
+                else:
+                    if self._failing:
+                        log.info("read the printers' spools from 3D Print Log again")
+                    self._failing = False
+                next_refresh = self.clock() + self.interval
             else:
-                if self._failing:
-                    log.info("read the printers' spools from 3D Print Log again")
-                self._failing = False
-            await asyncio.sleep(self.interval)
+                try:
+                    await self.retry_tags()
+                except Exception as e:
+                    log.warning("couldn't look a spool's tag up in 3D Print Log: %s", e)
+            self._rescheduled.clear()
+            await self._sleep_until(self._next_wake(next_refresh))
+
+    def _next_wake(self, next_refresh: float) -> float:
+        """When `run` wakes next: at the next refresh, or when a tag that's still in its slot
+        is due again; at once for one that fell due while `run` was busy, or whose refresh
+        failed before it was retried. Forgets each retry whose tag is no longer in its slot."""
+        live = {}
+        for key, (uid, at) in self._retry_at.items():
+            reading = self._readings.get(key)
+            looked_up = self._tags.get(key)
+            if (
+                reading is not None
+                and reading.printer in self.printers
+                and normalize_tag(reading.tag or "") == uid
+                and not (looked_up is not None and looked_up[0] == uid and looked_up[1])
+            ):
+                live[key] = (uid, at)
+        self._retry_at = live
+        return min([next_refresh, *(max(at, self.clock()) for _, at in live.values())])
+
+    async def _sleep_until(self, wake: float) -> None:
+        """Sleeps until `wake`, or until a retry is scheduled. Not `asyncio.wait_for`: before
+        Python 3.12 it swallows a cancel that arrives with the wait's result, and the bridge
+        then never finishes shutting down."""
+        assert self._rescheduled is not None
+        waiter = asyncio.ensure_future(self._rescheduled.wait())
+        try:
+            await asyncio.wait({waiter}, timeout=max(0.0, wake - self.clock()))
+        finally:
+            waiter.cancel()
 
     def _remember(
         self, printer: str, rows: Iterable[Mapping[str, Any]], slot_count: int | None = None
@@ -314,22 +376,38 @@ class Spools:
     async def spool_reading(self, reading: SpoolReading) -> None:
         key = (reading.printer, reading.slot)
         self._readings[key] = reading
+        uid = normalize_tag(reading.tag or "")
+        if uid is None:
+            # The spool is out (or its tag can't be read): putting one back looks it up again.
+            self._tags.pop(key, None)
+            self._retry_at.pop(key, None)
         printer_id = self.printers.get(reading.printer)
         if printer_id is None or not self._tag_pending(reading):
             return
-        uid = normalize_tag(reading.tag or "")
         assert uid is not None  # _tag_pending made sure
         slot = _label(reading.slot)
+        retry = False
         try:
             async with self._lock(reading.printer):
+                if not self._still_in_slot(key, uid) or not self._tag_pending(reading):
+                    return  # pulled out, or looked up, while this waited for the lock
+                retry = (self._retry_at.get(key) or ("",))[0] == uid
+                # Whatever comes of it, the next try is no sooner than this.
+                self._retry_at[key] = (uid, self.clock() + self.retry_after)
+                if self._rescheduled is not None:
+                    self._rescheduled.set()
                 spool = await self.api.filament_by_tag(uid)
+                if not self._still_in_slot(key, uid):
+                    return  # pulled out while 3D Print Log answered: the answer is for no slot
                 if spool is None:
+                    first = self._tags.get(key) != (uid, None)
                     self._tags[key] = (uid, None)
-                    log.info(
-                        "[printer %s] %s's reader sees tag %s, which no spool in 3D Print Log "
-                        "has; add it to the spool in the app to have it assigned",
-                        reading.printer, slot, uid,
-                    )  # fmt: skip
+                    if first:
+                        log.info(
+                            "[printer %s] %s's reader sees tag %s, which no spool in 3D Print "
+                            "Log has; add it to the spool in the app to have it assigned",
+                            reading.printer, slot, uid,
+                        )  # fmt: skip
                     return
                 filament_id = str(spool["id"])
                 if self.loaded(reading.printer).get(reading.slot) != filament_id:
@@ -342,19 +420,33 @@ class Spools:
                     log.info("[printer %s] %s", reading.printer, what)
                     self._event(reading.printer, what)
                 self._tags[key] = (uid, filament_id)
+                self._retry_at.pop(key, None)
         except ApiError as e:
-            # Not marked as looked up, so the next refresh tries it again.
-            log.warning(
+            # Not marked as looked up, so it's tried again after `retry_after`, not over and
+            # over while 3D Print Log is down. Only the first try of a tag is worth a warning.
+            level = logging.DEBUG if retry or self._failing else logging.WARNING
+            log.log(
+                level,
                 "[printer %s] couldn't assign the spool with tag %s to %s: %s",
                 reading.printer, uid, slot, e,
             )  # fmt: skip
 
     def _tag_pending(self, reading: SpoolReading) -> bool:
+        """Whether the reading's tag is to be looked up now: not found yet, and not asked about
+        within `retry_after`. Another tag in the slot is asked about at once."""
         uid = normalize_tag(reading.tag or "")
         if uid is None:
             return False
-        looked_up = self._tags.get((reading.printer, reading.slot))
-        return looked_up is None or looked_up[0] != uid
+        key = (reading.printer, reading.slot)
+        looked_up = self._tags.get(key)
+        if looked_up is not None and looked_up[0] == uid and looked_up[1] is not None:
+            return False  # found its spool
+        asked = self._retry_at.get(key)
+        return asked is None or asked[0] != uid or self.clock() >= asked[1]
+
+    def _still_in_slot(self, key: tuple[str, int], uid: str) -> bool:
+        reading = self._readings.get(key)
+        return reading is not None and normalize_tag(reading.tag or "") == uid
 
     def mismatches(self, printer: str, slots: Iterable[int]) -> list[str]:
         """A note for each of `slots` whose reader saw a material or color other than its
