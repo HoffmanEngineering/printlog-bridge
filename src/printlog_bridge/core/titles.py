@@ -27,6 +27,21 @@ def title_from_file_name(file_name: str) -> str:
     Those always end with the print time, so nothing is stripped from a name that doesn't, and a
     file the user named themselves keeps all of its words.
     """
+    words = _words(file_name)
+    title = " ".join(w[:1].upper() + w[1:] for w in words)[:MAX_TITLE_LENGTH].strip()
+    return title or UNTITLED
+
+
+def same_file(a: str, b: str) -> bool:
+    """Whether two file names are the same model, as `title_from_file_name` reads them: folders,
+    extensions, the slicer's suffix, case, and `_`, `-` and spaces don't count.
+
+    `parts/benchy_0.2mm_PLA_MK4_1h2m.gcode` is the same file as `Benchy.bgcode`."""
+    key = [w.lower() for w in _words(a)]
+    return bool(key) and key == [w.lower() for w in _words(b)]
+
+
+def _words(file_name: str) -> list[str]:
     name = re.split(r"[/\\]", file_name)[-1]
     while True:
         extension = next((e for e in EXTENSIONS if name.lower().endswith(e)), None)
@@ -43,6 +58,4 @@ def title_from_file_name(file_name: str) -> str:
         elif len(parts) > 1 and parts[-1].upper() in FILAMENT_TYPES:
             parts.pop()  # OrcaSlicer: _{filament}
 
-    words = " ".join(parts).replace("-", " ").split()
-    title = " ".join(w[:1].upper() + w[1:] for w in words)[:MAX_TITLE_LENGTH].strip()
-    return title or UNTITLED
+    return " ".join(parts).replace("-", " ").split()

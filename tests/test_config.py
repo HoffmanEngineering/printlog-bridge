@@ -8,6 +8,7 @@ import pytest
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.config import (
     DEFAULT_API_URL,
+    Adoption,
     ApiKeySource,
     ConfigError,
     find_config,
@@ -365,3 +366,50 @@ class TestTrace:
     def test_a_bad_variable_is_a_config_error(self, tmp_path):
         with pytest.raises(ConfigError, match="PRINTLOG_BRIDGE_TRACE must be"):
             self.config(tmp_path, env={"PRINTLOG_BRIDGE_TRACE": "maybe"})
+
+
+class TestAdoption:
+    """`adopt_prints`, `create_prints` and `adopt_window` (#43)."""
+
+    def test_defaults_adopt_a_matching_print_else_create_one(self, tmp_path):
+        [printer] = load(write(tmp_path, "[printer voron]\nadapter = fake\n")).printers
+
+        assert printer.adoption == Adoption(adopt=True, create=True, window_s=12 * 60 * 60)
+        assert printer.adapter.options == {}  # not adapter options
+
+    def test_bridge_sets_every_printer_and_a_printer_overrides_it(self, tmp_path):
+        path = write(
+            tmp_path,
+            "[bridge]\ncreate_prints = false\nadopt_window = 2d\n"
+            "[printer a]\nadapter = fake\n"
+            "[printer b]\nadapter = fake\ncreate_prints = true\nadopt_window = 90m\n",
+        )
+
+        a, b = load(path).printers
+
+        assert a.adoption == Adoption(adopt=True, create=False, window_s=2 * 24 * 60 * 60)
+        assert b.adoption == Adoption(adopt=True, create=True, window_s=90 * 60)
+        assert b.adapter.options == {}
+
+    @pytest.mark.parametrize(("value", "seconds"), [("6", 6 * 3600), ("0.5h", 1800), ("30s", 30)])
+    def test_adopt_window_units(self, tmp_path, value, seconds):
+        path = write(tmp_path, f"[printer voron]\nadapter = fake\nadopt_window = {value}\n")
+
+        [printer] = load(path).printers
+
+        assert printer.adoption.window_s == seconds
+
+    @pytest.mark.parametrize(
+        ("option", "message"),
+        [
+            ("adopt_window = soon", "adopt_window must be a time"),
+            ("adopt_window = 0h", "adopt_window must be a time"),
+            ("create_prints = maybe", "create_prints must be true or false"),
+            ("adopt_prints = false\ncreate_prints = false", "no print would ever be logged"),
+        ],
+    )
+    def test_bad_values_are_config_errors(self, tmp_path, option, message):
+        path = write(tmp_path, f"[printer voron]\nadapter = fake\n{option}\n")
+
+        with pytest.raises(ConfigError, match=message):
+            load(path)

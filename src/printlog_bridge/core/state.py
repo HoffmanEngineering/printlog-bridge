@@ -2,7 +2,8 @@
 
 One JSON file per printer holds its connection's instance id, which makes every job's external
 ID unique to this bridge and printer, and the jobs it has seen, so a replayed event is
-recognised and a restart picks up where the last run stopped.
+recognised and a restart picks up where the last run stopped. An adapter that can find its
+printer again after an address change keeps what it needs for that in `discovery`.
 """
 
 from __future__ import annotations
@@ -36,13 +37,31 @@ class JobRecord:
     images: dict[str, bool] = field(default_factory=dict)
     """Each picture already fetched for the job (`thumbnail`, `snapshot`), and whether there
     was one to add, so a replayed job isn't fetched again."""
+    claiming: int | None = None
+    """The print being adopted, from just before the claim is sent until `print_id` is set, so
+    a claim whose answer was lost is sent again rather than a second print created."""
+    adopted: bool = False
+    """The print was the user's (an uploader's), adopted rather than created by the bridge."""
+    had_picture: bool = False
+    """The adopted print already had a picture, which the thumbnail mustn't replace."""
 
 
 class PrinterState:
-    def __init__(self, path: Path, instance_id: str, jobs: dict[str, JobRecord]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        instance_id: str,
+        jobs: dict[str, JobRecord],
+        discovery: dict[str, Any] | None = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
         self.path = path
+        self.read_only = read_only
         self.instance_id = instance_id
         self.jobs = jobs
+        self.discovery: dict[str, Any] = discovery or {}
+        """The printer's identity and where it was last found, for the adapter's own use."""
 
     @classmethod
     def load(cls, state_dir: Path, printer: str) -> PrinterState:
@@ -55,7 +74,10 @@ class PrinterState:
                 job_id: JobRecord(**{k: v for k, v in job.items() if k in known})
                 for job_id, job in data["jobs"].items()
             }
-            return cls(path, data["instance_id"], jobs)
+            discovery = data.get("discovery")
+            return cls(
+                path, data["instance_id"], jobs, discovery if isinstance(discovery, dict) else {}
+            )
         except FileNotFoundError:
             pass
         except (ValueError, KeyError, TypeError) as e:
@@ -70,6 +92,28 @@ class PrinterState:
         state.save()
         return state
 
+    @classmethod
+    def peek(cls, state_dir: Path, printer: str) -> PrinterState | None:
+        """The printer's state as it is on disk, or None when there isn't a readable one.
+
+        Unlike `load`, this never writes: a missing file isn't created and a broken one isn't
+        moved aside, so `doctor` can look while the bridge is running. It holds only
+        `instance_id` and `discovery`, and `save()` refuses it.
+        """
+        path = state_dir / "printers" / f"{safe_file_name(printer)}.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            discovery = data.get("discovery")
+            return cls(
+                path,
+                data["instance_id"],
+                {},  # not read: saving it back would lose them, so it can't be saved
+                discovery if isinstance(discovery, dict) else {},
+                read_only=True,
+            )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
     def resume_after(self) -> datetime | None:
         unfinished = [j.started_at for j in self.jobs.values() if not j.finished]
         candidates = unfinished or [j.started_at for j in self.jobs.values()]
@@ -78,6 +122,8 @@ class PrinterState:
         return datetime.fromisoformat(min(candidates) if unfinished else max(candidates))
 
     def save(self) -> None:
+        if self.read_only:
+            raise RuntimeError(f"{self.path} was read with peek(), which can't be saved")
         finished = sorted(
             (job_id for job_id, j in self.jobs.items() if j.finished),
             key=lambda job_id: self.jobs[job_id].started_at,
@@ -90,6 +136,8 @@ class PrinterState:
             "instance_id": self.instance_id,
             "jobs": {job_id: asdict(job) for job_id, job in self.jobs.items()},
         }
+        if self.discovery:
+            data["discovery"] = self.discovery
         # Write then rename, so a power cut leaves the old file or the new one, never half.
         temporary = self.path.with_suffix(".tmp")
         temporary.write_text(json.dumps(data, indent=1), encoding="utf-8")

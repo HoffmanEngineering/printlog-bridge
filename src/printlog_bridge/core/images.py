@@ -13,16 +13,33 @@ import asyncio
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qsl,
+    quote,
+    quote_plus,
+    unquote,
+    unquote_plus,
+    urlencode,
+    urlsplit,
+    urlunsplit,
+)
 
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.core.secrets import URL_USERINFO, mask_query_values
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 """The API refuses larger images ("Image must be under 10MB")."""
 
 _SECRET_QUERY = re.compile(r"(token|key|pass|pwd|secret|auth|sig|user)", re.IGNORECASE)
+MAX_ERROR_CHARS = 2000
+"""How much of an error's message `scrub_url` keeps: enough for a log line, and a bound on the
+work, since the message can come from the network (Moonraker's errors, up to a 4 MB frame)."""
+_MIN_SECRET_LENGTH = 3
+"""A secret shorter than this (a user such as `pi`) is hidden only where a URL holds it: as
+plain text, it is too likely to be part of a host name or a word."""
+_ESCAPE = re.compile(r"(%[0-9A-Fa-f]{2})")
 _CHUNK = 64 * 1024
 
 
@@ -141,22 +158,86 @@ async def read_image_file(path: Path, *, max_bytes: int = MAX_IMAGE_BYTES) -> by
 
 def scrub_url(error: BaseException, url: str | None) -> str:
     """The error's message, without the URL's user, password or secret query values should it
-    repeat them."""
+    repeat them.
+
+    aiohttp shows a URL as yarl writes it, which needn't be how the config spells it (yarl
+    upper-cases percent escapes, decodes some and keeps others), so each secret is looked for
+    as given, decoded and re-encoded. Any URL in the message also has its user and password,
+    and its secret-looking query values, hidden, however short."""
     text = str(error) or type(error).__name__
+    cut = len(text) > MAX_ERROR_CHARS
     if not url:
-        return text
-    text = text.replace(url, mask_url(url))
+        return _cut(text) if cut else text
     try:
         parts = urlsplit(url)
-        secrets = [parts.password, parts.username]
+        userinfo = parts.netloc.rpartition("@")[0]
+        secrets = userinfo.split(":", 1) if userinfo else []
         secrets += [
             value
             for key, value in parse_qsl(parts.query, keep_blank_values=True)
             if _SECRET_QUERY.search(key)
         ]
+        secrets += [
+            value
+            for key, _, value in (p.partition("=") for p in parts.query.split("&"))
+            if _SECRET_QUERY.search(key)
+        ]  # as written, before parse_qsl decodes it
     except ValueError:
         secrets = []
-    for secret in secrets:
-        if secret and len(secret) >= 3:
-            text = text.replace(secret, "***")
-    return text
+    forms = sorted({form for secret in secrets for form in _spellings(secret)}, key=len)[::-1]
+    if cut:
+        # Enough past the cut that any secret starting before it is whole, and so found.
+        window = MAX_ERROR_CHARS + len(url) + max((len(f) for f in forms), default=0)
+        truncated = len(text) > window
+        text = text[:window]
+    text = text.replace(url, mask_url(url))
+    for form in forms:
+        if len(form) >= _MIN_SECRET_LENGTH:
+            text = _pattern(form).sub("***", text)
+    text = URL_USERINFO.sub(r"\1***@", text)
+    text = mask_query_values(text, _SECRET_QUERY, "***")
+    if cut and (truncated or len(text) > MAX_ERROR_CHARS):
+        return _cut(text)
+    return text  # all of it was scrubbed, and it fits
+
+
+_NOT_IN_AUTHORITY = re.compile(r"[\s\"'\\]")
+
+
+def _cut(text: str) -> str:
+    """The first `MAX_ERROR_CHARS` of `text`, less the word cut in two. Without whitespace to
+    cut at (minified JSON), it cuts at the limit itself. Either way no part of a secret it
+    knows shows, since each is found whole past the limit and replaced first; and a URL's user
+    and password cut off before their `@` are hidden all the same."""
+    head = text[:MAX_ERROR_CHARS]
+    end = len(head)
+    while end and not head[end - 1].isspace():
+        end -= 1
+    if end:
+        head = head[: end - 1]
+    slash = head.rfind("/")
+    if slash >= 2 and head[slash - 2 : slash + 1] == "://":
+        authority = head[slash + 1 :]
+        if authority and not _NOT_IN_AUTHORITY.search(authority):
+            head = head[: slash + 1] + "***"
+    return head + "…"
+
+
+def _spellings(secret: str) -> set[str]:
+    """`secret` as written, decoded, and encoded the ways a URL library might write it."""
+    decoded = unquote(secret)
+    forms = {secret, decoded, unquote_plus(secret), quote_plus(decoded)}
+    forms.update(quote(decoded, safe=safe) for safe in ("", "/", "!$&'()*+,;=:@/?"))
+    return forms
+
+
+def _pattern(form: str) -> re.Pattern[str]:
+    """Matches `form`, with its percent escapes in either case (`%2f` or `%2F`)."""
+    return re.compile(
+        "".join(
+            "%" + "".join(f"[{c.upper()}{c.lower()}]" for c in part[1:])
+            if _ESCAPE.fullmatch(part)
+            else re.escape(part)
+            for part in _ESCAPE.split(form)
+        )
+    )

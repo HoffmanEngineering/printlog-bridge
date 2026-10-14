@@ -46,7 +46,8 @@ class JobFinished:
     filament_mm: Mapping[int, float] = field(default_factory=dict)
     """Filament fed per slot (tool index), in millimetres."""
     note: str | None = None
-    """Why it failed, in words for the print's notes, such as "Klipper shutdown"."""
+    """For the print's notes: why it failed, such as "Klipper shutdown", and what else the
+    user would want to know, such as objects they cancelled mid-print."""
 
 
 class ImageKind(Enum):

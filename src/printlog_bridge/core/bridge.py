@@ -51,6 +51,9 @@ async def run_bridge(
     """
     check_runnable(config)
     assert config.api_key is not None  # check_runnable made sure
+    api_url_warning = config.api_url_warning()
+    if api_url_warning is not None:
+        log.warning("%s", api_url_warning)
 
     board = StatusBoard(config.state_dir)
     board.start([p.name for p in config.printers], trace=config.trace)
@@ -66,7 +69,9 @@ async def run_bridge(
             sink = JobLogger(
                 api,
                 {
-                    p.name: LoggedPrinter(printer_id=p.printer_id, source=p.adapter.name)
+                    p.name: LoggedPrinter(
+                        printer_id=p.printer_id, source=p.adapter.name, adoption=p.adoption
+                    )
                     for p in config.printers
                     if p.printer_id is not None
                 },
@@ -93,6 +98,8 @@ async def run_bridge(
             sink.before_create = heartbeat.ensure_registered
             for printer in config.printers:
                 printer.adapter.use_spools(spools)
+                if printer.printer_id is not None:
+                    printer.adapter.use_state(sink.state(printer.name))
                 log.info(
                     "[printer %s] watching: %s, logging to printer %s",
                     printer.name, printer.adapter.describe(), printer.printer_id,

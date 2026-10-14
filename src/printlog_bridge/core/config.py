@@ -12,6 +12,9 @@ adapter = moonraker      ; the default
 url = http://voron.local:7125
 ```
 
+`adopt_prints`, `create_prints` and `adopt_window` go in `[bridge]` for every printer, or in a
+`[printer]` section for that one (see `Adoption`).
+
 The API key is looked up in this order: the `PRINTLOG_API_KEY` environment variable, the key
 file `<state_dir>/api_key` (which `printlog-bridge store-key` and install.sh write, mode 600),
 then `api_key` in `[bridge]`. In local mode the config sits in Klipper's config folder, which
@@ -22,18 +25,22 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import errno
+import io
 import ipaddress
 import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
 from printlog_bridge.core.adapter import Adapter
+from printlog_bridge.core.images import mask_url
 
 DEFAULT_API_URL = "https://api.3dprintlog.com"
 ALLOW_HTTP_ON_LAN_ENV = "PRINTLOG_ALLOW_HTTP_ON_LAN"
@@ -54,10 +61,31 @@ BOOLEANS = {
 }  # fmt: skip
 
 PRINTER_PREFIX = "printer"
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*(s|m|h)?$")
+_UNITS = {None: 1, "s": 1, "m": 60, "h": 3600}
+ADOPTION_OPTIONS = ("adopt_prints", "create_prints", "adopt_window")
+DEFAULT_ADOPT_WINDOW_S = 12 * 60 * 60
+_WINDOW = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$")
+_WINDOW_UNITS = {"s": 1, "m": 60, "h": 60 * 60, "d": 24 * 60 * 60, "": 60 * 60}
 
 
 class ConfigError(Exception):
     """The config file is missing or invalid. The message is shown to the user as is."""
+
+
+@dataclass(frozen=True)
+class Adoption:
+    """What the bridge does when a job starts and the user already made its print (the Slic3r
+    uploader, the Cura plugin, or by hand)."""
+
+    adopt: bool = True
+    """`adopt_prints`: log the job to a matching print in Printing instead of a new one."""
+    create: bool = True
+    """`create_prints`: create a print when there's none to adopt. False is finish-only mode,
+    where a job with no print to adopt isn't logged."""
+    window_s: float = DEFAULT_ADOPT_WINDOW_S
+    """`adopt_window`: how recently the print must have been created (`12h`, `90m`, `2d`; a
+    bare number is hours)."""
 
 
 @dataclass(frozen=True)
@@ -66,6 +94,7 @@ class PrinterConfig:
     adapter: Adapter
     printer_id: int | None = None
     """The printer's id in 3D Print Log, which its prints are logged to. Pairing will set it."""
+    adoption: Adoption = field(default_factory=Adoption)
 
 
 class ApiKeySource(Enum):
@@ -87,6 +116,18 @@ class BridgeConfig:
     """`api_key` in `[bridge]`, even when another source wins: doctor warns about it."""
     trace: bool = False
     """Record every message to and from each printer in `state_dir/traces` (core/trace.py)."""
+
+    def api_url_warning(self) -> str | None:
+        """What to say, every time, when `api_url` is plain http to another computer, which
+        only `allow_http_on_lan` allows."""
+        parsed = urlparse(self.api_url)
+        if parsed.scheme != "http" or _is_loopback(parsed.hostname or ""):
+            return None
+        return (
+            f"api_url is {mask_url(self.api_url)}, plain http (allow_http_on_lan): the API key "
+            "and your prints travel unencrypted on your network. Use it only for a development "
+            "API."
+        )
 
     @property
     def api_key_file(self) -> Path:
@@ -125,11 +166,17 @@ def load_config(
     adapters: Mapping[str, type[Adapter]],
     env: Mapping[str, str],
     home: Path,
+    text: str | None = None,
 ) -> BridgeConfig:
+    """`text` is the config's contents when the caller has already read them (store-key, which
+    checks who owns the file it read); otherwise they are read from `path`."""
     parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
     try:
-        with path.open(encoding="utf-8-sig") as f:
-            parser.read_file(f)
+        if text is not None:
+            parser.read_string(text, source=str(path))
+        else:
+            with path.open(encoding="utf-8-sig") as f:
+                parser.read_file(f)
     except FileNotFoundError:
         raise ConfigError(f"Config file not found: {path}") from None
     except configparser.Error as e:
@@ -152,8 +199,9 @@ def load_config(
     config_api_key = (bridge.get("api_key") or "").strip() or None
     api_key, source = _api_key(env, state_dir / API_KEY_FILE, config_api_key)
 
+    adoption = _adoption("[bridge]", bridge, Adoption())
     printers = [
-        _load_printer(section, parser[section], adapters)
+        _load_printer(section, parser[section], adapters, adoption)
         for section in parser.sections()
         if section != "bridge"
     ]
@@ -186,6 +234,14 @@ def _trace(option: str | None, variable: str | None) -> bool:
     return value
 
 
+def parse_duration(text: str) -> float | None:
+    """Seconds from `90`, `90s`, `3m` or `1h`, or None when `text` isn't one."""
+    match = _DURATION.match(text.strip().lower())
+    if match is None:
+        return None
+    return float(match.group(1)) * _UNITS[match.group(2)]
+
+
 def _api_url(value: str, allow_http_on_lan: bool = False) -> str:
     """3D Print Log's address. Plain http is refused except to this computer itself (a test
     server, or a proxy on the same host), so the key and the prints only ever travel over TLS.
@@ -212,6 +268,18 @@ def _api_url(value: str, allow_http_on_lan: bool = False) -> str:
     return api_url
 
 
+_LAN_NETWORKS = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",  # RFC 1918
+        "169.254.0.0/16", "fe80::/10",  # link-local
+        "fc00::/7",  # IPv6 unique local
+    )
+)  # fmt: skip
+"""Named, not `is_private`: that also counts Teredo (2001::/32), which tunnels to the
+internet, and documentation, benchmarking and reserved ranges, none of which is a LAN."""
+
+
 def _is_private(host: str) -> bool:
     """An IP address on a private network (RFC 1918, link-local, IPv6 unique local). Names are
     never private here: what a name resolves to can change."""
@@ -219,7 +287,9 @@ def _is_private(host: str) -> bool:
         address = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return address.is_private and not address.is_loopback and not address.is_unspecified
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return any(address in network for network in _LAN_NETWORKS)
 
 
 def _flag(value: str, name: str) -> bool:
@@ -288,6 +358,7 @@ def _load_printer(
     section: str,
     options: configparser.SectionProxy,
     adapters: Mapping[str, type[Adapter]],
+    adoption: Adoption | None = None,
 ) -> PrinterConfig:
     kind, _, name = section.partition(" ")
     if kind != PRINTER_PREFIX:
@@ -298,6 +369,9 @@ def _load_printer(
 
     values = dict(options)
     printer_id = _printer_id(name, values.pop("printer_id", None))
+    adoption = _adoption(f"[printer {name}]", values, adoption or Adoption())
+    for option in ADOPTION_OPTIONS:
+        values.pop(option, None)
     adapter_name = values.pop("adapter", DEFAULT_ADAPTER).strip()
     adapter_type = adapters.get(adapter_name)
     if adapter_type is None:
@@ -306,7 +380,41 @@ def _load_printer(
             f"[printer {name}]: unknown adapter {adapter_name!r} (available: {known})"
         )
 
-    return PrinterConfig(name, adapter_type.from_config(name, values), printer_id)
+    return PrinterConfig(name, adapter_type.from_config(name, values), printer_id, adoption)
+
+
+def _adoption(where: str, options: Mapping[str, str], base: Adoption) -> Adoption:
+    """`base` with what `options` sets of `adopt_prints`, `create_prints` and `adopt_window`."""
+
+    def flag(option: str, default: bool) -> bool:
+        text = (options.get(option) or "").strip()
+        if not text:
+            return default
+        value = BOOLEANS.get(text.lower())
+        if value is None:
+            raise ConfigError(f"{where} {option} must be true or false, not {text!r}")
+        return value
+
+    window = (options.get("adopt_window") or "").strip()
+    window_s = base.window_s
+    if window:
+        match = _WINDOW.match(window.lower())
+        if match is None or float(match.group(1)) <= 0:
+            raise ConfigError(
+                f"{where} adopt_window must be a time such as 12h, 90m or 2d, not {window!r}"
+            )
+        window_s = float(match.group(1)) * _WINDOW_UNITS[match.group(2)]
+    adoption = Adoption(
+        adopt=flag("adopt_prints", base.adopt),
+        create=flag("create_prints", base.create),
+        window_s=window_s,
+    )
+    if not adoption.adopt and not adoption.create:
+        raise ConfigError(
+            f"{where} sets adopt_prints and create_prints both to false, so no print would ever "
+            "be logged. Finish-only mode is create_prints = false with adopt_prints = true."
+        )
+    return adoption
 
 
 def _printer_id(printer: str, value: str | None) -> int | None:
@@ -331,11 +439,63 @@ _SECTION = re.compile(r"^\s*\[([^\]]*)\]")
 _API_KEY_LINE = re.compile(r"^(\s*)api_key\s*[=:]", re.IGNORECASE)  # configparser ignores case
 
 
-def clear_config_api_key(path: Path) -> bool:
+def clear_config_api_key(
+    path: Path, *, folder_fd: int | None = None, identity: tuple[int, int] | None = None
+) -> bool:
     """Empties `api_key` in the config's `[bridge]` section, leaving every other line (and its
-    line ending) as it was. True when there was a line to empty."""
+    line ending) as it was. True when there was a line to empty. A symlink stays one: the file
+    it points to is rewritten.
+
+    With `folder_fd`, the config's folder held open (POSIX), the file is found and replaced in
+    that folder, whatever has been renamed since, and only while it is still the file
+    `identity` (device, inode) names; otherwise OSError."""
+    if folder_fd is None:
+        return _clear_by_path(Path(os.path.realpath(path)))
+    name = path.name
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=folder_fd)
+    with os.fdopen(fd, "rb") as f:
+        found = os.fstat(f.fileno())
+        if identity is not None and (found.st_dev, found.st_ino) != identity:
+            raise OSError(errno.ESTALE, "it was replaced while store-key was running")
+        # Split as readlines() would (only \n, \r and \r\n), keeping each line's ending.
+        lines = io.StringIO(f.read().decode("utf-8"), newline="").readlines()
+    if not _empty_api_key(lines):
+        return False
+    temporary = f".{name}.{os.urandom(6).hex()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    out = os.open(temporary, flags, 0o600, dir_fd=folder_fd)
+    try:
+        with os.fdopen(out, "w", encoding="utf-8", newline="") as f:
+            os.fchmod(f.fileno(), stat.S_IMODE(found.st_mode))
+            f.writelines(lines)
+        os.replace(temporary, name, src_dir_fd=folder_fd, dst_dir_fd=folder_fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary, dir_fd=folder_fd)
+        raise
+    return True
+
+
+def _clear_by_path(path: Path) -> bool:
     with path.open(encoding="utf-8", newline="") as f:
         lines = f.readlines()
+    if not _empty_api_key(lines):
+        return False
+    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.writelines(lines)
+        shutil.copymode(str(path), temporary)
+        os.replace(temporary, str(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+    return True
+
+
+def _empty_api_key(lines: list[str]) -> bool:
+    """Empties, in place, each `api_key` line of `[bridge]`. True when there was one."""
     section = None
     changed = False
     for i, line in enumerate(lines):
@@ -348,15 +508,4 @@ def clear_config_api_key(path: Path) -> bool:
             ending = line[len(line.rstrip("\r\n")) :]
             lines[i] = f"{match.group(1)}api_key ={ending}"
             changed = True
-    if changed:
-        fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.writelines(lines)
-            shutil.copymode(str(path), temporary)
-            os.replace(temporary, str(path))
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary)
-            raise
     return changed

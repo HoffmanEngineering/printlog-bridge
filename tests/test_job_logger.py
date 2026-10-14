@@ -13,6 +13,7 @@ from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import (
     ImageKind,
@@ -57,6 +58,7 @@ async def logging_to(
     backoff=FAST_BACKOFF,
     image_timeout: float | None = None,
     spools: bool = False,
+    adoption: Adoption | None = None,
     **printers: int,
 ):
     """A JobLogger sending to `api`. With `spools`, it links each print to the loaded spools."""
@@ -74,7 +76,9 @@ async def logging_to(
             yield JobLogger(
                 client,
                 {
-                    name: LoggedPrinter(printer_id=printer_id, source="moonraker")
+                    name: LoggedPrinter(
+                        printer_id=printer_id, source="moonraker", adoption=adoption or Adoption()
+                    )
                     for name, printer_id in targets.items()
                 },
                 state_dir,
@@ -103,6 +107,7 @@ def run(
     timeout: float = 1.0,
     backoff=FAST_BACKOFF,
     spools: bool = False,
+    adoption: Adoption | None = None,
     **printers: int,
 ):
     """Emits `events` in order, sending each before the next, as a restart of the bridge would.
@@ -112,7 +117,9 @@ def run(
     """
 
     async def scenario():
-        async with logging_to(api, state_dir, backoff=backoff, spools=spools, **printers) as logger:
+        async with logging_to(
+            api, state_dir, backoff=backoff, spools=spools, adoption=adoption, **printers
+        ) as logger:
             try:
                 await drain(logger, timeout)  # what the last run left in the outbox
                 for event in events:
@@ -410,7 +417,7 @@ class TestWhenTheApiIsDown:
 
         asyncio.run(scenario())
 
-        assert api.requests == [("GET", "/api/Users/me/user-settings")]  # the start's, failed
+        assert api.requests == [("GET", "/api/Prints/claimable")]  # the start's lookup, failed
 
     def test_one_print_the_api_keeps_failing_does_not_hold_up_the_others(self, tmp_path):
         api = FakePrintLogApi()
@@ -457,7 +464,7 @@ class TestWhenTheApiIsDown:
         wait = asyncio.run(scenario())
 
         assert 9 < wait <= 10
-        assert api.requests == [("GET", "/api/Users/me/user-settings")]  # not sent again at once
+        assert api.requests == [("GET", "/api/Prints/claimable")]  # not sent again at once
 
     def test_does_not_retry_a_revoked_key_but_keeps_the_job(self, tmp_path, caplog):
         api = FakePrintLogApi(api_key="the-real-key")
@@ -697,44 +704,71 @@ def report_run(api: FakePrintLogApi, state_dir: Path, *events, register=None):
     return asyncio.run(scenario())
 
 
+def heartbeat_registration(state_dir: Path):
+    """`report_run`'s `register`: the bridge's own hook, `Heartbeat.ensure_registered`."""
+
+    def register(client, board):
+        instance_id = PrinterState.load(state_dir, "voron").instance_id
+        heartbeat = Heartbeat(client, [Connection("voron", instance_id, "moonraker", 42)], board)
+        return heartbeat.ensure_registered
+
+    return register
+
+
 class TestConnection:
     def test_the_connection_is_registered_before_the_print_so_the_print_links_to_it(self, tmp_path):
         api = FakePrintLogApi()
 
-        def register(client, board):
-            instance_id = PrinterState.load(tmp_path, "voron").instance_id
-            heartbeat = Heartbeat(
-                client, [Connection("voron", instance_id, "moonraker", 42)], board
-            )
-            return heartbeat.ensure_registered
-
-        report_run(api, tmp_path, started(), register=register)
+        report_run(api, tmp_path, started(), register=heartbeat_registration(tmp_path))
 
         [print_] = api.prints.values()
         assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
+
+    def test_a_print_waits_for_a_registration_that_could_not_reach_3d_print_log(self, tmp_path):
+        """3D Print Log coming back between the registration and the create (the end of an
+        outage) must not log the print unlinked: it never links to the connection afterwards,
+        and the connection itself would wait for the next heartbeat, minutes away."""
+        api = FakePrintLogApi()
+        api.fail_next(1)  # the registration's PUT; everything after it gets through
+
+        report_run(api, tmp_path, started(), register=heartbeat_registration(tmp_path))
+
+        [print_] = api.prints.values()
+        assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
+        assert [r for r in api.requests if r[0] == "POST"] == [("POST", "/api/Prints")]
 
     def test_a_print_waits_for_its_connection_when_the_line_comes_back_mid_attempt(self, tmp_path):
+        """The same, with the connection cut rather than answered with a 503."""
         api = FakePrintLogApi()
         api.offline = True
+        register = heartbeat_registration(tmp_path)
 
-        def register(client, board):
-            instance_id = PrinterState.load(tmp_path, "voron").instance_id
-            heartbeat = Heartbeat(
-                client, [Connection("voron", instance_id, "moonraker", 42)], board
-            )
+        def register_then_reconnect(client, board):
+            ensure_registered = register(client, board)
 
-            async def register_then_reconnect(printer):
+            async def hook(printer):
                 try:
-                    await heartbeat.ensure_registered(printer)
+                    await ensure_registered(printer)
                 finally:
-                    api.offline = False  # back between the heartbeat and the create
+                    api.offline = False  # back between the registration and the create
 
-            return register_then_reconnect
+            return hook
 
-        report_run(api, tmp_path, started(), register=register)
+        report_run(api, tmp_path, started(), register=register_then_reconnect)
 
         [print_] = api.prints.values()
         assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
+
+    def test_a_refused_registration_still_logs_the_print(self, tmp_path):
+        """Refused is not unreachable: sending it again won't change the answer, so the print
+        goes ahead unlinked rather than waiting for nothing."""
+        api = FakePrintLogApi()
+        api.fail_next(1, status=400)
+
+        report_run(api, tmp_path, started(), register=heartbeat_registration(tmp_path))
+
+        [print_] = api.prints.values()
+        assert print_["connectionId"] is None
 
     def test_a_failed_registration_still_logs_the_print(self, tmp_path):
         api = FakePrintLogApi()

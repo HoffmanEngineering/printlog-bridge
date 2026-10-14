@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import logging
 
+import pytest
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge import __version__
-from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.api_client import ApiClient, ApiUnavailable
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.status import StatusBoard, read_status
 
@@ -174,13 +175,42 @@ def test_ensure_registered_registers_only_once(tmp_path):
     assert len(api.heartbeats) == 1
 
 
+def test_ensure_registered_raises_when_3d_print_log_is_unavailable(tmp_path):
+    """So the print it runs before waits for the API rather than being created unlinked."""
+    api = FakePrintLogApi()
+
+    async def scenario():
+        async with heartbeat(api, tmp_path, VORON) as beat:
+            api.fail_next(1)
+            with pytest.raises(ApiUnavailable):
+                await beat.ensure_registered("voron")
+
+    run(scenario)
+
+    assert api.connections == {}
+
+
+def test_ensure_registered_does_not_raise_when_the_connection_is_refused(tmp_path):
+    api = FakePrintLogApi()
+
+    async def scenario():
+        async with heartbeat(api, tmp_path, VORON) as beat:
+            api.fail_next(1, status=400)
+            await beat.ensure_registered("voron")
+
+    run(scenario)
+
+    assert api.connections == {}
+
+
 def test_ensure_registered_tries_again_after_a_failure(tmp_path):
     api = FakePrintLogApi()
 
     async def scenario():
         async with heartbeat(api, tmp_path, VORON) as beat:
             api.fail_next(1)
-            await beat.ensure_registered("voron")
+            with pytest.raises(ApiUnavailable):
+                await beat.ensure_registered("voron")
             await beat.ensure_registered("voron")
 
     run(scenario)

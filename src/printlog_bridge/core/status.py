@@ -52,6 +52,10 @@ class PrinterReport(Protocol):
     def warn(self, topic: str, message: str | None) -> None:
         """Something the user should fix, until the same `topic` is cleared with None."""
 
+    def moved(self, old: str, new: str, at: str | None = None) -> None:
+        """The printer was found at a new address (`old` and `new` are hosts, `at` when, ISO
+        8601, defaulting to now)."""
+
 
 class NullReport:
     """A PrinterReport that keeps nothing, for code run outside `printlog-bridge run`."""
@@ -66,6 +70,9 @@ class NullReport:
         pass
 
     def warn(self, topic: str, message: str | None) -> None:
+        pass
+
+    def moved(self, old: str, new: str, at: str | None = None) -> None:
         pass
 
 
@@ -95,6 +102,7 @@ class StatusBoard:
                     "last_event_at": None,
                     "last_heartbeat_at": None,
                     "warnings": {},
+                    "moved": None,
                 }
                 for name in printers
             },
@@ -188,6 +196,11 @@ class BoardReport:
             warnings[topic] = message
         self.board.update(self.printer, warnings=warnings)
 
+    def moved(self, old: str, new: str, at: str | None = None) -> None:
+        self.board.update(
+            self.printer, moved={"from": old, "to": new, "at": at or self.board._now()}
+        )
+
     def event(self, text: str) -> None:
         self.board.update(self.printer, last_event=text, last_event_at=self.board._now())
 
@@ -276,6 +289,12 @@ def _printer_lines(printer, known, running: bool, config: BridgeConfig, now: dat
             connection += f" ({printer.adapter.describe()})"
 
     lines = [f"Connection: {connection}"]
+    moved = known.get("moved")
+    if moved:
+        lines.append(
+            f"Address: moved from {moved['from']} to {moved['to']} at {_clock(moved['at'])}; "
+            "the bridge found it again, and the config is unchanged"
+        )
     if running and known.get("printer_state"):
         lines.append(f"Printer state: {known['printer_state']}")
     key = f"API key from {config.describe_api_key()}" if config.api_key else "no API key"
