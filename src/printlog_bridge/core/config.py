@@ -163,11 +163,17 @@ def load_config(
     adapters: Mapping[str, type[Adapter]],
     env: Mapping[str, str],
     home: Path,
+    text: str | None = None,
 ) -> BridgeConfig:
+    """`text` is the config's contents when the caller has already read them (store-key, which
+    checks who owns the file it read); otherwise they are read from `path`."""
     parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
     try:
-        with path.open(encoding="utf-8-sig") as f:
-            parser.read_file(f)
+        if text is not None:
+            parser.read_string(text, source=str(path))
+        else:
+            with path.open(encoding="utf-8-sig") as f:
+                parser.read_file(f)
     except FileNotFoundError:
         raise ConfigError(f"Config file not found: {path}") from None
     except configparser.Error as e:
@@ -432,7 +438,9 @@ _API_KEY_LINE = re.compile(r"^(\s*)api_key\s*[=:]", re.IGNORECASE)  # configpars
 
 def clear_config_api_key(path: Path) -> bool:
     """Empties `api_key` in the config's `[bridge]` section, leaving every other line (and its
-    line ending) as it was. True when there was a line to empty."""
+    line ending) as it was. True when there was a line to empty. A symlink stays one: the file
+    it points to is rewritten."""
+    path = Path(os.path.realpath(path))
     with path.open(encoding="utf-8", newline="") as f:
         lines = f.readlines()
     section = None

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import pytest
 
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.cli.main import main
-from printlog_bridge.core.config import ApiKeySource, load_config
+from printlog_bridge.core.config import ApiKeySource, clear_config_api_key, load_config
 
 PRINTERS = "[printer voron]\nprinter_id = 42\nurl = http://voron:7125\nmoonraker_api_key = mk\n"
 
@@ -35,10 +36,36 @@ def no_key_in_the_environment(monkeypatch):
     monkeypatch.delenv("PRINTLOG_API_KEY", raising=False)
 
 
+NAMES = {0: "root", 1000: "pi", 1001: "bob"}
+
+
+class Owners:
+    """Who store-key runs as, and who owns the config and its folder, as it sees them: the
+    tests can't chown files, and CI isn't root (a container may be)."""
+
+    def __init__(self, monkeypatch):
+        self.euid = 1000
+        self.file = 1000
+        self.folder = 1000
+        self.folder_mode = 0o755
+        self.on_file_check = None
+        monkeypatch.setattr("printlog_bridge.cli.main.os.geteuid", lambda: self.euid, raising=False)
+        monkeypatch.setattr("printlog_bridge.cli.main._owner", self.owner)
+        monkeypatch.setattr("printlog_bridge.cli.main._user_name", NAMES.get)
+        monkeypatch.delenv("SUDO_UID", raising=False)
+
+    def owner(self, fd):
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            return self.folder, stat.S_IFDIR | self.folder_mode
+        if self.on_file_check is not None:
+            self.on_file_check()
+        return self.file, mode
+
+
 @pytest.fixture(autouse=True)
-def not_root(monkeypatch):
-    """As a normal user, whoever runs the tests (CI isn't root; a container may be)."""
-    monkeypatch.setattr("printlog_bridge.cli.main.os.geteuid", lambda: 1000, raising=False)
+def owners(monkeypatch):
+    return Owners(monkeypatch)
 
 
 def test_moves_a_key_out_of_the_config(tmp_path, capsys):
@@ -166,75 +193,178 @@ def test_run_says_when_it_cant_write_the_state_directory(tmp_path, capsys):
     assert "/data" in err
 
 
+POSIX = pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX owners")
+
+
+@POSIX
 class TestNotAsRoot:
     """`sudo printlog-bridge store-key` would write the key under root's home and leave the
     user's config owned by root, so the service, which runs as that user, couldn't read either."""
 
     @pytest.fixture(autouse=True)
-    def as_root(self, monkeypatch):
-        monkeypatch.setattr("printlog_bridge.cli.main.os.geteuid", lambda: 0, raising=False)
+    def as_root(self, owners, monkeypatch):
+        owners.euid = 0
+        monkeypatch.setenv("SUDO_UID", "1000")
 
-    def owned_by(self, monkeypatch, uid):
-        monkeypatch.setattr("printlog_bridge.cli.main._owner_uid", lambda path: uid)
-
-    def test_refuses_a_config_another_user_owns(self, tmp_path, monkeypatch, capsys):
-        path = write_config(tmp_path, "api_key = k-inline\n")
-        before = path.read_bytes()
-        self.owned_by(monkeypatch, 4242)
-        monkeypatch.setattr("printlog_bridge.cli.main._user_name", lambda uid: "pi")
-
+    def refused(self, path, capsys, before=None):
         assert main(["store-key", "--config", str(path)]) == 1
+        if before is not None:
+            assert path.read_bytes() == before, "the config is left as it was"
+        assert not (path.parent / "state").exists(), "no key file, nor a state directory"
+        return capsys.readouterr().err
 
-        assert path.read_bytes() == before, "the config is left as it was"
-        assert not (tmp_path / "state").exists(), "no key file, nor a state directory"
-        err = capsys.readouterr().err
+    def test_refuses_a_config_another_user_owns(self, tmp_path, capsys):
+        path = write_config(tmp_path, "api_key = k-inline\n")
+
+        err = self.refused(path, capsys, path.read_bytes())
+
         assert "root" in err
         assert "Run it as pi, without sudo" in err
         assert f"store-key --config {path}" in err
 
-    def test_refuses_without_asking_for_a_key(self, tmp_path, monkeypatch, capsys):
+    def test_refuses_a_config_an_earlier_sudo_left_to_root(self, tmp_path, owners, capsys):
+        """The config is root's, but its folder and the bridge are pi's: storing the key under
+        root's home would leave pi's bridge without one."""
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        owners.file = 0
+
+        err = self.refused(path, capsys, path.read_bytes())
+
+        assert f"sudo chown pi: {path}" in err
+        assert "without sudo" in err
+
+    def test_refuses_without_asking_for_a_key(self, tmp_path, owners, monkeypatch):
         path = write_config(tmp_path, "")
-        self.owned_by(monkeypatch, 4242)
+        owners.file = 0
         monkeypatch.setattr(sys, "stdin", io.StringIO("k-new\n"))
 
         assert main(["store-key", "--config", str(path)]) == 1
 
-        assert not (tmp_path / "state" / "api_key").exists()
+        assert not (tmp_path / "state").exists()
         assert sys.stdin.read() == "k-new\n", "the key wasn't read"
 
-    def test_names_the_owner_by_uid_when_it_has_no_name(self, tmp_path, monkeypatch, capsys):
+    def test_names_the_owner_by_uid_when_it_has_no_name(self, tmp_path, owners, capsys):
         path = write_config(tmp_path, "")
-        self.owned_by(monkeypatch, 4242)
-        monkeypatch.setattr("printlog_bridge.cli.main._user_name", lambda uid: None)
+        owners.file = owners.folder = 4242
 
-        assert main(["store-key", "--config", str(path)]) == 1
+        assert "uid 4242" in self.refused(path, capsys)
 
-        assert "uid 4242" in capsys.readouterr().err
-
-    def test_refuses_when_there_is_no_config_to_find(self, tmp_path, monkeypatch, capsys):
+    def test_refuses_when_there_is_no_config_to_find(self, tmp_path, capsys):
         """`sudo printlog-bridge store-key` looks in root's home and finds nothing: saying so
         is less useful than saying not to use sudo."""
-        self.owned_by(monkeypatch, None)
+        err = self.refused(tmp_path / "missing.cfg", capsys)
 
-        assert main(["store-key", "--config", str(tmp_path / "missing.cfg")]) == 1
-
-        err = capsys.readouterr().err
         assert "root" in err
         assert "the user the bridge runs as" in err
 
-    def test_a_config_root_owns_is_roots_to_change(self, tmp_path, monkeypatch):
-        """A bridge set up as root (its config and state are root's) still works."""
+    def test_refuses_roots_own_config_through_sudo(self, tmp_path, owners, capsys):
         path = write_config(tmp_path, "api_key = k-inline\n")
-        self.owned_by(monkeypatch, 0)
+        owners.file = owners.folder = 0
+
+        err = self.refused(path, capsys, path.read_bytes())
+
+        assert "sudo" in err
+        assert "pi" in err
+
+    def test_refuses_a_root_config_in_a_folder_others_can_write(
+        self, tmp_path, owners, monkeypatch, capsys
+    ):
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        owners.file = owners.folder = 0
+        owners.folder_mode = 0o777
+        monkeypatch.delenv("SUDO_UID")
+
+        assert "other users can write" in self.refused(path, capsys, path.read_bytes())
+
+    @pytest.mark.parametrize("sudo_uid", [None, "0"])
+    def test_a_config_root_owns_is_roots_to_change(self, tmp_path, owners, monkeypatch, sudo_uid):
+        """A bridge set up as root (its config, folder and state are root's) still works,
+        from a root shell rather than through sudo."""
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        owners.file = owners.folder = 0
+        if sudo_uid is None:
+            monkeypatch.delenv("SUDO_UID")
+        else:
+            monkeypatch.setenv("SUDO_UID", sudo_uid)
 
         assert main(["store-key", "--config", str(path)]) == 0
 
         assert load(path).api_key_source is ApiKeySource.KEY_FILE
 
-    @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX owners")
-    def test_the_owner_is_the_config_files(self, tmp_path):
-        from printlog_bridge.cli.main import _owner_uid
+    def test_the_config_checked_is_the_config_read(self, tmp_path, owners, monkeypatch):
+        """Swapping the file between the check and the read can't point root elsewhere."""
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        owners.file = owners.folder = 0
+        monkeypatch.delenv("SUDO_UID")
+        evil = tmp_path / "evil"
 
-        path = write_config(tmp_path, "")
-        assert _owner_uid(path) == path.stat().st_uid
-        assert _owner_uid(tmp_path / "missing.cfg") is None
+        def swap():
+            swapped = tmp_path / "swapped.cfg"
+            swapped.write_text(
+                f"[bridge]\nstate_dir = {evil}\napi_key = k-evil\n{PRINTERS}", encoding="utf-8"
+            )
+            os.replace(str(swapped), str(path))
+
+        owners.on_file_check = swap
+
+        main(["store-key", "--config", str(path)])
+
+        assert not evil.exists()
+        assert (tmp_path / "state" / "api_key").read_text(encoding="utf-8") == "k-inline\n"
+
+
+@POSIX
+class TestAsAnotherUser:
+    """`sudo -u bob`, or bob himself, on pi's config: the key file would be bob's, which pi's
+    bridge can't read, and the config pi's, which bob can't rewrite."""
+
+    def test_refuses_another_users_config(self, tmp_path, owners, capsys):
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        before = path.read_bytes()
+        owners.euid = 1001
+
+        assert main(["store-key", "--config", str(path)]) == 1
+
+        assert path.read_bytes() == before
+        assert not (tmp_path / "state").exists(), "nothing is written"
+        err = capsys.readouterr().err
+        assert "belongs to pi" in err
+        assert "Run it as pi" in err
+
+    def test_refuses_a_config_an_earlier_sudo_left_to_root(self, tmp_path, owners, capsys):
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        owners.file = 0
+
+        assert main(["store-key", "--config", str(path)]) == 1
+
+        assert not (tmp_path / "state").exists()
+        assert f"sudo chown pi: {path}" in capsys.readouterr().err
+
+
+@POSIX
+class TestSymlinkedConfig:
+    """A config kept with someone's dotfiles is often a link: it stays one."""
+
+    def linked(self, tmp_path):
+        (tmp_path / "dotfiles").mkdir()
+        target = write_config(tmp_path / "dotfiles", "api_key = k-inline\n")
+        link = tmp_path / "printlog-bridge.cfg.link"
+        link.symlink_to(target)
+        return link, target
+
+    def test_store_key_keeps_the_link(self, tmp_path):
+        link, target = self.linked(tmp_path)
+
+        assert main(["store-key", "--config", str(link)]) == 0
+
+        assert link.is_symlink()
+        assert "k-inline" not in target.read_text(encoding="utf-8")
+        assert load(link).api_key == "k-inline"
+
+    def test_clearing_the_key_keeps_the_link(self, tmp_path):
+        link, target = self.linked(tmp_path)
+
+        assert clear_config_api_key(link)
+
+        assert link.is_symlink()
+        assert "k-inline" not in target.read_text(encoding="utf-8")

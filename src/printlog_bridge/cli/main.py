@@ -5,14 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import errno
 import getpass
 import logging
 import logging.handlers
 import os
 import signal
+import stat
 import sys
 import tempfile
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from pathlib import Path
 
 from printlog_bridge import __version__
@@ -181,12 +183,16 @@ def _store_key(explicit_config: Path | None) -> int:
     env = dict(os.environ)
     home = Path.home()
     config_path = find_config(explicit_config, env=env, home=home)
-    refusal = _root_refusal(config_path, explicit_config)
-    if refusal:
-        print(f"printlog-bridge: {refusal}", file=sys.stderr)
-        return 1
     try:
-        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        config_path, text = _read_own_config(config_path, explicit_config, env)
+    except _Refused as e:
+        print(f"printlog-bridge: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"printlog-bridge: can't read {config_path}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    try:
+        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home, text=text)
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
         return 2
@@ -231,38 +237,142 @@ def _store_key(explicit_config: Path | None) -> int:
     return 0
 
 
-def _root_refusal(config_path: Path, explicit_config: Path | None) -> str | None:
-    """Why `store-key` won't run, when it runs as root on a config that isn't root's.
+class _Refused(Exception):
+    """store-key won't run as this user on this config. The message says who should run it."""
 
-    With sudo, the key file would land in root's home (or, in a state directory that is the
-    user's, be root's and mode 600), and the rewritten config would be root's: the bridge,
-    which runs as the config's owner, could then read neither. A bridge whose config root owns
-    runs as root, so root may store its key."""
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        return None
-    owner = _owner_uid(config_path)
-    if owner == 0:
-        return None
+
+def _read_own_config(
+    config_path: Path, explicit_config: Path | None, env: Mapping[str, str]
+) -> tuple[Path, str | None]:
+    """The config's real path (through any symlink, so rewriting it keeps the link) and its
+    text, or None when there is no such file (load_config then says so).
+
+    Raises _Refused unless the config belongs to the user running store-key: as another user,
+    the key file would be that user's, which the bridge can't read, and as root, under root's
+    home besides. Root may run it only on root's own config, in a folder only root can write,
+    and not through sudo. The ownership checked is that of the file opened, which is the file
+    read, so it can't be swapped in between."""
+    path = Path(os.path.realpath(config_path))
+    if not hasattr(os, "geteuid"):  # Windows: no owners to check
+        return path, None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    data = file_owner = folder_owner = None
+    folder_mode = 0
+    try:
+        folder_fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY | nofollow)
+    except FileNotFoundError:
+        folder_fd = None
+    if folder_fd is not None:
+        try:
+            folder_owner, folder_mode = _owner(folder_fd)
+            try:
+                fd = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | nofollow, dir_fd=folder_fd)
+            except FileNotFoundError:
+                fd = None
+            if fd is not None:
+                with os.fdopen(fd, "rb") as f:
+                    file_owner, mode = _owner(f.fileno())
+                    if not stat.S_ISREG(mode):
+                        raise OSError(errno.EINVAL, "not a file")
+                    data = f.read()
+        finally:
+            os.close(folder_fd)
+
     command = "printlog-bridge store-key"
     if explicit_config is not None:
         command += f" --config {explicit_config}"
-    if owner is None:
-        who = "the user the bridge runs as (such as pi)"
-    else:
-        who = _user_name(owner) or f"uid {owner}"
+    refusal = _ownership_refusal(
+        path,
+        command,
+        euid=os.geteuid(),
+        file_owner=file_owner,
+        folder_owner=folder_owner,
+        folder_mode=folder_mode,
+        sudo_uid=(env.get("SUDO_UID") or "").strip(),
+    )
+    if refusal:
+        raise _Refused(refusal)
+    if data is None:
+        return path, None
+    try:
+        return path, data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise OSError(errno.EINVAL, f"not UTF-8 text ({e})") from None
+
+
+def _ownership_refusal(
+    path: Path,
+    command: str,
+    *,
+    euid: int,
+    file_owner: int | None,
+    folder_owner: int | None,
+    folder_mode: int,
+    sudo_uid: str,
+) -> str | None:
+    """Why store-key won't run as `euid` on the config at `path`, or None when it may."""
+    if file_owner is None:  # no config: load_config says so, unless this is sudo's root
+        if euid != 0:
+            return None
+        return (
+            "don't run store-key as root (or with sudo): the key file and the config would then "
+            "belong to root, and the bridge couldn't read them. Run it as the user the bridge "
+            f"runs as (such as pi), without sudo: {command}"
+        )
+    if file_owner == 0 and euid != 0:
+        return _give_back(path, euid, command)
+    if file_owner != euid:
+        owner = _who(file_owner)
+        if euid == 0:
+            return (
+                "don't run store-key as root (or with sudo): the key file and the config would "
+                f"then belong to root, and the bridge couldn't read them. Run it as {owner}, "
+                f"without sudo: {command}"
+            )
+        return (
+            f"{path} belongs to {owner}, but store-key is running as {_who(euid)}: the key file "
+            f"would be {_who(euid)}'s, and the bridge, which runs as {owner}, couldn't read it. "
+            f"Run it as {owner}: {command}"
+        )
+    if euid != 0:
+        return None
+    # Root's own config: is it really a bridge that runs as root?
+    if folder_owner != 0:
+        return _give_back(path, folder_owner, command)
+    if folder_mode & 0o022:
+        return (
+            f"other users can write {path.parent}, so they could change {path} under root. "
+            f"Run store-key as the user the bridge runs as, or make the folder root's alone."
+        )
+    if sudo_uid not in ("", "0"):
+        user = _who(int(sudo_uid)) if sudo_uid.isdigit() else sudo_uid
+        return (
+            f"store-key was started through sudo by {user}. Run it as the user the bridge runs "
+            f"as, without sudo: {command}. Only if the bridge itself runs as root, run it from a "
+            "root login (`su -`), not through sudo."
+        )
+    return None
+
+
+def _give_back(path: Path, uid: int | None, command: str) -> str:
+    """For a config left root's by an earlier `sudo store-key`, in a folder that isn't."""
+    who = _who(uid) if uid is not None else "the user the bridge runs as"
+    chown = (_user_name(uid) or str(uid)) if uid is not None else "<user>"
     return (
-        "don't run store-key as root (or with sudo): the key file and the config would then "
-        f"belong to root, and the bridge couldn't read them. Run it as {who}, without sudo: "
-        f"{command}"
+        f"{path} belongs to root, probably from an earlier `sudo printlog-bridge store-key`, "
+        f"so the bridge, which runs as {who}, can't rewrite it. Give it back, then run store-key "
+        f"as {who}, without sudo: sudo chown {chown}: {path} && {command}"
     )
 
 
-def _owner_uid(path: Path) -> int | None:
-    """The uid that owns `path`, or None when there is no such file."""
-    try:
-        return path.stat().st_uid
-    except OSError:
-        return None
+def _owner(fd: int) -> tuple[int, int]:
+    """The owner and mode of the file open as `fd`."""
+    result = os.fstat(fd)
+    return result.st_uid, result.st_mode
+
+
+def _who(uid: int) -> str:
+    return _user_name(uid) or f"uid {uid}"
 
 
 def _user_name(uid: int) -> str | None:
