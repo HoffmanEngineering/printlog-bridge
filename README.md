@@ -29,7 +29,7 @@ It asks for an API key and the printer's number in 3D Print Log (press Enter to 
 - adds an `[update_manager printlog-bridge]` section to `moonraker.conf`, so updates show up in Mainsail's and Fluidd's update panels, and restarts Moonraker to load it;
 - copies the `PRINTLOG_SET_SPOOL` macros to `~/printer_data/config/printlog.cfg` and adds `[include printlog.cfg]` to `printer.cfg` (above its SAVE_CONFIG block), unless you pass `--no-macros`. Restart Klipper when it isn't printing to load them; the installer doesn't, since that would end a print.
 
-Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key for later, store it with `~/printlog-bridge-env/bin/printlog-bridge store-key`; set the printer in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it). Then restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
+Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key for later, store it with `~/printlog-bridge-env/bin/printlog-bridge store-key`, as yourself rather than with `sudo` (it refuses to run as root); set the printer in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it). Then restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
 
 `./printlog-bridge/uninstall.sh` removes the service and the virtualenv, puts `moonraker.conf`, `moonraker.asvc` and `printer.cfg` back exactly as they were, and removes `printlog.cfg` unless you changed it. It keeps your config and the state directory (including prints not yet logged) for a reinstall; `--purge` removes those too.
 
@@ -121,7 +121,7 @@ docker exec printlog-bridge printlog-bridge doctor
 
 To find your printers' addresses for the config, run `docker run --rm <image> discover --subnet 192.168.1.0/24` with your LAN's network: with Docker's default (bridge) networking the container sees its own network, not your LAN's, so it needs telling which one to scan. Finding a printer again after its address changes works with bridge networking too; only the zeroconf shortcut needs host networking (`network_mode: host`), and the scan covers for it.
 
-Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`. Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
+Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`; `run` and `doctor` then warn that the key travels unencrypted. Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
 
 ## Try it
 

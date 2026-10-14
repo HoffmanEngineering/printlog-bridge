@@ -409,7 +409,15 @@ class TestOnlyOutboundConnections:
         assert load_config(path, adapters=ADAPTERS, env={}, home=tmp_path).api_url == url
 
     @pytest.mark.parametrize(
-        "url", ["http://192.168.4.65:5000", "http://10.0.0.2:5000", "http://[fd00::2]:5000"]
+        "url",
+        [
+            "http://192.168.4.65:5000",
+            "http://10.0.0.2:5000",
+            "http://172.16.0.5:5000",
+            "http://169.254.10.20:5000",
+            "http://[fd00::2]:5000",
+            "http://[::ffff:192.168.4.65]:5000",
+        ],
     )
     def test_plain_http_to_a_lan_address_needs_the_opt_in(self, tmp_path, url):
         """A development API on another computer on the network, for testing before a release."""
@@ -427,7 +435,21 @@ class TestOnlyOutboundConnections:
         assert load_config(path, adapters=ADAPTERS, env=env, home=tmp_path).api_url == url
 
     @pytest.mark.parametrize(
-        "url", ["http://api.3dprintlog.com", "http://8.8.8.8:5000", "http://dev-pc.local:5000"]
+        "url",
+        [
+            "http://api.3dprintlog.com",
+            "http://8.8.8.8:5000",
+            "http://dev-pc.local:5000",
+            # Python calls these private, but they aren't a LAN: Teredo tunnels to the
+            # internet, the others are benchmarking, documentation and reserved addresses.
+            "http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]:5000",
+            "http://198.18.0.1:5000",
+            "http://192.0.2.1:5000",
+            "http://[2001:db8::1]:5000",
+            "http://240.0.0.1:5000",
+            "http://0.1.2.3:5000",
+            "http://[::ffff:8.8.8.8]:5000",
+        ],
     )
     def test_the_opt_in_never_allows_plain_http_off_the_lan(self, tmp_path, url):
         path = tmp_path / "printlog-bridge.cfg"
@@ -437,6 +459,73 @@ class TestOnlyOutboundConnections:
 
         with pytest.raises(ConfigError, match="https"):
             load_config(path, adapters=ADAPTERS, env={}, home=tmp_path)
+
+
+class TestPlainHttpOnTheLanIsWarnedAbout:
+    """`allow_http_on_lan` sends the API key unencrypted, so it never goes unremarked."""
+
+    LAN = "http://10.255.255.1:5000"
+
+    def config(self, tmp_path, url, *, api_key=""):
+        path = tmp_path / "printlog-bridge.cfg"
+        path.write_text(
+            f"[bridge]\nallow_http_on_lan = true\napi_url = {url}\napi_key = {api_key}\n"
+            f"state_dir = {tmp_path / 'state'}\n[printer v]\nprinter_id = 42\n"
+            "url = http://v:7125\n"
+        )
+        return load_config(path, adapters=ADAPTERS, env={}, home=tmp_path)
+
+    def test_the_config_says_why(self, tmp_path):
+        warning = self.config(tmp_path, self.LAN).api_url_warning()
+
+        assert warning is not None
+        assert self.LAN in warning
+        assert "unencrypted" in warning
+
+    def test_hides_a_password_in_the_url(self, tmp_path):
+        config = self.config(tmp_path, "http://dev:hunter22@10.0.0.2:5000/?token=abc123")
+        text = config.api_url_warning()
+
+        assert "hunter22" not in text and "abc123" not in text
+        assert "10.0.0.2:5000" in text
+
+    @pytest.mark.parametrize("url", ["https://api.3dprintlog.com", "http://127.0.0.1:5000"])
+    def test_not_for_https_or_this_computer(self, tmp_path, url):
+        assert self.config(tmp_path, url).api_url_warning() is None
+
+    def test_doctor_warns(self, tmp_path):
+        from printlog_bridge.core.checks import Status
+        from printlog_bridge.core.doctor import diagnose
+
+        self.config(tmp_path, self.LAN)  # writes it; without a key, doctor sends nothing
+        results = asyncio.run(
+            diagnose(tmp_path / "printlog-bridge.cfg", adapters=ADAPTERS, env={}, home=tmp_path)
+        )
+
+        warnings = [r for r in results if r.status is Status.WARN and self.LAN in r.detail]
+        assert len(warnings) == 1
+        assert "unencrypted" in warnings[0].detail
+
+    def test_run_logs_a_warning(self, tmp_path, caplog):
+        from printlog_bridge.core.bridge import run_bridge
+
+        config = self.config(tmp_path, self.LAN, api_key="k")
+        for printer in config.printers:
+            printer.adapter.run = lambda sink, report: asyncio.Event().wait()
+
+        async def scenario():
+            task = asyncio.ensure_future(run_bridge(config))
+            await eventually(lambda: any(self.LAN in r.getMessage() for r in caplog.records))
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(scenario())
+
+        assert any(
+            r.levelno == logging.WARNING and self.LAN in r.getMessage() for r in caplog.records
+        )
 
 
 class TestMoonrakerUrlsAreMasked:
