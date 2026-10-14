@@ -4,6 +4,7 @@ serve it, and takes it out of printlog-bridge.cfg."""
 from __future__ import annotations
 
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -32,6 +33,12 @@ def load(path: Path):
 @pytest.fixture(autouse=True)
 def no_key_in_the_environment(monkeypatch):
     monkeypatch.delenv("PRINTLOG_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def not_root(monkeypatch):
+    """As a normal user, whoever runs the tests (CI isn't root; a container may be)."""
+    monkeypatch.setattr("printlog_bridge.cli.main.os.geteuid", lambda: 1000, raising=False)
 
 
 def test_moves_a_key_out_of_the_config(tmp_path, capsys):
@@ -157,3 +164,77 @@ def test_run_says_when_it_cant_write_the_state_directory(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "can't write the state directory" in err
     assert "/data" in err
+
+
+class TestNotAsRoot:
+    """`sudo printlog-bridge store-key` would write the key under root's home and leave the
+    user's config owned by root, so the service, which runs as that user, couldn't read either."""
+
+    @pytest.fixture(autouse=True)
+    def as_root(self, monkeypatch):
+        monkeypatch.setattr("printlog_bridge.cli.main.os.geteuid", lambda: 0, raising=False)
+
+    def owned_by(self, monkeypatch, uid):
+        monkeypatch.setattr("printlog_bridge.cli.main._owner_uid", lambda path: uid)
+
+    def test_refuses_a_config_another_user_owns(self, tmp_path, monkeypatch, capsys):
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        before = path.read_bytes()
+        self.owned_by(monkeypatch, 4242)
+        monkeypatch.setattr("printlog_bridge.cli.main._user_name", lambda uid: "pi")
+
+        assert main(["store-key", "--config", str(path)]) == 1
+
+        assert path.read_bytes() == before, "the config is left as it was"
+        assert not (tmp_path / "state").exists(), "no key file, nor a state directory"
+        err = capsys.readouterr().err
+        assert "root" in err
+        assert "Run it as pi, without sudo" in err
+        assert f"store-key --config {path}" in err
+
+    def test_refuses_without_asking_for_a_key(self, tmp_path, monkeypatch, capsys):
+        path = write_config(tmp_path, "")
+        self.owned_by(monkeypatch, 4242)
+        monkeypatch.setattr(sys, "stdin", io.StringIO("k-new\n"))
+
+        assert main(["store-key", "--config", str(path)]) == 1
+
+        assert not (tmp_path / "state" / "api_key").exists()
+        assert sys.stdin.read() == "k-new\n", "the key wasn't read"
+
+    def test_names_the_owner_by_uid_when_it_has_no_name(self, tmp_path, monkeypatch, capsys):
+        path = write_config(tmp_path, "")
+        self.owned_by(monkeypatch, 4242)
+        monkeypatch.setattr("printlog_bridge.cli.main._user_name", lambda uid: None)
+
+        assert main(["store-key", "--config", str(path)]) == 1
+
+        assert "uid 4242" in capsys.readouterr().err
+
+    def test_refuses_when_there_is_no_config_to_find(self, tmp_path, monkeypatch, capsys):
+        """`sudo printlog-bridge store-key` looks in root's home and finds nothing: saying so
+        is less useful than saying not to use sudo."""
+        self.owned_by(monkeypatch, None)
+
+        assert main(["store-key", "--config", str(tmp_path / "missing.cfg")]) == 1
+
+        err = capsys.readouterr().err
+        assert "root" in err
+        assert "the user the bridge runs as" in err
+
+    def test_a_config_root_owns_is_roots_to_change(self, tmp_path, monkeypatch):
+        """A bridge set up as root (its config and state are root's) still works."""
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        self.owned_by(monkeypatch, 0)
+
+        assert main(["store-key", "--config", str(path)]) == 0
+
+        assert load(path).api_key_source is ApiKeySource.KEY_FILE
+
+    @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="POSIX owners")
+    def test_the_owner_is_the_config_files(self, tmp_path):
+        from printlog_bridge.cli.main import _owner_uid
+
+        path = write_config(tmp_path, "")
+        assert _owner_uid(path) == path.stat().st_uid
+        assert _owner_uid(tmp_path / "missing.cfg") is None

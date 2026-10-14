@@ -181,6 +181,10 @@ def _store_key(explicit_config: Path | None) -> int:
     env = dict(os.environ)
     home = Path.home()
     config_path = find_config(explicit_config, env=env, home=home)
+    refusal = _root_refusal(config_path, explicit_config)
+    if refusal:
+        print(f"printlog-bridge: {refusal}", file=sys.stderr)
+        return 1
     try:
         config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
     except ConfigError as e:
@@ -225,6 +229,51 @@ def _store_key(explicit_config: Path | None) -> int:
     if env.get(API_KEY_ENV):
         print(f"Note: {API_KEY_ENV} is set here, and wins over the stored key while it is.")
     return 0
+
+
+def _root_refusal(config_path: Path, explicit_config: Path | None) -> str | None:
+    """Why `store-key` won't run, when it runs as root on a config that isn't root's.
+
+    With sudo, the key file would land in root's home (or, in a state directory that is the
+    user's, be root's and mode 600), and the rewritten config would be root's: the bridge,
+    which runs as the config's owner, could then read neither. A bridge whose config root owns
+    runs as root, so root may store its key."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    owner = _owner_uid(config_path)
+    if owner == 0:
+        return None
+    command = "printlog-bridge store-key"
+    if explicit_config is not None:
+        command += f" --config {explicit_config}"
+    if owner is None:
+        who = "the user the bridge runs as (such as pi)"
+    else:
+        who = _user_name(owner) or f"uid {owner}"
+    return (
+        "don't run store-key as root (or with sudo): the key file and the config would then "
+        f"belong to root, and the bridge couldn't read them. Run it as {who}, without sudo: "
+        f"{command}"
+    )
+
+
+def _owner_uid(path: Path) -> int | None:
+    """The uid that owns `path`, or None when there is no such file."""
+    try:
+        return path.stat().st_uid
+    except OSError:
+        return None
+
+
+def _user_name(uid: int) -> str | None:
+    try:
+        import pwd
+    except ImportError:  # Windows
+        return None
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return None
 
 
 def _ask_for_key() -> str:
