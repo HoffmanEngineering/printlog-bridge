@@ -3,8 +3,10 @@
 The bridge reads each printer's loaded spools from 3D Print Log when it starts, every five
 minutes after, and again when a print is created or completed, so a spool changed in the app
 between prints is on the next print's usage rows. `PRINTLOG_SET_SPOOL` assigns a spool from the
-printer's console (`spool_command`), and a reader in a slot, such as the Snapmaker U1's RFID
-reader, assigns the spool whose tag it reads (`spool_reading`).
+printer's console (`spool_command`), and so does a spool picked in Mainsail, Fluidd or
+KlipperScreen when Moonraker's Spoolman integration points at 3D Print Log, by its spool number.
+A reader in a slot, such as the Snapmaker U1's RFID reader, assigns the spool whose tag it reads
+(`spool_reading`).
 
 Assigning a spool is not queued like a print: it says at once whether it worked, and a command
 that couldn't reach 3D Print Log is run again by the user rather than applied hours later, when
@@ -16,8 +18,9 @@ effect without a restart, and at once when the spool is pulled out and put back 
 A spool assigned to a slot while a job runs is a swap (#44): `on_swap` hears of it, with the
 point the job had reached, so the job's usage on that slot is split there.
 
-What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration, its
-active spool and its usage reports are left alone.
+What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration is
+followed only when its server is 3D Print Log (`adapters/moonraker/spoolman.py`); a Spoolman
+server of the user's own, and its active spool and usage reports, are left alone.
 """
 
 from __future__ import annotations
@@ -297,7 +300,7 @@ class Spools:
 
     async def _carry_out(self, command: SpoolCommand, printer_id: int) -> str:
         slot = _label(command.slot)
-        if command.filament_id is None and command.tag is None:
+        if command.filament_id is None and command.tag is None and command.spool_number is None:
             await self.api.unload_slot(printer_id, command.slot)
             self._loaded.setdefault(command.printer, {}).pop(command.slot, None)
             return f"{slot} has no spool in 3D Print Log now"
@@ -314,6 +317,14 @@ class Spools:
                     f"no spool in 3D Print Log has tag {uid}; nothing changed. Add the tag to "
                     "the spool in the app, then run it again."
                 )
+            filament_id = str(spool["id"])
+        elif command.spool_number is not None:
+            spool = await self.api.filament_by_number(command.spool_number)
+            if spool is None:
+                # A deleted spool, or a number from another Spoolman: nothing to load, and
+                # nothing asks again until the next pick.
+                number = command.spool_number
+                return f"no spool in 3D Print Log has number {number}; nothing changed"
             filament_id = str(spool["id"])
         else:
             filament_id = str(command.filament_id)
@@ -522,6 +533,8 @@ def _describe(command: SpoolCommand) -> str:
     slot = _label(command.slot)
     if command.tag is not None:
         return f"set {slot} to the spool with tag {command.tag}"
+    if command.spool_number is not None:
+        return f"set {slot} to spool number {command.spool_number}"
     if command.filament_id is not None:
         return f"set {slot} to spool {command.filament_id}"
     return f"clear {slot}"

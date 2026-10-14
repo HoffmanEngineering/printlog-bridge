@@ -126,9 +126,12 @@ class EventSink(Protocol):
 
 @dataclass(frozen=True)
 class SpoolCommand:
-    """The user assigns a spool to a slot on the printer (`PRINTLOG_SET_SPOOL`), or clears it.
+    """The user assigns a spool to a slot on the printer (`PRINTLOG_SET_SPOOL`, or a spool
+    picked in Mainsail, Fluidd or KlipperScreen through Moonraker's Spoolman integration), or
+    clears it.
 
-    Exactly one of `filament_id` and `tag` names the spool; with neither, the slot is cleared.
+    Exactly one of `filament_id`, `tag` and `spool_number` names the spool; with none, the slot
+    is cleared.
     """
 
     printer: str
@@ -138,6 +141,9 @@ class SpoolCommand:
     """The spool's id in 3D Print Log."""
     tag: str | None = None
     """The UID of an RFID/NFC tag on the spool, in any common format (`04:A2:3F:11`)."""
+    spool_number: int | None = None
+    """The spool's number in 3D Print Log (`spoolNumber`), which is what Moonraker's Spoolman
+    integration calls its spool id when it is pointed at 3D Print Log."""
     slot_count: int | None = None
     """How many slots (tools) the printer has, when the adapter knows."""
     during: JobPoint | None = None

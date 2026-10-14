@@ -85,6 +85,29 @@ class TestSetSpool:
         assert "DEADBEEF" in answer
         assert "no spool" in answer.lower()
 
+    def test_spool_number_loads_the_spool_it_names(self):
+        # What a spool picked in Mainsail or Fluidd sends: Moonraker's spool id is the number.
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 2
+        api.add_spool("Galaxy Black PLA", number=11)
+        spool = api.add_spool("Silk Gold", number=12)
+
+        answer = run(api, lambda s: s.spool_command(command(1, spool_number=12)))
+
+        assert api.slot_spools(42) == {1: spool}
+        assert "Silk Gold" in answer
+        assert ("GET", "/api/Filaments/by-number/12") in api.requests
+
+    def test_unknown_spool_number_changes_nothing(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Loaded", number=1)
+        api.user_loads(42, 0, spool)
+
+        answer = run(api, lambda s: s.spool_command(command(0, spool_number=99)))
+
+        assert api.slot_spools(42) == {0: spool}
+        assert answer == "no spool in 3D Print Log has number 99; nothing changed"
+
     def test_a_tag_that_isnt_hex_is_refused_without_asking_the_api(self):
         api = FakePrintLogApi()
 
