@@ -8,10 +8,15 @@ while the bridge (or its connection) was down is still reported. The sink recogn
 With `images`, each start is followed by the job's thumbnail, and each end seen as it happens
 by a webcam snapshot (when snapshots are on). A job that ended while the bridge was away gets
 no snapshot: the camera would show the bed as it is now, not as the job left it.
+
+While a job runs, the tracker also knows how far it has got (`point`), which a spool assigned
+mid-print is split at (#44), and reports a pause for a filament change (`changes.py`) once the
+job resumes from it, prompting on the console for the new spool when it sees one.
 """
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from collections.abc import Mapping
@@ -24,14 +29,17 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobPoint,
     JobStarted,
 )
 from printlog_bridge.core.status import NullReport, PrinterReport
 
+from .changes import FilamentChanges
 from .excluded import ExcludedObjects
 from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
-from .tools import ToolUsage, estimated_grams_by_slot, per_slot
+from .spools import RESPOND_MACRO, answer_script
+from .tools import PRINTING, ToolUsage, estimated_grams_by_slot, per_slot, slot_of
 
 log = logging.getLogger(__name__)
 
@@ -68,9 +76,17 @@ class JobTracker:
         self._call: Call | None = None
         self._usage = ToolUsage()
         self._excluded = ExcludedObjects()
+        self._changes = FilamentChanges(printer)
+        self._status: Mapping[str, Any] = {}
+        self._active = 0
+        self._job: tuple[str, str, dict[int, float]] | None = None
+        """The job in progress: its id, its file, and the slicer's grams per tool."""
+        self._can_respond: bool | None = None
+        self._tasks: set[asyncio.Future] = set()
 
     async def on_connected(self, call: Call) -> None:
         self._call = call
+        self._can_respond = None
         try:
             jobs = await self._jobs_to_replay(call)
         except MoonrakerRpcError as e:
@@ -89,11 +105,21 @@ class JobTracker:
             await self._report(job, latest=n == len(jobs))
 
     async def on_klippy_state(self, state: str) -> None:
-        pass
+        if state == "ready":
+            self._can_respond = None  # a config change may have added printlog.cfg
 
     async def on_status(self, status: Mapping[str, Any], changed: Mapping[str, Any]) -> None:
+        self._status = status
+        slot = slot_of((status.get("toolhead") or {}).get("extruder"))
+        if slot is not None:
+            self._active = slot
         self._usage.update(status)
         self._excluded.update(status)
+        prompts, change = self._changes.update(status, self.point, self._active)
+        for prompt in prompts:
+            self._spawn(self._prompt(prompt))
+        if change is not None:
+            await self.sink.emit(change)
         if "print_stats" not in changed:
             return
         print_stats = status.get("print_stats") or {}
@@ -106,6 +132,46 @@ class JobTracker:
     async def on_history(self, action: str, job: Mapping[str, Any]) -> None:
         if action in ("added", "finished"):
             await self._report(job, live=True, latest=True)
+
+    def point(self) -> JobPoint | None:
+        """How far the job Klipper is running has got, or None when none is."""
+        stats = self._status.get("print_stats") or {}
+        if self._job is None or stats.get("state") not in PRINTING:
+            return None
+        job_id, filename, estimated = self._job
+        if (stats.get("filename") or filename) != filename:
+            return None  # Klipper is on another file than the job history last announced
+        used = stats.get("filament_used")
+        used = float(used) if isinstance(used, (int, float)) else 0.0
+        tracked = self._usage.slots if self._usage.filename == filename else {}
+        progress = (self._status.get("virtual_sdcard") or {}).get("progress")
+        layer = (stats.get("info") or {}).get("current_layer")
+        return JobPoint(
+            job_id=job_id,
+            fed_mm=per_slot(used, tracked, estimated),
+            progress=float(progress) if isinstance(progress, (int, float)) else None,
+            layer=layer if isinstance(layer, int) and not isinstance(layer, bool) else None,
+        )
+
+    async def _prompt(self, text: str) -> None:
+        """Shows `text` on the console, when printlog.cfg is there to show it."""
+        log.info("[printer %s] %s", self.printer, text)
+        call = self._call
+        if call is None:
+            return
+        try:
+            if self._can_respond is None:
+                objects = (await call("printer.objects.list", None))["objects"]
+                self._can_respond = RESPOND_MACRO in objects
+            if self._can_respond:
+                await call("printer.gcode.script", {"script": answer_script(text)})
+        except Exception as e:
+            log.debug("[printer %s] couldn't show it on the console: %s", self.printer, e)
+
+    def _spawn(self, work) -> None:
+        task = asyncio.ensure_future(work)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def on_gcode_response(self, line: str) -> None:
         pass
@@ -135,6 +201,10 @@ class JobTracker:
         self, job: Mapping[str, Any], live: bool = False, latest: bool = False
     ) -> None:
         start = started(self.printer, job)
+        if job.get("status", "in_progress") == "in_progress":
+            self._job = (start.job_id, start.file_name, dict(start.estimated_filament_g_by_slot))
+        elif self._job is not None and self._job[0] == start.job_id:
+            self._job = None
         await self.sink.emit(start)
         images, call = self.images, self._call
         if images is not None and call is not None:

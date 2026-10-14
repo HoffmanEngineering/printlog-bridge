@@ -10,6 +10,9 @@ Assigning a spool is not queued like a print: it says at once whether it worked,
 that couldn't reach 3D Print Log is run again by the user rather than applied hours later, when
 the spool may have moved. A tag the reader keeps reporting is retried with each refresh.
 
+A spool assigned to a slot while a job runs is a swap (#44): `on_swap` hears of it, with the
+point the job had reached, so the job's usage on that slot is split there.
+
 What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration, its
 active spool and its usage reports are left alone.
 """
@@ -21,7 +24,7 @@ import logging
 import math
 import re
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from printlog_bridge.core.api_client import (
@@ -31,8 +34,9 @@ from printlog_bridge.core.api_client import (
     ApiUnavailable,
     AuthRejected,
 )
-from printlog_bridge.core.events import SpoolCommand, SpoolReading
+from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolReading
 from printlog_bridge.core.status import StatusBoard
+from printlog_bridge.core.swaps import SpoolSwap
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +120,9 @@ class Spools:
         """The tag each slot's reader reported that was looked up, and the spool it found."""
         self._locks: dict[str, asyncio.Lock] = {}
         self._failing = False
+        self.on_swap: Callable[[SpoolSwap], bool] | None = None
+        """Told of each spool assigned to a slot while a job runs; True when that job's usage
+        is split there (the job logger's `spool_swapped`)."""
 
     # -- what's loaded -------------------------------------------------------------------------
 
@@ -200,7 +207,10 @@ class Spools:
             return f"there is no T{command.slot}: tools are numbered 0 to {MAX_SLOTS - 1}"
         try:
             async with self._lock(command.printer):
+                before = self._loaded.get(command.printer, {}).get(command.slot)
                 answer = await self._carry_out(command, printer_id)
+                if self._swapped(command.printer, command.slot, before, command.during):
+                    answer += f". This print's {slot} usage is split here"
         except AuthRejected:
             answer = (
                 "3D Print Log rejected the bridge's API key; nothing changed. Check it with "
@@ -323,9 +333,11 @@ class Spools:
                     return
                 filament_id = str(spool["id"])
                 if self.loaded(reading.printer).get(reading.slot) != filament_id:
+                    before = self._loaded.get(reading.printer, {}).get(reading.slot)
                     await self._load(
                         reading.printer, printer_id, reading.slot, filament_id, reading.slot_count
                     )
+                    self._swapped(reading.printer, reading.slot, before, reading.during)
                     what = f"{slot} is now {_name(spool)}, from its tag {uid}"
                     log.info("[printer %s] %s", reading.printer, what)
                     self._event(reading.printer, what)
@@ -377,6 +389,22 @@ class Spools:
         return notes
 
     # -- helpers -------------------------------------------------------------------------------
+
+    def _swapped(
+        self,
+        printer: str,
+        slot: int,
+        before: Mapping[str, Any] | None,
+        during: JobPoint | None,
+    ) -> bool:
+        """Tells `on_swap` when the slot's spool changed while a job ran. Whether it split it."""
+        after = self._loaded.get(printer, {}).get(slot)
+        old = None if before is None else str(before["id"])
+        new = None if after is None else str(after["id"])
+        if during is None or self.on_swap is None or old == new:
+            return False
+        names = (None if f is None else _name(f) for f in (before, after))
+        return self.on_swap(SpoolSwap(printer, slot, old, new, *names, during=during))
 
     def _lock(self, printer: str) -> asyncio.Lock:
         if printer not in self._locks:

@@ -50,6 +50,42 @@ class JobFinished:
     user would want to know, such as objects they cancelled mid-print."""
 
 
+@dataclass(frozen=True)
+class JobPoint:
+    """How far a running job has got, at the moment a spool changes in one of its slots (#44).
+
+    The adapter takes it when it hears of the change, so the split falls where the change
+    happened, however long 3D Print Log then takes to answer.
+    """
+
+    job_id: str
+    fed_mm: Mapping[int, float] = field(default_factory=dict)
+    """Filament fed per slot so far, in millimetres, on the same scale as `JobFinished`'s
+    `filament_mm`: the length before this point is the old spool's, the rest the new one's."""
+    progress: float | None = None
+    """How far through the file the job is, 0 to 1."""
+    layer: int | None = None
+    """The layer it's on, when the slicer reports layers."""
+
+
+@dataclass(frozen=True)
+class FilamentChange:
+    """A job was paused for a filament change and resumed (#44): a runout sensor found no
+    filament, or filament was unloaded while it was paused (an M600). If no spool was assigned
+    to the slot at that point, the print gets a note saying how to split its usage."""
+
+    printer: str
+    slot: int
+    at: JobPoint
+    """Where the job was paused."""
+    reason: str
+    """`runout` or `unload`."""
+
+    @property
+    def job_id(self) -> str:
+        return self.at.job_id
+
+
 class ImageKind(Enum):
     THUMBNAIL = "thumbnail"
     """The slicer's preview, from the job's file, reported when the job starts."""
@@ -72,7 +108,7 @@ class JobImage:
     fetch: Callable[[], Awaitable[bytes | None]] = field(compare=False, repr=False)
 
 
-JobEvent = Union[JobStarted, JobFinished, JobImage]
+JobEvent = Union[JobStarted, JobFinished, JobImage, FilamentChange]
 
 
 class EventSink(Protocol):
@@ -104,6 +140,9 @@ class SpoolCommand:
     """The UID of an RFID/NFC tag on the spool, in any common format (`04:A2:3F:11`)."""
     slot_count: int | None = None
     """How many slots (tools) the printer has, when the adapter knows."""
+    during: JobPoint | None = None
+    """Where the job running when the user gave the command was, so its usage is split there;
+    None between jobs."""
 
 
 @dataclass(frozen=True)
@@ -119,6 +158,8 @@ class SpoolReading:
     color_hex: str | None = None
     """The tag's color, as `#RRGGBB`."""
     slot_count: int | None = None
+    during: JobPoint | None = None
+    """Where the job running when the reader saw this was; None between jobs."""
 
 
 class SpoolSink(Protocol):

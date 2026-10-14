@@ -21,6 +21,10 @@ rather than duplicated: before creating one, the bridge looks for an unclaimed p
 on the same printer, made within `adopt_window`, for the same file, claims the newest, and logs
 the job to it. In finish-only mode (`create_prints = false`) a job with nothing to adopt isn't
 logged. See `_adopt`.
+
+A spool assigned to a slot while the job runs (`Spools.on_swap`, #44) is kept in the job's state
+with the point it was assigned at, and the slot's usage is split between the spools there when
+the job ends. See `swaps.py`.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from printlog_bridge.core.api_client import (
 )
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
+    FilamentChange,
     ImageKind,
     JobEvent,
     JobFinished,
@@ -56,6 +61,15 @@ from printlog_bridge.core.outbox import Entry, Outbox, utc_now
 from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState, safe_file_name
 from printlog_bridge.core.status import BoardReport, StatusBoard
+from printlog_bridge.core.swaps import (
+    SpoolSwap,
+    change_hints,
+    change_record,
+    on_slot,
+    segments,
+    swap_notes,
+    swap_record,
+)
 from printlog_bridge.core.titles import same_file, title_from_file_name
 
 log = logging.getLogger(__name__)
@@ -220,6 +234,8 @@ class JobLogger:
         state = self.state(event.printer)
         if isinstance(event, JobImage):
             await self._emit_image(state, event)
+        elif isinstance(event, FilamentChange):
+            self._filament_changed(state, event)
         elif isinstance(event, JobStarted):
             job = state.jobs.get(event.job_id)
             if job is None:
@@ -250,6 +266,51 @@ class JobLogger:
                 job.ended_at = event.finished_at.isoformat()
                 state.save()
             self._queue(event.printer, event.job_id, FINISH, _finish_payload(event))
+
+    def _filament_changed(self, state: PrinterState, event: FilamentChange) -> None:
+        job = state.jobs.get(event.at.job_id)
+        if job is None or job.finished:
+            return
+        record = change_record(event)
+        if record in job.filament_changes:
+            return  # a replay
+        job.filament_changes.append(record)
+        state.save()
+        self._event(
+            event.printer,
+            f"job {event.at.job_id}: T{event.slot} was paused for a filament change "
+            f"({event.reason})",
+        )
+
+    def spool_swapped(self, swap: SpoolSwap) -> bool:
+        """Keeps a spool assigned to a slot while a job ran, to split the job's usage on that
+        slot where it was assigned. Whether it will be: not for a job already logged as ended,
+        or one the bridge isn't logging."""
+        if swap.printer not in self.printers:
+            return False
+        state = self.state(swap.printer)
+        job = state.jobs.get(swap.during.job_id)
+        if job is None or job.finished:
+            return False
+        job.swaps.append(swap_record(swap))
+        try:
+            state.save()
+        except STORAGE_ERRORS as e:
+            # Kept in memory, and written with the job's next save.
+            self._storage_failed(e)
+        self._event(
+            swap.printer,
+            f"job {swap.during.job_id}: T{swap.slot} usage split, "
+            f"{swap.old_name or swap.old or 'no spool'} before, "
+            f"{swap.new_name or swap.new or 'no spool'} after",
+        )
+        return True
+
+    def _event(self, printer: str, what: str) -> None:
+        log.info("[printer %s] %s", printer, what)
+        report = self._report(printer)
+        if report is not None:
+            report.event(what)
 
     def _queue(self, printer: str, job_id: str, kind: str, payload: dict[str, Any]) -> None:
         if self.outbox.add(printer, job_id, kind, payload):
@@ -794,7 +855,7 @@ class JobLogger:
         loaded = await self.spools.current(event.printer) if self.spools is not None else {}
         slot_count = self.spools.slot_count(event.printer) if self.spools is not None else None
         single_tool = (slot_count or 1) <= 1 and all(slot == 0 for slot in event.filament_mm)
-        rows = _usage_rows(event, print_.get("filamentUsage") or [], loaded, single_tool)
+        rows = _usage_rows(event, print_.get("filamentUsage") or [], loaded, single_tool, job.swaps)
         if rows:
             body["filamentUsage"] = rows
 
@@ -802,13 +863,14 @@ class JobLogger:
         if completed is None:
             return self._deleted(state, event, job)
 
-        if event.note:
-            notes = (completed.get("notes") or "").rstrip()
-            if event.note not in notes:
-                await self.api.patch_print(
-                    int(print_["id"]),
-                    {"notes": f"{notes}\n\n{event.note}" if notes else event.note},
-                )
+        notes = (completed.get("notes") or "").rstrip()
+        swaps = "\n".join(swap_notes(job.swaps))
+        hints = change_hints(job.filament_changes, job.swaps)
+        added = [n for n in (event.note, swaps, *hints) if n and n not in notes]
+        if added:
+            await self.api.patch_print(
+                int(print_["id"]), {"notes": "\n\n".join([notes, *added] if notes else added)}
+            )
 
         job.finished = True
         state.save()
@@ -977,11 +1039,17 @@ def _usage_rows(
     rows: Sequence[Mapping[str, Any]],
     loaded: Mapping[int, str] | None = None,
     single_tool: bool = False,
+    swaps: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """One row per slot that fed filament, linked to the spool in that slot when it's known.
 
     A slot with no spool still gets its row, with its slot and no `filamentId`. The API takes
     one row per spool, so a spool on two slots gets one row, on the first, with both lengths.
+
+    A slot whose spool changed while the job ran (`swaps`, #44) is split where it changed: one
+    row per spool, the slot's first spool first, so the API's completion puts that one on the
+    row the print started with (its estimate stays there) and adds a row for the next. The first
+    spool is the one on the print's row, else the one the slot had before the first swap.
 
     On a single-tool printer a row with no slot (an uploader's) is slot 0's, so the spool the
     user linked on it wins. The API's completion fills that row from slot 0's in the same way
@@ -989,24 +1057,39 @@ def _usage_rows(
     """
     if single_tool:
         rows = [{**row, "slot": 0} if row.get("slot") is None else row for row in rows]
-    spools = _spools_by_slot(rows, loaded or {})
+    before = dict(loaded or {})
+    for slot in {swap["slot"] for swap in swaps}:
+        first = on_slot(swaps, slot)[0].get("old")
+        # What's loaded now came after the swaps: the slot's first spool is what it had before.
+        before.pop(slot, None)
+        if first is not None:
+            before[slot] = first
+    spools = _spools_by_slot(rows, before)
     usage: list[dict[str, Any]] = []
-    mm_by_spool: dict[str, float] = {}
+    mm_by_row: dict[tuple[int, str | None] | str, float] = {}
     for slot, mm in sorted(event.filament_mm.items()):
-        if mm <= 0:
-            continue
-        spool = spools.get(slot)
-        if spool is not None and spool in mm_by_spool:
-            mm_by_spool[spool] += mm
-            row = next(r for r in usage if r.get("filamentId") == spool)
-            row["lengthInM"] = round(mm_by_spool[spool] / 1000, 4)
-            continue
-        row = {"slot": slot, "lengthInM": round(mm / 1000, 4), "source": LENGTH}
-        if spool is not None:
-            row["filamentId"] = spool
-            mm_by_spool[spool] = mm
-        usage.append(row)
+        for spool, length in segments(mm, spools.get(slot), on_slot(swaps, slot)):
+            if length <= 0:
+                continue
+            # One row per spool, and one row per slot with no spool (the API matches those by
+            # slot, so it takes only one each).
+            key: tuple[int, str | None] | str = spool if spool is not None else (slot, None)
+            if key in mm_by_row:
+                mm_by_row[key] += length
+                row = next(r for r in usage if _row_key(r) == key)
+                row["lengthInM"] = round(mm_by_row[key] / 1000, 4)
+                continue
+            row = {"slot": slot, "lengthInM": round(length / 1000, 4), "source": LENGTH}
+            if spool is not None:
+                row["filamentId"] = spool
+            mm_by_row[key] = length
+            usage.append(row)
     return usage
+
+
+def _row_key(row: Mapping[str, Any]) -> tuple[int, str | None] | str:
+    spool = row.get("filamentId")
+    return spool if spool is not None else (row["slot"], None)
 
 
 def _spools_by_slot(rows: Sequence[Mapping[str, Any]], loaded: Mapping[int, str]) -> dict[int, str]:

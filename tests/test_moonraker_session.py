@@ -67,10 +67,27 @@ def test_subscribes_to_the_objects_a_job_needs():
 
     assert objects == {
         "print_stats": None,
-        "toolhead": ["extruder"],
+        "toolhead": ["extruder", "position"],
         "virtual_sdcard": None,
         "webhooks": None,
     }
+
+
+def test_subscribes_to_every_runout_sensor():
+    async def scenario():
+        fake_objects = ("webhooks", "print_stats", "toolhead", "virtual_sdcard",
+                        "filament_switch_sensor runout", "filament_motion_sensor encoder",
+                        "gcode_macro M600")  # fmt: skip
+        async with fake_moonraker(objects=fake_objects) as (fake, base):
+            async with running(session_for(base, Recorder())):
+                await eventually(lambda: fake.subscriptions)
+            return fake.subscriptions[0]
+
+    objects = asyncio.run(scenario())
+
+    assert objects["filament_switch_sensor runout"] == ["filament_detected", "enabled"]
+    assert objects["filament_motion_sensor encoder"] == ["filament_detected", "enabled"]
+    assert "gcode_macro M600" not in objects
 
 
 def test_subscribes_to_filament_detect_when_the_printer_has_it():

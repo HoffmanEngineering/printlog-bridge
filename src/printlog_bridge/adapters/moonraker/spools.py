@@ -21,11 +21,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
 
-from printlog_bridge.core.events import SpoolCommand, SpoolSink
+from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolSink
 
 from .session import Call
 from .tools import EXTRUDER, slot_of
@@ -37,6 +37,8 @@ COMMAND = re.compile(r"// printlog: (SET_SPOOL|CLEAR_SPOOL)((?: +[A-Z]+=\S+)*) *
 UNSAFE = re.compile(r"[#;*\r\n]")
 """What Klipper takes as the start of a comment (`;` `#` `*`) or the end of a command."""
 ANSWER_PREFIX = "printlog-bridge: "
+RESPOND_MACRO = "gcode_macro _PRINTLOG_RESPOND"
+"""The Klipper object `printlog.cfg`'s answering macro is, when it's included."""
 MAX_ANSWER = 300
 
 
@@ -68,12 +70,21 @@ class SpoolWatcher:
     """A MoonrakerListener that passes spool commands and slot readings to a SpoolSink.
 
     Each is handled in a task of its own, so the API's answer never holds up the connection.
+    Each carries where the running job was when it came (`point`, the JobTracker's), so a spool
+    changed mid-print splits the job's usage there.
     """
 
-    def __init__(self, printer: str, spools: SpoolSink, reader: U1RfidReader | None = None):
+    def __init__(
+        self,
+        printer: str,
+        spools: SpoolSink,
+        reader: U1RfidReader | None = None,
+        point: Callable[[], JobPoint | None] | None = None,
+    ):
         self.printer = printer
         self.spools = spools
         self.reader = reader
+        self.point = point or (lambda: None)
         self._call: Call | None = None
         self._active = 0
         self._tools: int | None = None
@@ -94,6 +105,9 @@ class SpoolWatcher:
             self._active = slot
         if self.reader is not None and "filament_detect" in changed:
             for reading in self.reader.update(status.get("filament_detect") or {}):
+                during = self.point()
+                if during is not None:
+                    reading = replace(reading, during=during)
                 self._spawn(self.spools.spool_reading(reading))
 
     async def on_history(self, action: str, job: Mapping[str, Any]) -> None:
@@ -103,6 +117,7 @@ class SpoolWatcher:
         for each in line.splitlines():  # one response can hold several lines
             command = parse_command(self.printer, each, self._active)
             if command is not None:
+                command = replace(command, during=self.point())
                 self._spawn(self._carry_out(command, self._call))
 
     async def _carry_out(self, command: SpoolCommand, call: Call | None) -> None:
