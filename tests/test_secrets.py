@@ -15,6 +15,9 @@ LONG_TEXT = {
     "schemes": "a://" * 50_000,
     "secret query names": "&token" * 33_000,
     "user infos": "http://u:p" * 20_000,
+    "letters after digits": "1a" * 100_000,
+    "schemes after digits": "1http://u:p" * 20_000,
+    "query values of nested URLs": "?a=http://h/?b=" * 15_000,
 }
 
 
@@ -44,9 +47,23 @@ def test_hides_passwords_in_urls_and_secret_query_values():
         ("see rtsp://u:p@cam/", f"see rtsp://{REDACTED}@cam/"),
         ("(git+ssh://u:p@host/x)", f"(git+ssh://{REDACTED}@host/x)"),
         ('"http://u:p@h"', f'"http://{REDACTED}@h"'),
+        ("1http://u:pw@h/", f"1http://{REDACTED}@h/"),
+        ("éhttp://u:pw@h/", f"éhttp://{REDACTED}@h/"),
+        ("x_http://u:pw@h/", f"x_http://{REDACTED}@h/"),
         ("mailto:me@example.com", "mailto:me@example.com"),
         ("http://cam.local/a@b", "http://cam.local/a@b"),
     ],
 )
 def test_url_userinfo(text, expected):
     assert URL_USERINFO.sub(rf"\1{REDACTED}@", text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GET http://h/redirect?next=http://cam/snap?token=SECRET123",
+        "GET http://h/x?a=1?token=SECRET123",
+    ],
+)
+def test_hides_a_secret_query_value_after_a_nested_url(text):
+    assert "SECRET123" not in scrub(text, [])

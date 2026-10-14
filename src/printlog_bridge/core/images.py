@@ -187,23 +187,40 @@ def scrub_url(error: BaseException, url: str | None) -> str:
     forms = sorted({form for secret in secrets for form in _spellings(secret)}, key=len)[::-1]
     if cut:
         # Enough past the cut that any secret starting before it is whole, and so found.
-        text = text[: MAX_ERROR_CHARS + len(url) + max((len(f) for f in forms), default=0)]
+        window = MAX_ERROR_CHARS + len(url) + max((len(f) for f in forms), default=0)
+        truncated = len(text) > window
+        text = text[:window]
     text = text.replace(url, mask_url(url))
     for form in forms:
         if len(form) >= _MIN_SECRET_LENGTH:
             text = _pattern(form).sub("***", text)
     text = URL_USERINFO.sub(r"\1***@", text)
     text = mask_query_values(text, _SECRET_QUERY, "***")
-    return _cut(text) if cut else text
+    if cut and (truncated or len(text) > MAX_ERROR_CHARS):
+        return _cut(text)
+    return text  # all of it was scrubbed, and it fits
+
+
+_NOT_IN_AUTHORITY = re.compile(r"[\s\"'\\]")
 
 
 def _cut(text: str) -> str:
-    """The first `MAX_ERROR_CHARS` of `text`, less the word cut in two: part of a URL, or of a
-    secret, would no longer look like one."""
-    end = MAX_ERROR_CHARS
-    while end and not text[end - 1].isspace():
+    """The first `MAX_ERROR_CHARS` of `text`, less the word cut in two. Without whitespace to
+    cut at (minified JSON), it cuts at the limit itself. Either way no part of a secret it
+    knows shows, since each is found whole past the limit and replaced first; and a URL's user
+    and password cut off before their `@` are hidden all the same."""
+    head = text[:MAX_ERROR_CHARS]
+    end = len(head)
+    while end and not head[end - 1].isspace():
         end -= 1
-    return text[:end] + "…"
+    if end:
+        head = head[: end - 1]
+    slash = head.rfind("/")
+    if slash >= 2 and head[slash - 2 : slash + 1] == "://":
+        authority = head[slash + 1 :]
+        if authority and not _NOT_IN_AUTHORITY.search(authority):
+            head = head[: slash + 1] + "***"
+    return head + "…"
 
 
 def _spellings(secret: str) -> set[str]:

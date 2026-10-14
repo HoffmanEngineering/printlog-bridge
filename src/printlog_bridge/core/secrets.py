@@ -12,12 +12,14 @@ from collections.abc import Iterable
 
 REDACTED = "<redacted>"
 
-URL_USERINFO = re.compile(r"(?<![\w+.-])([A-Za-z][\w+.-]*://)[^/@\s\"'\\]+@")
-"""The user and password in a URL. The scheme can only start where a word does, so a long
-word is scanned once, not once from each of its letters."""
-_QUERY_VALUE = re.compile(r"([?&])([^=&\s\"'\\?#]*)=([^&#\s\"'<\\]+)")
-"""Each `name=value` of a query. A name can't hold `?` or `&`, so no two of them overlap and
-the text is scanned once, however long."""
+URL_USERINFO = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z0-9+.-]+://)[^/@\s\"'\\]+@")
+"""The user and password in a URL. The scheme is a whole run of scheme characters (taking in
+any digits before it, as in `1http://`), so a long run is scanned once, not once from each of
+its letters."""
+_QUERY_VALUE = re.compile(r"([?&])([^=&\s\"'\\?#]*)=([^&#?\s\"'<\\]+)")
+"""Each `name=value` of a query. Neither a name nor a value can hold `?` or `&`, so no two of
+them overlap and the text is scanned once, however long; and a value holding a URL of its own
+(`?next=http://cam/?token=...`) ends where that URL's query starts."""
 SECRET_QUERY_NAME = re.compile(r"token|key|pass|pwd|secret|auth|sig", re.IGNORECASE)
 """A query value named like a secret (`token`, `api_key`...), as in a webcam's URL."""
 
