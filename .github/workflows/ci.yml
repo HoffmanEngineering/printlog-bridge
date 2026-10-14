@@ -19,7 +19,7 @@ jobs:
         python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -71,7 +71,7 @@ jobs:
           - { name: master 2026-10, ref: 9e676eba6b02661a4dfa3ec6e7ac3f3504498e6d }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.9"
           cache: pip
