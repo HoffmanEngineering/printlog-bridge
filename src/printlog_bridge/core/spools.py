@@ -18,14 +18,20 @@ effect without a restart, and at once when the spool is pulled out and put back 
 A spool assigned to a slot while a job runs is a swap (#44): `on_swap` hears of it, with the
 point the job had reached, so the job's usage on that slot is split there.
 
+An adapter can `watch_loaded` a printer: it hears each change to what's in the printer's slots,
+whatever made it (a refresh, a command, a reader), with each slot's spool as 3D Print Log
+describes it, `spoolNumber` included. That is how Moonraker's active spool follows the active
+tool's spool when its Spoolman server is 3D Print Log (`adapters/moonraker/spoolman.py`).
+
 What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration is
-followed only when its server is 3D Print Log (`adapters/moonraker/spoolman.py`); a Spoolman
-server of the user's own, and its active spool and usage reports, are left alone.
+followed only when its server is 3D Print Log; a Spoolman server of the user's own, and its
+active spool and usage reports, are left alone.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import re
@@ -102,6 +108,10 @@ def _label(slot: int) -> str:
     return f"T{slot}"
 
 
+LoadedWatcher = Callable[[Mapping[int, Mapping[str, Any]]], None]
+"""Told a printer's spool (the API's filament summary) in each slot, when that changes."""
+
+
 def _name(filament: Mapping[str, Any]) -> str:
     return str(filament.get("displayName") or filament.get("id"))
 
@@ -140,6 +150,7 @@ class Spools:
         """Set when a retry is scheduled, to wake `run` for it."""
         self._locks: dict[str, asyncio.Lock] = {}
         self._failing = False
+        self._watchers: dict[str, list[LoadedWatcher]] = {}
         self.on_swap: Callable[[SpoolSwap], bool] | None = None
         """Told of each spool assigned to a slot while a job runs; True when that job's usage
         is split there (the job logger's `spool_swapped`)."""
@@ -152,6 +163,22 @@ class Spools:
 
     def slot_count(self, printer: str) -> int | None:
         return self._slot_counts.get(printer)
+
+    def watch_loaded(self, printer: str, watcher: LoadedWatcher) -> Callable[[], None]:
+        """Tells `watcher` the printer's spool in each slot now, when it has been read, and
+        again after each change to it. Returns what stops that.
+
+        The watcher is called in the middle of whatever changed the slots: it must not block,
+        and what it raises is logged and goes no further."""
+        self._watchers.setdefault(printer, []).append(watcher)
+        if printer in self._loaded:
+            self._tell(watcher, printer, self._loaded[printer])
+
+        def unwatch() -> None:
+            with contextlib.suppress(ValueError):
+                self._watchers.get(printer, []).remove(watcher)
+
+        return unwatch
 
     async def current(self, printer: str) -> dict[int, str]:
         """The spool in each slot, read again now; what was last read when that fails."""
@@ -259,7 +286,21 @@ class Spools:
         if count <= 1 and 0 not in loaded and unslotted:
             # A single-tool printer's spool loaded the old way, with no slot, is in slot 0.
             loaded[0] = dict(unslotted[0])
+        self._set_loaded(printer, loaded)
+
+    def _set_loaded(self, printer: str, loaded: dict[int, dict[str, Any]]) -> None:
+        """Keeps what's in the printer's slots, and tells its watchers when that changed."""
+        changed = self._loaded.get(printer) != loaded
         self._loaded[printer] = loaded
+        if changed:
+            for watcher in list(self._watchers.get(printer, [])):
+                self._tell(watcher, printer, loaded)
+
+    def _tell(self, watcher: LoadedWatcher, printer: str, loaded: Mapping[int, Any]) -> None:
+        try:
+            watcher({slot: dict(f) for slot, f in loaded.items()})
+        except Exception:
+            log.exception("[printer %s] a watcher of its spools failed", printer)
 
     # -- PRINTLOG_SET_SPOOL --------------------------------------------------------------------
 
@@ -302,7 +343,9 @@ class Spools:
         slot = _label(command.slot)
         if command.filament_id is None and command.tag is None and command.spool_number is None:
             await self.api.unload_slot(printer_id, command.slot)
-            self._loaded.setdefault(command.printer, {}).pop(command.slot, None)
+            loaded = dict(self._loaded.get(command.printer, {}))
+            loaded.pop(command.slot, None)
+            self._set_loaded(command.printer, loaded)
             return f"{slot} has no spool in 3D Print Log now"
         if command.tag is not None:
             uid = normalize_tag(command.tag)

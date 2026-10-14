@@ -704,3 +704,78 @@ def test_color_distance_is_zero_for_the_same_color_in_any_format():
     assert color_distance("#ff0000", "FF0000") == 0
     assert color_distance("#FF0000", "#00FF00") > 300
     assert color_distance("#FF0000", "not a color") is None
+
+
+class TestWatchLoaded:
+    """How an adapter hears that a printer's spools changed: Moonraker's active spool follows."""
+
+    def test_a_watcher_hears_each_change_with_each_slots_spool_number(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 2
+        first = api.add_spool("Galaxy Black PLA", number=4)
+        second = api.add_spool("Silk Gold", number=7)
+        api.user_loads(42, 0, first)
+        heard: list[dict[int, int | None]] = []
+
+        def numbers(loaded):
+            heard.append({slot: f.get("spoolNumber") for slot, f in loaded.items()})
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("u1", numbers)
+            await spools.refresh("u1")
+            await spools.refresh("u1")  # nothing changed: nothing to hear
+            await spools.spool_command(command(1, filament_id=second))
+            await spools.spool_command(command(0))  # cleared
+            await spools.refresh("u1")
+
+        run(api, scenario)
+
+        assert heard == [{0: 4}, {0: 4, 1: 7}, {1: 7}]
+
+    def test_a_new_watcher_hears_what_is_already_known(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Loaded", number=4))
+        heard = []
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("u1", heard.append)  # nothing read yet: nothing to hear
+            await spools.refresh("u1")
+            spools.watch_loaded("u1", heard.append)
+
+        run(api, scenario)
+
+        assert [{s: f["spoolNumber"] for s, f in loaded.items()} for loaded in heard] == [
+            {0: 4},
+            {0: 4},
+        ]
+
+    def test_a_watcher_hears_only_its_printer_and_not_once_unwatched(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Loaded", number=4))
+        other, mine = [], []
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("voron", other.append)
+            unwatch = spools.watch_loaded("u1", mine.append)
+            unwatch()
+            await spools.refresh("u1")
+
+        run(api, scenario)
+
+        assert other == [] and mine == []
+
+    def test_a_watcher_that_fails_breaks_nothing(self, caplog):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Loaded", number=4)
+
+        def broken(loaded):
+            raise RuntimeError("boom")
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("u1", broken)
+            return await spools.spool_command(command(0, filament_id=spool))
+
+        answer = run(api, scenario)
+
+        assert "is now Loaded" in answer
+        assert api.slot_spools(42) == {0: spool}

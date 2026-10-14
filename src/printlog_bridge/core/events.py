@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Protocol, Union
+from typing import Any, Protocol, Union
 
 
 class JobOutcome(Enum):
@@ -177,3 +177,13 @@ class SpoolSink(Protocol):
 
     async def spool_reading(self, reading: SpoolReading) -> None:
         """Takes a reader's view of a slot. A tag a spool has assigns that spool to the slot."""
+
+    def watch_loaded(
+        self, printer: str, watcher: Callable[[Mapping[int, Mapping[str, Any]]], None]
+    ) -> Callable[[], None]:
+        """Tells `watcher` the printer's spool in each slot (3D Print Log's filament summary,
+        `spoolNumber` included) once known, and after each change. Returns what stops that.
+
+        Optional: adapters look it up with `getattr`, so a sink without it (a test's) is told
+        nothing and needs no stub."""
+        return lambda: None

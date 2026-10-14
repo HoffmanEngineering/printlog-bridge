@@ -188,6 +188,7 @@ class MoonrakerAdapter(Adapter):
         )
         tracker = JobTracker(self.printer, sink, report, images)
         listener: MoonrakerListener = tracker
+        unwatch = None
         if self.spools is not None:
             # The U1's reader only reports on a printer with `filament_detect`; elsewhere it
             # never hears from it. After the tracker, which knows where the job is by then.
@@ -196,10 +197,13 @@ class MoonrakerAdapter(Adapter):
             )
             listeners: list[MoonrakerListener] = [listener, watcher]
             if self.api_url is not None:
-                # A spool picked in Mainsail or Fluidd, when its Spoolman server is 3D Print Log.
-                listeners.append(
-                    SpoolmanSync(self.printer, self.api_url, self.spools, point=tracker.point)
-                )
+                # A spool picked in Mainsail or Fluidd, when its Spoolman server is 3D Print Log;
+                # and Moonraker's active spool kept on the active tool's spool in 3D Print Log.
+                sync = SpoolmanSync(self.printer, self.api_url, self.spools, point=tracker.point)
+                listeners.append(sync)
+                watch = getattr(self.spools, "watch_loaded", None)
+                if watch is not None:
+                    unwatch = watch(self.printer, sync.on_loaded)
             listener = Listeners(*listeners)
         session = MoonrakerSession(
             self.printer,
@@ -214,6 +218,8 @@ class MoonrakerAdapter(Adapter):
         try:
             await session.run()
         finally:
+            if unwatch is not None:
+                unwatch()
             await tracker.close()
 
     def use_spools(self, spools: SpoolSink, api_url: str | None = None) -> None:
