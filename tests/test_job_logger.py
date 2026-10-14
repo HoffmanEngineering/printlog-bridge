@@ -704,21 +704,49 @@ def report_run(api: FakePrintLogApi, state_dir: Path, *events, register=None):
     return asyncio.run(scenario())
 
 
+def heartbeat_registration(state_dir: Path):
+    """`report_run`'s `register`: the bridge's own hook, `Heartbeat.ensure_registered`."""
+
+    def register(client, board):
+        instance_id = PrinterState.load(state_dir, "voron").instance_id
+        heartbeat = Heartbeat(client, [Connection("voron", instance_id, "moonraker", 42)], board)
+        return heartbeat.ensure_registered
+
+    return register
+
+
 class TestConnection:
     def test_the_connection_is_registered_before_the_print_so_the_print_links_to_it(self, tmp_path):
         api = FakePrintLogApi()
 
-        def register(client, board):
-            instance_id = PrinterState.load(tmp_path, "voron").instance_id
-            heartbeat = Heartbeat(
-                client, [Connection("voron", instance_id, "moonraker", 42)], board
-            )
-            return heartbeat.ensure_registered
-
-        report_run(api, tmp_path, started(), register=register)
+        report_run(api, tmp_path, started(), register=heartbeat_registration(tmp_path))
 
         [print_] = api.prints.values()
         assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
+
+    def test_a_print_waits_for_a_registration_that_could_not_reach_3d_print_log(self, tmp_path):
+        """3D Print Log coming back between the registration and the create (the end of an
+        outage) must not log the print unlinked: it never links to the connection afterwards,
+        and the connection itself would wait for the next heartbeat, minutes away."""
+        api = FakePrintLogApi()
+        api.fail_next(1)  # the registration's PUT; everything after it gets through
+
+        report_run(api, tmp_path, started(), register=heartbeat_registration(tmp_path))
+
+        [print_] = api.prints.values()
+        assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
+        assert [r for r in api.requests if r[0] == "POST"] == [("POST", "/api/Prints")]
+
+    def test_a_refused_registration_still_logs_the_print(self, tmp_path):
+        """Refused is not unreachable: sending it again won't change the answer, so the print
+        goes ahead unlinked rather than waiting for nothing."""
+        api = FakePrintLogApi()
+        api.fail_next(1, status=400)
+
+        report_run(api, tmp_path, started(), register=heartbeat_registration(tmp_path))
+
+        [print_] = api.prints.values()
+        assert print_["connectionId"] is None
 
     def test_a_failed_registration_still_logs_the_print(self, tmp_path):
         api = FakePrintLogApi()
