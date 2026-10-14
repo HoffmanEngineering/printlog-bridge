@@ -564,7 +564,7 @@ M73 P100 R0
 ; parking_pos_retraction = 92
 ; pellet_flow_coefficient = 0.4157
 ; pellet_modded_printer = 0
-; post_process = "\"C:\\Users\\cshHo\\Development\\Slic3rPostProcessingUploader\\Slic3rPostProcessingUploader\\bin\\Debug\\net8.0\\Slic3rPostProcessingUploader.exe\" --template \"C:\\Users\\cshHo\\Development\\Slic3rPostProcessingUploader\\Slic3rPostProcessingUploader\\bin\\Debug\\net8.0\\template.txt\" --debug \"C:\\tmp\" --local-dev"
+; post_process = "\"C:\\Users\\exmpl\\Development\\Slic3rPostProcessingUploader\\Slic3rPostProcessingUploader\\bin\\Debug\\net8.0\\Slic3rPostProcessingUploader.exe\" --template \"C:\\Users\\exmpl\\Development\\Slic3rPostProcessingUploader\\Slic3rPostProcessingUploader\\bin\\Debug\\net8.0\\template.txt\" --debug \"C:\\tmp\" --local-dev"
 ; precise_outer_wall = 0
 ; precise_z_height = 0
 ; preferred_orientation = 0
