@@ -113,6 +113,17 @@ class BridgeConfig:
     trace: bool = False
     """Record every message to and from each printer in `state_dir/traces` (core/trace.py)."""
 
+    def api_url_warning(self) -> str | None:
+        """What to say, every time, when `api_url` is plain http to another computer, which
+        only `allow_http_on_lan` allows."""
+        host = urlparse(self.api_url).hostname or ""
+        if urlparse(self.api_url).scheme != "http" or _is_loopback(host):
+            return None
+        return (
+            f"api_url is {self.api_url}, plain http (allow_http_on_lan): the API key and your "
+            "prints travel unencrypted on your network. Use it only for a development API."
+        )
+
     @property
     def api_key_file(self) -> Path:
         return self.state_dir / API_KEY_FILE
@@ -246,6 +257,18 @@ def _api_url(value: str, allow_http_on_lan: bool = False) -> str:
     return api_url
 
 
+_LAN_NETWORKS = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",  # RFC 1918
+        "169.254.0.0/16", "fe80::/10",  # link-local
+        "fc00::/7",  # IPv6 unique local
+    )
+)  # fmt: skip
+"""Named, not `is_private`: that also counts Teredo (2001::/32), which tunnels to the
+internet, and documentation, benchmarking and reserved ranges, none of which is a LAN."""
+
+
 def _is_private(host: str) -> bool:
     """An IP address on a private network (RFC 1918, link-local, IPv6 unique local). Names are
     never private here: what a name resolves to can change."""
@@ -253,7 +276,9 @@ def _is_private(host: str) -> bool:
         address = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return address.is_private and not address.is_loopback and not address.is_unspecified
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return any(address in network for network in _LAN_NETWORKS)
 
 
 def _flag(value: str, name: str) -> bool:
