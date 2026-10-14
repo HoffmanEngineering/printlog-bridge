@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fake_printlog_api import FakePrintLogApi
 from test_job_logger import drain, finished, logging_to, run, started
@@ -227,6 +228,32 @@ class TestAnswers:
         assert reads == ["00000A"]
         assert [p["status"] for p in api.prints.values()] == [3, 3]
         assert len([r for r in caplog.records if "slicer settings" in r.getMessage()]) == 1
+
+    def test_an_api_without_the_endpoint_is_asked_again_a_day_later(self, tmp_path):
+        """A 405 may be a maintenance page as much as an old API: it isn't believed forever."""
+        api = FakePrintLogApi()
+        api.slicer_settings_status = 405
+        reads: list = []
+        now = [datetime(2026, 10, 10, 9, 0, tzinfo=timezone.utc)]
+
+        async def scenario():
+            async with logging_to(api, tmp_path, clock=lambda: now[0]) as logger:
+                for job, hours in (("00000A", 0), ("00000B", 23), ("00000C", 1.5)):
+                    now[0] += timedelta(hours=hours)
+                    if job == "00000C":
+                        api.slicer_settings_status = None  # the API is back, with the endpoint
+                    await logger.emit(started(job))
+                    await logger.emit(settings(reads=reads, job_id=job))
+                    await drain(logger)
+                    await logger.emit(finished(job))
+                    await drain(logger)
+                logger.close()
+
+        asyncio.run(scenario())
+
+        assert reads == ["00000A", "00000C"]
+        assert [p for p, _ in api.slicer_posts] == [1, 3]
+        assert 3 in api.slicer_records
 
     def test_a_server_error_is_retried(self, tmp_path):
         api = FakePrintLogApi()

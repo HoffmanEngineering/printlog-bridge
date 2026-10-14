@@ -99,6 +99,9 @@ OPTIONAL_KINDS = IMAGE_KINDS | {SLICER_SETTINGS}
 NO_SLICER_SETTINGS = (405, 501)
 """What an API without the slicer settings endpoint (api#164) may answer it with. Its plain
 404 can't be told from a print that's gone, so that only drops the one print's."""
+NO_SLICER_SETTINGS_FOR = timedelta(hours=24)
+"""How long none are read or sent after such an answer: it may as well be a maintenance page
+as an API older than the endpoint, and either can change."""
 IMAGES_DIR = "images"
 IMAGE_TIMEOUT_S = 15.0
 """How long the bridge waits on an adapter for a picture. Adapters give up after 10 s."""
@@ -180,9 +183,10 @@ class JobLogger:
         self._storage_failures = 0
         """Writes to the state directory that failed in a row."""
         self._no_lookup_logged = False
-        self._no_slicer_settings = False
-        """The API answered that it has no slicer settings endpoint: none are read or sent for
-        the rest of this run."""
+        self.clock = clock
+        self._no_slicer_settings_until: datetime | None = None
+        """The API answered that it has no slicer settings endpoint: none are read or sent until
+        then (`NO_SLICER_SETTINGS_FOR`)."""
 
     def close(self) -> None:
         self.outbox.close()
@@ -335,7 +339,7 @@ class JobLogger:
         if not self.printers[event.printer].slicer_settings:
             return  # turned off: the file is never read
         job = state.jobs.get(event.job_id)
-        if job is None or job.finished or job.slicer_settings or self._no_slicer_settings:
+        if job is None or job.finished or job.slicer_settings or self._no_slicer_settings():
             return  # a job not logged, logged before (a replay), or read already
         file = None
         if event.read is not None:
@@ -638,7 +642,7 @@ class JobLogger:
                 where, job.print_id,
             )  # fmt: skip
             return
-        if self._no_slicer_settings:
+        if self._no_slicer_settings():
             return
         try:
             status = await self.api.post_slicer_settings(job.print_id, entry.payload)
@@ -649,11 +653,11 @@ class JobLogger:
         except ApiUnavailable as e:
             if e.status not in NO_SLICER_SETTINGS:
                 raise
-            self._no_slicer_settings = True
+            self._no_slicer_settings_until = self.clock() + NO_SLICER_SETTINGS_FOR
             log.warning(
-                "[printer %s] 3D Print Log doesn't take slicer settings yet (%s), so none are "
-                "sent until the bridge restarts",
-                entry.printer, e,
+                "[printer %s] 3D Print Log doesn't take slicer settings (%s), so none are read "
+                "or sent for %s; then the bridge tries again",
+                entry.printer, e, f"{NO_SLICER_SETTINGS_FOR.total_seconds() / 3600:g} hours",
             )  # fmt: skip
             return
         if status == 409:
@@ -671,6 +675,10 @@ class JobLogger:
             self._logged(
                 entry.printer, f"job {entry.job_id}: slicer settings added to print {job.print_id}"
             )
+
+    def _no_slicer_settings(self) -> bool:
+        until = self._no_slicer_settings_until
+        return until is not None and self.clock() < until
 
     async def _send_finish(self, entry: Entry) -> None:
         state = self.state(entry.printer)

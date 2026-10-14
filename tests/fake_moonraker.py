@@ -468,15 +468,30 @@ def _parse_range(header: str) -> tuple[int | None, int | None] | None:
     return start, end
 
 
-def gcode_metadata(data: bytes) -> dict[str, Any]:
+def gcode_metadata(data: bytes, moonraker: str = "9e676eb") -> dict[str, Any]:
     """`size`, `gcode_start_byte` and `gcode_end_byte` as Moonraker's metadata gives them for a
-    G-code file (`BaseSlicer.parse_gcode_start_byte` and `parse_gcode_end_byte`, Moonraker
-    9e676eb): where the first line that starts with a G or M command begins, and where the line
-    after the last one does."""
+    G-code file (`BaseSlicer.parse_gcode_start_byte` and `parse_gcode_end_byte`): where the first
+    line that starts with a G or M command begins, and where the line after the last one does.
+
+    Moonraker 9e676eb counts in bytes. `moonraker="v0.9.3"` gives what v0.9.3 (and older) does:
+    it reads the file in text mode, so it counts characters, with each `\\r\\n` read as one, and
+    `gcode_end_byte` (`size` less the characters after it) lands past the real end by every byte
+    of non-ASCII text and every `\\r` that follows."""
     read_size = 1024 * 1024
+    if moonraker == "v0.9.3":
+        text = data.decode().replace("\r\n", "\n").replace("\r", "\n")  # universal newlines
+        header, footer = text[:read_size], text[-read_size:]
+        metadata: dict[str, Any] = {"size": len(data)}
+        match = re.search(r"\n[MG]\d+\s.*\n", header)
+        if match is not None:
+            metadata["gcode_start_byte"] = match.start()
+        match = re.search(r"\n.*\s\d+[MG]\n", footer[::-1])
+        if match is not None:
+            metadata["gcode_end_byte"] = len(data) - match.start()
+        return metadata
     text = data[:read_size].decode(errors="ignore")
     footer = data[-read_size:].decode(errors="ignore") if len(data) > read_size else text
-    metadata: dict[str, Any] = {"size": len(data)}
+    metadata = {"size": len(data)}
     match = re.search(r"\n[MG]\d+\s.*\n", text)
     if match is not None:
         metadata["gcode_start_byte"] = len(text[: match.start()].encode())

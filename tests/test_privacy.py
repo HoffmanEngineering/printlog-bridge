@@ -288,7 +288,8 @@ class TestWhatIsSent:
         assert sorted(moonraker.downloads) == [
             ".thumbs/benchy-300x300.png", "benchy.gcode", "benchy.gcode"
         ]  # fmt: skip
-        toolpaths = range(METADATA["gcode_start_byte"], METADATA["gcode_end_byte"])
+        # The settings read starts on the line break ending the G-code's last line.
+        toolpaths = range(METADATA["gcode_start_byte"], METADATA["gcode_end_byte"] - 1)
         for path, header in moonraker.ranges:
             if path != "benchy.gcode":
                 continue
@@ -416,7 +417,7 @@ class TestOnlyTheHeaderAndSettingsAreRead:
 
         assert spans == [
             (0, METADATA["gcode_start_byte"]),
-            (METADATA["gcode_end_byte"], METADATA["size"]),
+            (METADATA["gcode_end_byte"] - 1, METADATA["size"]),
         ]
         assert "SECRET-GCODE" not in read.header + read.config_block
 

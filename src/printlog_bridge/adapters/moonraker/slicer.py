@@ -6,9 +6,11 @@ Moonraker's metadata says where a file's G-code begins (`gcode_start_byte`) and 
 
 - the header, from the start of the file to where the G-code begins, at most 64 KB (the first
   4 KB when Moonraker doesn't say where that is), cut at `; HEADER_BLOCK_END`;
-- the settings block, from where the G-code ends to the end of the file, at most its last 512 KB
-  (the last 128 KB when Moonraker doesn't say, of which only what follows the last G-code command
-  is kept).
+- the settings block, from the line break that ends the G-code's last line to the end of the
+  file, at most its last 512 KB, less the first line it reads, which may be cut (Moonraker v0.9.3
+  and older count `gcode_end_byte` in characters, so it can point into the settings). When
+  Moonraker doesn't say where the G-code ends, or says it ends before it begins, the last 128 KB,
+  of which only the comments and blank lines it ends with are kept.
 
 A remote bridge asks Moonraker's file API for each range (`Range: bytes=...`); a local one reads
 the same ranges from the gcodes folder. A file that isn't the size the job's metadata says was
@@ -87,7 +89,7 @@ class _Plan:
     """`[start, end)` of the header, or None when there's none to read."""
     tail: tuple[int, int] | None
     tail_mid_line: bool
-    """The tail read begins inside a line (it was capped)."""
+    """The tail read may begin inside a line, which is dropped."""
     tail_after_gcode: bool
     """The tail read may begin inside the G-code (Moonraker didn't say where it ends)."""
 
@@ -103,10 +105,17 @@ def _plan(metadata: Mapping[str, Any]) -> _Plan | None:
     if header_end is None:
         header_end = min(HEADER_FALLBACK_BYTES, size)
     end = _whole(metadata.get("gcode_end_byte"))
+    if end is not None and (start is not None and end < start):
+        end = None  # inconsistent: it can't end before it begins
     if end is not None and 0 < end <= size:
-        first = max(end, size - CONFIG_BLOCK_MAX_BYTES)
-        tail = (first, size) if first < size else None
-        mid_line, after_gcode = first > end, False
+        # From the line break that ends the G-code's last line, one byte before `end`, so a
+        # read that begins mid-line can be told and that line dropped: Moonraker v0.9.3 and
+        # older count `gcode_end_byte` in characters, which after non-ASCII text or CRLF line
+        # endings lands inside the settings, and a cut line could carry half a secret no
+        # scrubber recognises. With an exact `end`, all that is dropped is that line break.
+        first = max(end - 1, size - CONFIG_BLOCK_MAX_BYTES)
+        tail = (first, size) if end < size else None
+        mid_line, after_gcode = True, False
     else:
         first = max(0, size - TAIL_FALLBACK_BYTES)
         tail = (first, size)

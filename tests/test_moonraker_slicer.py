@@ -8,8 +8,11 @@ import contextlib
 import json
 from pathlib import Path
 
+import aiohttp
 import bridge_helpers as helpers
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from fake_moonraker import FakeMoonraker, eventually, gcode_metadata
 from fake_printlog_api import FakePrintLogApi
 
@@ -22,7 +25,12 @@ from printlog_bridge.adapters.moonraker.slicer import (
     slicer_metadata,
 )
 from printlog_bridge.core.events import SlicerMetadata
-from printlog_bridge.core.slicer_settings import CONFIG_BLOCK_MAX_BYTES, HEADER_MAX_BYTES
+from printlog_bridge.core.images import ImageUnavailable, fetch_image
+from printlog_bridge.core.slicer_settings import (
+    CONFIG_BLOCK_MAX_BYTES,
+    HEADER_MAX_BYTES,
+    request_body,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GCODE = FIXTURES / "gcode"
@@ -63,8 +71,11 @@ def ranges(fake: FakeMoonraker) -> list[tuple[int, int]]:
 
 
 def assert_no_toolpaths(spans: list[tuple[int, int]], data: bytes) -> None:
+    """No range reaches into the G-code, but for the line break that ends its last line, which
+    the settings read starts on so that it can tell a whole first line from a cut one."""
     metadata = gcode_metadata(data)
-    toolpaths = range(metadata["gcode_start_byte"], metadata["gcode_end_byte"])
+    toolpaths = range(metadata["gcode_start_byte"], metadata["gcode_end_byte"] - 1)
+    assert data[toolpaths.stop : toolpaths.stop + 1] == b"\n"
     for first, last in spans:
         assert last < toolpaths.start or first >= toolpaths.stop, (first, last)
 
@@ -119,7 +130,7 @@ class TestRemote:
         read, fake = read_remote(name, data)
 
         end = gcode_metadata(data)["gcode_end_byte"]
-        assert ranges(fake) == [(0, header_end - 1), (end, len(data) - 1)]
+        assert ranges(fake) == [(0, header_end - 1), (end - 1, len(data) - 1)]
         assert_no_toolpaths(ranges(fake), data)
         assert {path for path, _ in fake.ranges} == {name}
         assert read.header.startswith(first_line)
@@ -188,11 +199,68 @@ class TestRemote:
 
         assert read is None
 
-    def test_a_server_that_ignores_the_range_is_given_up_on(self):
-        """It would send the whole file, toolpaths and all."""
-        read, _ = read_remote("cube.gcode", ORCA, ignore_range=True)
+    def test_a_server_that_ignores_the_range_is_given_up_on(self, monkeypatch):
+        """It would send the whole file, toolpaths and all: not a byte of the body is read."""
+        chunks = []
+        original = aiohttp.StreamReader.iter_chunked
+
+        def recording(self, n):
+            chunks.append(n)
+            return original(self, n)
+
+        monkeypatch.setattr(aiohttp.StreamReader, "iter_chunked", recording)
+
+        read, fake = read_remote("cube.gcode", ORCA, ignore_range=True)
 
         assert read is None
+        assert len(fake.ranges) == 1  # given up on at the first answer
+        assert chunks == []
+
+    def test_a_redirect_is_not_followed_and_the_key_goes_nowhere_else(self):
+        async def scenario():
+            elsewhere = FakeMoonraker()
+            other_url = await elsewhere.start()
+            elsewhere.files["cube.gcode"] = ORCA
+            redirected: list = []
+
+            async def redirect(request):
+                redirected.append(request.path)
+                raise web.HTTPFound(f"{other_url}{request.path}")
+
+            app = web.Application()
+            app.router.add_get("/server/files/gcodes/{path:.+}", redirect)
+            server = TestServer(app)
+            await server.start_server()
+            try:
+                url = str(server.make_url("")).rstrip("/")
+                reader = remote(url, api_key="mrk-key")
+                read = await reader.read(no_calls, job("cube.gcode", ORCA))
+                thumbnail = None
+                with contextlib.suppress(ImageUnavailable):
+                    thumbnail = await fetch_image(
+                        f"{url}/server/files/gcodes/t.png", timeout=5, headers={"X-Api-Key": "k"}
+                    )
+                return read, thumbnail, redirected, elsewhere.ranges
+            finally:
+                await server.close()
+                await elsewhere.close()
+
+        read, thumbnail, redirected, reached = asyncio.run(scenario())
+
+        assert read is None and thumbnail is None
+        assert redirected  # asked, and answered with a redirect
+        assert reached == []
+
+    def test_inconsistent_metadata_falls_back_to_a_bounded_tail(self):
+        """A `gcode_end_byte` before `gcode_start_byte` can't be where the G-code ends."""
+        the_job = job("cube.gcode", ORCA)
+        the_job["metadata"]["gcode_end_byte"] = the_job["metadata"]["gcode_start_byte"] - 10
+
+        read, fake = read_remote("cube.gcode", ORCA, the_job)
+
+        size = len(ORCA)
+        assert ranges(fake)[1] == (max(0, size - TAIL_FALLBACK_BYTES), size - 1)
+        assert read.config_block == ORCA[gcode_metadata(ORCA)["gcode_end_byte"] :].decode()
 
     def test_a_file_that_isnt_gcode_is_never_requested(self):
         read, fake = read_remote("cube.ufp", ORCA, job("cube.ufp", ORCA))
@@ -212,6 +280,51 @@ class TestRemote:
         read, _ = read_remote("cube.gcode", data, job("cube.gcode", data, gcode_end_byte=40))
 
         assert read is None
+
+
+def older(data: bytes) -> dict:
+    """A job whose metadata came from Moonraker v0.9.3, which counts characters."""
+    the_job = job("cube.gcode", data)
+    the_job["metadata"].update(gcode_metadata(data, moonraker="v0.9.3"))
+    return the_job
+
+
+def assert_whole_lines_of_the_block(block: str, data: bytes) -> None:
+    true_tail = data[gcode_metadata(data)["gcode_end_byte"] :].decode()
+    assert block.lstrip("\r\n").startswith(";"), block[:80]
+    assert true_tail.endswith(block)
+    cut = len(true_tail) - len(block)
+    assert cut == 0 or true_tail[cut - 1] in "\r\n", "the block starts mid-line"
+
+
+class TestOlderMoonraker:
+    """Moonraker v0.9.3 and older count `gcode_end_byte` in characters, so after non-ASCII text
+    or CRLF line endings it points past where the G-code ends, into the settings block. The read
+    still never starts mid-line: a line it cuts is dropped, never sent unscrubbed."""
+
+    def test_non_ascii_in_the_settings_never_leaves_a_cut_secret(self):
+        head = ORCA[: gcode_metadata(ORCA)["gcode_end_byte"]]
+        prefix = b"; EXECUTABLE_BLOCK_END\n; printhost_apikey = "
+        notes = "\u6e2c" * ((len(prefix) + 4) // 2)  # 3 bytes, 1 character each
+        data = head + prefix + b"SECRETKEY123\n; printer_notes = " + notes.encode() + b"\n"
+        metadata = gcode_metadata(data, moonraker="v0.9.3")
+        landing = metadata["gcode_end_byte"] - len(head)
+        assert len(prefix) < landing < len(prefix) + len("SECRETKEY123")  # mid-secret
+
+        read, _ = read_remote("cube.gcode", data, older(data))
+
+        assert_whole_lines_of_the_block(read.config_block, data)
+        body = json.dumps(request_body(None, read))
+        assert "KEY123" not in body and "SECRET" not in body
+
+    def test_crlf_line_endings(self):
+        data = ORCA.replace(b"\n", b"\r\n")
+
+        read, fake = read_remote("cube.gcode", data, older(data))
+
+        assert_whole_lines_of_the_block(read.config_block, data)
+        assert SECRET not in json.dumps(request_body(None, read))
+        assert "; printhost_apikey =\r\n" in request_body(None, read)["configBlock"]
 
 
 class TestLocal:
@@ -244,7 +357,7 @@ class TestLocal:
 
         metadata = gcode_metadata(data)
         end = metadata["gcode_end_byte"]
-        assert spans == [(0, metadata["gcode_start_byte"] - 1), (end, len(data) - 1)]
+        assert spans == [(0, metadata["gcode_start_byte"] - 1), (end - 1, len(data) - 1)]
         assert_no_toolpaths(spans, data)
         assert read.config_block == data[end:].decode()
 

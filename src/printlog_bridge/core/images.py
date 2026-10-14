@@ -131,7 +131,12 @@ async def _download(
     max_bytes: int,
     headers: Mapping[str, str] | None,
 ) -> bytearray:
-    async with session.get(url, headers=dict(headers or {})) as response:
+    # With a key (Moonraker's, for a thumbnail), never redirected: the key would go along to
+    # wherever the redirect points. A webcam's snapshot URL carries no header of ours (aiohttp
+    # drops basic auth on a redirect to another host), and some cameras redirect to the frame.
+    async with session.get(
+        url, headers=dict(headers or {}), allow_redirects=not headers
+    ) as response:
         if response.status != 200:
             raise ImageUnavailable(f"{shown} answered {response.status}")
         if response.content_length is not None and response.content_length > max_bytes:
@@ -184,15 +189,18 @@ async def fetch_range(
     shown = mask_url(url)
     wanted = end - start
     try:
-        async with (
-            aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                headers={"User-Agent": f"printlog-bridge/{__version__}"},
-            ) as session,
-            session.get(
-                url, headers={**(headers or {}), "Range": f"bytes={start}-{end - 1}"}
-            ) as response,
-        ):
+        # Not one parenthesized `async with`: Python 3.9's documented grammar has none.
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers={"User-Agent": f"printlog-bridge/{__version__}"},
+        )
+        # Never redirected: Moonraker's key would go along to wherever the redirect points.
+        request = session.get(
+            url,
+            headers={**(headers or {}), "Range": f"bytes={start}-{end - 1}"},
+            allow_redirects=False,
+        )
+        async with session, request as response:
             if response.status == 206:
                 content_range = response.headers.get("Content-Range", "")
                 if content_range != f"bytes {start}-{end - 1}/{size}":

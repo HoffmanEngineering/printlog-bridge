@@ -39,16 +39,15 @@ SENSITIVE = (
 """A setting whose key holds any of these has its value blanked: the API's list
 (`SlicerSettingsScrubber`), with `post_process` matched within a key as well as whole."""
 
-_LINE_BREAK = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85  ]")
+_LINE_BREAK = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 """Every line break `str.splitlines()` knows, a superset of the API's: so a line the API reads
 starts where one of these does, and a CR-only block can't slip a key past."""
-_API_LINE_BREAK = re.compile(r"[\n\r\f\x85  ]")
+_API_LINE_BREAK = re.compile(r"[\n\r\f\x85\u2028\u2029]")
 """Where the API (`MemoryExtensions.EnumerateLines`) ends a line, and so where a value ends."""
+_TRAILING_LINE_BREAK = re.compile(r"(?:\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029])\Z")
 _SETTING = re.compile(r"[ \t]*;[ \t]*([A-Za-z0-9_.\-]+)[ \t]*[=:]")
 """`; key = value` or `; key: value`, up to the separator. No part of it matches a line break,
 so a match never runs past its line."""
-_COMMAND = re.compile(r"[GM]\d+(?:\s|$)")
-"""A line that is a G-code command, as Moonraker finds where the G-code ends."""
 
 
 def is_sensitive(key: str) -> bool:
@@ -85,18 +84,21 @@ def scrub(text: str) -> str:
 
 
 def header_from(data: bytes) -> str | None:
-    """The header from the start of a file: through its `; HEADER_BLOCK_END` line, or else its
-    first line (PrusaSlicer names itself and its version there). None for anything but text."""
+    """The header from the start of a file: the comment lines it starts with, through
+    `; HEADER_BLOCK_END` when that is among them. PrusaSlicer's is its first line, which names
+    it and its version; a blank line ends it. Never a line of G-code. None for anything but
+    text, or a file that doesn't start with a comment."""
     text = _text(data)
     if text is None:
         return None
-    marker = text.find(HEADER_END)
-    if marker >= 0:
-        line_break = _LINE_BREAK.search(text, marker)
-        header = text[: line_break.start()] if line_break is not None else text
-    else:
-        line_break = _LINE_BREAK.search(text)
-        header = text[: line_break.start()] if line_break is not None else text
+    end = 0
+    for line in _lines(text):
+        if not line.startswith(";") or not _TRAILING_LINE_BREAK.search(line):
+            break  # G-code, a blank line, or a line the read may have cut
+        end += len(line)
+        if line.startswith(HEADER_END):
+            break
+    header = _TRAILING_LINE_BREAK.sub("", text[:end])
     return header if header.strip() else None
 
 
@@ -113,10 +115,24 @@ def config_block_from(
         line_break = _LINE_BREAK.search(text)
         text = text[line_break.end() :] if line_break is not None else ""
     if after_gcode:
+        # Only the comments and blank lines the read ends with: whatever a toolpath looks like
+        # (`G1X10E.5`, indented, lower case, `T1`), it isn't one of those.
         lines = text.splitlines(keepends=True)
-        last = max((n for n, line in enumerate(lines) if _COMMAND.match(line)), default=-1)
-        text = "".join(lines[last + 1 :])
+        keep = len(lines)
+        while keep and (not lines[keep - 1].strip() or lines[keep - 1].lstrip().startswith(";")):
+            keep -= 1
+        text = "".join(lines[keep:])
     return text if text.strip() else None
+
+
+def _lines(text: str):
+    """Each line of `text` with its line break, as `_LINE_BREAK` splits them."""
+    position = 0
+    while position < len(text):
+        line_break = _LINE_BREAK.search(text, position)
+        end = line_break.end() if line_break is not None else len(text)
+        yield text[position:end]
+        position = end
 
 
 def request_body(metadata: SlicerMetadata | None, file: SlicerFile | None) -> dict[str, Any] | None:
@@ -157,12 +173,13 @@ _ORDER = (
 
 def metadata_fields(metadata: SlicerMetadata) -> dict[str, Any]:
     """The metadata under the API's names (`SlicerMetadataDto`). Text is cut to the API's
-    length, and a number outside its range (or not finite) is left out."""
+    length (in UTF-16 code units, as it counts), and a number outside its range (or not finite)
+    is left out."""
     fields: dict[str, Any] = {}
     for name, attribute, limit in _TEXT_FIELDS:
         value = getattr(metadata, attribute)
         if isinstance(value, str) and value.strip():
-            fields[name] = value.strip()[:limit]
+            fields[name] = _utf16_prefix(value.strip(), limit)
     for name, attribute, low, high in _NUMBER_FIELDS:
         value = getattr(metadata, attribute)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -170,6 +187,17 @@ def metadata_fields(metadata: SlicerMetadata) -> dict[str, Any]:
         if math.isfinite(value) and low <= value <= high:
             fields[name] = value
     return {name: fields[name] for name in _ORDER if name in fields}
+
+
+def _utf16_prefix(text: str, limit: int) -> str:
+    """The longest start of `text` that is at most `limit` UTF-16 code units, which is how the
+    API counts a length; a character outside the BMP (an emoji) is two, and never split."""
+    units = 0
+    for n, character in enumerate(text):
+        units += 2 if ord(character) > 0xFFFF else 1
+        if units > limit:
+            return text[:n]
+    return text
 
 
 def _text(data: bytes) -> str | None:
