@@ -173,6 +173,14 @@ class JobTracker:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    async def close(self) -> None:
+        """Cancels the console prompts still being shown, and waits for them to stop."""
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def on_gcode_response(self, line: str) -> None:
         pass
 

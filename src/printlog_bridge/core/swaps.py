@@ -25,6 +25,9 @@ SAME_POINT_MM = 1.0
 """How close (in millimetres fed) a swap may be to a filament change's pause and still count as
 the spool loaded in it: a swap made during the pause is at the pause's point, give or take."""
 NO_SPOOL = "no spool"
+STARTING_MM = 1.0
+"""A spool assigned before its slot fed more than this (a `PRINTLOG_SET_SPOOL` in the start
+G-code) is the slot's spool from the start, not a swap: nothing is split and nothing noted."""
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,41 @@ def on_slot(records: Iterable[Mapping[str, Any]], slot: int) -> list[Mapping[str
     return sorted((r for r in records if r.get("slot") == slot), key=lambda r: r["fed_mm"])
 
 
+def is_split(swap: Mapping[str, Any]) -> bool:
+    """Whether the swap splits its slot, rather than naming the spool it started with."""
+    return float(swap["fed_mm"]) > STARTING_MM
+
+
+def first_spool(swaps: Sequence[Mapping[str, Any]]) -> str | None:
+    """The spool a slot started the job with, given its swaps in order (`on_slot`): the last one
+    assigned before the slot fed anything, else the one the first swap replaced."""
+    starting = [swap for swap in swaps if not is_split(swap)]
+    return starting[-1].get("new") if starting else swaps[0].get("old")
+
+
+def before_swaps(loaded: Mapping[int, str], swaps: Sequence[Mapping[str, Any]]) -> dict[int, str]:
+    """`loaded` (the spools in the slots now) with each swapped slot's spool as it started the
+    job: what's loaded now came after the swaps."""
+    before = dict(loaded)
+    for slot in {swap["slot"] for swap in swaps}:
+        first = first_spool(on_slot(swaps, slot))
+        before.pop(slot, None)
+        if first is not None:
+            before[slot] = first
+    return before
+
+
+def named(swaps: Iterable[Mapping[str, Any]], slot: int) -> set[str]:
+    """Every spool the slot's swaps name, old or new."""
+    return {
+        spool
+        for swap in swaps
+        if swap["slot"] == slot
+        for spool in (swap.get("old"), swap.get("new"))
+        if spool is not None
+    }
+
+
 def segments(
     mm: float, first: str | None, swaps: Sequence[Mapping[str, Any]]
 ) -> list[tuple[str | None, float]]:
@@ -88,11 +126,16 @@ def segments(
     return pieces
 
 
-def swap_notes(swaps: Iterable[Mapping[str, Any]]) -> list[str]:
-    """Such as "T0: Spool A → Spool B at 63% (layer 112)", one per swap, in order."""
+def swap_notes(
+    swaps: Iterable[Mapping[str, Any]], fed: Mapping[int, float] | None = None
+) -> list[str]:
+    """Such as "T0: Spool A → Spool B at 63% (layer 112)", one per swap that split its slot, in
+    order. With `fed` (millimetres per slot), none for a slot that fed nothing."""
     notes = []
     for swap in sorted(swaps, key=lambda r: (r["slot"], r["fed_mm"])):
-        if swap.get("old") == swap.get("new"):
+        if swap.get("old") == swap.get("new") or not is_split(swap):
+            continue
+        if fed is not None and fed.get(swap["slot"], 0.0) <= 0:
             continue
         old, new = (_spool_name(swap, end) for end in ("old", "new"))
         notes.append(f"T{swap['slot']}: {old} → {new}{_where(swap)}")

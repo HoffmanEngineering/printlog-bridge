@@ -207,7 +207,7 @@ class Spools:
             return f"there is no T{command.slot}: tools are numbered 0 to {MAX_SLOTS - 1}"
         try:
             async with self._lock(command.printer):
-                before = self._loaded.get(command.printer, {}).get(command.slot)
+                before = self._before(command.printer, command.slot)
                 answer = await self._carry_out(command, printer_id)
                 if self._swapped(command.printer, command.slot, before, command.during):
                     answer += f". This print's {slot} usage is split here"
@@ -333,7 +333,7 @@ class Spools:
                     return
                 filament_id = str(spool["id"])
                 if self.loaded(reading.printer).get(reading.slot) != filament_id:
-                    before = self._loaded.get(reading.printer, {}).get(reading.slot)
+                    before = self._before(reading.printer, reading.slot)
                     await self._load(
                         reading.printer, printer_id, reading.slot, filament_id, reading.slot_count
                     )
@@ -390,14 +390,24 @@ class Spools:
 
     # -- helpers -------------------------------------------------------------------------------
 
+    def _before(self, printer: str, slot: int) -> Mapping[str, Any] | None | bool:
+        """The slot's spool before a change, None for none, or False when the printer's spools
+        were never read, so what was there isn't known."""
+        if printer not in self._loaded:
+            return False
+        return self._loaded[printer].get(slot)
+
     def _swapped(
         self,
         printer: str,
         slot: int,
-        before: Mapping[str, Any] | None,
+        before: Mapping[str, Any] | None | bool,
         during: JobPoint | None,
     ) -> bool:
-        """Tells `on_swap` when the slot's spool changed while a job ran. Whether it split it."""
+        """Tells `on_swap` when the slot's spool changed while a job ran. Whether it split it.
+        Not when the spool before isn't known: there'd be nothing to split from."""
+        if before is False:
+            return False
         after = self._loaded.get(printer, {}).get(slot)
         old = None if before is None else str(before["id"])
         new = None if after is None else str(after["id"])

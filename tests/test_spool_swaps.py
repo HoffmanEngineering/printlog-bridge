@@ -20,12 +20,14 @@ from typing import Any
 
 import bridge_helpers as helpers
 import pytest
+from aiohttp import web
 from bridge_helpers import write_config
 from fake_moonraker import DEFAULT_OBJECTS, FakeMoonraker, eventually
 from fake_printlog_api import FakePrintLogApi
 from test_moonraker_spools import FILAMENT_DETECT, SNAPMAKER_PLA_RED
 
 from printlog_bridge.adapters.moonraker.changes import FilamentChanges, sensor_slot
+from printlog_bridge.adapters.moonraker.jobs import JobTracker
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.events import (
     FilamentChange,
@@ -46,11 +48,12 @@ HINT = "T0 was paused for a filament change; run PRINTLOG_SET_SPOOL during the p
 
 
 @contextlib.asynccontextmanager
-async def running(config: Path, moonraker: FakeMoonraker):
+async def running(config: Path, moonraker: FakeMoonraker, **options):
     async with helpers.bridge(
         config,
         connected=lambda: moonraker.client_count == 1,
         disconnected=lambda: moonraker.client_count == 0,
+        **options,
     ) as task:
         await eventually(lambda: moonraker.subscriptions)
         yield task
@@ -64,6 +67,16 @@ async def fakes(tmp_path: Path, moonraker: FakeMoonraker, api: FakePrintLogApi):
     finally:
         await moonraker.close()
         await api.close()
+
+
+def logged(tmp_path: Path) -> bool:
+    """Whether the bridge's state file has every job it knows logged to the end, notes and all."""
+    path = tmp_path / "state" / "printers" / "voron.json"
+    try:
+        jobs = json.loads(path.read_text(encoding="utf-8"))["jobs"].values()
+    except (OSError, ValueError, KeyError):
+        return False
+    return bool(jobs) and all(job.get("finished") for job in jobs)
 
 
 def recorded(tmp_path: Path, key: str = "swaps") -> list[dict[str, Any]]:
@@ -125,7 +138,7 @@ def test_set_spool_during_a_pause_splits_the_tool_between_the_two_spools(tmp_pat
             await resume(moonraker)
             await feed(moonraker, 5000.0)
             await moonraker.finish_job(job, filament_used=5000.0)
-            await eventually(lambda: api.prints[1]["status"] != 2)
+            await eventually(lambda: logged(tmp_path))
 
     asyncio.run(scenario())
 
@@ -165,7 +178,7 @@ def test_a_runout_pause_resumed_without_the_macro_keeps_one_spool_and_adds_a_hin
             await eventually(lambda: recorded(tmp_path, "filament_changes"))
             await feed(moonraker, 5000.0)
             await moonraker.finish_job(job, filament_used=5000.0)
-            await eventually(lambda: api.prints[1]["status"] != 2)
+            await eventually(lambda: logged(tmp_path))
 
     asyncio.run(scenario())
 
@@ -201,7 +214,7 @@ def test_a_runout_with_the_macro_during_the_pause_splits_and_has_no_hint(tmp_pat
             await eventually(lambda: recorded(tmp_path, "filament_changes"))
             await feed(moonraker, 5000.0)
             await moonraker.finish_job(job, filament_used=5000.0)
-            await eventually(lambda: api.prints[1]["status"] != 2)
+            await eventually(lambda: logged(tmp_path))
 
     asyncio.run(scenario())
 
@@ -233,7 +246,7 @@ def test_a_u1_tag_change_mid_print_splits_the_same_way(tmp_path):
             await resume(moonraker)
             await feed(moonraker, 3000.0)
             await moonraker.finish_job(job, filament_used=3000.0)
-            await eventually(lambda: api.prints[1]["status"] != 2)
+            await eventually(lambda: logged(tmp_path))
 
     asyncio.run(scenario())
 
@@ -265,7 +278,7 @@ def test_a_restart_between_the_swap_and_the_finish_keeps_the_split(tmp_path):
             async with running(config, moonraker):
                 await feed(moonraker, 5000.0)
                 await moonraker.finish_job(job, filament_used=5000.0)
-                await eventually(lambda: api.prints[1]["status"] != 2)
+                await eventually(lambda: logged(tmp_path))
 
     asyncio.run(scenario())
 
@@ -306,7 +319,7 @@ def test_a_multi_tool_printer_splits_each_tool_on_its_own(tmp_path):
             await feed(moonraker, 3500.0, "extruder")
             await feed(moonraker, 5000.0, "extruder")  # T0 3500
             await moonraker.finish_job(job, filament_used=5000.0)
-            await eventually(lambda: api.prints[1]["status"] != 2)
+            await eventually(lambda: logged(tmp_path))
 
     asyncio.run(scenario())
 
@@ -335,7 +348,7 @@ def test_set_spool_between_prints_splits_nothing(tmp_path):
             await printing(moonraker, "vase.gcode")
             await feed(moonraker, 5000.0)
             await moonraker.finish_job(job, filament_used=5000.0)
-            await eventually(lambda: api.prints[1]["status"] != 2)
+            await eventually(lambda: logged(tmp_path))
 
     asyncio.run(scenario())
 
@@ -344,6 +357,186 @@ def test_set_spool_between_prints_splits_nothing(tmp_path):
     assert row["filament"] == {"id": second}
     assert not print_.get("notes")
     assert "split" not in moonraker.scripts[0]
+
+
+FAST = (0.05, 0.2)
+"""The outbox's backoff, scaled down so a retried send comes round at once."""
+
+
+def flaky(api: FakePrintLogApi, name: str, *, after: bool, times: int = 1) -> dict[str, int]:
+    """Makes the fake API's handler `name` answer 503 `times` times: before doing anything, or
+    `after` doing it, as when the answer is lost on the way back. Call before `api.start()`."""
+    real = getattr(api, name)
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        if calls["n"] > times:
+            return await real(request)
+        if after:
+            await real(request)
+        return web.Response(status=503)
+
+    setattr(api, name, handler)
+    return calls
+
+
+async def split_job(moonraker: FakeMoonraker, second: str, finished: bool = True) -> dict:
+    """A 5 m job on T0 whose spool changes to `second` at 3 m, during a pause."""
+    job = await moonraker.start_job("vase.gcode", METADATA)
+    await printing(moonraker, "vase.gcode")
+    await feed(moonraker, 3000.0)
+    await pause(moonraker, 0.6, 100)
+    answers = len(moonraker.scripts)
+    await moonraker.respond(f"// printlog: SET_SPOOL TOOL=0 ID={second}")
+    await eventually(lambda: len(moonraker.scripts) > answers)
+    await resume(moonraker)
+    await feed(moonraker, 5000.0)
+    if finished:
+        await moonraker.finish_job(job, filament_used=5000.0)
+    return job
+
+
+@pytest.mark.parametrize("loaded_before", [True, False], ids=["a-to-b", "none-to-b"])
+@pytest.mark.parametrize(
+    ("handler", "after"),
+    [("_patch", False), ("_complete", True)],
+    ids=["notes-patch-fails", "complete-answer-lost"],
+)
+@pytest.mark.parametrize("reordered", [False, True], ids=["in-order", "rows-reordered"])
+def test_a_retried_completion_sends_the_same_split(
+    tmp_path, loaded_before, handler, after, reordered
+):
+    """The completion is sent again when its answer is lost, or when the notes after it fail:
+    the second time, the print already has a row per spool, which mustn't change the split.
+    The real API returns a print's rows in no set order, hence `reordered`."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    first, second = api.add_spool("Spool A"), api.add_spool("Spool B")
+    if loaded_before:
+        api.user_loads(42, 0, first)
+    calls = flaky(api, handler, after=after)
+    if reordered:
+        real_get = api._get
+
+        async def get(request):
+            found = api.prints.get(int(request.match_info["id"]))
+            if found is not None:
+                found["filamentUsage"].reverse()
+            return await real_get(request)
+
+        api._get = get
+
+    async def scenario():
+        async with (
+            fakes(tmp_path, moonraker, api) as config,
+            running(config, moonraker, backoff=FAST),
+        ):
+            await split_job(moonraker, second)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    assert calls["n"] >= 2
+    print_ = api.prints[1]
+    rows = rows_on(print_, 0)
+    assert rows[first if loaded_before else None]["lengthInM"] == pytest.approx(3.0)
+    assert rows[second]["lengthInM"] == pytest.approx(2.0)
+    assert sum(r["lengthInM"] or 0 for r in print_["filamentUsage"]) == pytest.approx(5.0)
+    assert print_["notes"].count("→") == 1
+
+
+def test_a_print_created_after_the_swap_still_splits_it(tmp_path):
+    """The API was down until after the swap, so the print is only created then: its row is
+    the first spool's, not the one loaded now, and the new spool stays loaded."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    first, second = api.add_spool("Spool A"), api.add_spool("Spool B")
+    api.user_loads(42, 0, first)
+    down = {"yes": True}
+    real_create = api._create
+
+    async def create(request):
+        if down["yes"]:
+            return web.Response(status=503)
+        return await real_create(request)
+
+    api._create = create
+
+    async def scenario():
+        async with (
+            fakes(tmp_path, moonraker, api) as config,
+            running(config, moonraker, backoff=FAST),
+        ):
+            await split_job(moonraker, second, finished=False)
+            down["yes"] = False
+            await eventually(lambda: api.prints)
+            await moonraker.finish_job(moonraker.jobs[-1], filament_used=5000.0)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    print_ = api.prints[1]
+    rows = rows_on(print_, 0)
+    assert rows[first]["lengthInM"] == pytest.approx(3.0)
+    assert rows[first]["estimatedLengthInM"] == 5.0
+    assert rows[second]["lengthInM"] == pytest.approx(2.0)
+    # Loaded again after the create made the first spool the printer's. The API keeps that one
+    # too, with no slot, until the next print's create replaces the list; slot 0's wins.
+    assert api.slot_spools(42)[0] == second
+
+
+def test_set_spool_before_the_tool_fed_anything_is_the_starting_spool(tmp_path):
+    """A PRINTLOG_SET_SPOOL in the start G-code: no split, no note, the spool gets it all."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    first, second = api.add_spool("Spool A"), api.add_spool("Spool B")
+    api.user_loads(42, 0, first)
+
+    async def scenario():
+        async with fakes(tmp_path, moonraker, api) as config, running(config, moonraker):
+            job = await moonraker.start_job("vase.gcode", METADATA)
+            await eventually(lambda: api.prints)
+            await printing(moonraker, "vase.gcode")
+            await moonraker.respond(f"// printlog: SET_SPOOL TOOL=0 ID={second}")
+            await eventually(lambda: moonraker.scripts)
+            await feed(moonraker, 5000.0)
+            await moonraker.finish_job(job, filament_used=5000.0)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    print_ = api.prints[1]
+    rows = rows_on(print_, 0)
+    assert rows[second]["lengthInM"] == pytest.approx(5.0)
+    assert not rows.get(first, {}).get("lengthInM")
+    assert not print_.get("notes")
+    assert "split" not in moonraker.scripts[0]
+
+
+def test_an_unload_in_the_end_g_code_is_not_a_runout(tmp_path):
+    """The sensor goes empty as the print ends (or an MMU's gate sensor toggles mid-print)
+    with no pause: nothing is prompted, and no note is added."""
+    moonraker = FakeMoonraker(objects=(*DEFAULT_OBJECTS, RUNOUT_SENSOR, RESPOND_MACRO))
+    moonraker.status[RUNOUT_SENSOR] = {"filament_detected": True, "enabled": True}
+    api = FakePrintLogApi()
+    api.user_loads(42, 0, api.add_spool("Spool A"))
+
+    async def scenario():
+        async with fakes(tmp_path, moonraker, api) as config, running(config, moonraker):
+            job = await moonraker.start_job("vase.gcode", METADATA)
+            await eventually(lambda: api.prints)
+            await printing(moonraker, "vase.gcode")
+            await feed(moonraker, 2000.0)
+            await moonraker.set_status(**{RUNOUT_SENSOR: {"filament_detected": False}})
+            await moonraker.set_status(**{RUNOUT_SENSOR: {"filament_detected": True}})
+            await feed(moonraker, 5000.0)
+            await moonraker.set_status(**{RUNOUT_SENSOR: {"filament_detected": False}})
+            await moonraker.set_status(print_stats={"state": "complete"})
+            await moonraker.finish_job(job, filament_used=5000.0)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    assert moonraker.scripts == []
+    assert not api.prints[1].get("notes")
 
 
 # -- the pieces on their own ---------------------------------------------------------------------
@@ -421,6 +614,29 @@ class TestUsageRows:
 
         assert sum(r["lengthInM"] for r in usage) == pytest.approx(4.321, abs=0.0002)
 
+    def test_a_row_already_linked_to_the_new_spool_doesnt_take_the_first_part(self):
+        """A retried completion reads the print back with a row per spool, in no set order."""
+        rows = [{"slot": 0, "filament": {"id": "b"}}, {"slot": 0, "filament": {"id": "a"}}]
+
+        usage = _usage_rows(finished({0: 5000.0}), rows, {0: "b"}, True, [swap(0, 3000, "a", "b")])
+
+        assert [(r["filamentId"], r["lengthInM"]) for r in usage] == [("a", 3.0), ("b", 2.0)]
+
+    def test_a_spool_set_before_the_slot_fed_anything_is_its_first_spool(self):
+        rows = [{"slot": 0, "filament": {"id": "a"}}]
+
+        usage = _usage_rows(finished({0: 5000.0}), rows, {0: "b"}, True, [swap(0, 0.0, "a", "b")])
+
+        assert [(r["filamentId"], r["lengthInM"]) for r in usage] == [("b", 5.0)]
+
+    def test_the_rows_add_up_to_the_rounded_total_exactly(self):
+        swaps = [swap(0, 1000.05, "a", "b"), swap(0, 2000.10, "b", "c")]
+
+        usage = _usage_rows(finished({0: 3000.15}), [], {}, True, swaps)
+
+        # Each piece rounded on its own would be 1.0001 (or 1.0) three times over.
+        assert round(sum(r["lengthInM"] for r in usage), 4) == round(3000.15 / 1000, 4)
+
     def test_each_tool_is_split_on_its_own(self):
         rows = [{"slot": 0, "filament": {"id": "a"}}, {"slot": 1, "filament": {"id": "b"}}]
         swaps = [swap(1, 500, "b", "c")]
@@ -444,6 +660,15 @@ class TestNotes:
 
         assert swap_notes([record]) == ["T1: Spool A → no spool"]
 
+    def test_no_note_for_a_slot_that_fed_nothing_or_a_starting_spool(self):
+        records = [
+            swap(1, 0.0, "a", "b", old_name="Spool A", new_name="Spool B"),
+            swap(0, 0.0, "c", "d", old_name="Spool C", new_name="Spool D"),
+            swap(0, 10.0, "d", "e", old_name="Spool D", new_name="Spool E"),
+        ]
+
+        assert swap_notes(records, {0: 100.0, 1: 0.0}) == ["T0: Spool D → Spool E"]
+
     def test_a_filament_change_no_swap_followed_gets_the_hint(self):
         changes = [{"slot": 0, "fed_mm": 3000.0, "reason": "runout"}]
 
@@ -454,10 +679,13 @@ class TestNotes:
         assert change_hints(changes, [swap(1, 3000.0, "a", "b")]) == [HINT]  # another tool
 
 
-def status(state: str, *, e: float | None = None, **objects) -> dict[str, Any]:
-    out: dict[str, Any] = {"print_stats": {"state": state}, **objects}
+def status(
+    state: str, *, e: float | None = None, tool: str = "extruder", used: float = 0.0, **objects
+) -> dict[str, Any]:
+    out: dict[str, Any] = {"print_stats": {"state": state, "filament_used": used}, **objects}
+    out["toolhead"] = {"extruder": tool}
     if e is not None:
-        out["toolhead"] = {"position": [0.0, 0.0, 10.0, e]}
+        out["toolhead"]["position"] = [0.0, 0.0, 10.0, e]
     return out
 
 
@@ -521,6 +749,61 @@ class TestFilamentChanges:
             status("printing", **{sensor: {"filament_detected": False, "enabled": False}}),
             status("paused"), status("printing"),
         )  # fmt: skip
+
+        assert (prompts, found) == ([], [])
+
+    def test_a_tool_change_while_paused_is_not_an_unload(self):
+        """ACTIVATE_EXTRUDER makes `toolhead.position`'s E the other extruder's."""
+        prompts, found = self.run(
+            status("printing", e=500.0), status("paused", e=500.0),
+            status("paused", e=20.0, tool="extruder1"), status("paused", e=500.0),
+            status("printing", e=500.0),
+        )  # fmt: skip
+
+        assert (prompts, found) == ([], [])
+
+    def test_a_runout_only_counts_once_the_job_pauses(self):
+        sensor = "filament_switch_sensor runout"
+        on, off = {"filament_detected": True}, {"filament_detected": False}
+        prompts, found = self.run(
+            status("printing", **{sensor: on}),
+            status("printing", used=10.0, **{sensor: off}),
+        )
+        assert (prompts, found) == ([], [])
+
+        prompts, found = self.run(
+            status("printing", **{sensor: on}),
+            status("printing", used=10.0, **{sensor: off}),
+            status("paused", used=12.0, **{sensor: off}),
+            status("printing", used=12.0, **{sensor: on}),
+        )
+        assert len(prompts) == 1
+        assert [c.reason for c in found] == ["runout"]
+
+    def test_a_sensor_empty_long_before_a_pause_is_not_its_runout(self):
+        """An MMU's gate sensor, say, empty while another gate prints on."""
+        sensor = "filament_switch_sensor gate_1"
+        on, off = {"filament_detected": True}, {"filament_detected": False}
+        prompts, found = self.run(
+            status("printing", used=0.0, **{sensor: on}),
+            status("printing", used=10.0, **{sensor: off}),
+            status("printing", used=2000.0, **{sensor: off}),
+            status("paused", used=2000.0, **{sensor: off}),
+            status("printing", used=2000.0, **{sensor: off}),
+        )
+
+        assert (prompts, found) == ([], [])
+
+    def test_a_sensor_that_comes_back_before_a_pause_is_no_runout(self):
+        sensor = "filament_switch_sensor runout"
+        on, off = {"filament_detected": True}, {"filament_detected": False}
+        prompts, found = self.run(
+            status("printing", **{sensor: on}),
+            status("printing", used=5.0, **{sensor: off}),
+            status("printing", used=6.0, **{sensor: on}),
+            status("paused", used=6.0, **{sensor: on}),
+            status("printing", used=6.0, **{sensor: on}),
+        )
 
         assert (prompts, found) == ([], [])
 
@@ -588,6 +871,21 @@ class TestSwapHook:
         assert heard == [SpoolSwap("u1", 0, first, second, "Spool A", "Spool B", point())]
         assert answer.endswith("This print's T0 usage is split here")
 
+    def test_none_before_the_printers_spools_were_ever_read(self):
+        """The slot's spool was unknown, not empty: there's nothing to split from."""
+        api = FakePrintLogApi()
+        first, second = api.add_spool("Spool A"), api.add_spool("Spool B")
+        api.user_loads(42, 0, first)
+        heard: list[SpoolSwap] = []
+
+        async def scenario(spools):
+            spools.on_swap = lambda s: heard.append(s) or True
+            await spools.spool_command(SpoolCommand("u1", 0, filament_id=second, during=point()))
+
+        run_spools(api, scenario)
+
+        assert heard == []
+
     def test_between_jobs_or_when_nothing_changed_there_is_none(self):
         api = FakePrintLogApi()
         first, second = api.add_spool("Spool A"), api.add_spool("Spool B")
@@ -616,3 +914,24 @@ def run_spools(api: FakePrintLogApi, scenario):
             await api.close()
 
     return asyncio.run(main())
+
+
+def test_the_trackers_console_prompts_are_cancelled_when_it_stops():
+    async def scenario():
+        hung = asyncio.Event()
+
+        async def call(method, params):
+            hung.set()
+            await asyncio.sleep(3600)
+
+        tracker = JobTracker("voron", sink=None)  # type: ignore[arg-type]
+        tracker._call = call
+        tracker._spawn(tracker._prompt("hello"))
+        await hung.wait()
+        [task] = tracker._tasks
+        await tracker.close()
+        return task
+
+    task = asyncio.run(scenario())
+
+    assert task.cancelled()

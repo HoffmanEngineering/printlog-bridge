@@ -202,7 +202,10 @@ class MoonrakerAdapter(Adapter):
             trace=self.trace,
             locator=locator,
         )
-        await session.run()
+        try:
+            await session.run()
+        finally:
+            await tracker.close()
 
     def use_spools(self, spools: SpoolSink) -> None:
         self.spools = spools
