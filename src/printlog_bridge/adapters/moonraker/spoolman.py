@@ -82,10 +82,10 @@ class SpoolmanSync(MoonrakerListener):
         self._call = call
         self._tools = None
         self.active_slot = None
-        self.moonraker_spool = None
-        self.enabled = await self._points_at_printlog(call)
-        if self.enabled:
-            self.moonraker_spool = await self._active_spool(call)
+        # Set once known, not reset first: what the last connection read stands until then.
+        enabled = await self._points_at_printlog(call)
+        self.moonraker_spool = await self._active_spool(call) if enabled else None
+        self.enabled = enabled
 
     async def on_klippy_state(self, state: str) -> None:
         if state == "ready":
