@@ -27,18 +27,15 @@ from urllib.parse import (
 import aiohttp
 
 from printlog_bridge import __version__
-from printlog_bridge.core.secrets import URL_USERINFO
+from printlog_bridge.core.secrets import URL_USERINFO, mask_query_values
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 """The API refuses larger images ("Image must be under 10MB")."""
 
 _SECRET_QUERY = re.compile(r"(token|key|pass|pwd|secret|auth|sig|user)", re.IGNORECASE)
-_SECRET_QUERY_VALUE = re.compile(
-    r"([?&][^=&\s\"'\\?]*(?:token|key|pass|pwd|secret|auth|sig|user)[^=&\s\"'\\?]*=)"
-    r"[^&#\s\"'<\\]+",
-    re.IGNORECASE,
-)
-"""A query value `mask_url` would hide, in any URL an error writes."""
+MAX_ERROR_CHARS = 2000
+"""How much of an error's message `scrub_url` keeps: enough for a log line, and a bound on the
+work, since the message can come from the network (Moonraker's errors, up to a 4 MB frame)."""
 _MIN_SECRET_LENGTH = 3
 """A secret shorter than this (a user such as `pi`) is hidden only where a URL holds it: as
 plain text, it is too likely to be part of a host name or a word."""
@@ -168,9 +165,9 @@ def scrub_url(error: BaseException, url: str | None) -> str:
     as given, decoded and re-encoded. Any URL in the message also has its user and password,
     and its secret-looking query values, hidden, however short."""
     text = str(error) or type(error).__name__
+    cut = len(text) > MAX_ERROR_CHARS
     if not url:
-        return text
-    text = text.replace(url, mask_url(url))
+        return _cut(text) if cut else text
     try:
         parts = urlsplit(url)
         userinfo = parts.netloc.rpartition("@")[0]
@@ -187,12 +184,26 @@ def scrub_url(error: BaseException, url: str | None) -> str:
         ]  # as written, before parse_qsl decodes it
     except ValueError:
         secrets = []
-    forms = {form for secret in secrets for form in _spellings(secret)}
-    for form in sorted(forms, key=len, reverse=True):
+    forms = sorted({form for secret in secrets for form in _spellings(secret)}, key=len)[::-1]
+    if cut:
+        # Enough past the cut that any secret starting before it is whole, and so found.
+        text = text[: MAX_ERROR_CHARS + len(url) + max((len(f) for f in forms), default=0)]
+    text = text.replace(url, mask_url(url))
+    for form in forms:
         if len(form) >= _MIN_SECRET_LENGTH:
             text = _pattern(form).sub("***", text)
     text = URL_USERINFO.sub(r"\1***@", text)
-    return _SECRET_QUERY_VALUE.sub(r"\1***", text)
+    text = mask_query_values(text, _SECRET_QUERY, "***")
+    return _cut(text) if cut else text
+
+
+def _cut(text: str) -> str:
+    """The first `MAX_ERROR_CHARS` of `text`, less the word cut in two: part of a URL, or of a
+    secret, would no longer look like one."""
+    end = MAX_ERROR_CHARS
+    while end and not text[end - 1].isspace():
+        end -= 1
+    return text[:end] + "…"
 
 
 def _spellings(secret: str) -> set[str]:

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 
 import pytest
 from fake_webcam import JPEG, PNG, FakeWebcam
 
 from printlog_bridge.core.images import (
+    MAX_ERROR_CHARS,
     MAX_IMAGE_BYTES,
     ImageUnavailable,
     fetch_image,
@@ -124,6 +126,48 @@ class TestScrubUrl:
         text = scrub_url(OSError("about a tab: 404"), url)
 
         assert text == "about a tab: 404"
+
+
+LONG_MESSAGES = {
+    "one long word": "a" * 200_000,
+    "a long query name": "?" + "x" * 200_000,
+    "a query name of secret words": "?" + "token" * 40_000,
+    "schemes": "a://" * 50_000,
+    "secret query names": "&token" * 33_000,
+    "user infos": "http://u:p" * 20_000,
+}
+"""Error text can come from the network (Moonraker's own error messages, up to a 4 MB frame):
+scrubbing must take time in proportion to it, never its square."""
+
+
+class TestScrubUrlOnLongText:
+    @pytest.mark.parametrize("message", LONG_MESSAGES.values(), ids=LONG_MESSAGES.keys())
+    def test_is_quick(self, message):
+        began = time.perf_counter()
+        scrub_url(OSError(message), "http://pi:ab@cam.local/x?token=abc123")
+        assert time.perf_counter() - began < 1
+
+    def test_keeps_the_start_of_a_long_message(self):
+        text = scrub_url(OSError("Moonraker says: " + "x " * 5000), "http://cam.local/x")
+
+        assert text.startswith("Moonraker says: x x")
+        assert len(text) <= MAX_ERROR_CHARS + 1
+        assert text.endswith("…")
+
+    def test_a_secret_cut_in_two_shows_no_part_of_itself(self):
+        url = "http://maker:hunter22hunter22@cam.local/x?token=abc123"
+        for start in range(MAX_ERROR_CHARS - 30, MAX_ERROR_CHARS + 2):
+            message = "x" * start + " hunter22hunter22 tail http://u:pw@h/?token=abc123"
+            text = scrub_url(OSError(message), url)
+
+            assert "hunt" not in text, start
+            assert "pw" not in text, start
+            assert "abc" not in text, start
+
+    def test_a_short_message_is_not_cut(self):
+        assert scrub_url(OSError("x" * MAX_ERROR_CHARS), "http://cam.local/x") == (
+            "x" * MAX_ERROR_CHARS
+        )
 
 
 @contextlib.asynccontextmanager
