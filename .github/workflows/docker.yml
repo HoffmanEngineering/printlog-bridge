@@ -33,7 +33,7 @@ jobs:
           tags: printlog-bridge:smoke
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,scope=amd64,mode=max
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install "aiohttp>=3.8" # for the fakes
