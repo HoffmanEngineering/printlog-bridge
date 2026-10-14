@@ -10,7 +10,7 @@ import pytest
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
-from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.api_client import ApiClient, ApiUnavailable
 from printlog_bridge.core.events import SpoolCommand, SpoolReading
 from printlog_bridge.core.spools import (
     UNKNOWN_TAG_RETRY_S,
@@ -191,6 +191,36 @@ class TestSetSpool:
 
         assert "couldn't reach" in answer.lower()
         assert "again" in answer
+
+    def test_unreachable_api_on_a_pick_changes_nothing_and_queues_nothing(self):
+        # A spool picked in Mainsail while 3D Print Log can't be reached: the pick is dropped,
+        # with the reason, and never sent later.
+        api = FakePrintLogApi()
+        loaded = api.add_spool("Loaded", number=1)
+        api.add_spool("Silk Gold", number=12)
+        api.user_loads(42, 0, loaded)
+        heard = []
+
+        async def unreachable(number):
+            raise ApiUnavailable("the connection was reset")
+
+        async def scenario(spools: Spools):
+            await spools.refresh("u1")
+            spools.watch_loaded("u1", heard.append)
+            before = list(api.requests)
+            spools.api.filament_by_number = unreachable
+            answer = await spools.spool_command(command(0, spool_number=12))
+            await spools.refresh("u1")  # the API answers again
+            return answer, spools.loaded("u1"), api.requests[len(before) :]
+
+        answer, now_loaded, requests = run(api, scenario)
+
+        assert answer.startswith("couldn't reach 3D Print Log (the connection was reset)")
+        assert "nothing changed" in answer
+        assert now_loaded == {0: loaded}
+        assert len(heard) == 1  # what was already loaded, and no change since
+        assert all(method == "GET" for method, _ in requests)  # nothing sent later
+        assert api.slot_spools(42) == {0: loaded}
 
     def test_an_unknown_printer_is_refused(self):
         api = FakePrintLogApi()
