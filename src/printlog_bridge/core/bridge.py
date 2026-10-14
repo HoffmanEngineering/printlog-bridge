@@ -51,6 +51,9 @@ async def run_bridge(
     """
     check_runnable(config)
     assert config.api_key is not None  # check_runnable made sure
+    api_url_warning = config.api_url_warning()
+    if api_url_warning is not None:
+        log.warning("%s", api_url_warning)
 
     board = StatusBoard(config.state_dir)
     board.start([p.name for p in config.printers], trace=config.trace)

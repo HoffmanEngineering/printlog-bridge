@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 
 import pytest
 from fake_webcam import JPEG, PNG, FakeWebcam
 
 from printlog_bridge.core.images import (
+    MAX_ERROR_CHARS,
     MAX_IMAGE_BYTES,
     ImageUnavailable,
     fetch_image,
     image_type,
     mask_url,
     read_image_file,
+    scrub_url,
 )
 
 
@@ -50,6 +53,163 @@ class TestMaskUrl:
     def test_leaves_a_plain_url_alone(self):
         assert mask_url("http://cam.local:8080/?action=snapshot") == (
             "http://cam.local:8080/?action=snapshot"
+        )
+
+
+class TestScrubUrl:
+    """An error that repeats a URL, as aiohttp and yarl write it, which needn't be how the
+    config spells it: yarl upper-cases percent escapes, decodes some, and keeps others."""
+
+    def test_hides_the_url_as_given(self):
+        url = "http://maker:hunter22@cam.local/snap?token=abc123"
+        text = scrub_url(ValueError(f"bad URL {url}"), url)
+
+        assert "hunter22" not in text and "abc123" not in text
+        assert "cam.local/snap" in text
+
+    def test_hides_a_password_yarl_writes_with_upper_case_escapes(self):
+        url = "http://maker:s3cr%2fet@cam.local/snap"
+        shown = "http://maker:s3cr%2Fet@cam.local/snap"  # str(yarl.URL(url))
+        text = scrub_url(OSError(f"can't fetch {shown}; password s3cr%2Fet"), url)
+
+        assert "s3cr" not in text
+        assert "cam.local/snap" in text
+
+    def test_hides_a_password_shown_decoded(self):
+        url = "http://maker:p%40ssw0rd@cam.local/snap"
+        text = scrub_url(ValueError("login 'maker' with 'p@ssw0rd' was refused"), url)
+
+        assert "p@ssw0rd" not in text
+        assert "was refused" in text
+
+    def test_hides_a_query_value_yarl_keeps_encoded(self):
+        url = "http://cam.local/snap?token=tok%20en12"
+        # parse_qsl decodes the value to "tok en12"; yarl shows it as it was
+        text = scrub_url(OSError("token tok%20en12 expired"), url)
+
+        assert "tok%20en12" not in text
+
+    def test_hides_a_query_value_shown_with_a_plus(self):
+        url = "http://cam.local/snap?token=tok%20en12"
+        text = scrub_url(OSError("token tok+en12 expired"), url)
+
+        assert "tok+en12" not in text
+
+    def test_hides_a_short_user_and_password_in_a_url(self):
+        url = "http://pi:ab@Cam.local:8080/snap"
+        shown = "http://pi:ab@cam.local:8080/snap"  # yarl writes the host in lower case
+        text = scrub_url(OSError(f"can't fetch {shown}/"), url)
+
+        assert "pi:ab" not in text
+        assert "http://***@cam.local:8080/snap/" in text
+
+    def test_hides_a_short_secret_query_value_in_a_url(self):
+        url = "http://cam.local/snap?token=ab"
+        text = scrub_url(OSError("can't fetch http://cam.local/snap/?token=ab&x=1"), url)
+
+        assert "token=ab" not in text
+        assert "x=1" in text
+
+    def test_leaves_a_short_credential_alone_elsewhere(self):
+        """A two-letter user is far too common to scrub everywhere: `pi` would blank the host
+        name, and every word that holds it."""
+        url = "http://pi:raspberry@pi.local:7125"
+        text = scrub_url(
+            OSError("Cannot connect to host pi.local:7125 ssl:default [api pipe: raspberry]"),
+            url,
+        )
+
+        assert text == "Cannot connect to host pi.local:7125 ssl:default [api pipe: ***]"
+
+    def test_leaves_short_query_values_alone_outside_a_url(self):
+        url = "http://cam.local/snap?token=ab&action=snapshot"
+        text = scrub_url(OSError("about a tab: 404"), url)
+
+        assert text == "about a tab: 404"
+
+
+LONG_MESSAGES = {
+    "one long word": "a" * 200_000,
+    "a long query name": "?" + "x" * 200_000,
+    "a query name of secret words": "?" + "token" * 40_000,
+    "schemes": "a://" * 50_000,
+    "secret query names": "&token" * 33_000,
+    "user infos": "http://u:p" * 20_000,
+    "letters after digits": "1a" * 100_000,
+    "schemes after digits": "1http://u:p" * 20_000,
+    "query values of nested URLs": "?a=http://h/?b=" * 15_000,
+    "no whitespace": '{"a":"' + "x" * 200_000,
+}
+"""Error text can come from the network (Moonraker's own error messages, up to a 4 MB frame):
+scrubbing must take time in proportion to it, never its square."""
+
+
+class TestScrubUrlOnLongText:
+    @pytest.mark.parametrize("message", LONG_MESSAGES.values(), ids=LONG_MESSAGES.keys())
+    def test_is_quick(self, message):
+        began = time.perf_counter()
+        scrub_url(OSError(message), "http://pi:ab@cam.local/x?token=abc123")
+        assert time.perf_counter() - began < 1
+
+    def test_keeps_the_start_of_a_long_message(self):
+        text = scrub_url(OSError("Moonraker says: " + "x " * 5000), "http://cam.local/x")
+
+        assert text.startswith("Moonraker says: x x")
+        assert len(text) <= MAX_ERROR_CHARS + 1
+        assert text.endswith("…")
+
+    def test_a_secret_cut_in_two_shows_no_part_of_itself(self):
+        url = "http://maker:hunter22hunter22@cam.local/x?token=abc123"
+        for start in range(MAX_ERROR_CHARS - 30, MAX_ERROR_CHARS + 2):
+            message = "x" * start + " hunter22hunter22 tail http://u:pw@h/?token=abc123"
+            text = scrub_url(OSError(message), url)
+
+            assert "hunt" not in text, start
+            assert "pw" not in text, start
+            assert "abc" not in text, start
+
+    @pytest.mark.parametrize("repeats", [35, 40, 70])
+    def test_a_message_scrubbed_shorter_than_the_cut_is_still_cut_safely(self, repeats):
+        """Over the limit as written, under it once each secret is `***`."""
+        secret = "S" * 60
+        text = scrub_url(OSError((secret + " ") * repeats), f"http://cam.local/snap?token={secret}")
+
+        assert "SSS" not in text
+
+    def test_a_long_message_without_spaces_keeps_its_start(self):
+        """Minified JSON from Moonraker has no whitespace to cut at."""
+        text = scrub_url(OSError('{"error":"' + "x" * 120_000 + '"}'), "http://cam.local/x")
+
+        assert text.startswith('{"error":"xxx')
+        assert len(text) > MAX_ERROR_CHARS // 2
+
+    def test_a_secret_cut_in_two_without_spaces_shows_no_part_of_itself(self):
+        url = "http://maker:hunter22hunter22@cam.local/x?token=abc123"
+        password = "p" * 5000  # longer than any margin past the cut
+        for start in range(MAX_ERROR_CHARS - 30, MAX_ERROR_CHARS + 2):
+            for message in (
+                "x" * start + "hunter22hunter22,tail",
+                "x" * start + f"http://u:{password}@h/",
+                "x" * start + f',"http://u:{password}@h/"',
+            ):
+                text = scrub_url(OSError(message), url)
+
+                assert "hunt" not in text, start
+                assert "ppp" not in text, start
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "GET http://h/redirect?next=http://cam/snap?token=SECRET123",
+            "GET http://h/x?a=1?token=SECRET123",
+        ],
+    )
+    def test_hides_a_secret_query_value_after_a_nested_url(self, message):
+        assert "SECRET123" not in scrub_url(OSError(message), "http://cam.local/x")
+
+    def test_a_short_message_is_not_cut(self):
+        assert scrub_url(OSError("x" * MAX_ERROR_CHARS), "http://cam.local/x") == (
+            "x" * MAX_ERROR_CHARS
         )
 
 

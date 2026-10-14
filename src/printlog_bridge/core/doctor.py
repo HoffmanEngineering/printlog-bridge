@@ -52,6 +52,9 @@ async def diagnose(
     results.append(
         CheckResult.ok("Config", f"{config.path} ({count} printer{'' if count == 1 else 's'})")
     )
+    api_url_warning = config.api_url_warning()
+    if api_url_warning is not None:
+        results.append(CheckResult.warn("API URL", api_url_warning))
     results.append(_check_state_dir(config.state_dir))
     results.append(_check_sqlite())
     key_storage = _check_key_storage(config)
