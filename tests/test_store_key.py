@@ -152,7 +152,7 @@ def test_empties_the_key_whatever_its_case(tmp_path, line):
 
 def test_says_so_when_the_key_line_can_not_be_found(tmp_path, monkeypatch, capsys):
     path = write_config(tmp_path, "api_key = k-inline\n")
-    monkeypatch.setattr("printlog_bridge.cli.main.clear_config_api_key", lambda path: False)
+    monkeypatch.setattr("printlog_bridge.cli.main.clear_config_api_key", lambda *a, **k: False)
 
     assert main(["store-key", "--config", str(path)]) == 1
 
@@ -307,10 +307,45 @@ class TestNotAsRoot:
 
         owners.on_file_check = swap
 
-        main(["store-key", "--config", str(path)])
+        assert main(["store-key", "--config", str(path)]) == 1
 
         assert not evil.exists()
         assert (tmp_path / "state" / "api_key").read_text(encoding="utf-8") == "k-inline\n"
+        assert "k-evil" in path.read_text(encoding="utf-8"), "a file it didn't check is untouched"
+
+    def test_the_config_rewritten_is_the_config_checked(self, tmp_path, owners, monkeypatch):
+        """Moving the checked folder away and putting another in its place after the check
+        can't make root rewrite that other config, and leave the key in the real one."""
+        folder = tmp_path / "etc"
+        folder.mkdir()
+        path = folder / "printlog-bridge.cfg"
+        config = f"[bridge]\nstate_dir = {tmp_path / 'state'}\napi_key = {{}}\n{PRINTERS}"
+        path.write_text(config.format("k-inline"), encoding="utf-8")
+        owners.file = owners.folder = 0
+        monkeypatch.delenv("SUDO_UID")
+
+        def swap():
+            folder.rename(tmp_path / "moved")
+            folder.mkdir()
+            path.write_text(config.format("k-other"), encoding="utf-8")
+
+        owners.on_file_check = swap
+
+        assert main(["store-key", "--config", str(path)]) == 0
+
+        assert "k-inline" not in (tmp_path / "moved" / "printlog-bridge.cfg").read_text("utf-8")
+        assert "k-other" in path.read_text(encoding="utf-8")
+        assert (tmp_path / "state" / "api_key").read_text(encoding="utf-8") == "k-inline\n"
+
+    def test_still_refuses_through_sudo_when_the_config_holds_no_key(
+        self, tmp_path, owners, monkeypatch, capsys
+    ):
+        """Root writes the key file where root's config says, so the root rules stay."""
+        path = write_config(tmp_path, "")
+        owners.file = owners.folder = 0
+        monkeypatch.setattr(sys, "stdin", io.StringIO("k-new\n"))
+
+        assert "sudo" in self.refused(path, capsys)
 
 
 @POSIX
@@ -339,6 +374,50 @@ class TestAsAnotherUser:
 
         assert not (tmp_path / "state").exists()
         assert f"sudo chown pi: {path}" in capsys.readouterr().err
+
+    def test_a_root_config_without_a_key_is_fine(self, tmp_path, owners, monkeypatch):
+        """A service user (`printlog`) with root's config in /etc: store-key won't rewrite a
+        config that holds no key, so whose it is doesn't matter."""
+        path = write_config(tmp_path, "")
+        owners.euid = 1001
+        owners.file = owners.folder = 0
+        monkeypatch.setattr(sys, "stdin", io.StringIO("k-new\n"))
+
+        assert main(["store-key", "--config", str(path)]) == 0
+
+        assert (tmp_path / "state" / "api_key").read_text(encoding="utf-8") == "k-new\n"
+
+    def test_a_root_config_with_a_key_says_how_to_remove_it(self, tmp_path, owners, capsys):
+        path = write_config(tmp_path, "api_key = k-inline\n")
+        owners.euid = 1001
+        owners.file = owners.folder = 0
+
+        assert main(["store-key", "--config", str(path)]) == 1
+
+        assert not (tmp_path / "state").exists()
+        err = capsys.readouterr().err
+        assert "can't remove api_key" in err
+        assert "remove the api_key line as root" in err
+
+
+def test_says_the_key_is_stored_when_the_config_cant_be_rewritten(tmp_path, monkeypatch, capsys):
+    """The key file is written first, so a config it can't rewrite (a symlink into a folder
+    this user can't write) leaves the key stored: saying it wasn't would be wrong."""
+    path = write_config(tmp_path, "api_key = k-inline\n")
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("printlog_bridge.cli.main.clear_config_api_key", refuse)
+
+    assert main(["store-key", "--config", str(path)]) == 1
+
+    assert (tmp_path / "state" / "api_key").read_text(encoding="utf-8") == "k-inline\n"
+    err = capsys.readouterr().err
+    assert f"stored the key in {tmp_path / 'state' / 'api_key'}" in err
+    assert "Permission denied" in err
+    assert "Remove that line by hand" in err
+    assert "couldn't store the key" not in err
 
 
 @POSIX

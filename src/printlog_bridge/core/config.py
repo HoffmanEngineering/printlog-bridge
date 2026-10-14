@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import errno
+import io
 import ipaddress
 import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -436,13 +439,63 @@ _SECTION = re.compile(r"^\s*\[([^\]]*)\]")
 _API_KEY_LINE = re.compile(r"^(\s*)api_key\s*[=:]", re.IGNORECASE)  # configparser ignores case
 
 
-def clear_config_api_key(path: Path) -> bool:
+def clear_config_api_key(
+    path: Path, *, folder_fd: int | None = None, identity: tuple[int, int] | None = None
+) -> bool:
     """Empties `api_key` in the config's `[bridge]` section, leaving every other line (and its
     line ending) as it was. True when there was a line to empty. A symlink stays one: the file
-    it points to is rewritten."""
-    path = Path(os.path.realpath(path))
+    it points to is rewritten.
+
+    With `folder_fd`, the config's folder held open (POSIX), the file is found and replaced in
+    that folder, whatever has been renamed since, and only while it is still the file
+    `identity` (device, inode) names; otherwise OSError."""
+    if folder_fd is None:
+        return _clear_by_path(Path(os.path.realpath(path)))
+    name = path.name
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=folder_fd)
+    with os.fdopen(fd, "rb") as f:
+        found = os.fstat(f.fileno())
+        if identity is not None and (found.st_dev, found.st_ino) != identity:
+            raise OSError(errno.ESTALE, "it was replaced while store-key was running")
+        # Split as readlines() would (only \n, \r and \r\n), keeping each line's ending.
+        lines = io.StringIO(f.read().decode("utf-8"), newline="").readlines()
+    if not _empty_api_key(lines):
+        return False
+    temporary = f".{name}.{os.urandom(6).hex()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    out = os.open(temporary, flags, 0o600, dir_fd=folder_fd)
+    try:
+        with os.fdopen(out, "w", encoding="utf-8", newline="") as f:
+            os.fchmod(f.fileno(), stat.S_IMODE(found.st_mode))
+            f.writelines(lines)
+        os.replace(temporary, name, src_dir_fd=folder_fd, dst_dir_fd=folder_fd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary, dir_fd=folder_fd)
+        raise
+    return True
+
+
+def _clear_by_path(path: Path) -> bool:
     with path.open(encoding="utf-8", newline="") as f:
         lines = f.readlines()
+    if not _empty_api_key(lines):
+        return False
+    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.writelines(lines)
+        shutil.copymode(str(path), temporary)
+        os.replace(temporary, str(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+    return True
+
+
+def _empty_api_key(lines: list[str]) -> bool:
+    """Empties, in place, each `api_key` line of `[bridge]`. True when there was one."""
     section = None
     changed = False
     for i, line in enumerate(lines):
@@ -455,15 +508,4 @@ def clear_config_api_key(path: Path) -> bool:
             ending = line[len(line.rstrip("\r\n")) :]
             lines[i] = f"{match.group(1)}api_key ={ending}"
             changed = True
-    if changed:
-        fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                f.writelines(lines)
-            shutil.copymode(str(path), temporary)
-            os.replace(temporary, str(path))
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary)
-            raise
     return changed
