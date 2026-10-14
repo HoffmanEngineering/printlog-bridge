@@ -36,8 +36,9 @@ from printlog_bridge.core.events import (
     JobPoint,
     SpoolCommand,
 )
-from printlog_bridge.core.lifecycle import _usage_rows
+from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter, _usage_rows
 from printlog_bridge.core.spools import Spools
+from printlog_bridge.core.state import JobRecord
 from printlog_bridge.core.swaps import SpoolSwap, change_hints, swap_notes
 
 METADATA = {"estimated_time": 3900.0, "filament_total": 5000.0, "filament_weight_total": 15.0}
@@ -113,8 +114,23 @@ async def resume(moonraker: FakeMoonraker) -> None:
     await moonraker.set_status(print_stats={"state": "printing"})
 
 
+def no_stranded_estimate(print_: dict[str, Any]) -> None:
+    """A spool's row with an estimate and no actual, beside another row on the same slot, would
+    be counted at its estimate on top of the slot's actual usage: never leave one."""
+    rows = print_["filamentUsage"]
+    for row in rows:
+        others = [r for r in rows if r is not row and r["slot"] == row["slot"]]
+        stranded = (
+            row.get("filament")
+            and row.get("lengthInM") is None
+            and (row.get("estimatedAmountMg") or row.get("estimatedLengthInM"))
+        )
+        assert not (others and stranded), rows
+
+
 def rows_on(print_: dict[str, Any], slot: int) -> dict[str | None, dict[str, Any]]:
-    """The print's usage rows for `slot`, by spool id."""
+    """The print's usage rows for `slot`, by spool id. Checks `no_stranded_estimate` too."""
+    no_stranded_estimate(print_)
     return {
         (r["filament"] or {}).get("id"): r for r in print_["filamentUsage"] if r["slot"] == slot
     }
@@ -363,9 +379,11 @@ FAST = (0.05, 0.2)
 """The outbox's backoff, scaled down so a retried send comes round at once."""
 
 
-def flaky(api: FakePrintLogApi, name: str, *, after: bool, times: int = 1) -> dict[str, int]:
-    """Makes the fake API's handler `name` answer 503 `times` times: before doing anything, or
-    `after` doing it, as when the answer is lost on the way back. Call before `api.start()`."""
+def flaky(
+    api: FakePrintLogApi, name: str, *, after: bool, times: int = 1, status: int = 503
+) -> dict[str, int]:
+    """Makes the fake API's handler `name` answer `status` `times` times: before doing anything,
+    or `after` doing it, as when the answer is lost on the way back. Call before `api.start()`."""
     real = getattr(api, name)
     calls = {"n": 0}
 
@@ -375,7 +393,7 @@ def flaky(api: FakePrintLogApi, name: str, *, after: bool, times: int = 1) -> di
             return await real(request)
         if after:
             await real(request)
-        return web.Response(status=503)
+        return web.Response(status=status)
 
     setattr(api, name, handler)
     return calls
@@ -503,12 +521,55 @@ def test_set_spool_before_the_tool_fed_anything_is_the_starting_spool(tmp_path):
 
     asyncio.run(scenario())
 
+    # The print was logged with spool A when the job started, and its estimate is on A's row.
+    # Moving it to B would need the print's rows replaced, so A keeps it all, with a note.
     print_ = api.prints[1]
     rows = rows_on(print_, 0)
-    assert rows[second]["lengthInM"] == pytest.approx(5.0)
-    assert not rows.get(first, {}).get("lengthInM")
-    assert not print_.get("notes")
+    assert set(rows) == {first}
+    assert rows[first]["lengthInM"] == pytest.approx(5.0)
+    assert print_["notes"] == (
+        "T0 was set to Spool B before printing started, but this print was already logged "
+        "with Spool A; change the spool on this print by hand"
+    )
     assert "split" not in moonraker.scripts[0]
+
+
+def test_set_spool_before_printing_on_a_print_not_yet_logged_is_its_spool(tmp_path):
+    """3D Print Log was down when the job started, so the print is created after the spool
+    was set: it starts with that spool, which gets it all, with no note."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    first, second = api.add_spool("Spool A"), api.add_spool("Spool B")
+    api.user_loads(42, 0, first)
+    down = {"yes": True}
+    real_create = api._create
+
+    async def create(request):
+        return web.Response(status=503) if down["yes"] else await real_create(request)
+
+    api._create = create
+
+    async def scenario():
+        async with (
+            fakes(tmp_path, moonraker, api) as config,
+            running(config, moonraker, backoff=FAST),
+        ):
+            job = await moonraker.start_job("vase.gcode", METADATA)
+            await printing(moonraker, "vase.gcode")
+            await moonraker.respond(f"// printlog: SET_SPOOL TOOL=0 ID={second}")
+            await eventually(lambda: moonraker.scripts)
+            await feed(moonraker, 5000.0)
+            down["yes"] = False
+            await eventually(lambda: api.prints)
+            await moonraker.finish_job(job, filament_used=5000.0)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    print_ = api.prints[1]
+    rows = rows_on(print_, 0)
+    assert set(rows) == {second}
+    assert rows[second]["lengthInM"] == pytest.approx(5.0)
+    assert not print_.get("notes")
 
 
 def test_an_unload_in_the_end_g_code_is_not_a_runout(tmp_path):
@@ -537,6 +598,105 @@ def test_an_unload_in_the_end_g_code_is_not_a_runout(tmp_path):
 
     assert moonraker.scripts == []
     assert not api.prints[1].get("notes")
+
+
+def test_a_late_create_puts_back_what_was_loaded_before_it(tmp_path):
+    """Swap A for B, the job ends, and the user sets C for the next job, all before the print
+    could be created. Creating it with A (on a one-slot printer that loads A) mustn't leave A,
+    or B, loaded: C is."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    first, second, third = (api.add_spool(f"Spool {n}") for n in "ABC")
+    api.user_loads(42, 0, first)
+    down = {"yes": True}
+    real_create = api._create
+
+    async def create(request):
+        return web.Response(status=503) if down["yes"] else await real_create(request)
+
+    api._create = create
+
+    async def scenario():
+        async with (
+            fakes(tmp_path, moonraker, api) as config,
+            running(config, moonraker, backoff=FAST),
+        ):
+            await split_job(moonraker, second)
+            await moonraker.set_status(print_stats={"state": "complete"})
+            answers = len(moonraker.scripts)
+            await moonraker.respond(f"// printlog: SET_SPOOL TOOL=0 ID={third}")
+            await eventually(lambda: len(moonraker.scripts) > answers)
+            down["yes"] = False
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    rows = rows_on(api.prints[1], 0)
+    assert rows[first]["lengthInM"] == pytest.approx(3.0)
+    assert rows[second]["lengthInM"] == pytest.approx(2.0)
+    assert api.slot_spools(42)[0] == third
+    assert second not in api.slot_spools(42).values()
+
+
+def test_a_job_with_no_swaps_isnt_frozen(tmp_path):
+    """Only a split is worked out once: any other job's end is read afresh on each try."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    api.user_loads(42, 0, api.add_spool("Spool A"))
+
+    async def scenario():
+        async with fakes(tmp_path, moonraker, api) as config, running(config, moonraker):
+            job = await moonraker.start_job("vase.gcode", METADATA)
+            await eventually(lambda: api.prints)
+            await moonraker.finish_job(job, filament_used=5000.0)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    assert recorded(tmp_path, "completion") == []
+
+
+def test_a_rejected_completion_is_worked_out_again_next_time(tmp_path):
+    """The API refused the job's end (say, a spool deleted meanwhile): once the user has fixed
+    it, a restart replays the job, which mustn't resend what was refused."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    first, second = api.add_spool("Spool A"), api.add_spool("Spool B")
+    api.user_loads(42, 0, first)
+    flaky(api, "_complete", after=False, status=400)
+
+    async def scenario():
+        async with fakes(tmp_path, moonraker, api) as config, running(config, moonraker):
+            await split_job(moonraker, second)
+            await eventually(lambda: api.requests.count(("POST", "/api/Prints/1/complete")))
+            await eventually(lambda: state_job(tmp_path).get("completion", 1) is None)
+
+    asyncio.run(scenario())
+
+    assert not state_job(tmp_path).get("finished")
+
+
+def state_job(tmp_path: Path) -> dict[str, Any]:
+    path = tmp_path / "state" / "printers" / "voron.json"
+    try:
+        [job] = json.loads(path.read_text(encoding="utf-8"))["jobs"].values()
+    except (OSError, ValueError):
+        return {}
+    return job
+
+
+def test_a_swap_after_the_jobs_end_was_worked_out_isnt_a_split(tmp_path):
+    async def scenario():  # the logger is made in a running loop (Python 3.9)
+        logger = JobLogger(None, {"voron": LoggedPrinter(42, "moonraker")}, tmp_path)  # type: ignore[arg-type]
+        try:
+            state = logger.state("voron")
+            state.jobs["000001"] = JobRecord(started_at="2026-10-14T00:00:00+00:00")
+            swapped = SpoolSwap("voron", 0, "a", "b", "A", "B", point())
+            assert logger.spool_swapped(swapped) is True
+            state.jobs["000001"].completion = {"usage": [], "notes": []}
+            assert logger.spool_swapped(swapped) is False
+            assert len(state.jobs["000001"].swaps) == 1
+        finally:
+            logger.close()
+
+    asyncio.run(scenario())
 
 
 # -- the pieces on their own ---------------------------------------------------------------------
@@ -623,11 +783,33 @@ class TestUsageRows:
         assert [(r["filamentId"], r["lengthInM"]) for r in usage] == [("a", 3.0), ("b", 2.0)]
 
     def test_a_spool_set_before_the_slot_fed_anything_is_its_first_spool(self):
-        rows = [{"slot": 0, "filament": {"id": "a"}}]
-
-        usage = _usage_rows(finished({0: 5000.0}), rows, {0: "b"}, True, [swap(0, 0.0, "a", "b")])
+        usage = _usage_rows(finished({0: 5000.0}), [{"slot": 0}], {0: "b"}, True,
+                            [swap(0, 0.0, "a", "b")])  # fmt: skip
 
         assert [(r["filamentId"], r["lengthInM"]) for r in usage] == [("b", 5.0)]
+
+    def test_but_a_print_already_logged_with_another_keeps_it_with_a_note(self):
+        rows = [{"slot": 0, "filament": {"id": "a"}, "estimatedAmountMg": 15000}]
+        swaps = [swap(0, 0.0, "a", "b", old_name="Spool A", new_name="Spool B")]
+        notes: list[str] = []
+
+        usage = _usage_rows(finished({0: 5000.0}), rows, {0: "b"}, True, swaps, notes)
+
+        assert [(r["filamentId"], r["lengthInM"]) for r in usage] == [("a", 5.0)]
+        assert notes == [
+            "T0 was set to Spool B before printing started, but this print was already "
+            "logged with Spool A; change the spool on this print by hand"
+        ]
+
+    def test_a_spool_the_user_linked_in_the_app_keeps_the_first_part_without_a_note(self):
+        rows = [{"slot": 0, "filament": {"id": "mine"}}]
+        notes: list[str] = []
+
+        usage = _usage_rows(finished({0: 5000.0}), rows, {0: "b"}, True,
+                            [swap(0, 3000, "a", "b")], notes)  # fmt: skip
+
+        assert [(r["filamentId"], r["lengthInM"]) for r in usage] == [("mine", 3.0), ("b", 2.0)]
+        assert notes == []
 
     def test_the_rows_add_up_to_the_rounded_total_exactly(self):
         swaps = [swap(0, 1000.05, "a", "b"), swap(0, 2000.10, "b", "c")]

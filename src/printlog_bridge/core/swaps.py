@@ -142,6 +142,40 @@ def swap_notes(
     return notes
 
 
+def first_spools(
+    linked: Mapping[int, str], swaps: Sequence[Mapping[str, Any]]
+) -> tuple[dict[int, str | None], list[str]]:
+    """Each swapped slot's first spool, given the spool `linked` on the print's row for each
+    slot, and a note for each slot where that couldn't follow the swaps.
+
+    The print's link wins when it is a spool the swaps don't explain: the user chose it in the
+    app, or the print was logged with it before a spool was set for the start (a
+    `PRINTLOG_SET_SPOOL` in the start G-code after the print was created). Then the row the
+    estimate is on stays that spool's: moving it would mean replacing the print's rows, and
+    leaving it beside the new spool's would count the estimate on top of what was printed.
+    A link to a spool a split put in the slot was the bridge's own, and the slot's first spool
+    is the one it started with."""
+    firsts: dict[int, str | None] = {}
+    notes = []
+    for slot in sorted({swap["slot"] for swap in swaps}):
+        slot_swaps = on_slot(swaps, slot)
+        start, have = first_spool(slot_swaps), linked.get(slot)
+        news = {swap.get("new") for swap in slot_swaps if is_split(swap)}
+        if have is None or have == start or have in news:
+            firsts[slot] = start
+            continue
+        firsts[slot] = have
+        starting = [swap for swap in slot_swaps if not is_split(swap)]
+        if starting:
+            chosen = _spool_name(starting[-1], "new")
+            logged = next((_spool_name(s, "old") for s in slot_swaps if s.get("old") == have), have)
+            notes.append(
+                f"T{slot} was set to {chosen} before printing started, but this print was "
+                f"already logged with {logged}; change the spool on this print by hand"
+            )
+    return firsts, notes
+
+
 def change_hints(
     changes: Iterable[Mapping[str, Any]], swaps: Sequence[Mapping[str, Any]]
 ) -> list[str]:

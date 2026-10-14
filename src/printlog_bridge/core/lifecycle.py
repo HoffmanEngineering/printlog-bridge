@@ -66,8 +66,8 @@ from printlog_bridge.core.swaps import (
     before_swaps,
     change_hints,
     change_record,
+    first_spools,
     is_split,
-    named,
     on_slot,
     segments,
     swap_notes,
@@ -293,8 +293,8 @@ class JobLogger:
             return False
         state = self.state(swap.printer)
         job = state.jobs.get(swap.during.job_id)
-        if job is None or job.finished:
-            return False
+        if job is None or job.finished or job.completion is not None:
+            return False  # its end is already worked out
         record = swap_record(swap)
         job.swaps.append(record)
         try:
@@ -488,6 +488,8 @@ class JobLogger:
             # Sending it again won't change the answer. The job stays unfinished in the state
             # file, so a replay after the user fixes the cause (a restart) queues it again.
             log.error("[printer %s] job %s isn't logged: %s", entry.printer, entry.job_id, e)
+            if entry.kind == FINISH:
+                self._forget_completion(entry)
             self._done(entry)
             self._not_logged(entry, str(e))
         except ApiUnavailable as e:
@@ -526,6 +528,15 @@ class JobLogger:
         else:
             log.warning("%s wasn't added to its print", where, exc_info=error)
         self._done(entry)
+
+    def _forget_completion(self, entry: Entry) -> None:
+        """A refused end is worked out again when it's next sent (after a restart, once the
+        user has fixed the cause), rather than sent as it was refused."""
+        state = self.state(entry.printer)
+        job = state.jobs.get(entry.job_id)
+        if job is not None and job.completion is not None:
+            job.completion = None
+            state.save()
 
     async def _api_reachable(self) -> bool:
         """Whether the API answers a small request, after an upload that got no answer."""
@@ -691,10 +702,12 @@ class JobLogger:
             body["estimatedFilamentUsageMg"] = round(start["estimated_filament_g"] * 1000)
         rows = _estimate_rows(start)
         single_tool = False
+        current: dict[int, str] = {}
         if self.spools is not None:
             # A print created after a swap (3D Print Log was down until then) starts with the
             # spools the job started with, not the ones loaded now.
-            loaded = before_swaps(await self.spools.current(printer), job.swaps)
+            current = await self.spools.current(printer)
+            loaded = before_swaps(current, job.swaps)
             single_tool = (self.spools.slot_count(printer) or 1) <= 1
             _link_loaded(rows, loaded, single_tool=single_tool)
             notes = self.spools.mismatches(printer, [row["slot"] for row in rows] or [0])
@@ -707,26 +720,27 @@ class JobLogger:
         job.print_id = int(print_["id"])
         state.save()
         if single_tool and job.swaps:
-            await self._reload_swapped(target, printer, job)
+            await self._restore_loaded(target, printer, current)
         return print_
 
-    async def _reload_swapped(self, target: LoggedPrinter, printer: str, job: JobRecord) -> None:
-        """Loads each swapped slot's spool again after a print is created with the one it
-        started with: on a single-tool printer, creating a print loads its spools."""
-        for slot in sorted({swap["slot"] for swap in job.swaps}):
-            last = on_slot(job.swaps, slot)[-1].get("new")
-            try:
-                if last is None:
-                    await self.api.unload_slot(target.printer_id, slot)
-                else:
-                    await self.api.load_slot(target.printer_id, slot, last, f"T{slot}")
-            except Exception as e:  # the print matters more than what's loaded for the next
-                log.warning("[printer %s] couldn't load T%d's spool again: %s", printer, slot, e)
-        if self.spools is not None:
-            try:
+    async def _restore_loaded(
+        self, target: LoggedPrinter, printer: str, before: Mapping[int, str]
+    ) -> None:
+        """Puts back the spools that were loaded before a print was created with the ones its
+        job started with: on a single-tool printer, creating a print loads its spools. Exactly
+        what was loaded then, which may be a spool set since for the next job."""
+        assert self.spools is not None
+        try:
+            now = await self.spools.current(printer)
+            for slot, spool in sorted(before.items()):
+                if now.get(slot) != spool:
+                    await self.api.load_slot(target.printer_id, slot, spool, f"T{slot}")
+            for slot in sorted(set(now) - set(before)):
+                await self.api.unload_slot(target.printer_id, slot)
+            if now != dict(before):
                 await self.spools.refresh(printer)
-            except Exception as e:
-                log.debug("[printer %s] couldn't read its spools: %s", printer, e)
+        except Exception as e:  # the print matters more than what's loaded for the next
+            log.warning("[printer %s] couldn't load its spools again: %s", printer, e)
 
     async def _adopt(
         self, target: LoggedPrinter, state: PrinterState, printer: str, job_id: str, job: JobRecord
@@ -882,23 +896,24 @@ class JobLogger:
         }
         if event.duration_s is not None:
             body["printTimeInSeconds"] = round(event.duration_s)
-        if job.completion is None:
-            # Worked out once, from one look at the swaps, and sent the same way every time: a
-            # retry reads the print back with a row per spool already on it (#44).
+        completion = job.completion
+        if completion is None:
+            # With a swap, worked out once, from one look at the swaps, and sent the same way
+            # every time: a retry reads the print back with a row per spool already on it (#44).
             loaded = await self.spools.current(event.printer) if self.spools is not None else {}
             slot_count = self.spools.slot_count(event.printer) if self.spools is not None else None
             single_tool = (slot_count or 1) <= 1 and all(slot == 0 for slot in event.filament_mm)
             swaps = list(job.swaps)
             rows_now = print_.get("filamentUsage") or []
-            usage = _usage_rows(event, rows_now, loaded, single_tool, swaps)
-            noted = "\n".join(swap_notes(swaps, event.filament_mm))
+            conflicts: list[str] = []
+            usage = _usage_rows(event, rows_now, loaded, single_tool, swaps, conflicts)
+            noted = "\n".join([*swap_notes(swaps, event.filament_mm), *conflicts])
             hints = change_hints(job.filament_changes, swaps)
-            job.completion = {
-                "usage": usage,
-                "notes": [n for n in (event.note, noted, *hints) if n],
-            }
-            state.save()
-        rows = job.completion["usage"]
+            completion = {"usage": usage, "notes": [n for n in (event.note, noted, *hints) if n]}
+            if swaps:
+                job.completion = completion
+                state.save()
+        rows = completion["usage"]
         if rows:
             body["filamentUsage"] = rows
 
@@ -907,7 +922,7 @@ class JobLogger:
             return self._deleted(state, event, job)
 
         notes = (completed.get("notes") or "").rstrip()
-        added = [n for n in job.completion["notes"] if n not in notes]
+        added = [n for n in completion["notes"] if n not in notes]
         if added:
             await self.api.patch_print(
                 int(print_["id"]), {"notes": "\n\n".join([notes, *added] if notes else added)}
@@ -1081,6 +1096,7 @@ def _usage_rows(
     loaded: Mapping[int, str] | None = None,
     single_tool: bool = False,
     swaps: Sequence[Mapping[str, Any]] = (),
+    notes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """One row per slot that fed filament, linked to the spool in that slot when it's known.
 
@@ -1090,7 +1106,8 @@ def _usage_rows(
     A slot whose spool changed while the job ran (`swaps`, #44) is split where it changed: one
     row per spool, the slot's first spool first, so the API's completion puts that one on the
     row the print started with (its estimate stays there) and adds a row for the next. The first
-    spool is the one on the print's row, else the one the slot had before the first swap.
+    spool is the one the slot started with, unless the print's row is linked to another the
+    swaps don't explain (`first_spools`), which then keeps it, with a note added to `notes`.
 
     On a single-tool printer a row with no slot (an uploader's) is slot 0's, so the spool the
     user linked on it wins. The API's completion fills that row from slot 0's in the same way
@@ -1098,15 +1115,23 @@ def _usage_rows(
     """
     if single_tool:
         rows = [{**row, "slot": 0} if row.get("slot") is None else row for row in rows]
-    # A row linked to one of a swapped slot's spools was linked by the bridge (or a completion
-    # already sent), not chosen by the user: the slot's first spool is the one it started with.
+    linked: dict[int, str] = {}
+    for row in rows:
+        slot, spool = row.get("slot"), (row.get("filament") or {}).get("id")
+        if slot is not None and spool and slot not in linked:
+            linked[slot] = str(spool)
+    firsts, conflicts = first_spools(linked, swaps)
+    if notes is not None:
+        notes.extend(conflicts)
     rows = [
-        {k: v for k, v in row.items() if k != "filament"}
-        if (row.get("filament") or {}).get("id") in named(swaps, row.get("slot"))
-        else row
+        {k: v for k, v in row.items() if k != "filament"} if row.get("slot") in firsts else row
         for row in rows
     ]
     spools = _spools_by_slot(rows, before_swaps(loaded or {}, swaps))
+    for slot, first in firsts.items():
+        spools.pop(slot, None)
+        if first is not None:
+            spools[slot] = first
     usage: list[dict[str, Any]] = []
     for slot, mm in sorted(event.filament_mm.items()):
         slot_swaps = [swap for swap in on_slot(swaps, slot) if is_split(swap)]
