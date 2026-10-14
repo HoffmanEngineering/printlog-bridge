@@ -8,6 +8,10 @@ while the bridge (or its connection) was down is still reported. The sink recogn
 With `images`, each start is followed by the job's thumbnail, and each end seen as it happens
 by a webcam snapshot (when snapshots are on). A job that ended while the bridge was away gets
 no snapshot: the camera would show the bed as it is now, not as the job left it.
+
+After the thumbnail comes the job's slicer settings (#36): the summary in its metadata, and a
+way to read its file's header and settings block (`slicer.py`), which the sink uses only when
+it wants them.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobSlicerSettings,
     JobStarted,
 )
 from printlog_bridge.core.status import NullReport, PrinterReport
@@ -31,6 +36,7 @@ from printlog_bridge.core.status import NullReport, PrinterReport
 from .excluded import ExcludedObjects
 from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
+from .slicer import MoonrakerSlicerFiles, slicer_metadata
 from .tools import ToolUsage, estimated_grams_by_slot, per_slot
 
 log = logging.getLogger(__name__)
@@ -64,6 +70,7 @@ class JobTracker:
         self.sink = sink
         self.report = report or NullReport()
         self.images = images
+        self.slicer = MoonrakerSlicerFiles(printer, images) if images is not None else None
         self._error_message: str | None = None
         self._call: Call | None = None
         self._usage = ToolUsage()
@@ -144,6 +151,17 @@ class JobTracker:
                     start.job_id,
                     ImageKind.THUMBNAIL,
                     functools.partial(images.thumbnail, call, job),
+                )
+            )
+        if call is not None:
+            read = functools.partial(self.slicer.read, call, job) if self.slicer else None
+            metadata = job.get("metadata")
+            await self.sink.emit(
+                JobSlicerSettings(
+                    self.printer,
+                    start.job_id,
+                    slicer_metadata(metadata) if isinstance(metadata, Mapping) else None,
+                    read,
                 )
             )
         if job.get("status", "in_progress") != "in_progress":

@@ -70,7 +70,10 @@ async def run_bridge(
                 api,
                 {
                     p.name: LoggedPrinter(
-                        printer_id=p.printer_id, source=p.adapter.name, adoption=p.adoption
+                        printer_id=p.printer_id,
+                        source=p.adapter.name,
+                        adoption=p.adoption,
+                        slicer_settings=p.slicer_settings,
                     )
                     for p in config.printers
                     if p.printer_id is not None

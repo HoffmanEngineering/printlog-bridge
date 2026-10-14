@@ -37,6 +37,12 @@ class JobRecord:
     images: dict[str, bool] = field(default_factory=dict)
     """Each picture already fetched for the job (`thumbnail`, `snapshot`), and whether there
     was one to add, so a replayed job isn't fetched again."""
+    slicer_settings: bool = False
+    """The job's slicer settings were read and queued (or there were none), so a replayed job
+    isn't read again (#36)."""
+    print_with_settings: int | None = None
+    """A print the lookup for prints to adopt said already has slicer settings (the Slic3r
+    uploader's or the Cura plugin's). Adopted, it keeps them and the bridge's aren't sent."""
     claiming: int | None = None
     """The print being adopted, from just before the claim is sent until `print_id` is set, so
     a claim whose answer was lost is sent again rather than a second print created."""
