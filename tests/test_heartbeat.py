@@ -229,3 +229,86 @@ def test_ensure_registered_ignores_a_printer_it_does_not_know(tmp_path):
     run(scenario)
 
     assert api.heartbeats == []
+
+
+class TestUpdateNotice:
+    """The check-in answer says which bridge is the latest, so Docker and remote-mode users hear
+    about an update without the bridge calling anyone else (#39)."""
+
+    def beat(self, api, tmp_path, *connections, times=1, **kwargs):
+        async def scenario():
+            async with heartbeat(api, tmp_path, *connections, **kwargs) as beat:
+                for _ in range(times):
+                    await beat.beat_all()
+
+        run(scenario)
+
+    def notices(self, caplog):
+        return [r.getMessage() for r in caplog.records if "is available" in r.getMessage()]
+
+    def test_an_older_bridge_records_the_newer_version_for_status(self, tmp_path):
+        api = FakePrintLogApi()
+        api.latest_agent_version = "999.0.0"
+
+        self.beat(api, tmp_path, VORON)
+
+        assert read_status(tmp_path)["latest_version"] == "999.0.0"
+
+    def test_an_older_bridge_logs_the_notice_once_per_version(self, tmp_path, caplog):
+        api = FakePrintLogApi(printers=(42, 43))
+        api.latest_agent_version = "999.0.0"
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            self.beat(api, tmp_path, VORON, U1, times=3)
+
+        [notice] = self.notices(caplog)
+        assert notice.startswith(f"printlog-bridge 999.0.0 is available (this is {__version__})")
+
+    def test_a_newer_release_is_logged_again(self, tmp_path, caplog):
+        api = FakePrintLogApi()
+
+        async def scenario():
+            async with heartbeat(api, tmp_path, VORON) as beat:
+                api.latest_agent_version = "998.0.0"
+                await beat.beat_all()
+                await beat.beat_all()
+                api.latest_agent_version = "999.0.0"
+                await beat.beat_all()
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            run(scenario)
+
+        assert [n.split(" is ")[0] for n in self.notices(caplog)] == [
+            "printlog-bridge 998.0.0",
+            "printlog-bridge 999.0.0",
+        ]
+        assert read_status(tmp_path)["latest_version"] == "999.0.0"
+
+    def test_the_current_bridge_says_nothing(self, tmp_path, caplog):
+        api = FakePrintLogApi()
+        api.latest_agent_version = __version__
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            self.beat(api, tmp_path, VORON)
+
+        assert self.notices(caplog) == []
+        assert read_status(tmp_path)["latest_version"] == __version__
+
+    def test_an_api_that_does_not_know_says_nothing(self, tmp_path, caplog):
+        api = FakePrintLogApi()
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            self.beat(api, tmp_path, VORON)
+
+        assert self.notices(caplog) == []
+        assert read_status(tmp_path)["latest_version"] is None
+
+    def test_update_check_off_keeps_it_quiet(self, tmp_path, caplog):
+        api = FakePrintLogApi()
+        api.latest_agent_version = "999.0.0"
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            self.beat(api, tmp_path, VORON, update_check=False)
+
+        assert self.notices(caplog) == []
+        assert read_status(tmp_path)["latest_version"] is None

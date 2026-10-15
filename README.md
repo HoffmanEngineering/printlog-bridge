@@ -123,6 +123,22 @@ To find your printers' addresses for the config, run `docker run --rm <image> di
 
 Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`; `run` and `doctor` then warn that the key travels unencrypted. Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
 
+## Updating
+
+The bridge tells you when a newer release is out. 3D Print Log answers each heartbeat with the latest version, so the bridge never asks anyone else. When yours is older, you get:
+
+- one line in the log per new version: `printlog-bridge 0.2.0 is available (this is 0.1.0)`;
+- an `Update:` line in `printlog-bridge status`, and a warning in `printlog-bridge doctor`;
+- a note on the printer's Connections in 3D Print Log.
+
+Set `update_check = false` in `[bridge]` to turn the notice off. The heartbeat sends the same thing either way.
+
+To update:
+
+- **Docker, with Compose:** in the folder with `docker-compose.yml`, run `docker compose pull && docker compose up -d` (on a Synology NAS, over SSH, with `sudo`).
+- **Docker, without Compose:** `docker pull ghcr.io/hoffmanengineering/printlog-bridge:edge`, then `docker rm -f printlog-bridge` and the same `docker run` as before. Your config and state are in `/data`, so nothing is lost.
+- **On the printer (local mode):** update printlog-bridge in Mainsail's or Fluidd's update panel, where `install.sh` added it. Moonraker's update manager follows `main`, so it can be newer than the last release. Over SSH, `git -C ~/printlog-bridge pull && ~/printlog-bridge/install.sh --yes` does the same.
+
 ## Try it
 
 ```sh

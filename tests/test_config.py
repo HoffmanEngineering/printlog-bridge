@@ -413,3 +413,24 @@ class TestAdoption:
 
         with pytest.raises(ConfigError, match=message):
             load(path)
+
+
+class TestUpdateCheck:
+    """`update_check`: say when a newer bridge is out (#39)."""
+
+    def config(self, tmp_path, option: str = ""):
+        return load(write(tmp_path, f"[bridge]\n{option}\n[printer voron]\nadapter = fake\n"))
+
+    def test_is_on_by_default(self, tmp_path):
+        assert self.config(tmp_path).update_check is True
+
+    def test_a_blank_value_leaves_it_on(self, tmp_path):
+        assert self.config(tmp_path, "update_check =").update_check is True
+
+    @pytest.mark.parametrize("value", ["false", "no", "off", "0", "False"])
+    def test_false_turns_it_off(self, tmp_path, value):
+        assert self.config(tmp_path, f"update_check = {value}").update_check is False
+
+    def test_anything_else_is_a_config_error(self, tmp_path):
+        with pytest.raises(ConfigError, match="update_check must be true or false"):
+            self.config(tmp_path, "update_check = weekly")

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from printlog_bridge import __version__
 from printlog_bridge.core.outbox import read_waiting
 from printlog_bridge.core.trace import trace_dir
+from printlog_bridge.core.updates import is_newer, update_notice
 
 if TYPE_CHECKING:  # config imports the adapter interface, which imports this module
     from printlog_bridge.core.config import BridgeConfig
@@ -92,6 +93,7 @@ class StatusBoard:
             "updated_at": now,
             "stopped_at": None,
             "trace": trace,
+            "latest_version": None,
             "printers": {
                 name: {
                     "connection": "starting",
@@ -125,6 +127,13 @@ class StatusBoard:
 
     def get(self, printer: str) -> dict[str, Any]:
         return self._data["printers"][printer]
+
+    def latest_version(self, version: str | None) -> None:
+        """The newest bridge release, as 3D Print Log last reported it, for `status` and
+        `doctor` to say when this one is behind."""
+        if self._data.get("latest_version") != version:
+            self._data["latest_version"] = version
+            self._write()
 
     def _now(self) -> str:
         return self.clock().isoformat()
@@ -244,6 +253,9 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
             f"Bridge: not running: it last checked in {_ago(now, status['updated_at'])} ago and "
             "may have crashed. Check its log."
         ]
+    update = _update_line(config, status, running)
+    if update:
+        lines.append(update)
     trace = _trace_line(config, status, running)
     if trace:
         lines.append(trace)
@@ -259,6 +271,16 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
         lines.extend(f"  {line}" for line in _printer_lines(printer, known, running, config, now))
 
     return "\n".join(lines), 0 if running else 1
+
+
+def _update_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str | None:
+    """When the last heartbeat heard of a newer bridge than the one running (or, when none
+    runs, the one installed)."""
+    latest = status.get("latest_version")
+    current = status.get("version") if running else __version__
+    if not config.update_check or not isinstance(current, str) or not is_newer(latest, current):
+        return None
+    return f"Update: {update_notice(latest, current)}"
 
 
 def _trace_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str | None:

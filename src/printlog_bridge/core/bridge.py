@@ -94,6 +94,7 @@ async def run_bridge(
                 ],
                 board,
                 interval=heartbeat_interval,
+                update_check=config.update_check,
             )
             sink.before_create = heartbeat.ensure_registered
             spools.on_swap = sink.spool_swapped

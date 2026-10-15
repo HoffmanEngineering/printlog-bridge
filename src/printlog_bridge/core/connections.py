@@ -7,6 +7,9 @@ before creating a print if that first attempt failed. When that second attempt c
 Print Log either, the print waits and is tried again like any other request: created anyway, it
 would get through as soon as the API was back (the end of an outage) and never link. The app
 shows a connection as stale after 15 minutes without a heartbeat.
+
+3D Print Log answers each heartbeat with the newest bridge release (`latestAgentVersion`), which
+goes in the status file for `status` and `doctor`, and in the log once per version (#39).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from dataclasses import dataclass
 from printlog_bridge import __version__
 from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
 from printlog_bridge.core.status import StatusBoard
+from printlog_bridge.core.updates import is_newer, update_notice
 
 log = logging.getLogger(__name__)
 
@@ -46,12 +50,15 @@ class Heartbeat:
         connections: Sequence[Connection],
         board: StatusBoard,
         interval: float = HEARTBEAT_INTERVAL_S,
+        update_check: bool = True,
     ) -> None:
         self.api = api
         self.connections = {c.printer: c for c in connections}
         self.board = board
         self.interval = interval
+        self.update_check = update_check
         self._registered: set[str] = set()
+        self._announced: set[str] = set()
 
     async def run(self) -> None:
         """Beats for every printer now and then every `interval`, until cancelled."""
@@ -80,7 +87,7 @@ class Heartbeat:
             "printerId": connection.printer_id,
         }
         try:
-            await self.api.put_connection(connection.instance_id, body)
+            answer = await self.api.put_connection(connection.instance_id, body)
         except AuthRejected:
             problem = (
                 "3D Print Log rejected the API key, so the printer shows as offline and its jobs "
@@ -109,6 +116,20 @@ class Heartbeat:
             self._registered.add(printer)
             report.heartbeat()
             report.warn(TOPIC, None)
+            self._heard_latest(answer)
             return True
         report.warn(TOPIC, problem)
         return False
+
+    def _heard_latest(self, answer: object) -> None:
+        """Keeps the newest release the API reported, and logs it the first time it is newer
+        than this bridge. Every printer's check-in answers the same, so it is logged once."""
+        if not self.update_check:
+            return
+        latest = answer.get("latestAgentVersion") if isinstance(answer, dict) else None
+        if not isinstance(latest, str) or not latest.strip():
+            latest = None
+        self.board.latest_version(latest)
+        if latest is not None and is_newer(latest) and latest not in self._announced:
+            self._announced.add(latest)
+            log.info("%s", update_notice(latest))
