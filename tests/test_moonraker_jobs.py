@@ -288,6 +288,27 @@ class TestCatchingUp:
         assert "moonraker.conf" in caplog.text
         assert identified == 1  # no reconnect loop
 
+    def test_reports_the_printer_model_the_slicer_wrote_in_the_file(self):
+        async def scenario():
+            fake = FakeMoonraker()
+            base = await fake.start()
+            report = ReportRecorder()
+            tracker = JobTracker("voron", RecordingSink(), report)
+            session = MoonrakerSession("voron", url=base, listener=tracker, backoff=FAST)
+            try:
+                async with running(session):
+                    await eventually(lambda: fake.subscriptions)
+                    await fake.start_job("a.gcode", {"slicer": "OrcaSlicer"})
+                    await fake.start_job("b.gcode", {"printer_model": "InfiMech EX"})
+                    await eventually(lambda: report.named("printer_model"))
+            finally:
+                await fake.close()
+            return report
+
+        report = asyncio.run(scenario())
+
+        assert report.named("printer_model") == [("printer_model", "InfiMech EX")]
+
     def test_without_history_warns_in_the_status(self):
         async def scenario():
             fake = FakeMoonraker(history=False)

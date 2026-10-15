@@ -21,6 +21,7 @@ def test_url_selects_remote_mode():
     assert adapter.url == "http://u1.local:7125"
     assert adapter.socket is None
     assert adapter.describe() == "moonraker, remote http://u1.local:7125"
+    assert adapter.mode() == "remote"
 
 
 def test_socket_selects_local_mode():
@@ -29,6 +30,7 @@ def test_socket_selects_local_mode():
     assert adapter.socket == Path("/tmp/moonraker.sock")
     assert adapter.url is None
     assert adapter.describe() == f"moonraker, local socket {Path('/tmp/moonraker.sock')}"
+    assert adapter.mode() == "local"
 
 
 def test_defaults_to_the_standard_local_socket():

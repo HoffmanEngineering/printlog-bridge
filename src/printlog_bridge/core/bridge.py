@@ -10,6 +10,7 @@ from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.config import API_KEY_ENV, BridgeConfig, ConfigError
 from printlog_bridge.core.connections import HEARTBEAT_INTERVAL_S, Connection, Heartbeat
 from printlog_bridge.core.doctor import API_KEYS_PAGE, PRINTERS_PAGE
+from printlog_bridge.core.health import ProblemLog
 from printlog_bridge.core.lifecycle import BACKOFF_S, JobLogger, LoggedPrinter
 from printlog_bridge.core.spools import REFRESH_INTERVAL_S, Spools
 from printlog_bridge.core.status import TOUCH_INTERVAL_S, StatusBoard
@@ -51,6 +52,25 @@ async def run_bridge(
     """
     check_runnable(config)
     assert config.api_key is not None  # check_runnable made sure
+    # Every warning and error from here on is counted for the heartbeat (#37).
+    problems = ProblemLog([p.name for p in config.printers], secrets=_secrets(config))
+    bridge_log = logging.getLogger("printlog_bridge")
+    bridge_log.addHandler(problems)
+    try:
+        await _run(config, problems, heartbeat_interval, touch_interval, backoff, spool_interval)
+    finally:
+        bridge_log.removeHandler(problems)
+
+
+async def _run(
+    config: BridgeConfig,
+    problems: ProblemLog,
+    heartbeat_interval: float,
+    touch_interval: float,
+    backoff: tuple[float, float],
+    spool_interval: float,
+) -> None:
+    assert config.api_key is not None  # check_runnable made sure
     api_url_warning = config.api_url_warning()
     if api_url_warning is not None:
         log.warning("%s", api_url_warning)
@@ -88,12 +108,17 @@ async def run_bridge(
                         instance_id=sink.state(p.name).instance_id,
                         kind=p.adapter.name,
                         printer_id=p.printer_id,
+                        mode=p.adapter.mode(),
+                        snapshots=p.adapter.snapshots,
+                        # Nothing reads a file's slicer settings until #36.
+                        slicer_settings=False,
                     )
                     for p in config.printers
                     if p.printer_id is not None
                 ],
                 board,
                 interval=heartbeat_interval,
+                problems=problems,
             )
             sink.before_create = heartbeat.ensure_registered
             spools.on_swap = sink.spool_swapped
@@ -125,9 +150,7 @@ def _start_tracing(config: BridgeConfig) -> list[Trace]:
     """With `trace = true`, a trace for each printer, handed to its adapter."""
     if not config.trace:
         return []
-    secrets = known_secrets(config.path, config.state_dir, os.environ)
-    if config.api_key:
-        secrets.append(config.api_key)
+    secrets = _secrets(config)
     traces = []
     for printer in config.printers:
         trace = Trace(config.state_dir, printer.name, secrets=secrets)
@@ -138,6 +161,14 @@ def _start_tracing(config: BridgeConfig) -> list[Trace]:
         trace_dir(config.state_dir),
     )
     return traces
+
+
+def _secrets(config: BridgeConfig) -> list[str]:
+    """Every key and password the bridge knows of, for what it writes down or sends."""
+    secrets = known_secrets(config.path, config.state_dir, os.environ)
+    if config.api_key:
+        secrets.append(config.api_key)
+    return secrets
 
 
 async def _keep_touching(board: StatusBoard, interval: float) -> None:

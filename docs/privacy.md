@@ -11,7 +11,7 @@ The bridge sends 3D Print Log exactly these calls, and nothing else:
 | `GET /api/Users/me` | `doctor` | nothing; checks the key |
 | `GET /api/Printers/{id}` | `doctor`; at start and every 5 minutes; when a print starts and ends | nothing; checks `printer_id`, and reads which spool is loaded in each slot |
 | `GET /api/Users/me/user-settings` | first print after a start | nothing; reads your default visibility and comment settings |
-| `PUT /api/Connections/{instance}` | at start, then every 5 minutes | `kind` (`moonraker`), `displayName` (`printlog-bridge (<printer name from your config>)`), `agentVersion`, `printerId` |
+| `PUT /api/Connections/{instance}` | at start, then every 5 minutes (the heartbeat) | `kind` (`moonraker`), `displayName` (`printlog-bridge (<printer name from your config>)`), `agentVersion`, `printerId`, and the printer's health: see [The heartbeat](#the-heartbeat) |
 | `GET /api/Prints/claimable` | a print starts (and when a print ends that the bridge saw no start for), unless `adopt_prints = false` | `printerId` and `createdAfter` (the start time less `adopt_window`): looks for a print you made yourself, with the Slic3r uploader, the Cura plugin or by hand, to log the job to instead of a new one. The file name is compared on the bridge, not sent |
 | `POST /api/Prints/{id}/claim` | a print starts and one of yours matches it | `externalSource`, `externalId`, `connectionInstanceId` and `startDate`, as for `POST /api/Prints`; your print keeps everything else |
 | `POST /api/Prints` | a print starts and there's no print of yours to adopt (never with `create_prints = false`) | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id), the slicer's estimated print time and filament (length and weight, and the weight per tool on a multi-tool file), when the file has them, each tool's row linked to the spool loaded in its slot, and `notes` when the printer's RFID reader disagrees with a spool's material or color |
@@ -34,6 +34,30 @@ That is all. In particular:
 - **The webcam is asked only when a print ends**, for one frame, and never when `snapshots = false` is set for the printer.
 
 Tests: `TestSpoolCalls` assigns spools by tag and by id and checks each call and field, and that the printer is sent back as read. `TestWhatIsSent` runs a whole print through the bridge and checks every call against this table and every field against these lists, that the only images uploaded are the thumbnail and the webcam frame, and that Moonraker was never asked for the G-code file. `TestGcodeIsNeverRead` points a thumbnail at the G-code file itself, and `test_with_snapshots_off_the_webcam_is_never_asked` does what it says.
+
+### The heartbeat
+
+Each heartbeat also tells 3D Print Log how the bridge is doing, so the app can show a printer whose prints aren't getting through, and so 3D Print Log can see which Klipper and Moonraker versions cause trouble. It goes only to 3D Print Log, in the same request as the heartbeat. **There is no third-party telemetry**: no analytics service, no crash reporter, nothing else is contacted. These are all of its fields, sent with every heartbeat (`null` when not known yet):
+
+| Field | What it is |
+| --- | --- |
+| `mode` | `local` (Moonraker's socket on this host) or `remote` (Moonraker over the network). Never the address. |
+| `klipperVersion` | Klipper's version, as Moonraker reports it (`software_version` in `printer.info`), at most 50 characters |
+| `moonrakerVersion` | Moonraker's version (`moonraker_version` in `server.info`), at most 50 characters |
+| `printerModel` | the printer model the slicer wrote in the last job's file (`printer_model`, such as `InfiMech EX`), when it wrote one, at most 100 characters |
+| `outboxDepth` | how many events and pictures for this printer are waiting in the outbox to be sent |
+| `outboxOldestAgeSeconds` | how long the oldest of them has waited, in seconds |
+| `lastError` | the last warning or error the bridge logged for this printer, scrubbed (below), at most 300 characters |
+| `lastErrorAt` | when that was, in UTC |
+| `errorCount` | how many warnings and errors it logged for this printer since the last heartbeat that got through |
+| `snapshots` | whether a webcam frame is added to each print (`snapshots` in the config) |
+| `slicerSettings` | whether each print's slicer settings are sent; always `false` for now (printlog-bridge#36) |
+
+`kind` is the adapter (`moonraker`). A problem that names no printer (the state directory is full, say) counts for every printer.
+
+**No host names, IP addresses, file names or keys are in a heartbeat.** The bridge asks Moonraker for `printer.info` only for Klipper's version, and drops the host name beside it. Before `lastError` leaves the printer, the bridge removes from it every key and password it knows of, every URL, path, IP address, `host:port`, dotted name (`u1.local`, `benchy.gcode`), quoted text (which is how file names turn up in messages) and the names of your printers, leaving only what went wrong, such as `couldn't send the heartbeat: can't reach 3D Print Log at <url>: Cannot connect to host <ip> ...`. The bridge's own log keeps the full message.
+
+Tests: `TestWhatIsSent` runs a print with a failing heartbeat and checks that every heartbeat carries exactly these fields, what each one holds, and that none holds the API or Moonraker key, a password, Moonraker's address or host name, the file name or the state directory. `tests/test_health.py` checks the scrubbing of each kind of host, address, path and file name, and `tests/test_heartbeat.py` each field.
 
 ## Where it connects
 
@@ -81,6 +105,7 @@ What a trace holds is what Moonraker tells the bridge, and what the bridge asks 
 - the printer's state as it changes: print progress, the active tool, filament used, Klipper's state, and on a U1 its RFID reader's tags;
 - Moonraker's job history: file names (with their folders), times, outcomes and the slicer's metadata;
 - the printer's list of objects, its webcams (their URLs, scrubbed), and lines printed to the console;
+- Moonraker's and Klipper's versions, and the host name Klipper reports beside its version (`printer.info`);
 - the bridge's own requests, such as which objects it subscribes to.
 
 It holds no G-code. Before a line is written, every secret the support bundle removes is removed from it: your 3D Print Log API key, Moonraker's API key, passwords in URLs and secret-looking query values (a webcam's `?token=`), any field named like a key, token, secret or password, and Moonraker's answer to a request for a oneshot token or API key. The support bundle scrubs traces a second time.

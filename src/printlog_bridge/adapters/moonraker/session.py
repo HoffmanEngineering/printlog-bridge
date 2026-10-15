@@ -359,6 +359,8 @@ class MoonrakerSession:
             await self.listener.on_connected(rpc.call)
 
             info = await rpc.call("server.info")
+            if info.get("moonraker_version"):
+                self.report.software("moonraker", str(info["moonraker_version"]))
             klippy = info.get("klippy_state", "unknown")
             if klippy == "ready":
                 await self._subscribe(rpc)
@@ -404,6 +406,19 @@ class MoonrakerSession:
         self.status = {name: dict(fields) for name, fields in result["status"].items()}
         await self._klippy_state("ready")
         await self.listener.on_status(self.status, self.status)
+        await self._klipper_version(rpc)
+
+    async def _klipper_version(self, rpc: _JsonRpc) -> None:
+        """Klipper's version, for the heartbeat. Only `software_version` is kept from the
+        answer, never the host name beside it."""
+        try:
+            info = await rpc.call("printer.info")
+        except MoonrakerRpcError as e:
+            log.debug("[printer %s] couldn't read Klipper's version: %s", self.printer, e)
+            return
+        version = (info or {}).get("software_version")
+        if version:
+            self.report.software("klipper", str(version))
 
     async def _klippy_state(self, state: str) -> None:
         self.report.printer_state(state)

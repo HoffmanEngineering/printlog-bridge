@@ -7,17 +7,24 @@ before creating a print if that first attempt failed. When that second attempt c
 Print Log either, the print waits and is tried again like any other request: created anyway, it
 would get through as soon as the API was back (the end of an outage) and never link. The app
 shows a connection as stale after 15 minutes without a heartbeat.
+
+Each heartbeat also carries the printer's health (#37): its software's versions, the outbox's
+backlog, and the problems logged since the last heartbeat. docs/privacy.md lists every field.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 from printlog_bridge import __version__
 from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
+from printlog_bridge.core.health import ProblemLog, Problems, utc_now
+from printlog_bridge.core.outbox import read_waiting
 from printlog_bridge.core.status import StatusBoard
 
 log = logging.getLogger(__name__)
@@ -25,8 +32,12 @@ log = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_S = 5 * 60
 MAX_DISPLAY_NAME = 100
 """The API's limit."""
+MAX_VERSION = 50
+MAX_PRINTER_MODEL = 100
+"""The API's limits."""
 
 TOPIC = "heartbeat"
+NO_PROBLEMS = Problems(0, None, None)
 
 
 @dataclass(frozen=True)
@@ -37,6 +48,12 @@ class Connection:
     kind: str
     """The adapter's name, such as `moonraker`."""
     printer_id: int
+    mode: str | None = None
+    """How the adapter reaches the printer (`local` or `remote`), if it has modes."""
+    snapshots: bool | None = None
+    """Whether a webcam frame is added to each print; None for an adapter without webcams."""
+    slicer_settings: bool = False
+    """Whether each print's slicer settings are sent (#36)."""
 
 
 class Heartbeat:
@@ -46,11 +63,16 @@ class Heartbeat:
         connections: Sequence[Connection],
         board: StatusBoard,
         interval: float = HEARTBEAT_INTERVAL_S,
+        problems: ProblemLog | None = None,
+        clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self.api = api
         self.connections = {c.printer: c for c in connections}
         self.board = board
         self.interval = interval
+        self.problems = problems
+        """Where the problems each heartbeat reports are counted; None reports none."""
+        self.clock = clock
         self._registered: set[str] = set()
 
     async def run(self) -> None:
@@ -73,12 +95,8 @@ class Heartbeat:
     async def beat(self, printer: str, raise_unavailable: bool = False) -> bool:
         connection = self.connections[printer]
         report = self.board.printer(printer)
-        body = {
-            "kind": connection.kind,
-            "displayName": f"printlog-bridge ({printer})"[:MAX_DISPLAY_NAME],
-            "agentVersion": __version__,
-            "printerId": connection.printer_id,
-        }
+        problems = self.problems.problems(printer) if self.problems else NO_PROBLEMS
+        body = self._body(connection, problems)
         try:
             await self.api.put_connection(connection.instance_id, body)
         except AuthRejected:
@@ -107,8 +125,41 @@ class Heartbeat:
             if printer not in self._registered:
                 log.info("[printer %s] registered with 3D Print Log", printer)
             self._registered.add(printer)
+            if self.problems:
+                self.problems.reported(printer, problems.count)
             report.heartbeat()
             report.warn(TOPIC, None)
             return True
         report.warn(TOPIC, problem)
         return False
+
+    def _body(self, connection: Connection, problems: Problems) -> dict[str, Any]:
+        """Everything a heartbeat sends. Every field is listed in docs/privacy.md, and none may
+        hold a host name, an IP address, a file name or a key (tests/test_privacy.py)."""
+        known = self.board.get(connection.printer)
+        software = known.get("software") or {}
+        waiting = read_waiting(self.board.state_dir).get(connection.printer)
+        now = self.clock()
+        return {
+            "kind": connection.kind,
+            "displayName": f"printlog-bridge ({connection.printer})"[:MAX_DISPLAY_NAME],
+            "agentVersion": __version__,
+            "printerId": connection.printer_id,
+            "mode": connection.mode,
+            "klipperVersion": _cut(software.get("klipper"), MAX_VERSION),
+            "moonrakerVersion": _cut(software.get("moonraker"), MAX_VERSION),
+            "printerModel": _cut(known.get("printer_model"), MAX_PRINTER_MODEL),
+            "outboxDepth": waiting.entries if waiting else 0,
+            "outboxOldestAgeSeconds": (
+                max(0, int((now - waiting.since).total_seconds())) if waiting else None
+            ),
+            "lastError": problems.last,
+            "lastErrorAt": problems.last_at.isoformat() if problems.last_at else None,
+            "errorCount": problems.count,
+            "snapshots": connection.snapshots,
+            "slicerSettings": connection.slicer_settings,
+        }
+
+
+def _cut(value: Any, limit: int) -> str | None:
+    return str(value)[:limit] if value else None
