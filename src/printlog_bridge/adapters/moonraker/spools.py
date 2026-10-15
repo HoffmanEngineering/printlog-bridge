@@ -34,8 +34,12 @@ from .u1_rfid import U1RfidReader
 log = logging.getLogger(__name__)
 
 COMMAND = re.compile(r"// printlog: (SET_SPOOL|CLEAR_SPOOL)((?: +[A-Z]+=\S+)*) *")
-UNSAFE = re.compile(r"[#;*\r\n]")
-"""What Klipper takes as the start of a comment (`;` `#` `*`) or the end of a command."""
+UNSAFE = re.compile(r"[#;*]")
+"""What Klipper's releases take as the start of a comment (`;` `#` `*`), even in quotes, so it
+can't be in an answer. `\\` becomes `/`: Klipper's shlex parse of `MSG="..."` reads it as an
+escape (one before the closing quote leaves the quote open, and the answer is a malformed command
+that never shows), and a Windows path stays readable. `"` becomes `'`, and a line break, which
+would end the command, a space."""
 ANSWER_PREFIX = "printlog-bridge: "
 RESPOND_MACRO = "gcode_macro _PRINTLOG_RESPOND"
 """The Klipper object `printlog.cfg`'s answering macro is, when it's included."""
@@ -72,7 +76,8 @@ async def tool_count(call: Call) -> int | None:
 
 def answer_script(answer: str) -> str:
     """The G-code that shows the bridge's answer on the console."""
-    text = " ".join(UNSAFE.sub("", answer.replace('"', "'")).split())[:MAX_ANSWER]
+    safe = answer.replace('"', "'").replace("\\", "/")
+    text = " ".join(UNSAFE.sub("", safe).split())[:MAX_ANSWER]
     return f'_PRINTLOG_RESPOND MSG="{ANSWER_PREFIX}{text}"'
 
 

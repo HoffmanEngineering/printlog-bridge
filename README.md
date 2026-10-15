@@ -208,7 +208,7 @@ On a printer with more than one tool (a toolchanger, an IDEX, a Snapmaker U1), e
 
 ### Spools
 
-Each tool's usage row is linked to the spool loaded in its slot in 3D Print Log (in the web or Android app, on the printer's page). The bridge reads the loaded spools when it starts, every 5 minutes, and again when each print starts and ends, so changing a spool in the app between prints is on the next print. On a single-tool printer, a print also keeps its spool loaded in 3D Print Log.
+Each tool's usage row is linked to the spool loaded in its slot in 3D Print Log (in the web or Android app, on the printer's page). The bridge reads the loaded spools when it starts, every 5 minutes, and again when each print starts and ends, so changing a spool in the app between prints is on the next print. On a single-tool printer, a print also keeps its spool loaded in 3D Print Log; so when the read as a print starts fails, the print waits up to an hour for a read that works rather than use the spool read earlier, which may have been unloaded in the app since. After that it's logged with the earlier read, and a note on the print says so.
 
 From the printer's console or a macro, with [`klipper/printlog.cfg`](klipper/printlog.cfg) included (`install.sh` does it; in remote mode copy it to the printer's config folder and add `[include printlog.cfg]` yourself, where the printer allows it):
 
@@ -218,7 +218,7 @@ PRINTLOG_SET_SPOOL ID=<spool id>         ; the active tool has this spool
 PRINTLOG_CLEAR_SPOOL TOOL=1              ; T1 has no spool
 ```
 
-`TOOL` is 0 for T0 or a single-tool printer; without it, it's the active tool. A tag is the UID stored on the spool in 3D Print Log, in any common format (`04:a2:3f:11` is `04A23F11`). The bridge answers on the console within a second or two, and adds slots to the printer in 3D Print Log when it has fewer than its tools. The macros only print a line for the bridge to read, so they never fail and never stop a print, even with the bridge offline: if no answer comes, run it again once the bridge is back. Assign spools before a print starts; a print keeps the spools it started with, and you can change them on the print in the app. Moonraker's Spoolman integration is left alone unless it points at 3D Print Log (see [Spoolman](#spoolman)).
+`TOOL` is 0 for T0 or a single-tool printer; without it, it's the active tool. A tag is the UID stored on the spool in 3D Print Log, in any common format (`04:a2:3f:11` is `04A23F11`). The bridge answers on the console within a second or two, and adds slots to the printer in 3D Print Log when it has fewer than its tools. 3D Print Log takes more slots only with the whole printer saved again, so that needs the printer's Make, Model and Name filled in there (the answer says which is missing), and a spool loaded or unloaded in the app at that same moment may be undone; you can also set the number of slots on the printer in the app yourself. The macros only print a line for the bridge to read, so they never fail and never stop a print, even with the bridge offline: if no answer comes, run it again once the bridge is back. Assign spools before a print starts; a print keeps the spools it started with, and you can change them on the print in the app. Moonraker's Spoolman integration is left alone unless it points at 3D Print Log (see [Spoolman](#spoolman)).
 
 #### Spoolman
 

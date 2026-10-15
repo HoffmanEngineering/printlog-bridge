@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import configparser
+import re
+import shlex
 from pathlib import Path
 
 import pytest
 
-from printlog_bridge.adapters.moonraker.spools import answer_script, parse_command
+from printlog_bridge.adapters.moonraker.spools import (
+    ANSWER_PREFIX,
+    MAX_ANSWER,
+    answer_script,
+    parse_command,
+)
 from printlog_bridge.core.events import SpoolCommand
 
 jinja2 = pytest.importorskip("jinja2")
@@ -38,6 +45,48 @@ def run_macro(name: str, params: dict[str, str], active: str = "extruder") -> li
         action_respond_info=respond_info,
     )
     return lines
+
+
+# How Klipper reads the parameters of a command like _PRINTLOG_RESPOND MSG="..." (klippy/gcode.py).
+# A line it can't split is a "Malformed command" error, and the answer never shows. Two versions:
+# the releases (v0.12, v0.13) match `extended_r` and then `shlex.split`; master, since 2025, takes
+# `get_raw_command_parameters()` into a `shlex.shlex` with `#` and `;` as commenters outside
+# quotes, and `*` only as a checksum marker.
+KLIPPER_EXTENDED = re.compile(
+    r"^\s*(?:N[0-9]+\s*)?"
+    r"(?P<cmd>[a-zA-Z_][a-zA-Z0-9_]+)(?:\s+|$)"
+    r"(?P<args>[^#*;]*?)"
+    r"\s*(?:[#*;].*)?$"
+)
+
+
+def klipper_release_params(script: str) -> dict[str, str]:
+    match = KLIPPER_EXTENDED.match(script)
+    assert match is not None, script
+    pairs = [arg.split("=", 1) for arg in shlex.split(match.group("args"))]
+    return {key.upper(): value for key, value in pairs}
+
+
+def klipper_master_params(script: str) -> dict[str, str]:
+    line = script.strip()
+    command = line.split(None, 1)[0].upper()
+    start = len(command)
+    if line[start : start + 1].isspace():
+        start += 1
+    lexer = shlex.shlex(line[start:], posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#;"
+    pairs = [arg.split("=", 1) for arg in lexer]
+    return {key.upper(): value for key, value in pairs}
+
+
+def klipper_params(script: str) -> dict[str, str]:
+    """The parameters Klipper gives the macro a one-line script runs, read by both versions,
+    which must agree."""
+    assert "\n" not in script
+    params = klipper_release_params(script)
+    assert klipper_master_params(script) == params
+    return params
 
 
 def commands(lines: list[str]) -> list[SpoolCommand]:
@@ -83,9 +132,46 @@ def test_clear_spool_reaches_the_bridge():
 
 def test_the_bridges_answer_is_shown_and_isnt_taken_for_a_command():
     script = answer_script("T2 is now Silk Gold in 3D Print Log")
-    message = script.split('MSG="', 1)[1].rstrip('"')
+    message = klipper_params(script)["MSG"]
 
     lines = run_macro("_PRINTLOG_RESPOND", {"MSG": message})
 
     assert lines == ["// printlog-bridge: T2 is now Silk Gold in 3D Print Log"]
     assert commands(lines) == []
+
+
+@pytest.mark.parametrize(
+    ("name", "shown"),
+    [
+        ("Spool\\", "Spool/"),  # a backslash before the closing quote leaves it unclosed
+        ("Back\\\\slash", "Back//slash"),  # shlex would turn two into one
+        ("Back\\slash", "Back/slash"),
+        ("C:\\Spools\\PLA red", "C:/Spools/PLA red"),  # a Windows path stays readable
+        ('Say "hi"', "Say 'hi'"),
+        ("It's mine", "It's mine"),
+        ("Gold; #2 *new*", "Gold 2 new"),
+        ("$HOME {printer} %s", "$HOME {printer} %s"),
+        ("Tab\tand  spaces", "Tab and spaces"),
+        ("Two\nlines\r", "Two lines"),
+    ],
+)
+def test_an_answer_with_shlex_special_characters_still_shows(name, shown):
+    """The answer reaches the console whole, as Klipper parses it, whatever the spool's name."""
+    for answer, expected in [
+        (f"T0 is now {name} in 3D Print Log", f"T0 is now {shown} in 3D Print Log"),
+        (f"T0 is now {name}", f"T0 is now {shown}"),  # at the end, next to the closing quote
+    ]:
+        params = klipper_params(answer_script(answer))
+
+        assert params == {"MSG": ANSWER_PREFIX + expected}
+        lines = run_macro("_PRINTLOG_RESPOND", params)
+        assert lines == [f"// {ANSWER_PREFIX}{expected}"]
+        assert commands(lines) == []
+
+
+def test_an_answer_cut_short_after_a_backslash_still_shows():
+    answer = "x" * (MAX_ANSWER - 1) + "\\" + "and more"
+
+    params = klipper_params(answer_script(answer))
+
+    assert params["MSG"].startswith(ANSWER_PREFIX + "x" * (MAX_ANSWER - 1))

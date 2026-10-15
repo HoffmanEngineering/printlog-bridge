@@ -24,7 +24,7 @@ The bridge sends 3D Print Log exactly these calls, and nothing else:
 | `GET /api/Filaments/by-number/{n}` | a spool is picked in Mainsail, Fluidd or KlipperScreen, or with `SET_ACTIVE_SPOOL`, and Moonraker's `[spoolman]` server is 3D Print Log | the spool number |
 | `PUT /api/Printers/{id}/slots/{slot}` | `PRINTLOG_SET_SPOOL`, or a U1 tag that matches one of your spools | `filamentId` (the spool), `slotLabel` (`T0`, `T1`...) |
 | `DELETE /api/Printers/{id}/slots/{slot}` | `PRINTLOG_CLEAR_SPOOL` | nothing |
-| `PUT /api/Printers/{id}` | a spool is assigned to a tool beyond the printer's slot count in 3D Print Log | the printer as 3D Print Log returned it, with only `slotCount` raised to the printer's tool count |
+| `PUT /api/Printers/{id}` | a spool is assigned to a tool beyond the printer's slot count in 3D Print Log | the printer as 3D Print Log returned it, with only `slotCount` raised to the printer's tool count; not sent when its make, model or name is empty |
 
 Every request also carries the API key (`X-Api-Key`) and `User-Agent: printlog-bridge/<version>`.
 

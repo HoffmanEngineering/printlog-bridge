@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from aiohttp import web
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
@@ -23,7 +24,12 @@ from printlog_bridge.core.events import (
     JobStarted,
     SpoolReading,
 )
-from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter, backoff_delay
+from printlog_bridge.core.lifecycle import (
+    SPOOL_READ_HOLD,
+    JobLogger,
+    LoggedPrinter,
+    backoff_delay,
+)
 from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, Outbox, read_waiting
 from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState
@@ -1416,6 +1422,92 @@ class TestLoadedSpools:
         assert api.slot_spools(42) == {None: spool}
         [row] = api.prints[1]["filamentUsage"]
         assert row["filament"] == {"id": spool}
+
+    def test_a_printer_read_that_keeps_failing_holds_the_print_only_so_long(self, tmp_path):
+        """The printer's GET is far heavier than the create, so it can keep failing while the
+        create would work. The print waits for a read (#29), but only for SPOOL_READ_HOLD; then
+        it's created with the spools read earlier, and says so."""
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, None, spool)
+        now = [STARTED_AT]
+        real = api._printer
+        reads = {"n": 0}
+
+        async def printer(request):
+            reads["n"] += 1
+            return await real(request) if reads["n"] == 1 else web.Response(status=503)
+
+        api._printer = printer
+
+        async def scenario():
+            async with logging_to(api, tmp_path, clock=lambda: now[0], spools=True) as logger:
+                try:
+                    assert logger.spools is not None
+                    await logger.spools.refresh("voron")  # the read at start worked
+                    await logger.emit(started(estimated_filament_mm=4400.0))
+                    await drain(logger, 0.2)
+                    held = dict(api.prints)
+                    now[0] += SPOOL_READ_HOLD - timedelta(minutes=1)
+                    await drain(logger, 0.2)
+                    still_held = dict(api.prints)
+                    now[0] += timedelta(minutes=2)
+                    await drain(logger, 0.5)
+                finally:
+                    logger.close()
+                return held, still_held
+
+        held, still_held = asyncio.run(scenario())
+
+        assert held == {} and still_held == {}
+        assert reads["n"] >= 3
+        [print_] = api.prints.values()
+        [row] = print_["filamentUsage"]
+        assert row["filament"] == {"id": spool}
+        assert "earlier read" in print_["notes"]
+
+    def test_a_printer_read_the_bridge_cant_make_sense_of_doesnt_hold_the_print(self, tmp_path):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, None, spool)
+        real = api._printer
+        reads = {"n": 0}
+
+        async def printer(request):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return await real(request)
+            detail = api._printer_detail(42)
+            detail["loadedFilaments"] = [{"slot": "T0", "filament": {"id": spool}}]
+            return web.json_response(detail)
+
+        api._printer = printer
+
+        async def scenario():
+            async with logging_to(api, tmp_path, spools=True) as logger:
+                try:
+                    assert logger.spools is not None
+                    await logger.spools.refresh("voron")
+                    await logger.emit(started(estimated_filament_mm=4400.0))
+                    await logger.send_due()  # once, with no retry
+                finally:
+                    logger.close()
+
+        asyncio.run(scenario())
+
+        [print_] = api.prints.values()
+        [row] = print_["filamentUsage"]
+        assert row["filament"] == {"id": spool}
+        assert "earlier read" in print_["notes"]
+
+    def test_a_print_with_a_fresh_read_has_no_note_about_it(self, tmp_path):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, None, spool)
+
+        run(api, tmp_path, started(estimated_filament_mm=4400.0), spools=True)
+
+        assert "earlier read" not in (api.prints[1].get("notes") or "")
 
     def test_each_tool_gets_the_spool_in_its_slot(self, tmp_path):
         api = FakePrintLogApi()
