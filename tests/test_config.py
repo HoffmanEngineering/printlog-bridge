@@ -434,3 +434,33 @@ class TestUpdateCheck:
     def test_anything_else_is_a_config_error(self, tmp_path):
         with pytest.raises(ConfigError, match="update_check must be true or false"):
             self.config(tmp_path, "update_check = weekly")
+
+
+class TestSlicerSettings:
+    """`slicer_settings` (#36): on unless turned off, in `[bridge]` or for one printer."""
+
+    def test_on_by_default_and_not_an_adapter_option(self, tmp_path):
+        [printer] = load(write(tmp_path, "[printer voron]\nadapter = fake\n")).printers
+
+        assert printer.slicer_settings is True
+        assert printer.adapter.options == {}
+
+    def test_bridge_sets_every_printer_and_a_printer_overrides_it(self, tmp_path):
+        path = write(
+            tmp_path,
+            "[bridge]\nslicer_settings = false\n"
+            "[printer a]\nadapter = fake\n"
+            "[printer b]\nadapter = fake\nslicer_settings = true\n"
+            "[printer c]\nadapter = fake\nslicer_settings = no\n",
+        )
+
+        a, b, c = load(path).printers
+
+        assert (a.slicer_settings, b.slicer_settings, c.slicer_settings) == (False, True, False)
+        assert b.adapter.options == {}
+
+    def test_anything_else_is_a_config_error(self, tmp_path):
+        path = write(tmp_path, "[printer voron]\nadapter = fake\nslicer_settings = some\n")
+
+        with pytest.raises(ConfigError, match="slicer_settings must be true or false"):
+            load(path)

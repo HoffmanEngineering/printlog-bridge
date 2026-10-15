@@ -6,6 +6,9 @@ the config, the key file and the environment, is replaced wherever it appears in
 the bundle, in case one was ever written to the log or the status file. The key file itself
 (`<state_dir>/api_key`) is never bundled. With `trace = true`, the newest traces are bundled
 too, up to `TRACE_BYTES`; they were scrubbed when written, and are scrubbed again here.
+
+The outbox goes in as `outbox.json`, less the text of any slicer settings waiting to be sent
+(the file's header and settings block): only their size is kept.
 """
 
 from __future__ import annotations
@@ -22,8 +25,9 @@ from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.core.config import API_KEY_ENV, API_KEY_FILE
-from printlog_bridge.core.outbox import read_entries
+from printlog_bridge.core.outbox import Entry, read_entries
 from printlog_bridge.core.secrets import REDACTED, URL_USERINFO, scrub
+from printlog_bridge.core.slicer_settings import OUTBOX_KIND, TEXT_FIELDS
 from printlog_bridge.core.status import STATUS_FILE
 from printlog_bridge.core.trace import TRACE_DIR, trace_files
 
@@ -68,7 +72,11 @@ def write_support_bundle(
     entries = read_entries(state_dir)
     if entries is not None:
         files["outbox.json"] = json.dumps(
-            [{**asdict(e), "queued_at": e.queued_at.isoformat()} for e in entries], indent=1
+            [
+                {**asdict(e), "queued_at": e.queued_at.isoformat(), "payload": _payload(e)}
+                for e in entries
+            ],
+            indent=1,
         )
     files.update(_latest_traces(state_dir, trace_bytes))
 
@@ -148,6 +156,17 @@ def _environment(config_path: Path, state_dir: Path) -> str:
             "",
         ]
     )
+
+
+def _payload(entry: Entry) -> dict:
+    if entry.kind != OUTBOX_KIND:
+        return entry.payload
+    return {
+        field: f"<{len(value)} characters, left out>"
+        if field in TEXT_FIELDS and isinstance(value, str)
+        else value
+        for field, value in entry.payload.items()
+    }
 
 
 def _read(path: Path) -> str | None:
