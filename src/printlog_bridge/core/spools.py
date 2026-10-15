@@ -145,6 +145,9 @@ class Spools:
         """
         self._rescheduled: asyncio.Event | None = None
         """Set when a retry is scheduled, to wake `run` for it."""
+        self._refused_growth: dict[str, tuple[tuple[Any, ...], str]] = {}
+        """Each printer whose slot-growing PUT the API refused: what the printer was then
+        (`_growth_key`), and what to tell the user. Not sent again until that changes."""
         self._locks: dict[str, asyncio.Lock] = {}
         self._failing = False
         self.on_swap: Callable[[SpoolSwap], bool] | None = None
@@ -182,7 +185,10 @@ class Spools:
             return
         detail = await self.api.get_printer(printer_id)
         if detail is None:
-            return  # doctor and the heartbeat say why; nothing here can be assigned either
+            # Deleted, or not the key owner's: doctor and the heartbeat say why. It has no
+            # spools to link, rather than the ones last read.
+            self._loaded.pop(printer, None)
+            return
         self._remember(printer, detail.get("loadedFilaments") or [], detail.get("slotCount"))
 
     async def refresh_all(self) -> None:
@@ -390,13 +396,19 @@ class Spools:
         ]
         if empty:
             # Sent as it is, the API refuses it with a 400 that names a field, not what to do.
-            fields = " and ".join(empty)
+            one = len(empty) == 1
             raise SlotsNotAdded(
-                f"{needed}, and the bridge can't add them while its {fields} "
-                f"{'is' if len(empty) == 1 else 'are'} empty. Fill "
-                f"{'it' if len(empty) == 1 else 'them'} in on the printer in the app, or set "
-                f"its slots to {count} there, then run it again"
+                f"{needed}, and the bridge can't add them while its {_join(empty)} "
+                f"{'is' if one else 'are'} empty. Fill {'it' if one else 'them'} in on the "
+                f"printer in the app, or set its slots to {count} there, then run it again"
             )
+        key = _growth_key(detail)
+        refused = self._refused_growth.get(printer)
+        if refused is not None and refused[0] == key:
+            # Refused before, and nothing the API checks has changed: a PUT would be refused
+            # again, while replacing the whole printer (racing the app, clearing beamDiameter).
+            raise SlotsNotAdded(refused[1])
+        self._refused_growth.pop(printer, None)
         body = {k: v for k, v in detail.items() if k not in PRINTER_FIELDS_NOT_SENT}
         body["id"] = printer_id
         body["slotCount"] = count
@@ -414,10 +426,12 @@ class Spools:
             if e.status != BAD_REQUEST:
                 raise
             # The action first: the API's reason can be long, and the console shows 300 characters.
-            raise SlotsNotAdded(
+            message = (
                 f"{needed}, and it refused them. Set its slots to {count} on the printer in the "
                 f"app, then run it again ({e})"
-            ) from e
+            )
+            self._refused_growth[printer] = (key, message)
+            raise SlotsNotAdded(message) from e
         log.info("[printer %s] set its slot count in 3D Print Log to %d", printer, count)
         self._slot_counts[printer] = int((updated or {}).get("slotCount") or count)
 
@@ -566,6 +580,19 @@ class Spools:
     def _event(self, printer: str, what: str) -> None:
         if self.board is not None:
             self.board.printer(printer).event(what)
+
+
+def _join(words: list[str]) -> str:
+    """`a`, `a and b`, `a, b and c`."""
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+
+
+def _growth_key(detail: Mapping[str, Any]) -> tuple[Any, ...]:
+    """What, changed on the printer, may have the API take a slot-growing PUT it refused: its
+    slot count and its own fields (its loaded spools aren't checked)."""
+    return tuple(
+        (k, repr(v)) for k, v in sorted(detail.items()) if k not in ("loadedFilaments", "images")
+    )
 
 
 def _describe(command: SpoolCommand) -> str:
