@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import bridge_helpers as helpers
+from aiohttp import web
 from bridge_helpers import write_config
 from fake_moonraker import DEFAULT_OBJECTS, FakeMoonraker, eventually
 from fake_printlog_api import FakePrintLogApi
@@ -113,3 +114,49 @@ def test_an_empty_u1_slot_changes_nothing(tmp_path):
 
     assert api.slot_spools(42) == {None: spool}
     assert not [r for r in api.requests if "/slots/" in r[1] or "by-tag" in r[1]]
+
+
+def test_a_failed_read_at_create_doesnt_load_a_spool_unloaded_in_the_app(tmp_path):
+    """On a single-tool printer, creating a print makes its spools the printer's loaded ones.
+    The bridge read the printer with a spool loaded, the user unloaded it in the app (within the
+    five minutes before the next read), and the read when the print is created fails: the print
+    waits for a read that works, rather than loading that spool again from the older one."""
+    from test_spool_swaps import FAST, fakes, feed, logged, printing, running
+
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    spool = api.add_spool("Unloaded in the app")
+    api.user_loads(42, 0, spool)
+    real = api._printer
+    reads = {"n": 0}
+
+    async def printer(request):
+        reads["n"] += 1
+        if reads["n"] == 1:  # the bridge's first read, as it starts
+            response = await real(request)
+            api.loaded[42].clear()  # and right after it, the user unloads the spool in the app
+            return response
+        if reads["n"] == 2:  # the read when the print is created
+            return web.Response(status=503)
+        return await real(request)
+
+    api._printer = printer
+
+    async def scenario():
+        async with (
+            fakes(tmp_path, moonraker, api) as config,
+            running(config, moonraker, backoff=FAST),
+        ):
+            await eventually(lambda: reads["n"] >= 1)
+            job = await moonraker.start_job("vase.gcode", METADATA)
+            await eventually(lambda: api.prints)
+            await printing(moonraker, "vase.gcode")
+            await feed(moonraker, 4400.0)
+            await moonraker.finish_job(job, filament_used=4400.0)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    assert reads["n"] >= 3  # the failed read, then one that worked before the create
+    assert api.slot_spools(42) == {}  # still unloaded
+    [print_] = api.prints.values()
+    assert [row.get("filament") for row in print_["filamentUsage"]] == [None]

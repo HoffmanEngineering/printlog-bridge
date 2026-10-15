@@ -7,11 +7,13 @@ import contextlib
 import logging
 
 import pytest
+from aiohttp import web
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
+from printlog_bridge.adapters.moonraker.spools import MAX_ANSWER
 from printlog_bridge.core.api_client import ApiClient, ApiUnavailable
-from printlog_bridge.core.events import SpoolCommand, SpoolReading
+from printlog_bridge.core.events import SpoolCommand, SpoolmanSpool, SpoolReading
 from printlog_bridge.core.spools import (
     UNKNOWN_TAG_RETRY_S,
     Spools,
@@ -108,6 +110,82 @@ class TestSetSpool:
         assert api.slot_spools(42) == {0: spool}
         assert answer == "no spool in 3D Print Log has number 99; nothing changed"
 
+    def test_spoolman_spool_loads_the_material_linked_to_it(self):
+        # A spool from the user's own Spoolman (#38): its Spoolman id is stored on the material.
+        api = FakePrintLogApi()
+        api.add_spool("Galaxy Black PLA", spoolman_id=11)
+        spool = api.add_spool("Silk Gold", spoolman_id=12, tags=("04A23F11",))
+
+        answer = run(
+            api,
+            lambda s: s.spool_command(
+                command(0, spoolman=SpoolmanSpool(12, "Polymaker Silk Gold", ("FFFFFFFF",)))
+            ),
+        )
+
+        assert api.slot_spools(42) == {0: spool}
+        assert "Silk Gold" in answer
+        assert ("GET", "/api/Filaments/by-spoolman-id/12") in api.requests
+        assert not any("/by-tag/" in path for _, path in api.requests)  # the id was enough
+
+    def test_spoolman_spool_falls_back_to_its_tag(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Silk Gold", tags=("04A23F11",))
+
+        answer = run(
+            api,
+            lambda s: s.spool_command(
+                command(0, spoolman=SpoolmanSpool(12, tags=("nope", "04:a2:3f:11")))
+            ),
+        )
+
+        assert api.slot_spools(42) == {0: spool}
+        assert "Silk Gold" in answer
+        assert ("GET", "/api/Filaments/by-tag/04A23F11") in api.requests
+
+    def test_unmapped_spoolman_spool_gets_a_hint_and_changes_nothing(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Loaded")
+        api.user_loads(42, 0, spool)
+
+        answer = run(
+            api,
+            lambda s: s.spool_command(command(0, spoolman=SpoolmanSpool(12, "Polymaker PLA Red"))),
+        )
+
+        assert api.slot_spools(42) == {0: spool}
+        assert answer == (
+            "no material in 3D Print Log has Spoolman spool 12 (Polymaker PLA Red); nothing "
+            "changed. Link it in the app."
+        )
+
+    def test_unmapped_spoolman_spool_with_a_tag_says_the_tag_would_do(self):
+        api = FakePrintLogApi()
+
+        answer = run(
+            api,
+            lambda s: s.spool_command(command(0, spoolman=SpoolmanSpool(12, tags=("04A23F11",)))),
+        )
+
+        assert api.slot_spools(42) == {}
+        assert answer == (
+            "no material in 3D Print Log has Spoolman spool 12 or its tag 04A23F11; nothing "
+            "changed. Link it in the app, or add the tag to the material."
+        )
+
+    def test_an_api_without_spoolman_ids_still_maps_by_tag(self):
+        # Until the API stores Spoolman ids, its lookup is a 404, as for any unlinked spool.
+        api = FakePrintLogApi()
+        api.spoolman_ids = False
+        spool = api.add_spool("Silk Gold", tags=("04A23F11",))
+
+        run(
+            api,
+            lambda s: s.spool_command(command(0, spoolman=SpoolmanSpool(12, tags=("04A23F11",)))),
+        )
+
+        assert api.slot_spools(42) == {0: spool}
+
     def test_a_tag_that_isnt_hex_is_refused_without_asking_the_api(self):
         api = FakePrintLogApi()
 
@@ -160,6 +238,134 @@ class TestSetSpool:
 
         assert api.slot_counts[42] == 3
         assert api.slot_spools(42) == {2: spool}
+
+    @pytest.mark.parametrize(
+        ("empty", "named"),
+        [
+            ({"make": ""}, "its Make is empty"),
+            ({"model": None}, "its Model is empty"),
+            ({"make": " ", "model": ""}, "its Make and Model are empty"),
+            ({"make": "", "model": "", "name": ""}, "its Make, Model and Name are empty"),
+        ],
+    )
+    def test_growing_a_printer_with_no_make_or_model_says_what_to_fill_in(self, empty, named):
+        """The API needs them to save the printer, so it would refuse the slots unexplained."""
+        api = FakePrintLogApi()
+        api.user_edits_printer(42, **empty)
+        spool = api.add_spool()
+
+        answer = run(api, lambda s: s.spool_command(command(3, filament_id=spool, slot_count=4)))
+
+        assert api.printer_puts == []  # not sent: the API would refuse it
+        assert api.slot_counts.get(42, 1) == 1
+        assert api.slot_spools(42) == {}
+        assert "nothing changed" in answer
+        assert named in answer
+        assert "4 slots" in answer
+        assert "in the app" in answer
+        assert "refused it" not in answer
+        assert len(answer) <= MAX_ANSWER  # shown whole on the console
+
+    def test_a_reader_beyond_a_printer_with_no_model_logs_what_to_fill_in(self, caplog):
+        api = FakePrintLogApi()
+        api.user_edits_printer(42, model="")
+        api.add_spool(tags=("04A23F11",))
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            run(api, lambda s: s.spool_reading(reading(2, tag="04A23F11", slot_count=4)))
+
+        assert api.printer_puts == []
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "its Model is empty" in warning
+        assert "in the app" in warning
+
+    def test_growing_keeps_every_field_the_printer_had(self):
+        """The PUT replaces the printer: whatever it read comes back as it was."""
+        api = FakePrintLogApi()
+        api.user_edits_printer(
+            42,
+            description="Toolchanger",
+            nozzleDiameter=0.6,
+            filamentDiameter=2.85,
+            isActive=False,
+            bedWidthMm=270.0,
+            bedHeightMm=270.0,
+            bedDepthMm=270.0,
+            hasHeatedBed=True,
+            hasHeatedChamber=False,
+            wattageW=350.0,
+            beamDiameter=0.08,
+            category="IDEX",
+        )
+        kept = api.add_spool("Kept")
+        api.user_loads(42, 0, kept)
+        spool = api.add_spool()
+        before = api._printer_detail(42)
+
+        run(api, lambda s: s.spool_command(command(3, filament_id=spool, slot_count=4)))
+
+        after = api._printer_detail(42)
+        for field in set(before) - {"slotCount", "loadedFilaments"}:
+            assert after[field] == before[field], field
+        assert after["slotCount"] == 4
+        assert api.slot_spools(42) == {0: kept, 3: spool}
+        # The one it can't keep: the GET has no beamDiameter, so the PUT clears it. Only a printer
+        # PATCH (or a slot-count endpoint) on the API would leave it alone.
+        assert api.beam_diameter(42) is None
+
+    def test_any_other_refusal_to_grow_says_to_set_the_slots_in_the_app(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+
+        async def refuse(_request):
+            return web.Response(status=400, text="Printer Category not found")
+
+        api._put_printer = refuse
+
+        answer = run(api, lambda s: s.spool_command(command(3, filament_id=spool, slot_count=4)))
+
+        assert api.slot_spools(42) == {}
+        assert "nothing changed" in answer
+        assert "Printer Category not found" in answer
+        assert "4 slots" in answer
+        assert "in the app" in answer
+
+    def test_a_refused_growth_isnt_sent_again_until_the_printer_changes(self):
+        """Each PUT replaces the whole printer, racing the app; one the API refused would be
+        refused the same way."""
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        real = api._put_printer
+        refusing = {"yes": True}
+
+        async def put(request):
+            if refusing["yes"]:
+                api.printer_puts.append(await request.json())
+                return web.Response(status=400, text="Printer Category not found")
+            return await real(request)
+
+        api._put_printer = put
+
+        async def scenario(spools):
+            answers = []
+            for _ in range(2):
+                answers.append(await spools.spool_command(command(3, filament_id=spool)))
+            sent = len(api.printer_puts)
+            refusing["yes"] = False
+            await spools.spool_command(command(3, filament_id=spool))
+            unchanged = len(api.printer_puts)
+            api.user_edits_printer(42, name="Renamed")
+            await spools.spool_command(command(3, filament_id=spool))
+            return answers, sent, unchanged
+
+        answers, sent, unchanged = run(api, scenario)
+
+        assert sent == 1
+        assert answers[0] == answers[1]
+        assert "4 slots" in answers[1]
+        assert unchanged == 1  # nothing about the printer changed
+        assert len(api.printer_puts) == 2
+        assert api.slot_spools(42) == {3: spool}
 
     def test_a_slot_within_the_count_leaves_the_printer_alone(self):
         api = FakePrintLogApi()
@@ -268,6 +474,38 @@ class TestLoaded:
 
         assert run(api, scenario) == {0: spool}
 
+    def test_a_fresh_read_fails_rather_than_answer_with_what_was_last_read(self):
+        """For a print's create, where an older read could load a spool again (#29)."""
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, 0, spool)
+
+        async def scenario(spools):
+            await spools.refresh_all()
+            api.loaded[42].clear()  # unloaded in the app
+            api.fail_next(1)
+            with pytest.raises(ApiUnavailable):
+                await spools.fresh("u1")
+            return await spools.fresh("u1")
+
+        assert run(api, scenario) == {}
+
+    @pytest.mark.parametrize("gone", ["deleted", "another users"])
+    def test_a_printer_that_isnt_there_has_no_spools_not_the_last_read(self, gone):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, 0, spool)
+
+        async def scenario(spools):
+            await spools.refresh_all()
+            if gone == "deleted":
+                api.printers.discard(42)
+            else:
+                api.fail_next(1, status=403)
+            return await spools.fresh("u1"), spools.loaded("u1")
+
+        assert run(api, scenario) == ({}, {})
+
     def test_run_reads_again_every_interval(self):
         api = FakePrintLogApi()
         a, b = api.add_spool("A"), api.add_spool("B")
@@ -312,6 +550,29 @@ def reading(slot: int = 0, **kwargs) -> SpoolReading:
 
 
 class TestReadings:
+    def test_a_refused_growth_isnt_sent_again_on_the_next_retry(self):
+        api = FakePrintLogApi()
+        api.add_spool(tags=("04A23F11",))
+
+        async def refuse(request):
+            api.printer_puts.append(await request.json())
+            return web.Response(status=400, text="Printer Category not found")
+
+        api._put_printer = refuse
+        clock = FakeClock()
+
+        async def scenario(spools):
+            await spools.spool_reading(reading(2, tag="04A23F11", slot_count=4))
+            clock.now += UNKNOWN_TAG_RETRY_S + 1
+            await spools.retry_tags()
+            clock.now += UNKNOWN_TAG_RETRY_S + 1
+            await spools.retry_tags()
+
+        run(api, scenario, clock=clock)
+
+        assert tag_lookups(api) == 3  # it was tried again
+        assert len(api.printer_puts) == 1
+
     def test_a_tag_a_spool_has_assigns_it_to_the_slot(self):
         api = FakePrintLogApi()
         api.slot_counts[42] = 4

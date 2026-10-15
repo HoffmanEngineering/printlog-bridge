@@ -15,6 +15,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from fake_moonraker import FakeMoonraker
 
+from printlog_bridge import __version__
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.adapters.moonraker.locator import config_key
 from printlog_bridge.cli.main import main
@@ -70,10 +71,13 @@ def serve_me(status: int = 200):
     return TestServer(app)
 
 
-def write_config(tmp_path: Path, api_url: str, api_key: str = "k", printers: str = "") -> Path:
+def write_config(
+    tmp_path: Path, api_url: str, api_key: str = "k", printers: str = "", bridge: str = ""
+) -> Path:
     path = tmp_path / "printlog-bridge.cfg"
     path.write_text(
         f"[bridge]\napi_url = {api_url}\napi_key = {api_key}\nstate_dir = {tmp_path / 'state'}\n"
+        + bridge
         + (printers or "[printer voron]\nadapter = fake\nprinter_id = 7\n"),
         encoding="utf-8",
     )
@@ -81,13 +85,19 @@ def write_config(tmp_path: Path, api_url: str, api_key: str = "k", printers: str
 
 
 def run_diagnose(
-    tmp_path: Path, status: int = 200, api_key: str = "k", printers: str = "", clock=None
+    tmp_path: Path,
+    status: int = 200,
+    api_key: str = "k",
+    printers: str = "",
+    clock=None,
+    bridge: str = "",
 ):
     async def scenario():
         server = serve_me(status)
         await server.start_server()
         try:
-            path = write_config(tmp_path, str(server.make_url("")).rstrip("/"), api_key, printers)
+            url = str(server.make_url("")).rstrip("/")
+            path = write_config(tmp_path, url, api_key, printers, bridge)
             kwargs = {"clock": clock} if clock else {}
             return await diagnose(path, adapters=ADAPTERS, env={}, home=tmp_path, **kwargs)
         finally:
@@ -106,6 +116,7 @@ def test_a_healthy_setup_passes_every_check(tmp_path):
     assert [r.name for r in results] == [
         "Python",
         "Config",
+        "Version",
         "State directory",
         "SQLite",
         "API key",
@@ -683,3 +694,46 @@ class TestPeek:
 
         with pytest.raises(RuntimeError, match="peek"):
             peeked.save()
+
+
+class TestVersion:
+    """`doctor` says when a newer bridge is out, as the running bridge last heard it from 3D
+    Print Log (#39). It asks nobody itself."""
+
+    def heard(self, tmp_path, latest):
+        board = StatusBoard(tmp_path / "state")
+        board.start(["voron"])
+        board.latest_version(latest)
+
+    def test_names_this_version(self, tmp_path):
+        check = by_name(run_diagnose(tmp_path))["Version"]
+
+        assert check.status is Status.OK
+        assert check.detail == __version__
+
+    def test_an_older_bridge_is_a_warning_saying_how_to_update(self, tmp_path):
+        self.heard(tmp_path, "999.0.0")
+
+        check = by_name(run_diagnose(tmp_path))["Version"]
+
+        assert check.status is Status.WARN
+        assert check.detail.startswith(
+            f"printlog-bridge 999.0.0 is available (this is {__version__})."
+        )
+        assert "docker compose pull" in check.detail
+
+    def test_the_latest_bridge_says_so(self, tmp_path):
+        self.heard(tmp_path, __version__)
+
+        check = by_name(run_diagnose(tmp_path))["Version"]
+
+        assert check.status is Status.OK
+        assert check.detail == f"{__version__}, the latest"
+
+    def test_update_check_off_says_nothing_about_updates(self, tmp_path):
+        self.heard(tmp_path, "999.0.0")
+
+        check = by_name(run_diagnose(tmp_path, bridge="update_check = false\n"))["Version"]
+
+        assert check.status is Status.OK
+        assert check.detail == __version__

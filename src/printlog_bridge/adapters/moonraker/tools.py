@@ -24,7 +24,16 @@ from collections.abc import Mapping
 from typing import Any
 
 EXTRUDER = re.compile(r"extruder(\d*)")
+TOOL_MACRO = re.compile(r"gcode_macro t(\d+)", re.IGNORECASE)
+"""A toolchanger's tool macro (`gcode_macro T1`). Fluidd and Mainsail keep each tool's spool
+in the user's own Spoolman as its `spool_id` variable."""
 PRINTING = ("printing", "paused")
+
+
+def macro_slot(name: str) -> int | None:
+    """The slot of a tool macro (`gcode_macro T1` is slot 1), or None for any other object."""
+    match = TOOL_MACRO.fullmatch(name)
+    return None if match is None else int(match.group(1))
 
 
 def slot_of(extruder: str | None) -> int | None:

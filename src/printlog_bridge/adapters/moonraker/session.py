@@ -27,6 +27,7 @@ from printlog_bridge.core.status import NullReport, PrinterReport
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 from .changes import SENSOR_FIELDS, is_sensor
+from .tools import macro_slot, slot_of
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ SUBSCRIPTION: Mapping[str, list[str] | None] = {
 OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "filament_detect": None,  # Snapmaker U1's RFID reader
     "exclude_object": ["objects", "excluded_objects"],  # objects cancelled mid-print
+    "save_variables": ["variables"],  # each tool's spool in the user's own Spoolman (#38)
 }
 
 T = TypeVar("T")
@@ -390,6 +392,8 @@ class MoonrakerSession:
             await self.listener.on_connected(rpc.call)
 
             info = await rpc.call("server.info")
+            if info.get("moonraker_version"):
+                self.report.software("moonraker", str(info["moonraker_version"]))
             klippy = info.get("klippy_state", "unknown")
             if klippy == "ready":
                 await self._subscribe(rpc)
@@ -433,6 +437,12 @@ class MoonrakerSession:
             objects.update({k: v for k, v in OPTIONAL_SUBSCRIPTION.items() if k in available})
             # Runout sensors, which are named: `filament_switch_sensor <name>` (#44).
             objects.update({k: list(SENSOR_FIELDS) for k in sorted(available) if is_sensor(k)})
+            # A toolchanger's tool macros, for each tool's spool in the user's own Spoolman: of
+            # the tools it has (the U1 defines T0 to T31 for its four).
+            extruders = {slot_of(k) for k in available} - {None}
+            objects.update(
+                {k: ["spool_id"] for k in sorted(available) if macro_slot(k) in extruders}
+            )
             result = await rpc.call("printer.objects.subscribe", {"objects": objects})
         except MoonrakerRpcError as e:
             # Klipper went away between ready and subscribe; its next ready notification retries.
@@ -442,6 +452,19 @@ class MoonrakerSession:
         self.status = {name: dict(fields) for name, fields in result["status"].items()}
         await self._klippy_state("ready")
         await self.listener.on_status(self.status, self.status)
+        await self._klipper_version(rpc)
+
+    async def _klipper_version(self, rpc: _JsonRpc) -> None:
+        """Klipper's version, for the heartbeat. Only `software_version` is kept from the
+        answer, never the host name beside it."""
+        try:
+            info = await rpc.call("printer.info")
+        except MoonrakerRpcError as e:
+            log.debug("[printer %s] couldn't read Klipper's version: %s", self.printer, e)
+            return
+        version = (info or {}).get("software_version")
+        if version:
+            self.report.software("klipper", str(version))
 
     async def _klippy_state(self, state: str) -> None:
         self.report.printer_state(state)

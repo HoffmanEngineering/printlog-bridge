@@ -1,4 +1,4 @@
-"""Moonraker's Spoolman integration, when it points at 3D Print Log.
+"""Moonraker's Spoolman integration, when it points at 3D Print Log or at the user's own Spoolman.
 
 3D Print Log answers Spoolman's API at `/spoolman`, so a user can set moonraker.conf's
 
@@ -35,12 +35,28 @@ connect, Moonraker is set to the active tool's spool only when no print is runni
 the running print's usage is on Moonraker's active spool, and changing it then would put the
 rest of the print on another spool than the one it started on. From the next tool or spool
 change it follows again.
+
+With a Spoolman server of the user's own (#38), the spool active there is assigned to its
+material in 3D Print Log, one way only: nothing is ever written to Spoolman (Moonraker reports
+usage to it already) or to Moonraker's active spool. The spool is read through Moonraker's
+Spoolman proxy (`GET /v1/spool/{id}`), and 3D Print Log finds its material by the Spoolman id
+stored on it, else by the tag UID in the spool's `nfc_id` extra field (where nfc2klipper and
+FilaMan keep it); with neither, the bridge logs how to link it, and nothing changes.
+
+Which slot: a toolchanger whose tool macros keep each tool's spool (Fluidd's and Mainsail's
+`spool_id` variable on `gcode_macro T<n>`, or `t<n>__spool_id` in `[save_variables]`) has each
+tool's spool assigned to that tool's slot, and Moonraker's active spool, which its tool change
+macros set from those, is left to them. Elsewhere the active spool is the active tool's: slot 0
+on a single-tool printer. On connect the spools are assigned when no print is under way, and
+then only those that changed since the bridge last saw them; from then on, each change.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -48,13 +64,22 @@ from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
-from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolSink
+from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolmanSpool, SpoolSink
 
 from .session import Call, ConnectionLost, MoonrakerListener, MoonrakerRpcError
 from .spools import tool_count
-from .tools import slot_of
+from .tools import macro_slot, slot_of
 
 log = logging.getLogger(__name__)
+
+PRINTLOG = "printlog"
+"""Moonraker's Spoolman server is 3D Print Log."""
+OWN = "own"
+"""Moonraker's Spoolman server is the user's own."""
+TAG_FIELD = "nfc_id"
+"""The Spoolman extra field holding a spool's tag UID (nfc2klipper, FilaMan)."""
+SAVED_TOOL_SPOOL = re.compile(r"t(\d+)__spool_id", re.IGNORECASE)
+"""A `[save_variables]` variable holding a tool's spool in the user's own Spoolman."""
 
 METHOD_NOT_FOUND = -32601
 """What Moonraker answers a `server.spoolman.*` call with when its spoolman component isn't
@@ -81,6 +106,57 @@ def spool_number(filament: Mapping[str, Any]) -> int | None:
     return number if isinstance(number, int) and not isinstance(number, bool) else None
 
 
+def spool_id_of(value: object) -> int | None:
+    """A Spoolman spool id from a macro or saved variable, or None for none (or not one)."""
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def tool_spools(status: Mapping[str, Any]) -> dict[int, int | None]:
+    """Each tool's spool in the user's own Spoolman, by slot, when the printer's macros keep
+    one per tool; empty when they don't. A tool macro's `spool_id` is the live one, and wins
+    over a saved variable."""
+    spools: dict[int, int | None] = {}
+    variables = (status.get("save_variables") or {}).get("variables")
+    if isinstance(variables, Mapping):
+        for name, value in variables.items():
+            match = SAVED_TOOL_SPOOL.fullmatch(str(name))
+            if match is not None:
+                spools[int(match.group(1))] = spool_id_of(value)
+    for name, fields in status.items():
+        slot = macro_slot(str(name))
+        if slot is not None and isinstance(fields, Mapping) and "spool_id" in fields:
+            spools[slot] = spool_id_of(fields["spool_id"])
+    return spools
+
+
+def tag_values(raw: object) -> tuple[str, ...]:
+    """The tag UIDs in a Spoolman extra field. Spoolman keeps extra values as JSON text
+    (`"\\"04A23F11\\""`); a value that isn't is taken as written."""
+    value = raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw
+    values = value if isinstance(value, list) else [value]
+    return tuple(str(v).strip() for v in values if isinstance(v, (str, int)) and str(v).strip())
+
+
+def describe_spool(spool_id: int, body: Mapping[str, Any]) -> SpoolmanSpool:
+    """What 3D Print Log needs of a Spoolman spool (`GET /v1/spool/{id}`): its id and tags, and
+    its name for the log."""
+    filament = body.get("filament")
+    filament = filament if isinstance(filament, Mapping) else {}
+    vendor = filament.get("vendor")
+    parts = ((vendor if isinstance(vendor, Mapping) else {}).get("name"), filament.get("name"))
+    name = " ".join(p.strip() for p in parts if isinstance(p, str) and p.strip()) or None
+    extra = body.get("extra")
+    tags = tag_values((extra if isinstance(extra, Mapping) else {}).get(TAG_FIELD))
+    return SpoolmanSpool(spool_id, name, tags)
+
+
 @dataclass(eq=False)
 class _Post:
     """A spool number the bridge set Moonraker's active spool to, until Moonraker announces it."""
@@ -94,7 +170,8 @@ class _Post:
 class SpoolmanSync(MoonrakerListener):
     """A MoonrakerListener that loads the spool picked on the printer into the active tool's
     slot, and keeps Moonraker's active spool on the active tool's spool, when Moonraker's
-    Spoolman server is 3D Print Log."""
+    Spoolman server is 3D Print Log; and assigns the spools active in the user's own Spoolman
+    to their materials, when it's theirs."""
 
     def __init__(
         self,
@@ -130,6 +207,16 @@ class SpoolmanSync(MoonrakerListener):
         self._posted: deque[_Post] = deque()
         """The bridge's posts Moonraker hasn't announced yet, oldest first (see `_echo`)."""
         self._posts: asyncio.Lock | None = None
+        self.external = False
+        """Whether Moonraker's `[spoolman]` server is the user's own, as read on connect."""
+        self.per_tool = False
+        """Whether the printer's macros keep each tool's spool in the user's own Spoolman."""
+        self._seen_active: int | None = None
+        """The active spool in the user's own Spoolman last assigned, or left as it was for a
+        print under way. Kept across connections, so a reconnect assigns only a change."""
+        self._seen_tools: dict[int, int | None] = {}
+        """The same for each tool's spool, by slot."""
+        self._spoolman_host: str | None = None
 
     async def on_connected(self, call: Call) -> None:
         self._call = call
@@ -139,16 +226,24 @@ class SpoolmanSync(MoonrakerListener):
         self._settled = False
         self._posted.clear()
         # Set once known, not reset first: what the last connection read stands until then.
-        enabled = await self._points_at_printlog(call)
-        spool, loaded = await self._active_spool(call) if enabled else (None, False)
+        kind = await self._server_kind(call)
+        spool, loaded = await self._active_spool(call) if kind else (None, False)
         self.moonraker_spool = spool
-        self.enabled = enabled and loaded
+        self.enabled = kind == PRINTLOG and loaded
+        self.external = kind == OWN and loaded
         if self.enabled:
             log.info(
                 "[printer %s] Moonraker's Spoolman server is 3D Print Log: a spool picked on the "
                 "printer is loaded into the active tool's slot",
                 self.printer,
             )
+        elif self.external:
+            log.info(
+                "[printer %s] Moonraker's Spoolman server is your own (%s): the spool active "
+                "there is assigned to its material in 3D Print Log, and nothing is written to "
+                "Spoolman",
+                self.printer, self._spoolman_host,
+            )  # fmt: skip
 
     async def on_klippy_state(self, state: str) -> None:
         if state == "ready":
@@ -159,11 +254,13 @@ class SpoolmanSync(MoonrakerListener):
         if isinstance(state, str):
             self._busy = state in BUSY
         slot = slot_of((status.get("toolhead") or {}).get("extruder"))
-        if slot is None:
-            return
-        tool_changed = slot != self.active_slot
-        self.active_slot = slot
-        self._follow(tool_changed, by_tool=True)
+        tool_changed = slot is not None and slot != self.active_slot
+        if slot is not None:
+            self.active_slot = slot
+        if self.external:
+            self._follow_own(status)
+        elif slot is not None:
+            self._follow(tool_changed, by_tool=True)
 
     def on_loaded(self, loaded: Mapping[int, Mapping[str, Any]]) -> None:
         """What 3D Print Log has in the printer's slots changed (`Spools.watch_loaded`)."""
@@ -190,6 +287,9 @@ class SpoolmanSync(MoonrakerListener):
                 self._follow(True)
             return
         self.moonraker_spool = spool_id
+        if self.external:
+            self._own_pick(spool_id)
+            return
         if not self.enabled:
             log.debug("[printer %s] Moonraker's active spool is now %s", self.printer, spool_id)
             return
@@ -216,9 +316,11 @@ class SpoolmanSync(MoonrakerListener):
         )  # fmt: skip
         self._spawn(self._carry_out(command, self._call))
 
-    async def _points_at_printlog(self, call: Call) -> bool:
-        """Whether moonraker.conf's `[spoolman]` server is 3D Print Log. Says so in the log
-        when it isn't; `on_connected` says so when it is, once the component is found."""
+    async def _server_kind(self, call: Call) -> str | None:
+        """Whose moonraker.conf's `[spoolman]` server is: 3D Print Log's (`PRINTLOG`), the
+        user's own (`OWN`), or None without one. Says so in the log when there's none;
+        `on_connected` says which it is, once the component is found."""
+        self._spoolman_host = None
         try:
             config = (await call("server.config", None)).get("config") or {}
         except Exception as e:
@@ -227,7 +329,7 @@ class SpoolmanSync(MoonrakerListener):
                 "printer aren't synced with 3D Print Log",
                 self.printer, e,
             )  # fmt: skip
-            return False
+            return None
         section = config.get("spoolman")
         if not isinstance(section, Mapping):
             log.info(
@@ -235,17 +337,18 @@ class SpoolmanSync(MoonrakerListener):
                 "printer aren't synced with 3D Print Log",
                 self.printer,
             )
-            return False
+            return None
         # Only the host is ever logged: the server URL holds the printer's Spoolman secret.
         host = host_of(section.get("server"))
-        if host is None or self.api_host is None or host != self.api_host:
+        if host is None:
             log.info(
-                "[printer %s] Moonraker's Spoolman server is %s, not 3D Print Log (%s), so "
-                "spools picked on the printer aren't synced with 3D Print Log",
-                self.printer, host or "unset", self.api_host,
-            )  # fmt: skip
-            return False
-        return True
+                "[printer %s] Moonraker's [spoolman] section has no server, so spools picked "
+                "on the printer aren't synced with 3D Print Log",
+                self.printer,
+            )
+            return None
+        self._spoolman_host = host
+        return PRINTLOG if host == self.api_host else OWN
 
     async def _active_spool(self, call: Call) -> tuple[int | None, bool]:
         """Moonraker's active spool, and whether its spoolman component is loaded at all."""
@@ -383,14 +486,121 @@ class SpoolmanSync(MoonrakerListener):
             self.printer, number, slot,
         )  # fmt: skip
 
-    async def _carry_out(self, command: SpoolCommand, call: Call | None) -> None:
+    # -- the user's own Spoolman (#38) ---------------------------------------------------------
+
+    def _follow_own(self, status: Mapping[str, Any]) -> None:
+        """Assigns the spools active in the user's own Spoolman that changed: each tool's, when
+        the macros keep them, else the active spool, the first time once Klipper has said which
+        tool is active and whether a print is under way."""
+        tools = tool_spools(status)
+        self.per_tool = bool(tools)
+        if not self._settled:
+            if self._busy is None or (not tools and self.active_slot is None):
+                return
+            self._settled = True
+            if self._busy:
+                self._seen_tools.update(tools)
+                if not tools:
+                    self._seen_active = self.moonraker_spool
+                log.info(
+                    "[printer %s] a print is under way, so the spools active in Spoolman are "
+                    "assigned in 3D Print Log from their next change",
+                    self.printer,
+                )
+                return
+            if not tools:
+                spool = self.moonraker_spool
+                if spool is not None and spool != self._seen_active:
+                    self._seen_active = spool
+                    assert self.active_slot is not None  # settled needs it without tools
+                    self._assign_later(self.active_slot, spool)
+                return
+        for slot, spool in sorted(tools.items()):
+            if slot in self._seen_tools and self._seen_tools[slot] == spool:
+                continue
+            self._seen_tools[slot] = spool
+            if spool is not None:
+                self._assign_later(slot, spool)
+
+    def _own_pick(self, spool_id: int | None) -> None:
+        """Moonraker's active spool changed, in the user's own Spoolman."""
+        if spool_id is None:
+            log.info(
+                "[printer %s] the active spool was cleared in Spoolman; 3D Print Log's slots "
+                "are left as they are",
+                self.printer,
+            )
+            return
+        if self.per_tool:
+            log.debug(
+                "[printer %s] Moonraker's active spool is now %d; each tool's spool is assigned "
+                "from its macro",
+                self.printer, spool_id,
+            )  # fmt: skip
+            return
+        if not self._settled:
+            return  # assigned once Klipper says which tool is active, and whether it prints
+        assert self.active_slot is not None  # settled needs it without tools
+        self._seen_active = spool_id
+        self._assign_later(self.active_slot, spool_id)
+
+    def _assign_later(self, slot: int, spool_id: int) -> None:
+        # Where the job is now, not once Spoolman and 3D Print Log answer: a split falls here.
+        during = self.point()
+        log.info(
+            "[printer %s] Spoolman spool %d is active on the printer, for T%d",
+            self.printer, spool_id, slot,
+        )  # fmt: skip
+        self._spawn(self._assign(slot, spool_id, during, self._call))
+
+    async def _assign(
+        self, slot: int, spool_id: int, during: JobPoint | None, call: Call | None
+    ) -> None:
+        async with self._ordered():  # assigned in the order they were made
+            spool = await self._spoolman_spool(spool_id, call)
+            command = SpoolCommand(self.printer, slot, spoolman=spool, during=during)
+            await self._send(command, call)
+
+    async def _spoolman_spool(self, spool_id: int, call: Call | None) -> SpoolmanSpool:
+        """The spool as the user's Spoolman describes it, read through Moonraker's proxy. With
+        no answer, just its id, which 3D Print Log can still find it by."""
+        params = {"request_method": "GET", "path": f"/v1/spool/{spool_id}"}
+        try:
+            if call is None:
+                raise ConnectionLost("not connected to Moonraker")
+            answer = await call("server.spoolman.proxy", {**params, "use_v2_response": True})
+            body = answer
+            if isinstance(answer, Mapping) and "response" in answer and "error" in answer:
+                if answer.get("error"):
+                    raise MoonrakerRpcError(0, str(answer["error"]))
+                body = answer.get("response")
+            if not isinstance(body, Mapping):
+                raise MoonrakerRpcError(0, "not a spool")
+        except Exception as e:
+            log.info(
+                "[printer %s] couldn't read Spoolman spool %d through Moonraker (%s); looking "
+                "it up in 3D Print Log by its id alone",
+                self.printer, spool_id, e,
+            )  # fmt: skip
+            return SpoolmanSpool(spool_id)
+        return describe_spool(spool_id, body)
+
+    # -- carrying out --------------------------------------------------------------------------
+
+    def _ordered(self) -> asyncio.Lock:
         if self._in_order is None:
             self._in_order = asyncio.Lock()  # made here, in the running loop (Python 3.9)
-        async with self._in_order:  # picks are carried out in the order they were made
-            if self._tools is None and call is not None:
-                self._tools = await tool_count(call)
-            # Never raises; it logs what came of it, and puts it on the status board.
-            await self.spools.spool_command(replace(command, slot_count=self._tools))
+        return self._in_order
+
+    async def _carry_out(self, command: SpoolCommand, call: Call | None) -> None:
+        async with self._ordered():  # picks are carried out in the order they were made
+            await self._send(command, call)
+
+    async def _send(self, command: SpoolCommand, call: Call | None) -> None:
+        if self._tools is None and call is not None:
+            self._tools = await tool_count(call)
+        # Never raises; it logs what came of it, and puts it on the status board.
+        await self.spools.spool_command(replace(command, slot_count=self._tools))
 
     def _spawn(self, work) -> None:
         task = asyncio.ensure_future(work)

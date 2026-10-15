@@ -125,6 +125,8 @@ class BridgeConfig:
     """Record every message to and from each printer in `state_dir/traces` (core/trace.py)."""
     max_attachment_mb: int = DEFAULT_MAX_ATTACHMENT_MB
     """A file to attach to a print (a timelapse video) larger than this is skipped."""
+    update_check: bool = True
+    """Say in the log, `status` and `doctor` when 3D Print Log reports a newer bridge (#39)."""
 
     def api_url_warning(self) -> str | None:
         """What to say, every time, when `api_url` is plain http to another computer, which
@@ -228,6 +230,7 @@ def load_config(
         config_api_key,
         trace=_trace(bridge.get("trace"), env.get(TRACE_ENV)),
         max_attachment_mb=_max_attachment_mb(bridge.get("max_attachment_mb")),
+        update_check=_flag(bridge.get("update_check") or "true", "update_check"),
     )
 
 

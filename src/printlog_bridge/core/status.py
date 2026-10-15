@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from printlog_bridge import __version__
 from printlog_bridge.core.outbox import read_waiting
 from printlog_bridge.core.trace import trace_dir
+from printlog_bridge.core.updates import is_newer, update_notice
 
 if TYPE_CHECKING:  # config imports the adapter interface, which imports this module
     from printlog_bridge.core.config import BridgeConfig
@@ -56,6 +57,14 @@ class PrinterReport(Protocol):
         """The printer was found at a new address (`old` and `new` are hosts, `at` when, ISO
         8601, defaulting to now)."""
 
+    def software(self, name: str, version: str) -> None:
+        """The version of the printer's `name` software (`klipper`, `moonraker`), sent with the
+        connection's heartbeat."""
+
+    def printer_model(self, model: str) -> None:
+        """The printer's model, as the slicer named it in a job's file, sent with the heartbeat.
+        Never a host name or anything the user typed for the printer."""
+
 
 class NullReport:
     """A PrinterReport that keeps nothing, for code run outside `printlog-bridge run`."""
@@ -75,9 +84,16 @@ class NullReport:
     def moved(self, old: str, new: str, at: str | None = None) -> None:
         pass
 
+    def software(self, name: str, version: str) -> None:
+        pass
+
+    def printer_model(self, model: str) -> None:
+        pass
+
 
 class StatusBoard:
     def __init__(self, state_dir: Path, clock: Clock = utc_now) -> None:
+        self.state_dir = state_dir
         self.path = state_dir / STATUS_FILE
         self.clock = clock
         self._data: dict[str, Any] = {}
@@ -92,6 +108,7 @@ class StatusBoard:
             "updated_at": now,
             "stopped_at": None,
             "trace": trace,
+            "latest_version": None,
             "printers": {
                 name: {
                     "connection": "starting",
@@ -103,6 +120,8 @@ class StatusBoard:
                     "last_heartbeat_at": None,
                     "warnings": {},
                     "moved": None,
+                    "software": {},
+                    "printer_model": None,
                 }
                 for name in printers
             },
@@ -125,6 +144,13 @@ class StatusBoard:
 
     def get(self, printer: str) -> dict[str, Any]:
         return self._data["printers"][printer]
+
+    def latest_version(self, version: str | None) -> None:
+        """The newest bridge release, as 3D Print Log last reported it, for `status` and
+        `doctor` to say when this one is behind."""
+        if self._data.get("latest_version") != version:
+            self._data["latest_version"] = version
+            self._write()
 
     def _now(self) -> str:
         return self.clock().isoformat()
@@ -201,6 +227,17 @@ class BoardReport:
             self.printer, moved={"from": old, "to": new, "at": at or self.board._now()}
         )
 
+    def software(self, name: str, version: str) -> None:
+        software = dict(self.board.get(self.printer).get("software") or {})
+        if software.get(name) == version:
+            return
+        software[name] = version
+        self.board.update(self.printer, software=software)
+
+    def printer_model(self, model: str) -> None:
+        if self.board.get(self.printer).get("printer_model") != model:
+            self.board.update(self.printer, printer_model=model)
+
     def event(self, text: str) -> None:
         self.board.update(self.printer, last_event=text, last_event_at=self.board._now())
 
@@ -244,6 +281,9 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
             f"Bridge: not running: it last checked in {_ago(now, status['updated_at'])} ago and "
             "may have crashed. Check its log."
         ]
+    update = _update_line(config, status, running)
+    if update:
+        lines.append(update)
     trace = _trace_line(config, status, running)
     if trace:
         lines.append(trace)
@@ -259,6 +299,16 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
         lines.extend(f"  {line}" for line in _printer_lines(printer, known, running, config, now))
 
     return "\n".join(lines), 0 if running else 1
+
+
+def _update_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str | None:
+    """When the last heartbeat heard of a newer bridge than the one running (or, when none
+    runs, the one installed)."""
+    latest = status.get("latest_version")
+    current = status.get("version") if running else __version__
+    if not config.update_check or not isinstance(current, str) or not is_newer(latest, current):
+        return None
+    return f"Update: {update_notice(latest, current)}"
 
 
 def _trace_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str | None:

@@ -166,6 +166,9 @@ class MoonrakerAdapter(Adapter):
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
         return cls(printer, url=None, socket=socket, snapshots=snapshots, timelapse=timelapse)
 
+    def mode(self) -> str:
+        return "local" if self.url is None else "remote"
+
     def describe(self) -> str:
         if self.url is not None:
             return f"moonraker, remote {where(self.url, None)}"

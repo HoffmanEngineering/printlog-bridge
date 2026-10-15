@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from printlog_bridge import __version__
@@ -450,3 +451,60 @@ class TestStatusCommand:
         assert main(["status", "--config", str(tmp_path / "missing.cfg")]) == 2
 
         assert "not found" in capsys.readouterr().err
+
+
+class TestUpdateNotice:
+    """`status` says when a newer bridge is out, as the last heartbeat heard (#39)."""
+
+    def started(self, tmp_path, latest, version=__version__):
+        b = board(tmp_path)
+        b.start(["voron"])
+        b.latest_version(latest)
+        if version != __version__:  # a bridge started from an older install
+            data = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+            data["version"] = version
+            (tmp_path / "status.json").write_text(json.dumps(data), encoding="utf-8")
+        return b
+
+    def test_an_older_running_bridge_says_what_is_available_and_how_to_update(self, tmp_path):
+        self.started(tmp_path, "999.0.0")
+
+        text, code = report(tmp_path, NOW)
+
+        assert code == 0
+        assert f"Update: printlog-bridge 999.0.0 is available (this is {__version__})." in text
+        assert "docker compose pull && docker compose up -d" in text
+
+    def test_compares_with_the_version_that_is_running(self, tmp_path):
+        self.started(tmp_path, __version__, version="0.0.1")
+
+        text, _ = report(tmp_path, NOW)
+
+        assert f"printlog-bridge {__version__} is available (this is 0.0.1)" in text
+
+    def test_the_latest_bridge_says_nothing(self, tmp_path):
+        self.started(tmp_path, __version__)
+
+        text, _ = report(tmp_path, NOW)
+
+        assert "Update" not in text
+
+    def test_nothing_is_said_before_the_api_answered(self, tmp_path):
+        self.started(tmp_path, None)
+
+        text, _ = report(tmp_path, NOW)
+
+        assert "Update" not in text
+
+    def test_update_check_off_says_nothing(self, tmp_path):
+        self.started(tmp_path, "999.0.0")
+
+        text, _ = format_status(replace(config(tmp_path), update_check=False), now=NOW)
+
+        assert "Update" not in text
+
+    def test_a_new_run_forgets_the_last_answer(self, tmp_path):
+        self.started(tmp_path, "999.0.0")
+        board(tmp_path).start(["voron"])
+
+        assert read_status(tmp_path)["latest_version"] is None

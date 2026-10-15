@@ -63,9 +63,11 @@ class Entry:
 
 @dataclass(frozen=True)
 class Waiting:
-    """One printer's part of the outbox, for `printlog-bridge status`."""
+    """One printer's part of the outbox, for `printlog-bridge status` and the heartbeat."""
 
     jobs: int
+    entries: int
+    """Events and pictures waiting, across those jobs."""
     since: datetime
     """When the oldest entry was queued."""
     last_error: str | None
@@ -172,6 +174,7 @@ def read_waiting(state_dir: Path) -> dict[str, Waiting]:
         errors = [e.last_error for e in entries if e.last_error]
         waiting[printer] = Waiting(
             jobs=len({e.job_id for e in entries}),
+            entries=len(entries),
             since=min(e.queued_at for e in entries),
             last_error=errors[-1] if errors else None,
         )

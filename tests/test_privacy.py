@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import aiohttp
@@ -29,6 +30,7 @@ from fake_moonraker import FakeMoonraker, eventually, gcode_metadata
 from fake_printlog_api import SAS_SIGNATURE, FakePrintLogApi
 from fake_webcam import JPEG, FakeWebcam
 
+from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.adapters.moonraker.images import MoonrakerImages
@@ -65,6 +67,7 @@ METADATA = {
     "filament_total": 1200.0,
     "filament_weight_total": 3.6,
     "slicer": "OrcaSlicer",
+    "printer_model": "Voron 2.4",
     "thumbnails": [
         {"width": 300, "height": 300, "size": 9, "relative_path": ".thumbs/benchy-300x300.png"}
     ],
@@ -88,6 +91,9 @@ API_CALLS = [
     ("POST", r"/api/Prints/\d+/slicer-settings"),
     # Spool assignment (#6): PRINTLOG_SET_SPOOL, and the U1's RFID reader.
     ("GET", r"/api/Filaments/by-tag/[0-9A-F]+"),
+    # Moonraker's Spoolman active spool: 3D Print Log's spool numbers, or the user's own (#38).
+    ("GET", r"/api/Filaments/by-number/\d+"),
+    ("GET", r"/api/Filaments/by-spoolman-id/\d+"),
     ("PUT", r"/api/Printers/\d+/slots/\d+"),
     ("DELETE", r"/api/Printers/\d+/slots/\d+"),
     ("PUT", r"/api/Printers/\d+"),
@@ -114,7 +120,15 @@ SLICER_METADATA_FIELDS = {
     "slicer", "slicerVersion", "layerHeightMm", "firstLayerHeightMm", "nozzleDiameterMm",
     "filamentName", "filamentType", "firstLayerNozzleTemperatureC", "firstLayerBedTemperatureC",
 }  # fmt: skip
-CONNECTION_FIELDS = {"kind", "displayName", "agentVersion", "printerId"}
+CONNECTION_FIELDS = {
+    "kind", "displayName", "agentVersion", "printerId",
+    # The printer's health (#37).
+    "mode", "klipperVersion", "moonrakerVersion", "printerModel", "outboxDepth",
+    "outboxOldestAgeSeconds", "lastError", "lastErrorAt", "errorCount", "snapshots",
+    "slicerSettings",
+}  # fmt: skip
+HOSTNAME = "klipper-host-7f3a"
+"""The host name Klipper reports in `printer.info`, which never leaves the printer."""
 SLOT_FIELDS = {"filamentId", "slotLabel"}
 UPLOAD_URL_FIELDS = {"fileName", "contentType", "sizeBytes"}
 CONFIRM_FIELDS = {"blobPath", "fileName", "contentType", "sizeBytes"}
@@ -189,7 +203,7 @@ async def one_print(
     """A whole print, start to end, through the bridge in remote mode, with a Moonraker that
     needs a key, a URL with a password, and a webcam that needs a password and a token. With
     `timelapse`, moonraker-timelapse renders its video, and the account has Pro."""
-    moonraker = FakeMoonraker(api_key=MOONRAKER_KEY, timelapse=timelapse)
+    moonraker = FakeMoonraker(api_key=MOONRAKER_KEY, hostname=HOSTNAME, timelapse=timelapse)
     api = FakePrintLogApi(api_key=API_KEY)
     api.pro = timelapse
     cam = FakeWebcam(credentials=("cam", PASSWORD), status=webcam_status)
@@ -222,6 +236,7 @@ async def one_print(
             config_path,
             connected=lambda: moonraker.client_count == 1,
             disconnected=lambda: moonraker.client_count == 0,
+            heartbeat_interval=0.2,
         ):
             job = await moonraker.start_job("benchy.gcode", METADATA)
             await eventually(lambda: api.images, WAIT_S)
@@ -239,6 +254,9 @@ async def one_print(
             # Moonraker restarts: the reason is logged and kept for `status`.
             await moonraker.drop()
             await eventually(lambda: moonraker.client_count == 1, WAIT_S)
+            # A heartbeat fails, and says why in the log; the next one reports it, scrubbed.
+            api.fail_next(1)
+            await eventually(lambda: api.heartbeats[-1][1]["errorCount"] > 0, WAIT_S)
     finally:
         await moonraker.close()
         await api.close()
@@ -289,8 +307,38 @@ class TestWhatIsSent:
         for body in [*api.created, *api.completions]:
             for row in body.get("filamentUsage", []):
                 assert set(row) <= USAGE_FIELDS
-        for _, body in api.heartbeats:
-            assert set(body) <= CONNECTION_FIELDS
+
+    def test_every_heartbeat_carries_exactly_the_listed_fields(self, run):
+        heartbeats = run["api"].heartbeats
+        assert heartbeats
+        for _, body in heartbeats:
+            assert set(body) == CONNECTION_FIELDS
+
+    def test_each_heartbeat_field_holds_what_docs_privacy_md_says(self, run):
+        [_, body] = run["api"].heartbeats[-1]
+        assert body["kind"] == "moonraker"
+        assert body["displayName"] == "printlog-bridge (voron)"
+        assert body["agentVersion"] == __version__
+        assert body["printerId"] == 42
+        assert body["mode"] == "remote"
+        assert body["klipperVersion"] == "v0.12.0-fake"
+        assert body["moonrakerVersion"] == "v0.9.3-fake"
+        assert body["printerModel"] == "Voron 2.4"
+        assert isinstance(body["outboxDepth"], int)
+        assert body["outboxOldestAgeSeconds"] is None or body["outboxDepth"] > 0
+        assert body["errorCount"] >= 1
+        assert body["lastError"].startswith("couldn't send the heartbeat")
+        assert datetime.fromisoformat(body["lastErrorAt"]).tzinfo is not None
+        assert body["snapshots"] is True
+        assert body["slicerSettings"] is True
+
+    def test_no_heartbeat_holds_a_host_address_file_name_or_key(self, run):
+        for _, body in run["api"].heartbeats:
+            # The printer's name from the config is in displayName, as it always was.
+            sent = json.dumps({k: v for k, v in body.items() if k != "displayName"})
+            for leak in (*SECRETS, "127.0.0.1", "localhost", HOSTNAME, "benchy", ".gcode",
+                         "voron", str(run["state"]), "http"):  # fmt: skip
+                assert leak not in sent, (leak, body)
 
     def test_the_file_name_is_sent_without_its_folder(self, run):
         [created] = run["api"].created
@@ -439,6 +487,8 @@ class TestOnlyTheHeaderAndSettingsAreRead:
         assert result["moonraker"].downloads == [".thumbs/benchy-300x300.png"]
         assert result["moonraker"].ranges == [(".thumbs/benchy-300x300.png", None)]
         assert result["api"].slicer_posts == []
+        assert result["api"].heartbeats
+        assert all(body["slicerSettings"] is False for _, body in result["api"].heartbeats)
 
     def test_local_reads_only_the_two_ranges(self, tmp_path, monkeypatch):
         from printlog_bridge.adapters.moonraker import slicer

@@ -19,25 +19,38 @@ env:
 
 jobs:
   smoke:
-    # Builds the amd64 image and runs version, store-key, doctor, run and status inside it,
-    # against fakes on the runner (tests/docker/smoke.sh). Nothing calls the real API.
-    runs-on: ubuntu-latest
+    # Builds the image for each platform and runs version, store-key, doctor, run and status
+    # inside it, against fakes on the runner (tests/docker/smoke.sh). Nothing calls the real API.
+    # arm64 (a Pi 4 or 5 on 64-bit Raspberry Pi OS) runs natively on GitHub's Arm runner; arm/v7
+    # (32-bit Raspberry Pi OS) runs under QEMU. The main branch's ruleset requires a check called
+    # `smoke`, so the amd64 leg keeps that name.
+    name: ${{ matrix.platform == 'linux/amd64' && 'smoke' || format('smoke ({0})', matrix.platform) }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-latest, cache: amd64 }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm, cache: arm64 }
+          - { platform: linux/arm/v7, runner: ubuntu-latest, cache: armv7, qemu: true }
     steps:
       - uses: actions/checkout@v4
+      - if: matrix.qemu
+        uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           load: true
           tags: printlog-bridge:smoke
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,scope=amd64,mode=max
+          cache-from: type=gha,scope=${{ matrix.cache }}
+          cache-to: type=gha,scope=${{ matrix.cache }},mode=max
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install "aiohttp>=3.8" # for the fakes
-      - run: bash tests/docker/smoke.sh printlog-bridge:smoke
+      - run: bash tests/docker/smoke.sh printlog-bridge:smoke "${{ matrix.platform }}"
 
   build:
     # Pull requests (forks included) build every platform and push nothing, with no registry
@@ -65,6 +78,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.version }} # edge, or 1.2.3 for a v1.2.3 tag
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -102,3 +117,14 @@ jobs:
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha,scope=multiarch
           cache-to: type=gha,scope=multiarch,mode=max
+
+  verify:
+    # Checks what was just published the way someone without a GitHub account sees it: it pulls
+    # without logging in, has every platform, and each one starts. GHCR makes a new package
+    # private, so this fails until the package is made public.
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - run: bash tests/docker/check_published.sh "${{ env.IMAGE }}:${{ needs.publish.outputs.tag }}"
