@@ -47,7 +47,7 @@ from printlog_bridge.core.api_client import (
     ApiUnavailable,
     AuthRejected,
 )
-from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolReading
+from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolmanSpool, SpoolReading
 from printlog_bridge.core.status import StatusBoard
 from printlog_bridge.core.swaps import SpoolSwap
 
@@ -341,7 +341,8 @@ class Spools:
 
     async def _carry_out(self, command: SpoolCommand, printer_id: int) -> str:
         slot = _label(command.slot)
-        if command.filament_id is None and command.tag is None and command.spool_number is None:
+        named = (command.filament_id, command.tag, command.spool_number, command.spoolman)
+        if all(name is None for name in named):
             await self.api.unload_slot(printer_id, command.slot)
             loaded = dict(self._loaded.get(command.printer, {}))
             loaded.pop(command.slot, None)
@@ -369,6 +370,11 @@ class Spools:
                 number = command.spool_number
                 return f"no spool in 3D Print Log has number {number}; nothing changed"
             filament_id = str(spool["id"])
+        elif command.spoolman is not None:
+            spool = await self._spoolman_material(command.spoolman)
+            if spool is None:
+                return _unmapped(command.spoolman)
+            filament_id = str(spool["id"])
         else:
             filament_id = str(command.filament_id)
             try:
@@ -382,6 +388,18 @@ class Spools:
             command.printer, printer_id, command.slot, filament_id, command.slot_count
         )
         return f"{slot} is now {_name(loaded)} in 3D Print Log"
+
+    async def _spoolman_material(self, spool: SpoolmanSpool) -> Mapping[str, Any] | None:
+        """The material linked to a spool in the user's own Spoolman: by its Spoolman id, else
+        by a tag Spoolman has for it. None when neither finds one."""
+        found = await self.api.filament_by_spoolman_id(spool.id)
+        if found is not None:
+            return found
+        for uid in _tags(spool):
+            found = await self.api.filament_by_tag(uid)
+            if found is not None:
+                return found
+        return None
 
     async def _load(
         self,
@@ -572,12 +590,33 @@ class Spools:
             self.board.printer(printer).event(what)
 
 
+def _tags(spool: SpoolmanSpool) -> list[str]:
+    """The spool's tag UIDs as 3D Print Log stores them; what isn't one is left out."""
+    uids = (normalize_tag(tag) for tag in spool.tags)
+    return list(dict.fromkeys(uid for uid in uids if uid is not None))
+
+
+def _unmapped(spool: SpoolmanSpool) -> str:
+    """The answer for a Spoolman spool no material in 3D Print Log is linked to."""
+    named = f"Spoolman spool {spool.id}" + (f" ({spool.name})" if spool.name else "")
+    tags = _tags(spool)
+    if not tags:
+        return f"no material in 3D Print Log has {named}; nothing changed. Link it in the app."
+    its = "its tag" if len(tags) == 1 else "its tags"
+    return (
+        f"no material in 3D Print Log has {named} or {its} {', '.join(tags)}; nothing "
+        "changed. Link it in the app, or add the tag to the material."
+    )
+
+
 def _describe(command: SpoolCommand) -> str:
     slot = _label(command.slot)
     if command.tag is not None:
         return f"set {slot} to the spool with tag {command.tag}"
     if command.spool_number is not None:
         return f"set {slot} to spool number {command.spool_number}"
+    if command.spoolman is not None:
+        return f"set {slot} to Spoolman spool {command.spoolman.id}"
     if command.filament_id is not None:
         return f"set {slot} to spool {command.filament_id}"
     return f"clear {slot}"

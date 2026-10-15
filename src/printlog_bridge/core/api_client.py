@@ -151,6 +151,13 @@ class ApiClient:
         """The key owner's spool with this `spoolNumber`, or None when none of theirs has it."""
         return await self._request("GET", f"/api/Filaments/by-number/{number}", missing_ok=True)
 
+    async def filament_by_spoolman_id(self, spoolman_id: int) -> dict[str, Any] | None:
+        """The key owner's spool linked to this spool in their own Spoolman server
+        (`spoolmanId`), or None when none of theirs is, or the API doesn't store the link."""
+        return await self._request(
+            "GET", f"/api/Filaments/by-spoolman-id/{spoolman_id}", missing_ok=True
+        )
+
     async def create_print(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         """The print, and whether it is new. An `externalId` already used returns the original."""
         status, print_ = await self._send("POST", "/api/Prints", body)
