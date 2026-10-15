@@ -315,6 +315,28 @@ adopt_window = 12h     ; 90m, 2d; a bare number is hours
 
 Finish-only mode is for uploader users who only want the bridge to report how each print ended. The bridge looks for a print to adopt again when the job ends, so a print uploaded after the job started is still found. Without a match, the job is skipped with a line in the log.
 
+### Prints from before the bridge
+
+The bridge logs the prints it sees from the moment it starts. To add the ones Moonraker's job history already holds, run:
+
+```sh
+printlog-bridge backfill --days 90   # in Docker: docker exec printlog-bridge printlog-bridge backfill
+```
+
+It reads each printer's history over a connection of its own (`--printer NAME` for one printer, `--days` for how far back; 90 by default), and creates each finished job as a print in 3D Print Log, at most one request a second, waiting whenever 3D Print Log asks it to slow down. It shows each job as it goes, then a summary:
+
+```
+[printer voron] 37 finished jobs in the last 90 days:
+  31 created
+  4 already in 3D Print Log
+  2 skipped: the file no longer exists on the printer
+Imported prints don't change your spools' remaining filament or what's loaded on the printer: their usage happened before, and would count against spools added since.
+```
+
+A backfilled print is finished, has the job's total filament on one row (not split by tool, and linked to no spool), and says "Imported from Moonraker history" in its notes. Its usage doesn't change any spool's remaining filament, and creating it doesn't change what's loaded on the printer: link a spool to its row in the app if you want it counted. A job whose file is no longer on the printer is skipped.
+
+Running it twice, or while the bridge runs, logs no job twice: each print carries the job's external ID, as the bridge's own do. Jobs the running bridge logs itself (the ones from where it resumes reading the history) are left to it, and a job it already logged is left exactly as it is. The bridge has to have run once for the printer first, for the id its prints carry; backfill only reads its state, never writes it. Stopped part way (Ctrl-C, or 3D Print Log out of reach for several minutes), run it again to carry on.
+
 ### Slicer settings
 
 Each print records the slicer settings it was sliced with, as the Cura plugin and the Slic3r uploader do: the bridge sends the settings block the slicer wrote at the end of the file (OrcaSlicer, PrusaSlicer, Anycubic Slicer Next and their forks write one), the file's header, which names the slicer and its version, and the summary Moonraker read from the file (slicer, layer heights, nozzle, filament, first layer temperatures). 3D Print Log adds them to the print's notes. They are read once, when the job starts, by byte range: only the start of the file up to the G-code and its end after the G-code, never the toolpaths. Before they leave the printer, the values of every setting naming a host or holding a credential (`print_host`, `printhost_apikey`, passwords, tokens, `post_process`...) are blanked. They go through the outbox like the print's other events, and never hold up logging the print: when the file can't be read, Moonraker's summary is sent alone, and when 3D Print Log can't take them, they are dropped. A print you made with the Slic3r uploader or the Cura plugin keeps the settings those recorded.

@@ -781,3 +781,64 @@ class TestAdoptionCalls:
         assert claimed == print_id
         assert set(body) <= CLAIM_FIELDS
         assert "benchy" not in json.dumps(lookup).lower()  # the file name stays on the bridge
+
+
+class TestBackfillCalls:
+    """`printlog-bridge backfill` (#8) sends only what docs/privacy.md lists, reads Moonraker's
+    history without taking the running bridge's place, and writes nothing on the printer."""
+
+    BACKFILL_FIELDS = CREATE_FIELDS | {"imported", "printTimeInSeconds"}
+
+    def test_sends_only_the_listed_calls_and_fields_and_no_secret(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from printlog_bridge.cli.main import main
+        from printlog_bridge.core import backfill
+        from printlog_bridge.core.state import PrinterState
+
+        monkeypatch.setattr(backfill, "REQUEST_INTERVAL_S", 0.0)
+        moonraker = FakeMoonraker(api_key=MOONRAKER_KEY)
+        api = FakePrintLogApi(api_key=API_KEY)
+        state = tmp_path / "state"
+        PrinterState.load(state, "voron")
+        (state / "api_key").write_text(API_KEY + "\n", encoding="utf-8")
+        before = state_files(state)
+        exit_code = {}
+
+        async def scenario():
+            moonraker_url, api_url = await moonraker.start(), await api.start()
+            try:
+                job = await moonraker.start_job("parts/benchy.gcode", METADATA, notify=False)
+                await moonraker.finish_job(job, notify=False)
+                config = tmp_path / "printlog-bridge.cfg"
+                config.write_text(
+                    f"[bridge]\napi_url = {api_url}\nstate_dir = {state}\n"
+                    f"[printer voron]\nadapter = moonraker\nurl = {with_password(moonraker_url)}\n"
+                    f"moonraker_api_key = {MOONRAKER_KEY}\nprinter_id = 42\n",
+                    encoding="utf-8",
+                )
+                loop = asyncio.get_running_loop()
+                exit_code["value"] = await loop.run_in_executor(
+                    None, main, ["backfill", "--config", str(config)]
+                )
+            finally:
+                await moonraker.close()
+                await api.close()
+
+        with bridge_logs() as logs:
+            asyncio.run(scenario())
+
+        out = capsys.readouterr()
+        assert exit_code["value"] == 0
+        for method, path in api.requests:
+            assert any(method == m and re.fullmatch(pattern, path) for m, pattern in API_CALLS), (
+                f"{method} {path} isn't in docs/privacy.md"
+            )
+        [body] = api.created
+        assert set(body) <= self.BACKFILL_FIELDS
+        assert all(set(row) <= USAGE_FIELDS for row in body["filamentUsage"])
+        assert body["fileName"] == "benchy.gcode"
+        assert moonraker.identified == []  # never takes the agent name the bridge holds
+        assert state_files(state) == before
+        for secret in SECRETS:
+            assert secret not in out.out + out.err + logs.text
