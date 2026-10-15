@@ -59,6 +59,7 @@ async def logging_to(
     image_timeout: float | None = None,
     spools: bool = False,
     adoption: Adoption | None = None,
+    slicer_settings: bool = True,
     **printers: int,
 ):
     """A JobLogger sending to `api`. With `spools`, it links each print to the loaded spools."""
@@ -77,7 +78,10 @@ async def logging_to(
                 client,
                 {
                     name: LoggedPrinter(
-                        printer_id=printer_id, source="moonraker", adoption=adoption or Adoption()
+                        printer_id=printer_id,
+                        source="moonraker",
+                        adoption=adoption or Adoption(),
+                        slicer_settings=slicer_settings,
                     )
                     for name, printer_id in targets.items()
                 },
@@ -108,6 +112,8 @@ def run(
     backoff=FAST_BACKOFF,
     spools: bool = False,
     adoption: Adoption | None = None,
+    slicer_settings: bool = True,
+    image_timeout: float | None = None,
     **printers: int,
 ):
     """Emits `events` in order, sending each before the next, as a restart of the bridge would.
@@ -118,7 +124,14 @@ def run(
 
     async def scenario():
         async with logging_to(
-            api, state_dir, backoff=backoff, spools=spools, adoption=adoption, **printers
+            api,
+            state_dir,
+            backoff=backoff,
+            spools=spools,
+            adoption=adoption,
+            slicer_settings=slicer_settings,
+            image_timeout=image_timeout,
+            **printers,
         ) as logger:
             try:
                 await drain(logger, timeout)  # what the last run left in the outbox

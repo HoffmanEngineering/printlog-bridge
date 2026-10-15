@@ -21,6 +21,16 @@ rather than duplicated: before creating one, the bridge looks for an unclaimed p
 on the same printer, made within `adopt_window`, for the same file, claims the newest, and logs
 the job to it. In finish-only mode (`create_prints = false`) a job with nothing to adopt isn't
 logged. See `_adopt`.
+
+A spool assigned to a slot while the job runs (`Spools.on_swap`, #44) is kept in the job's state
+with the point it was assigned at, and the slot's usage is split between the spools there when
+the job ends. See `swaps.py`.
+
+The slicer settings of the job's file (#36) go through the outbox too, once per job, after its
+start: read from the printer when the adapter reports them, scrubbed (`slicer_settings.py`), and
+sent once the print exists. Like a picture, they never hold up their print: an answer that says
+they can't or needn't be recorded (400, 404, 409, 413) drops them, and so do too many failures.
+A print adopted with settings of its own (the uploader's, the Cura plugin's) keeps them.
 """
 
 from __future__ import annotations
@@ -33,7 +43,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from printlog_bridge.core.api_client import (
     ApiClient,
@@ -44,21 +54,37 @@ from printlog_bridge.core.api_client import (
 )
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
+    FilamentChange,
     ImageKind,
     JobEvent,
     JobFinished,
     JobImage,
     JobOutcome,
+    JobSlicerSettings,
     JobStarted,
 )
 from printlog_bridge.core.images import EXTENSIONS, MAX_IMAGE_BYTES, ImageUnavailable, image_type
 from printlog_bridge.core.outbox import Entry, Outbox, utc_now
+from printlog_bridge.core.slicer_settings import OUTBOX_KIND, request_body
 from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState, safe_file_name
 from printlog_bridge.core.status import BoardReport, StatusBoard
+from printlog_bridge.core.swaps import (
+    SpoolSwap,
+    before_swaps,
+    change_hints,
+    change_record,
+    first_spools,
+    is_split,
+    on_slot,
+    segments,
+    swap_notes,
+    swap_record,
+)
 from printlog_bridge.core.titles import same_file, title_from_file_name
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 PRINTING = 2
 STATUS_FOR = {JobOutcome.COMPLETED: 3, JobOutcome.CANCELLED: 4, JobOutcome.FAILED: 5}
@@ -84,6 +110,15 @@ STORAGE_ERRORS = (OSError, sqlite3.Error)
 """A full or read-only disk, or an outbox another process holds locked past SQLite's timeout."""
 START, FINISH = "start", "finish"
 IMAGE_KINDS = frozenset(kind.value for kind in ImageKind)
+SLICER_SETTINGS = OUTBOX_KIND
+OPTIONAL_KINDS = IMAGE_KINDS | {SLICER_SETTINGS}
+"""Entries that must never hold up their print: given up on after `IMAGE_MAX_ATTEMPTS`."""
+NO_SLICER_SETTINGS = (405, 501)
+"""What an API without the slicer settings endpoint (api#164) may answer it with. Its plain
+404 can't be told from a print that's gone, so that only drops the one print's."""
+NO_SLICER_SETTINGS_FOR = timedelta(hours=24)
+"""How long none are read or sent after such an answer: it may as well be a maintenance page
+as an API older than the endpoint, and either can change."""
 IMAGES_DIR = "images"
 IMAGE_TIMEOUT_S = 15.0
 """How long the bridge waits on an adapter for a picture. Adapters give up after 10 s."""
@@ -109,6 +144,8 @@ class LoggedPrinter:
     """The API's `externalSource`: the adapter's name, such as `moonraker`."""
     adoption: Adoption = Adoption()
     """Whether to adopt the user's own print for a job, and whether to create one otherwise."""
+    slicer_settings: bool = True
+    """Whether to read and send each job's slicer settings (`slicer_settings`)."""
 
 
 def backoff_delay(attempts: int, base: float, cap: float) -> float:
@@ -163,6 +200,10 @@ class JobLogger:
         self._storage_failures = 0
         """Writes to the state directory that failed in a row."""
         self._no_lookup_logged = False
+        self.clock = clock
+        self._no_slicer_settings_until: datetime | None = None
+        """The API answered that it has no slicer settings endpoint: none are read or sent until
+        then (`NO_SLICER_SETTINGS_FOR`)."""
 
     def close(self) -> None:
         self.outbox.close()
@@ -185,30 +226,31 @@ class JobLogger:
         """Queues the event in the outbox, on disk, unless it's a replay. Never waits on the API.
 
         When the state directory can't be written (a full disk), the event is kept in memory and
-        queued, in order, once it can be, and `status` shows a warning meanwhile. A picture is
-        skipped instead: it is fetched now or never.
+        queued, in order, once it can be, and `status` shows a warning meanwhile. A picture, or
+        the slicer settings, is skipped instead: it is fetched now or never.
         """
-        if self._unqueued and not isinstance(event, JobImage):
+        optional = isinstance(event, (JobImage, JobSlicerSettings))
+        if self._unqueued and not optional:
             self._unqueued.append(event)  # nothing jumps ahead of what waits to be queued
             return
-        if isinstance(event, JobImage) and any(
+        if optional and any(
             (e.printer, e.job_id) == (event.printer, event.job_id) for e in self._unqueued
         ):
             # Queued now, it would go ahead of its job's start or end: a thumbnail before the
             # print exists is dropped, and a snapshot before the end misses its outcome.
             log.warning(
                 "[printer %s] job %s's %s is skipped: the outbox can't be written",
-                event.printer, event.job_id, event.kind.value,
+                event.printer, event.job_id, _what(event),
             )  # fmt: skip
             return
         try:
             await self._emit(event)
         except STORAGE_ERRORS as e:
             self._storage_failed(e)
-            if isinstance(event, JobImage):
+            if optional:
                 log.warning(
                     "[printer %s] job %s's %s is skipped: the outbox can't be written",
-                    event.printer, event.job_id, event.kind.value,
+                    event.printer, event.job_id, _what(event),
                 )  # fmt: skip
             else:
                 self._unqueued.append(event)
@@ -221,6 +263,10 @@ class JobLogger:
         state = self.state(event.printer)
         if isinstance(event, JobImage):
             await self._emit_image(state, event)
+        elif isinstance(event, JobSlicerSettings):
+            await self._emit_slicer_settings(state, event)
+        elif isinstance(event, FilamentChange):
+            self._filament_changed(state, event)
         elif isinstance(event, JobStarted):
             job = state.jobs.get(event.job_id)
             if job is None:
@@ -251,6 +297,54 @@ class JobLogger:
                 job.ended_at = event.finished_at.isoformat()
                 state.save()
             self._queue(event.printer, event.job_id, FINISH, _finish_payload(event))
+
+    def _filament_changed(self, state: PrinterState, event: FilamentChange) -> None:
+        job = state.jobs.get(event.at.job_id)
+        if job is None or job.finished:
+            return
+        record = change_record(event)
+        if record in job.filament_changes:
+            return  # a replay
+        job.filament_changes.append(record)
+        state.save()
+        self._event(
+            event.printer,
+            f"job {event.at.job_id}: T{event.slot} was paused for a filament change "
+            f"({event.reason})",
+        )
+
+    def spool_swapped(self, swap: SpoolSwap) -> bool:
+        """Keeps a spool assigned to a slot while a job ran, to split the job's usage on that
+        slot where it was assigned. Whether it will be: not for a job already logged as ended,
+        or one the bridge isn't logging."""
+        if swap.printer not in self.printers:
+            return False
+        state = self.state(swap.printer)
+        job = state.jobs.get(swap.during.job_id)
+        if job is None or job.finished or job.completion is not None:
+            return False  # its end is already worked out
+        record = swap_record(swap)
+        job.swaps.append(record)
+        try:
+            state.save()
+        except STORAGE_ERRORS as e:
+            # Kept in memory, and written with the job's next save.
+            self._storage_failed(e)
+        if not is_split(record):
+            return False  # before the slot fed anything: the spool it starts with
+        self._event(
+            swap.printer,
+            f"job {swap.during.job_id}: T{swap.slot} usage split, "
+            f"{swap.old_name or swap.old or 'no spool'} before, "
+            f"{swap.new_name or swap.new or 'no spool'} after",
+        )
+        return True
+
+    def _event(self, printer: str, what: str) -> None:
+        log.info("[printer %s] %s", printer, what)
+        report = self._report(printer)
+        if report is not None:
+            report.event(what)
 
     def _queue(self, printer: str, job_id: str, kind: str, payload: dict[str, Any]) -> None:
         if self.outbox.add(printer, job_id, kind, payload):
@@ -308,16 +402,39 @@ class JobLogger:
         job.images[kind] = True
         state.save()
 
+    async def _emit_slicer_settings(self, state: PrinterState, event: JobSlicerSettings) -> None:
+        if not self.printers[event.printer].slicer_settings:
+            return  # turned off: the file is never read
+        job = state.jobs.get(event.job_id)
+        if job is None or job.finished or job.slicer_settings or self._no_slicer_settings():
+            return  # a job not logged, logged before (a replay), or read already
+        file = None
+        if event.read is not None:
+            where = f"[printer {event.printer}] job {event.job_id}'s slicer settings"
+            file = await self._wait_for(event.read, where)
+        body = request_body(event.metadata, file)
+        if body is not None:
+            self._queue(event.printer, event.job_id, SLICER_SETTINGS, body)
+        else:
+            log.debug("[printer %s] job %s: no slicer settings", event.printer, event.job_id)
+        # Marked only once queued, as a picture is.
+        job.slicer_settings = True
+        state.save()
+
     async def _fetch(self, event: JobImage) -> bytes | None:
         """The adapter's picture, or None when there's none, it fails, or it takes too long."""
-        task = asyncio.ensure_future(event.fetch())
+        where = f"[printer {event.printer}] job {event.job_id}'s {event.kind.value}"
+        return await self._wait_for(event.fetch, where)
+
+    async def _wait_for(self, fetch: Callable[[], Awaitable[T]], where: str) -> T | None:
+        """What the adapter's `fetch` gives, or None when it fails or takes too long."""
+        task = asyncio.ensure_future(fetch())
         try:
             # asyncio.wait, not wait_for, which can swallow a cancel before Python 3.12.
             done, _ = await asyncio.wait({task}, timeout=self.image_timeout)
         except asyncio.CancelledError:
             task.cancel()
             raise
-        where = f"[printer {event.printer}] job {event.job_id}'s {event.kind.value}"
         if not done:
             task.cancel()
             log.info("%s took longer than %gs; skipping it", where, self.image_timeout)
@@ -397,10 +514,12 @@ class JobLogger:
 
     async def _send(self, entry: Entry) -> None:
         loop = asyncio.get_running_loop()
-        image = entry.kind in IMAGE_KINDS
+        image = entry.kind in OPTIONAL_KINDS  # given up on rather than holding up the print
         try:
             if entry.kind == START:
                 await self._send_start(entry)
+            elif entry.kind == SLICER_SETTINGS:
+                await self._send_slicer_settings(entry)
             elif image:
                 await self._send_image(entry)
             else:
@@ -422,6 +541,8 @@ class JobLogger:
             # Sending it again won't change the answer. The job stays unfinished in the state
             # file, so a replay after the user fixes the cause (a restart) queues it again.
             log.error("[printer %s] job %s isn't logged: %s", entry.printer, entry.job_id, e)
+            if entry.kind == FINISH:
+                self._forget_completion(entry)
             self._done(entry)
             self._not_logged(entry, str(e))
         except ApiUnavailable as e:
@@ -460,6 +581,15 @@ class JobLogger:
         else:
             log.warning("%s wasn't added to its print", where, exc_info=error)
         self._done(entry)
+
+    def _forget_completion(self, entry: Entry) -> None:
+        """A refused end is worked out again when it's next sent (after a restart, once the
+        user has fixed the cause), rather than sent as it was refused."""
+        state = self.state(entry.printer)
+        job = state.jobs.get(entry.job_id)
+        if job is not None and job.completion is not None:
+            job.completion = None
+            state.save()
 
     async def _api_reachable(self) -> bool:
         """Whether the API answers a small request, after an upload that got no answer."""
@@ -510,9 +640,11 @@ class JobLogger:
             )  # fmt: skip
             self._due.pop(entry.seq, None)
             self._image_tries.pop(entry.seq, None)
-            if entry.kind in IMAGE_KINDS:
-                # Only the picture is lost; the print's own events are judged on their own.
-                _unlink(self.images_dir / str(entry.payload.get("file")))
+            if entry.kind in OPTIONAL_KINDS:
+                # Only the picture (or the slicer settings) is lost; the print's own events are
+                # judged on their own.
+                if entry.kind in IMAGE_KINDS:
+                    _unlink(self.images_dir / str(entry.payload.get("file")))
                 continue
             state = self.state(entry.printer)
             job = state.jobs.get(entry.job_id)
@@ -573,6 +705,59 @@ class JobLogger:
             entry.printer, f"job {entry.job_id}: {entry.kind} added to print {job.print_id}"
         )
 
+    async def _send_slicer_settings(self, entry: Entry) -> None:
+        """Records the job's slicer settings on its print. An answer that sending again won't
+        change ends it here; anything worth retrying is raised to `_send`."""
+        where = f"[printer {entry.printer}] job {entry.job_id}'s slicer settings"
+        job = self.state(entry.printer).jobs.get(entry.job_id)
+        if job is None or job.print_id is None:
+            log.info("%s have no print to go on (the print wasn't logged); dropping them", where)
+            return
+        if job.print_with_settings is not None and job.print_with_settings == job.print_id:
+            log.info(
+                "%s aren't sent: print %s already has the slicer's own (the Slic3r uploader's or "
+                "the Cura plugin's)",
+                where, job.print_id,
+            )  # fmt: skip
+            return
+        if self._no_slicer_settings():
+            return
+        try:
+            status = await self.api.post_slicer_settings(job.print_id, entry.payload)
+        except ApiRejected as e:
+            # The API's own words, which never quote what was sent.
+            log.warning("%s weren't recorded: %s", where, e)
+            return
+        except ApiUnavailable as e:
+            if e.status not in NO_SLICER_SETTINGS:
+                raise
+            self._no_slicer_settings_until = self.clock() + NO_SLICER_SETTINGS_FOR
+            log.warning(
+                "[printer %s] 3D Print Log doesn't take slicer settings (%s), so none are read "
+                "or sent for %s; then the bridge tries again",
+                entry.printer, e, f"{NO_SLICER_SETTINGS_FOR.total_seconds() / 3600:g} hours",
+            )  # fmt: skip
+            return
+        if status == 409:
+            log.info(
+                "%s aren't recorded: print %s already has the slicer's own (the Slic3r "
+                "uploader's or the Cura plugin's)",
+                where, job.print_id,
+            )  # fmt: skip
+        elif status == 404:
+            log.info(
+                "%s weren't recorded: print %s is gone, or 3D Print Log doesn't take them yet",
+                where, job.print_id,
+            )  # fmt: skip
+        else:
+            self._logged(
+                entry.printer, f"job {entry.job_id}: slicer settings added to print {job.print_id}"
+            )
+
+    def _no_slicer_settings(self) -> bool:
+        until = self._no_slicer_settings_until
+        return until is not None and self.clock() < until
+
     async def _send_finish(self, entry: Entry) -> None:
         state = self.state(entry.printer)
         job = state.jobs.get(entry.job_id)
@@ -627,9 +812,15 @@ class JobLogger:
         if start.get("estimated_filament_g"):
             body["estimatedFilamentUsageMg"] = round(start["estimated_filament_g"] * 1000)
         rows = _estimate_rows(start)
+        single_tool = False
+        current: dict[int, str] = {}
         if self.spools is not None:
-            loaded = await self.spools.current(printer)
-            _link_loaded(rows, loaded, single_tool=(self.spools.slot_count(printer) or 1) <= 1)
+            # A print created after a swap (3D Print Log was down until then) starts with the
+            # spools the job started with, not the ones loaded now.
+            current = await self.spools.current(printer)
+            loaded = before_swaps(current, job.swaps)
+            single_tool = (self.spools.slot_count(printer) or 1) <= 1
+            _link_loaded(rows, loaded, single_tool=single_tool)
             notes = self.spools.mismatches(printer, [row["slot"] for row in rows] or [0])
             if notes:
                 body["notes"] = "\n\n".join(notes)
@@ -639,7 +830,28 @@ class JobLogger:
         print_, _ = await self.api.create_print(body)
         job.print_id = int(print_["id"])
         state.save()
+        if single_tool and job.swaps:
+            await self._restore_loaded(target, printer, current)
         return print_
+
+    async def _restore_loaded(
+        self, target: LoggedPrinter, printer: str, before: Mapping[int, str]
+    ) -> None:
+        """Puts back the spools that were loaded before a print was created with the ones its
+        job started with: on a single-tool printer, creating a print loads its spools. Exactly
+        what was loaded then, which may be a spool set since for the next job."""
+        assert self.spools is not None
+        try:
+            now = await self.spools.current(printer)
+            for slot, spool in sorted(before.items()):
+                if now.get(slot) != spool:
+                    await self.api.load_slot(target.printer_id, slot, spool, f"T{slot}")
+            for slot in sorted(set(now) - set(before)):
+                await self.api.unload_slot(target.printer_id, slot)
+            if now != dict(before):
+                await self.spools.refresh(printer)
+        except Exception as e:  # the print matters more than what's loaded for the next
+            log.warning("[printer %s] couldn't load its spools again: %s", printer, e)
 
     async def _adopt(
         self, target: LoggedPrinter, state: PrinterState, printer: str, job_id: str, job: JobRecord
@@ -694,6 +906,8 @@ class JobLogger:
             )  # fmt: skip
         for candidate in candidates:
             job.claiming = int(candidate["id"])
+            if candidate.get("hasSlicerSettings"):
+                job.print_with_settings = job.claiming
             state.save()
             claimed = await self._claim(state, printer, job_id, job, job.claiming, claim)
             if claimed is not None:
@@ -795,10 +1009,24 @@ class JobLogger:
         }
         if event.duration_s is not None:
             body["printTimeInSeconds"] = round(event.duration_s)
-        loaded = await self.spools.current(event.printer) if self.spools is not None else {}
-        slot_count = self.spools.slot_count(event.printer) if self.spools is not None else None
-        single_tool = (slot_count or 1) <= 1 and all(slot == 0 for slot in event.filament_mm)
-        rows = _usage_rows(event, print_.get("filamentUsage") or [], loaded, single_tool)
+        completion = job.completion
+        if completion is None:
+            # With a swap, worked out once, from one look at the swaps, and sent the same way
+            # every time: a retry reads the print back with a row per spool already on it (#44).
+            loaded = await self.spools.current(event.printer) if self.spools is not None else {}
+            slot_count = self.spools.slot_count(event.printer) if self.spools is not None else None
+            single_tool = (slot_count or 1) <= 1 and all(slot == 0 for slot in event.filament_mm)
+            swaps = list(job.swaps)
+            rows_now = print_.get("filamentUsage") or []
+            conflicts: list[str] = []
+            usage = _usage_rows(event, rows_now, loaded, single_tool, swaps, conflicts)
+            noted = "\n".join([*swap_notes(swaps, event.filament_mm), *conflicts])
+            hints = change_hints(job.filament_changes, swaps)
+            completion = {"usage": usage, "notes": [n for n in (event.note, noted, *hints) if n]}
+            if swaps:
+                job.completion = completion
+                state.save()
+        rows = completion["usage"]
         if rows:
             body["filamentUsage"] = rows
 
@@ -806,13 +1034,12 @@ class JobLogger:
         if completed is None:
             return self._deleted(state, event, job)
 
-        if event.note:
-            notes = (completed.get("notes") or "").rstrip()
-            if event.note not in notes:
-                await self.api.patch_print(
-                    int(print_["id"]),
-                    {"notes": f"{notes}\n\n{event.note}" if notes else event.note},
-                )
+        notes = (completed.get("notes") or "").rstrip()
+        added = [n for n in completion["notes"] if n not in notes]
+        if added:
+            await self.api.patch_print(
+                int(print_["id"]), {"notes": "\n\n".join([notes, *added] if notes else added)}
+            )
 
         job.finished = True
         state.save()
@@ -916,6 +1143,11 @@ def _finish_event(entry: Entry) -> JobFinished:
     )
 
 
+def _what(event: JobEvent) -> str:
+    """What an optional event brings, for a log line: `thumbnail`, `slicer settings`..."""
+    return event.kind.value if isinstance(event, JobImage) else "slicer settings"
+
+
 def _unlink(path: Path) -> None:
     try:
         path.unlink()
@@ -981,11 +1213,19 @@ def _usage_rows(
     rows: Sequence[Mapping[str, Any]],
     loaded: Mapping[int, str] | None = None,
     single_tool: bool = False,
+    swaps: Sequence[Mapping[str, Any]] = (),
+    notes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """One row per slot that fed filament, linked to the spool in that slot when it's known.
 
     A slot with no spool still gets its row, with its slot and no `filamentId`. The API takes
     one row per spool, so a spool on two slots gets one row, on the first, with both lengths.
+
+    A slot whose spool changed while the job ran (`swaps`, #44) is split where it changed: one
+    row per spool, the slot's first spool first, so the API's completion puts that one on the
+    row the print started with (its estimate stays there) and adds a row for the next. The first
+    spool is the one the slot started with, unless the print's row is linked to another the
+    swaps don't explain (`first_spools`), which then keeps it, with a note added to `notes`.
 
     On a single-tool printer a row with no slot (an uploader's) is slot 0's, so the spool the
     user linked on it wins. The API's completion fills that row from slot 0's in the same way
@@ -993,24 +1233,50 @@ def _usage_rows(
     """
     if single_tool:
         rows = [{**row, "slot": 0} if row.get("slot") is None else row for row in rows]
-    spools = _spools_by_slot(rows, loaded or {})
+    linked: dict[int, str] = {}
+    for row in rows:
+        slot, spool = row.get("slot"), (row.get("filament") or {}).get("id")
+        if slot is not None and spool and slot not in linked:
+            linked[slot] = str(spool)
+    firsts, conflicts = first_spools(linked, swaps)
+    if notes is not None:
+        notes.extend(conflicts)
+    rows = [
+        {k: v for k, v in row.items() if k != "filament"} if row.get("slot") in firsts else row
+        for row in rows
+    ]
+    spools = _spools_by_slot(rows, before_swaps(loaded or {}, swaps))
+    for slot, first in firsts.items():
+        spools.pop(slot, None)
+        if first is not None:
+            spools[slot] = first
     usage: list[dict[str, Any]] = []
-    mm_by_spool: dict[str, float] = {}
     for slot, mm in sorted(event.filament_mm.items()):
-        if mm <= 0:
-            continue
-        spool = spools.get(slot)
-        if spool is not None and spool in mm_by_spool:
-            mm_by_spool[spool] += mm
-            row = next(r for r in usage if r.get("filamentId") == spool)
-            row["lengthInM"] = round(mm_by_spool[spool] / 1000, 4)
-            continue
-        row = {"slot": slot, "lengthInM": round(mm / 1000, 4), "source": LENGTH}
-        if spool is not None:
-            row["filamentId"] = spool
-            mm_by_spool[spool] = mm
-        usage.append(row)
+        slot_swaps = [swap for swap in on_slot(swaps, slot) if is_split(swap)]
+        pieces = [p for p in segments(mm, spools.get(slot), slot_swaps) if p[1] > 0]
+        # In metres to 0.1 mm, the last piece taking what rounding left, so the slot's rows
+        # add up to its rounded total exactly.
+        metres = [round(length / 1000, 4) for _, length in pieces[:-1]]
+        if pieces:
+            metres.append(round(round(mm / 1000, 4) - sum(metres), 4))
+        for (spool, _), m in zip(pieces, metres):
+            # One row per spool, and one row per slot with no spool (the API matches those by
+            # slot, so it takes only one each).
+            key = _row_key({"slot": slot, "filamentId": spool})
+            row = next((r for r in usage if _row_key(r) == key), None)
+            if row is not None:
+                row["lengthInM"] = round(row["lengthInM"] + m, 4)
+                continue
+            row = {"slot": slot, "lengthInM": m, "source": LENGTH}
+            if spool is not None:
+                row["filamentId"] = spool
+            usage.append(row)
     return usage
+
+
+def _row_key(row: Mapping[str, Any]) -> tuple[int, str | None] | str:
+    spool = row.get("filamentId")
+    return spool if spool is not None else (row["slot"], None)
 
 
 def _spools_by_slot(rows: Sequence[Mapping[str, Any]], loaded: Mapping[int, str]) -> dict[int, str]:

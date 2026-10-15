@@ -183,11 +183,14 @@ class MoonrakerAdapter(Adapter):
             api_key=self.api_key,
             snapshots=self.snapshots,
         )
-        listener: MoonrakerListener = JobTracker(self.printer, sink, report, images)
+        tracker = JobTracker(self.printer, sink, report, images)
+        listener: MoonrakerListener = tracker
         if self.spools is not None:
             # The U1's reader only reports on a printer with `filament_detect`; elsewhere it
-            # never hears from it.
-            watcher = SpoolWatcher(self.printer, self.spools, U1RfidReader(self.printer))
+            # never hears from it. After the tracker, which knows where the job is by then.
+            watcher = SpoolWatcher(
+                self.printer, self.spools, U1RfidReader(self.printer), point=tracker.point
+            )
             listener = Listeners(listener, watcher)
         session = MoonrakerSession(
             self.printer,
@@ -199,7 +202,10 @@ class MoonrakerAdapter(Adapter):
             trace=self.trace,
             locator=locator,
         )
-        await session.run()
+        try:
+            await session.run()
+        finally:
+            await tracker.close()
 
     def use_spools(self, spools: SpoolSink) -> None:
         self.spools = spools
