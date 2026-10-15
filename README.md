@@ -108,9 +108,46 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
 
 If the config needs fixing (no key, a printer without `printer_id`), the bridge says what to fix in the container's log and exits, and the restart policy tries again every few seconds until you fix it. After editing `printlog-bridge.cfg`, restart the container.
 
-### Anywhere else (Unraid, a Pi, any Linux host)
+### On Unraid
 
-The same `docker-compose.yml` works after changing the folder (`/mnt/user/appdata/printlog-bridge` on Unraid, say) and `user:`. Without Compose:
+Unraid has no Compose out of the box, so use the template in [`unraid/printlog-bridge.xml`](unraid/printlog-bridge.xml). It runs the container as `nobody:users` (99:100), the owner of Unraid's appdata, with the folder `/mnt/user/appdata/printlog-bridge` at `/data`. Unraid passes its own time zone to the container. In the web terminal (the `>_` icon at the top right):
+
+1. **Make the folder and write the config**, with a `[printer <name>]` section per printer, as in step 2 of the Synology steps:
+   ```sh
+   mkdir -p /mnt/user/appdata/printlog-bridge
+   nano /mnt/user/appdata/printlog-bridge/printlog-bridge.cfg
+   chown -R nobody:users /mnt/user/appdata/printlog-bridge
+   ```
+2. **Store the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys):
+   ```sh
+   docker run --rm -it --user 99:100 -v /mnt/user/appdata/printlog-bridge:/data \
+     ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
+   ```
+   (Or leave this out and put the key in the template's API key field. That's simpler, but anyone who can edit the container can read it.)
+3. **Add the template:**
+   ```sh
+   wget -O /boot/config/plugins/dockerMan/templates-user/my-printlog-bridge.xml \
+     https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/unraid/printlog-bridge.xml
+   ```
+   Then Docker > Add Container > Template, pick **printlog-bridge** under the user templates, and Apply. Turn on its Autostart so it comes back after the array starts.
+4. **Check it** with `docker exec printlog-bridge printlog-bridge doctor` and `... status`, as on Synology. The Docker tab shows the container as healthy once the bridge runs.
+
+### On a Raspberry Pi
+
+To run the bridge on the printer's own Pi, use `install.sh` above instead. Docker suits a Pi that isn't a printer, watching printers over the network. A Pi 4 or 5 on 64-bit Raspberry Pi OS gets the `linux/arm64` image; on 32-bit Raspberry Pi OS (and a Pi 2 or 3), `linux/arm/v7`. Docker picks the right one by itself.
+
+```sh
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker "$USER"   # then log out and back in
+mkdir ~/printlog-bridge            # write printlog-bridge.cfg in it (Synology step 2)
+docker run --rm -it -v ~/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
+```
+
+Then start it with the `docker run -d` command below, or with `docker compose up -d` and [`docker-compose.yml`](docker-compose.yml) after changing its folder to `~/printlog-bridge` and removing the `user:` line. The first user on Raspberry Pi OS is uid 1000, the same as the image's own user, so it needs no `user:`.
+
+### Anywhere else (any Linux host)
+
+The same `docker-compose.yml` works after changing the folder and `user:`. Without Compose:
 
 ```sh
 docker run -d --name printlog-bridge --restart unless-stopped \
@@ -303,7 +340,7 @@ python -m venv .venv
 
 CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`.
 
-The Docker workflow builds the image for amd64 and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run` and `status` inside the container, as a non-root user, against three fake Moonrakers and a fake 3D Print Log API on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. It then builds all three platforms, and pushes them to GHCR from `main` (`edge`) and from `v*` tags. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev`.
+The Docker workflow builds the image for each platform and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run` and `status` inside the container, as a non-root user, against three fake Moonrakers and a fake 3D Print Log API on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. amd64 and arm64 run natively (arm64 on GitHub's Arm runner), arm/v7 under QEMU. It then pushes all three to GHCR from `main` (`edge`) and from `v*` tags, and `tests/docker/check_published.sh` checks the result without logging in: the tag pulls, has every platform, and each one starts. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev` (add `--platform linux/arm/v7` to the build, and `linux/arm/v7` after the image, to try another platform under QEMU).
 
 `tests/fixtures/moonraker/` holds REAL answers from a Snapmaker U1 and an Infimech EX, which `tests/test_real_captures.py` runs the adapter against. `tests/trace_replay.py` replays a trace as Moonraker, so a recorded print becomes a regression test: see `tests/test_trace_replay.py`, which replays a SYNTHETIC U1 print from `tests/fixtures/traces/`.
 
