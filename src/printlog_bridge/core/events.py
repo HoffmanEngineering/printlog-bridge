@@ -108,7 +108,53 @@ class JobImage:
     fetch: Callable[[], Awaitable[bytes | None]] = field(compare=False, repr=False)
 
 
-JobEvent = Union[JobStarted, JobFinished, JobImage, FilamentChange]
+@dataclass(frozen=True)
+class SlicerMetadata:
+    """The slicer's summary of a job's file, as the printer extracted it (Moonraker's metadata)."""
+
+    slicer: str | None = None
+    slicer_version: str | None = None
+    layer_height_mm: float | None = None
+    first_layer_height_mm: float | None = None
+    nozzle_diameter_mm: float | None = None
+    filament_name: str | None = None
+    filament_type: str | None = None
+    first_layer_nozzle_temperature_c: float | None = None
+    first_layer_bed_temperature_c: float | None = None
+
+
+@dataclass(frozen=True)
+class SlicerFile:
+    """What was read of a job's file for its slicer settings: never its toolpaths.
+
+    As read, before scrubbing: the sink removes host and credential values before anything
+    leaves the bridge (`core/slicer_settings.py`)."""
+
+    header: str | None = None
+    """The start of the file through `; HEADER_BLOCK_END` (PrusaSlicer: its first line)."""
+    config_block: str | None = None
+    """The `; key = value` settings the slicer wrote after the G-code."""
+
+
+@dataclass(frozen=True)
+class JobSlicerSettings:
+    """The slicer settings of the job's file, reported after its start (#36).
+
+    The sink calls `read` only when it still wants them, and never when they are turned off
+    (`slicer_settings = false`), so an adapter must not read the file before then. `read`
+    returns None when there's nothing to be had (not a G-code file, gone, unreadable), should
+    give up on its own after about 10 s, and anything it raises counts as nothing read.
+    `metadata` is sent either way."""
+
+    printer: str
+    job_id: str
+    metadata: SlicerMetadata | None = None
+    read: Callable[[], Awaitable[SlicerFile | None]] | None = field(
+        default=None, compare=False, repr=False
+    )
+
+
+JobEvent = Union[JobStarted, JobFinished, JobImage, JobSlicerSettings, FilamentChange]
 
 
 class EventSink(Protocol):

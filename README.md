@@ -207,7 +207,7 @@ Until pairing lands, the bridge signs in with a personal API key from [3dprintlo
 
 ## Privacy and security
 
-The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail and, unless you turn snapshots off, one webcam frame when it ends. It never reads or uploads G-code. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
+The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail, its slicer settings with hosts and credentials blanked (unless you turn them off), and, unless you turn snapshots off, one webcam frame when it ends. Of the G-code file it reads only the header and the settings block after the G-code, never the toolpaths, and it never uploads the file. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
 
 ## Config
 
@@ -257,6 +257,12 @@ adopt_window = 12h     ; 90m, 2d; a bare number is hours
 ```
 
 Finish-only mode is for uploader users who only want the bridge to report how each print ended. The bridge looks for a print to adopt again when the job ends, so a print uploaded after the job started is still found. Without a match, the job is skipped with a line in the log.
+
+### Slicer settings
+
+Each print records the slicer settings it was sliced with, as the Cura plugin and the Slic3r uploader do: the bridge sends the settings block the slicer wrote at the end of the file (OrcaSlicer, PrusaSlicer, Anycubic Slicer Next and their forks write one), the file's header, which names the slicer and its version, and the summary Moonraker read from the file (slicer, layer heights, nozzle, filament, first layer temperatures). 3D Print Log adds them to the print's notes. They are read once, when the job starts, by byte range: only the start of the file up to the G-code and its end after the G-code, never the toolpaths. Before they leave the printer, the values of every setting naming a host or holding a credential (`print_host`, `printhost_apikey`, passwords, tokens, `post_process`...) are blanked. They go through the outbox like the print's other events, and never hold up logging the print: when the file can't be read, Moonraker's summary is sent alone, and when 3D Print Log can't take them, they are dropped. A print you made with the Slic3r uploader or the Cura plugin keeps the settings those recorded.
+
+Set `slicer_settings = false` in `[bridge]`, or in a printer's section for that one, to turn this off; the G-code file is then never read. [docs/privacy.md](docs/privacy.md) says exactly what is read and sent.
 
 ### Recording a trace
 
