@@ -433,6 +433,8 @@ class FakePrintLogApi:
             return web.Response(
                 status=400, text="Selected printer does not belong to currently logged in user."
             )
+        if not _valid_file_hash(body.get("fileHash")):
+            return web.Response(status=400, text=FILE_HASH_REFUSED)
 
         source, external_id = body.get("externalSource"), body.get("externalId")
         existing = next(
@@ -620,6 +622,8 @@ class FakePrintLogApi:
         source, external_id = body.get("externalSource"), body.get("externalId")
         if not (source or "").strip() or not (external_id or "").strip():
             return web.Response(status=400, text="externalSource and externalId are both required")
+        if not _valid_file_hash(body.get("fileHash")):
+            return web.Response(status=400, text=FILE_HASH_REFUSED)
         if found["externalSource"] == source and found["externalId"] == external_id:
             return web.json_response(found)  # a replay, before the status is checked
         if found["externalSource"] or found["externalId"]:
@@ -643,6 +647,7 @@ class FakePrintLogApi:
             found["connectionInstanceId"] = body["connectionInstanceId"]
             found["connectionId"] = connection.get("id")
         found["startDate"] = found["startDate"] or body.get("startDate")
+        found["fileHash"] = found.get("fileHash") or body.get("fileHash")
         return web.json_response(found)
 
     async def _slicer_settings(self, request: web.Request) -> web.Response:
@@ -879,3 +884,13 @@ def _row(sent: dict[str, Any], filament_id: str | None) -> dict[str, Any]:
         "source": sent.get("source"),
         "notes": sent.get("notes"),
     }
+
+
+FILE_HASH_REFUSED = "fileHash must be 40 hex digits (20 bytes)."
+
+
+def _valid_file_hash(value: Any) -> bool:
+    """As the API's `PrintFileHashes`: absent, or exactly 20 bytes as hex."""
+    return value is None or (
+        isinstance(value, str) and re.fullmatch(r"[0-9A-Fa-f]{40}", value) is not None
+    )

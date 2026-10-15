@@ -16,13 +16,18 @@ job resumes from it, prompting on the console for the new spool when it sees one
 After the thumbnail comes the job's slicer settings (#36): the summary in its metadata, and a
 way to read its file's header and settings block (`slicer.py`), which the sink uses only when
 it wants them.
+
+Each start carries an identity of the job's file (#40, `file_identity`), for 3D Print Log to count
+reprints by.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import logging
+import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -270,7 +275,38 @@ def started(printer: str, job: Mapping[str, Any]) -> JobStarted:
         estimated_filament_mm=_positive(metadata.get("filament_total")),
         estimated_filament_g=_positive(metadata.get("filament_weight_total")),
         estimated_filament_g_by_slot=estimated_grams_by_slot(metadata),
+        file_identity=file_identity(metadata),
     )
+
+
+def file_identity(metadata: Mapping[str, Any]) -> str | None:
+    """The job's file, from its history entry's metadata, as 40 hex digits.
+
+    The file's `size` and `modified` time identify it: they are what Moonraker itself checks to
+    tell whether a file changed, and an upload always sets a new modified time, so every job of
+    one file has the same identity and a re-sliced upload a new one. Moonraker's `uuid` is used
+    only when either is missing: it is new each time Moonraker extracts the metadata, which can
+    happen to an unchanged file (a real U1 gave one file two uuids between two of its jobs, and
+    mainline Moonraker clears every file's metadata when its METADATA_VERSION goes up). Without
+    any of them, there's no identity.
+
+    It is read from the job's history entry as Moonraker last saved it (at the start, and again
+    at the finish), never from the file's metadata as it is now, so a job replayed after the
+    file was re-sliced keeps its own. A file can't change while it prints. A job that started
+    before Moonraker had read the file's metadata has none, and gets no identity. The file
+    itself is never read, so its content says nothing about it. Hashed, so the uuid isn't sent
+    and both kinds have the 20 bytes 3D Print Log keeps (its `fileHash`, an OctoPrint SHA-1),
+    each with its own prefix so the two can't meet.
+    """
+    size, modified = _finite(metadata.get("size")), _finite(metadata.get("modified"))
+    uuid = metadata.get("uuid")
+    if size is not None and modified is not None:
+        source = f"moonraker-file:{int(size)}:{modified!r}"
+    elif isinstance(uuid, str) and uuid.strip():
+        source = f"moonraker-uuid:{uuid.strip().lower()}"
+    else:
+        return None
+    return hashlib.sha256(source.encode()).hexdigest()[:40]
 
 
 def finished(
@@ -308,6 +344,14 @@ def finished(
 
 def _time(timestamp: float) -> datetime:
     return datetime.fromtimestamp(float(timestamp), timezone.utc)
+
+
+def _finite(value: Any) -> float | None:
+    """A number Moonraker gave, or None for anything else (a bool, a string, NaN)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _positive(value: Any) -> float | None:

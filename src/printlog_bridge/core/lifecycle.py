@@ -807,6 +807,8 @@ class JobLogger:
             "externalId": f"{state.instance_id}:{job_id}",
             "connectionInstanceId": state.instance_id,
         }
+        if start.get("file_identity"):  # a start saved by an older bridge has none
+            body["fileHash"] = start["file_identity"]
         if start.get("estimated_duration_s"):
             body["estimatedPrintTimeInSeconds"] = round(start["estimated_duration_s"])
         if start.get("estimated_filament_g"):
@@ -869,6 +871,9 @@ class JobLogger:
             "connectionInstanceId": state.instance_id,
             "startDate": start["started_at"],
         }
+        if start.get("file_identity"):
+            # Kept only when the print has none, so an OctoPrint SHA-1 already on it stays.
+            claim["fileHash"] = start["file_identity"]
         if job.claiming is not None:
             # Claimed before, and the answer was lost: the same claim again returns the print.
             claimed = await self._claim(state, printer, job_id, job, job.claiming, claim)
