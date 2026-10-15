@@ -38,7 +38,7 @@ jobs:
       - if: matrix.qemu
         uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}
@@ -107,7 +107,7 @@ jobs:
             org.opencontainers.image.description=Logs every Klipper/Moonraker print to 3D Print Log automatically.
           annotations: |
             org.opencontainers.image.description=Logs every Klipper/Moonraker print to 3D Print Log automatically.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}
