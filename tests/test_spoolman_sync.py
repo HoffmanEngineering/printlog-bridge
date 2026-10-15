@@ -84,6 +84,7 @@ class TestEnabled:
             sync = connected(fake)
 
         assert not sync.enabled
+        assert sync.external  # followed one way instead (#38)
         lines = [r.getMessage() for r in caplog.records if "Spoolman" in r.getMessage()]
         assert len(lines) == 1
         assert lines[0].startswith("[printer u1] ")
@@ -183,18 +184,20 @@ class TestPicks:
 
         assert sink.commands == []
 
-    def test_disabled_sync_ignores_picks(self):
+    def test_a_pick_in_another_spoolman_is_never_taken_for_a_spool_number(self):
+        # Its ids mean nothing in 3D Print Log: it's a Spoolman spool (test_own_spoolman.py).
         fake, sink = FakeMoonraker(), Recorder()
         fake.config["spoolman"] = {"server": "http://192.168.1.5:7912"}
 
         async def scenario():
             async with syncing(fake, sink):
                 await fake.pick_spool(12)
-                await asyncio.sleep(0.1)
+                await eventually(lambda: sink.commands)
 
         asyncio.run(scenario())
 
-        assert sink.commands == []
+        assert [(c.spool_number, c.spoolman.id) for c in sink.commands] == [(None, 12)]
+        assert fake.posted_spools == []
 
     def test_a_listener_without_spoolman_hears_nothing_of_picks(self):
         # Listeners written before Spoolman sync have no on_active_spool: a pick passes them by.

@@ -90,6 +90,9 @@ API_CALLS = [
     ("POST", r"/api/Prints/\d+/slicer-settings"),
     # Spool assignment (#6): PRINTLOG_SET_SPOOL, and the U1's RFID reader.
     ("GET", r"/api/Filaments/by-tag/[0-9A-F]+"),
+    # Moonraker's Spoolman active spool: 3D Print Log's spool numbers, or the user's own (#38).
+    ("GET", r"/api/Filaments/by-number/\d+"),
+    ("GET", r"/api/Filaments/by-spoolman-id/\d+"),
     ("PUT", r"/api/Printers/\d+/slots/\d+"),
     ("DELETE", r"/api/Printers/\d+/slots/\d+"),
     ("PUT", r"/api/Printers/\d+"),

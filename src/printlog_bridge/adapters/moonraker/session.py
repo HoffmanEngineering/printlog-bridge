@@ -27,6 +27,7 @@ from printlog_bridge.core.status import NullReport, PrinterReport
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 from .changes import SENSOR_FIELDS, is_sensor
+from .tools import macro_slot, slot_of
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ SUBSCRIPTION: Mapping[str, list[str] | None] = {
 OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "filament_detect": None,  # Snapmaker U1's RFID reader
     "exclude_object": ["objects", "excluded_objects"],  # objects cancelled mid-print
+    "save_variables": ["variables"],  # each tool's spool in the user's own Spoolman (#38)
 }
 
 T = TypeVar("T")
@@ -429,6 +431,12 @@ class MoonrakerSession:
             objects.update({k: v for k, v in OPTIONAL_SUBSCRIPTION.items() if k in available})
             # Runout sensors, which are named: `filament_switch_sensor <name>` (#44).
             objects.update({k: list(SENSOR_FIELDS) for k in sorted(available) if is_sensor(k)})
+            # A toolchanger's tool macros, for each tool's spool in the user's own Spoolman: of
+            # the tools it has (the U1 defines T0 to T31 for its four).
+            extruders = {slot_of(k) for k in available} - {None}
+            objects.update(
+                {k: ["spool_id"] for k in sorted(available) if macro_slot(k) in extruders}
+            )
             result = await rpc.call("printer.objects.subscribe", {"objects": objects})
         except MoonrakerRpcError as e:
             # Klipper went away between ready and subscribe; its next ready notification retries.

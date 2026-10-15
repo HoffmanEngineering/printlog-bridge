@@ -64,6 +64,9 @@ Spools and slots (api#146, PR 158; api#147, PR 159):
   whole hex bytes (64 hex characters at most), 404 when none of the user's spools has it.
 - `GET /api/Filaments/by-number/{n}` finds the user's spool with that `spoolNumber` (what
   Moonraker's Spoolman integration calls its spool id): 404 when none of theirs has it.
+- `GET /api/Filaments/by-spoolman-id/{n}` finds the user's spool linked to that spool in their
+  own Spoolman server (`spoolmanId`, #38): 404 when none of theirs is. With `spoolman_ids` off it
+  is a 404 always, as an API without the field is.
 - `AddPrint` on a printer with one slot makes the print's spools the printer's loaded list (so a
   print with no spool unloads it); on a printer with more slots it leaves the slots alone.
 """
@@ -160,6 +163,8 @@ class FakePrintLogApi:
         self.lookups: list[dict[str, str]] = []
         """Every lookup's query."""
         self.claims: list[tuple[int, dict[str, Any]]] = []
+        self.spoolman_ids = True
+        """False is an API that doesn't store Spoolman ids: `by-spoolman-id` isn't a route."""
         """Every claim body received, by print id."""
         self.slicer_settings_route = True
         """False answers the slicer settings endpoint 404, as an API without it does."""
@@ -185,6 +190,7 @@ class FakePrintLogApi:
         app.router.add_delete("/api/Printers/{id}/slots/{slot}", self._unload_slot)
         app.router.add_get("/api/Filaments/by-tag/{uid}", self._by_tag)
         app.router.add_get("/api/Filaments/by-number/{number}", self._by_number)
+        app.router.add_get("/api/Filaments/by-spoolman-id/{number}", self._by_spoolman_id)
         app.router.add_post("/api/Prints", self._create)
         app.router.add_get("/api/Prints/claimable", self._claimable)
         app.router.add_post("/api/Prints/{id}/claim", self._claim)
@@ -236,6 +242,7 @@ class FakePrintLogApi:
         color_hex: str | None = None,
         tags: tuple[str, ...] = (),
         number: int | None = None,
+        spoolman_id: int | None = None,
     ) -> str:
         """A spool in the user's inventory, as the app would add it. Returns its id. Its
         `spoolNumber` is `number`, or else the next after the highest so far, as the app's."""
@@ -249,6 +256,7 @@ class FakePrintLogApi:
             "materialType": material,
             "colorHex": color_hex,
             "tagUids": sorted(normalize_tag(t) for t in tags),
+            "spoolmanId": spoolman_id,
         }
         return filament_id
 
@@ -440,6 +448,13 @@ class FakePrintLogApi:
         number = request.match_info["number"]
         for filament in self.filaments.values():
             if number.isdigit() and filament["spoolNumber"] == int(number):
+                return web.json_response(filament)
+        return web.Response(status=404)
+
+    async def _by_spoolman_id(self, request: web.Request) -> web.Response:
+        number = request.match_info["number"]
+        for filament in self.filaments.values():
+            if self.spoolman_ids and number.isdigit() and filament["spoolmanId"] == int(number):
                 return web.json_response(filament)
         return web.Response(status=404)
 

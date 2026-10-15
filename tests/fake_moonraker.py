@@ -3,16 +3,16 @@
 It speaks just enough of the protocol for the bridge: identify, server.info,
 printer.objects.list/subscribe, printer.gcode.script, connection.register_remote_method,
 server.history.list, server.files.roots, server.files.metadata, server.webcams.list, server.config
-and server.spoolman.get_spool_id/post_spool_id, plus pushing notifications (console lines and
-spool picks among them) and dropping every client to simulate a restart. `start_job` and
-`finish_job` drive a print the way Moonraker's history component reports one. Over HTTP it
-serves the gcodes root's files (`GET /server/files/gcodes/<path>`), which is how a remote bridge
-gets a thumbnail and a G-code file's header and settings block, with a `Range` header served as
-Moonraker's Tornado file handler serves it (206 and `Content-Range`, 200 for a range that is the
-whole file, 416 past the end), and
-`/server/info`, `/machine/system_info`, `/printer/info` and `/printer/objects/list`, which is how
-discovery recognises it. `start(host=..., port=...)` serves it at a chosen address, so a test
-can move it from 127.0.0.87 to 127.0.0.91, as a printer given a new address by DHCP.
+and server.spoolman.get_spool_id/post_spool_id/proxy (to a Spoolman of its own), plus pushing
+notifications (console lines and spool picks among them) and dropping every client to simulate a
+restart. `start_job` and `finish_job` drive a print the way Moonraker's history component reports
+one. Over HTTP it serves the gcodes root's files (`GET /server/files/gcodes/<path>`), which is how a
+remote bridge gets a thumbnail and a G-code file's header and settings block, with a `Range` header
+served as Moonraker's Tornado file handler serves it (206 and `Content-Range`, 200 for a range that
+is the whole file, 416 past the end), and `/server/info`, `/machine/system_info`, `/printer/info`
+and `/printer/objects/list`, which is how discovery recognises it. `start(host=..., port=...)`
+serves it at a chosen address, so a test can move it from 127.0.0.87 to 127.0.0.91, as a printer
+given a new address by DHCP.
 
 Authorization copies real Moonraker (checked against v0.9): the WebSocket upgrade always
 succeeds, the Unix socket is trusted, and a WebSocket is authorized by an `X-Api-Key` header on
@@ -99,6 +99,15 @@ class FakeMoonraker:
         """False is a `spoolman` section whose component didn't load: its methods don't exist."""
         self.posted_spools: list[int] = []
         """Every spool id set through server.spoolman.post_spool_id, in order."""
+        self.spoolman_spools: dict[int, dict[str, Any]] = {}
+        """The spools in the Spoolman server Moonraker proxies to (`GET /v1/spool/{id}`)."""
+        self.spoolman_down = False
+        """True is a Spoolman server Moonraker can't reach."""
+        self.proxy_v2 = True
+        """False is an older Moonraker, which ignores `use_v2_response` and answers a proxied
+        request with Spoolman's body alone, or an error."""
+        self.proxied: list[dict[str, Any]] = []
+        """Every server.spoolman.proxy request's params, in order."""
         self._announce: list[tuple[str, dict]] = []
         """Notifications a method sends to every client, before it answers."""
         self.calls: list[str] = []
@@ -348,6 +357,10 @@ class FakeMoonraker:
                 self.spool_id = spool_id
                 self._announce.append(("notify_active_spool_set", {"spool_id": spool_id}))
             return {"spool_id": spool_id}
+        if method == "server.spoolman.proxy":
+            self._require_spoolman()
+            self.proxied.append(dict(params))
+            return self._proxy(params)
         if method == "printer.gcode.script":
             self._require_klippy()
             self.scripts.append(params["script"])
@@ -373,6 +386,28 @@ class FakeMoonraker:
         if limit > 0:
             jobs = jobs[start : start + limit]
         return {"count": len(jobs), "jobs": [dict(j) for j in jobs]}
+
+    def _proxy(self, params: dict) -> Any:
+        """Moonraker's answer to a proxied Spoolman request, in the shape it was asked for."""
+        status, body = self._spoolman(params)
+        if self.proxy_v2 and params.get("use_v2_response"):
+            if status != 200:
+                return {"response": None, "error": {"status_code": status, "message": body}}
+            return {"response": body, "error": None}
+        if status != 200:
+            raise _RpcError(status, str(body))
+        return body
+
+    def _spoolman(self, params: dict) -> tuple[int, Any]:
+        if self.spoolman_down:
+            return 503, "Spoolman server not available"
+        match = re.fullmatch(r"/v1/spool/(\d+)", str(params.get("path")))
+        if params.get("request_method") == "GET" and match is not None:
+            spool = self.spoolman_spools.get(int(match.group(1)))
+            if spool is None:
+                return 404, {"message": "Item not found"}
+            return 200, copy.deepcopy(spool)
+        return 200, {}
 
     def _require_spoolman(self) -> None:
         if "spoolman" not in self.config or not self.spoolman_loaded:

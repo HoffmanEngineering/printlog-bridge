@@ -90,6 +90,8 @@ class TestObjects:
             # A runout sensor per tool (#44).
             *(f"filament_motion_sensor e{n}_filament" for n in range(4)),
         }  # fmt: skip
+        # Its T4 to T31 macros are for tools it doesn't have (#38).
+        assert not any(name.startswith("gcode_macro") for name in objects)
         assert len(status["filament_detect"]["info"]) == 4
         assert status["toolhead"]["extruder"] == "extruder"
 
@@ -97,7 +99,8 @@ class TestObjects:
         objects, status = self.subscribed(INFIMECH)
 
         assert set(objects) == {
-            "print_stats", "toolhead", "virtual_sdcard", "webhooks", "exclude_object"
+            "print_stats", "toolhead", "virtual_sdcard", "webhooks", "exclude_object",
+            "save_variables",  # each tool's spool in the user's own Spoolman (#38)
         }  # fmt: skip
         assert "filament_manager" not in status
 

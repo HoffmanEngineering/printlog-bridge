@@ -171,13 +171,27 @@ class EventSink(Protocol):
 
 
 @dataclass(frozen=True)
+class SpoolmanSpool:
+    """A spool in the user's own Spoolman server (#38), as Moonraker's Spoolman proxy described
+    it. 3D Print Log finds its material by `id` (stored on the material) or by one of `tags`."""
+
+    id: int
+    """The spool's id in that Spoolman server."""
+    name: str | None = None
+    """What Spoolman calls it (`Polymaker PolyTerra PLA Red`), for the bridge's log; None when
+    Spoolman couldn't be asked."""
+    tags: tuple[str, ...] = ()
+    """RFID/NFC tag UIDs Spoolman has for the spool (its `nfc_id` extra field), as written."""
+
+
+@dataclass(frozen=True)
 class SpoolCommand:
     """The user assigns a spool to a slot on the printer (`PRINTLOG_SET_SPOOL`, or a spool
     picked in Mainsail, Fluidd or KlipperScreen through Moonraker's Spoolman integration), or
     clears it.
 
-    Exactly one of `filament_id`, `tag` and `spool_number` names the spool; with none, the slot
-    is cleared.
+    Exactly one of `filament_id`, `tag`, `spool_number` and `spoolman` names the spool; with
+    none, the slot is cleared.
     """
 
     printer: str
@@ -190,6 +204,8 @@ class SpoolCommand:
     spool_number: int | None = None
     """The spool's number in 3D Print Log (`spoolNumber`), which is what Moonraker's Spoolman
     integration calls its spool id when it is pointed at 3D Print Log."""
+    spoolman: SpoolmanSpool | None = None
+    """A spool in the user's own Spoolman server, active on the printer."""
     slot_count: int | None = None
     """How many slots (tools) the printer has, when the adapter knows."""
     during: JobPoint | None = None
