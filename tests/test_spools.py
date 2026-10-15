@@ -12,7 +12,7 @@ from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.adapters.moonraker.spools import MAX_ANSWER
-from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.api_client import ApiClient, ApiUnavailable
 from printlog_bridge.core.events import SpoolCommand, SpoolReading
 from printlog_bridge.core.spools import (
     UNKNOWN_TAG_RETRY_S,
@@ -306,6 +306,22 @@ class TestLoaded:
             return await spools.current("u1")
 
         assert run(api, scenario) == {0: spool}
+
+    def test_a_fresh_read_fails_rather_than_answer_with_what_was_last_read(self):
+        """For a print's create, where an older read could load a spool again (#29)."""
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+        api.user_loads(42, 0, spool)
+
+        async def scenario(spools):
+            await spools.refresh_all()
+            api.loaded[42].clear()  # unloaded in the app
+            api.fail_next(1)
+            with pytest.raises(ApiUnavailable):
+                await spools.fresh("u1")
+            return await spools.fresh("u1")
+
+        assert run(api, scenario) == {}
 
     def test_run_reads_again_every_interval(self):
         api = FakePrintLogApi()

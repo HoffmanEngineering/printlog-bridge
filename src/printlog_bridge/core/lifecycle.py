@@ -816,8 +816,12 @@ class JobLogger:
         current: dict[int, str] = {}
         if self.spools is not None:
             # A print created after a swap (3D Print Log was down until then) starts with the
-            # spools the job started with, not the ones loaded now.
-            current = await self.spools.current(printer)
+            # spools the job started with, not the ones loaded now. Read now or not at all: a
+            # failed read holds the print to be tried again, as before_create's does, since on
+            # a single-tool printer the create makes its spools the loaded ones, and a spool
+            # from an older read may have been unloaded in the app since (#29). Linking none
+            # instead would unload a spool that is still there.
+            current = await self.spools.fresh(printer)
             loaded = before_swaps(current, job.swaps)
             single_tool = (self.spools.slot_count(printer) or 1) <= 1
             _link_loaded(rows, loaded, single_tool=single_tool)

@@ -163,9 +163,16 @@ class Spools:
     async def current(self, printer: str) -> dict[int, str]:
         """The spool in each slot, read again now; what was last read when that fails."""
         try:
-            await self.refresh(printer)
+            return await self.fresh(printer)
         except Exception as e:
             log.debug("[printer %s] couldn't read its spools: %s", printer, e)
+        return self.loaded(printer)
+
+    async def fresh(self, printer: str) -> dict[int, str]:
+        """The spool in each slot, read again now. Raises what the read raised when it fails,
+        rather than answer with what was last read, up to `interval` old: on a single-tool
+        printer, a print created with a spool unloaded in the app since then loads it again."""
+        await self.refresh(printer)
         return self.loaded(printer)
 
     async def refresh(self, printer: str) -> None:
