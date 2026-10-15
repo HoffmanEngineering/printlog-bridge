@@ -19,6 +19,7 @@ from printlog_bridge.core.backfill import (
     Backfill,
     BackfillStopped,
     BackfillSummary,
+    PrinterRefused,
     format_summary,
 )
 from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted, PastJob
@@ -95,7 +96,7 @@ class TimedRequests(list):
         super().append(item)
 
 
-def run_backfill(tmp_path, jobs, *, api=None, state_jobs=None, clock=None, **kwargs):
+def run_backfill(tmp_path, jobs, *, api=None, state_jobs=None, clock=None, target=TARGET, **kwargs):
     """Backfills `jobs` against the fake API. Returns the summary, the API, what was said, and
     the state the backfill saw."""
     api = api or FakePrintLogApi()
@@ -112,7 +113,7 @@ def run_backfill(tmp_path, jobs, *, api=None, state_jobs=None, clock=None, **kwa
                 runner = Backfill(
                     client, sleep=clock.sleep, clock=clock.monotonic, say=said.append, **kwargs
                 )
-                return await runner.run("voron", TARGET, state, jobs, history="Moonraker")
+                return await runner.run("voron", target, state, jobs, history="Moonraker")
         finally:
             await api.close()
 
@@ -137,7 +138,7 @@ class TestCreating:
         assert body["printTimeInSeconds"] == 3301
         assert body["estimatedPrintTimeInSeconds"] == 3000
         assert body["estimatedFilamentUsageMg"] == 3600
-        assert body["viewStatus"] == 3  # private, unless the account says otherwise
+        assert body["viewStatus"] == 3  # private, whatever the account's default
         assert body["allowComments"] is False
 
     def test_is_tagged_as_imported_in_its_notes(self, tmp_path):
@@ -174,16 +175,31 @@ class TestCreating:
 
         assert "filamentUsage" not in api.created[0]
 
-    def test_uses_the_accounts_default_visibility(self, tmp_path):
+    @staticmethod
+    def public_account() -> FakePrintLogApi:
         api = FakePrintLogApi()
         api.settings = [
             {"userSettingTypeId": 1, "value": "Public"},
             {"userSettingTypeId": 3, "value": "true"},
         ]
-        _, api, _, _ = run_backfill(tmp_path, [past("00000A")], api=api)
+        return api
 
-        assert api.created[0]["viewStatus"] == 1
+    def test_is_private_even_when_the_account_defaults_to_public(self, tmp_path):
+        # Hundreds of old prints would otherwise flood the public feed at once.
+        _, api, _, _ = run_backfill(tmp_path, [past("00000A")], api=self.public_account())
+
+        assert api.created[0]["viewStatus"] == 3
         assert api.created[0]["allowComments"] is True
+
+    @pytest.mark.parametrize(
+        ("visibility", "expected"), [("default", 1), ("public", 1), ("unlisted", 2)]
+    )
+    def test_visibility_can_be_chosen(self, tmp_path, visibility, expected):
+        _, api, _, _ = run_backfill(
+            tmp_path, [past("00000A")], api=self.public_account(), visibility=visibility
+        )
+
+        assert api.created[0]["viewStatus"] == expected
 
     def test_says_what_it_did_with_each_job(self, tmp_path):
         jobs = [past("00000A"), past("00000B", start=T0 + HOUR, exists=False)]
@@ -214,17 +230,96 @@ class TestNoDuplicates:
         live = api.user_creates(
             "Benchy, renamed",
             status=6,
+            startDate=at(T0).isoformat(),
             externalSource="moonraker",
             externalId=f"{state.instance_id}:00000A",
             usage=[{"slot": 0, "filament": {"id": spool}, "amountMg": 22_000}],
         )
         before = dict(api.prints[live])
 
-        summary, api, _, _ = run_backfill(tmp_path, [past("00000A")], api=api)
+        summary, api, said, _ = run_backfill(tmp_path, [past("00000A")], api=api)
 
         assert (summary.created, summary.present) == (0, 1)
+        assert api.created == []  # found by its external ID, so nothing was even sent
+        assert api.prints[live] == before
+        assert f"print {live}" in said[0]
+
+    def test_a_replay_the_lookup_missed_is_still_left_as_it_is(self, tmp_path):
+        # Logged live, but dated outside the window looked up: the API's replay rule holds.
+        api = FakePrintLogApi()
+        state = PrinterState.load(tmp_path, "voron")
+        live = api.user_creates(
+            "Benchy",
+            status=6,
+            created="2026-10-10T09:00:00+00:00",
+            externalSource="moonraker",
+            externalId=f"{state.instance_id}:00000A",
+        )
+        before = dict(api.prints[live])
+
+        summary, api, _, _ = run_backfill(tmp_path, [past("00000A")], api=api)
+
+        assert summary.present == 1
         assert api.prints[live] == before
         assert len(api.prints) == 1
+
+    def test_a_print_the_user_logged_without_the_bridge_is_not_imported_again(self, tmp_path):
+        # The Slic3r uploader, the Cura plugin or a hand entry: no external pair to find it by.
+        api = FakePrintLogApi()
+        uploaded = api.user_creates(
+            "My benchy",
+            file_name="benchy_PLA_1h.gcode",
+            status=3,
+            startDate=at(T0 - 600).isoformat(),
+        )
+        by_hand = api.user_creates(
+            "Bracket", status=3, startDate=at(T0 + 5 * HOUR + 120).isoformat()
+        )
+
+        jobs = [past("00000A"), past("00000B", start=T0 + 5 * HOUR, file_name="bracket.gcode")]
+        summary, api, said, _ = run_backfill(tmp_path, jobs, api=api)
+
+        assert (summary.created, summary.present) == (0, 2)
+        assert api.created == []
+        assert f"print {uploaded}" in said[0] and f"print {by_hand}" in said[1]
+
+    def test_one_print_of_a_file_stands_for_one_job_only(self, tmp_path):
+        api = FakePrintLogApi()
+        api.user_creates(
+            "Benchy", file_name="benchy.gcode", status=3, startDate=at(T0 + 60).isoformat()
+        )
+        jobs = [past("00000A"), past("00000B", start=T0 + 2 * HOUR)]
+
+        summary, api, _, _ = run_backfill(tmp_path, jobs, api=api)
+
+        assert (summary.created, summary.present) == (1, 1)
+        assert [b["externalId"].split(":")[1] for b in api.created] == ["00000B"]
+
+    def test_a_print_of_the_same_file_much_earlier_is_another_job(self, tmp_path):
+        api = FakePrintLogApi()
+        api.user_creates(
+            "Benchy", file_name="benchy.gcode", status=3, startDate=at(T0 - 30 * HOUR).isoformat()
+        )
+
+        summary, _, _, _ = run_backfill(tmp_path, [past("00000A")], api=api)
+
+        assert summary.created == 1
+
+    def test_a_print_the_bridge_logged_for_another_job_is_not_mistaken_for_this_one(self, tmp_path):
+        api = FakePrintLogApi()
+        state = PrinterState.load(tmp_path, "voron")
+        api.user_creates(
+            "Benchy",
+            file_name="benchy.gcode",
+            status=3,
+            startDate=at(T0 + 60).isoformat(),
+            externalSource="moonraker",
+            externalId=f"{state.instance_id}:000009",
+        )
+
+        summary, _, _, _ = run_backfill(tmp_path, [past("00000A")], api=api)
+
+        assert summary.created == 1
 
 
 class TestInventory:
@@ -246,13 +341,18 @@ class TestInventory:
 
         assert "don't change your spools' remaining filament" in text
 
+    def test_the_summary_says_a_deleted_print_can_come_back(self):
+        text = format_summary("voron", BackfillSummary(jobs=1, created=1), days=90)
+
+        assert "deleted" in text
+
 
 class TestSkipping:
     def test_a_job_whose_file_no_longer_exists_is_skipped(self, tmp_path):
         summary, api, _, _ = run_backfill(tmp_path, [past("00000A", exists=False)])
 
         assert summary.missing_file == 1
-        assert api.created == []
+        assert api.requests == []  # nothing to create, so nothing to ask
 
     def test_jobs_the_running_bridge_logs_itself_are_left_to_it(self, tmp_path):
         # The bridge knows 00000C and is still logging it: it replays everything from there.
@@ -289,7 +389,7 @@ class TestPacing:
         run_backfill(tmp_path, jobs, api=api, clock=clock)
 
         times = api.requests.times
-        assert len(times) == 6  # the account's defaults, then one create per job
+        assert len(times) == 7  # the lookup, the account's defaults, one create per job
         assert all(b - a >= 1.0 for a, b in zip(times, times[1:]))
 
     def test_a_429_is_waited_out_as_long_as_it_asks_and_the_job_retried(self, tmp_path):
@@ -335,16 +435,52 @@ class TestPacing:
         assert said[-1].startswith("[500/500] ")
 
 
+class RefusingApi(FakePrintLogApi):
+    """Refuses every `every`-th create with 400, as the API refuses a body it won't take."""
+
+    def __init__(self, every: int) -> None:
+        super().__init__()
+        self.every = every
+        self.creates = 0
+
+    @web.middleware
+    async def _middleware(self, request, handler):
+        if request.method == "POST" and request.path == "/api/Prints":
+            self.creates += 1
+            if self.creates % self.every == 0:
+                self.created.append(await request.json())
+                return web.Response(status=400, text="The Title field is required.")
+        return await super()._middleware(request, handler)
+
+
 class TestStopping:
     def test_a_job_the_api_refuses_is_counted_and_the_rest_go_on(self, tmp_path):
-        api = FakePrintLogApi(printers=(7,))  # printer 42 isn't the account's: every create 400s
-        jobs = [past("00000A"), past("00000B", start=T0 + HOUR)]
+        api = RefusingApi(every=2)
+        jobs = [past(f"00000{n}", start=T0 + n * HOUR) for n in range(1, 5)]
 
         summary, api, said, _ = run_backfill(tmp_path, jobs, api=api)
 
-        assert summary.refused == 2
-        assert len(api.created) == 2
-        assert all("refused" in line for line in said)
+        assert (summary.refused, summary.created) == (2, 2)
+        assert sum("refused" in line for line in said) == 2
+
+    def test_a_printer_that_isnt_the_accounts_stops_at_the_first_refusal(self, tmp_path):
+        api = FakePrintLogApi(printers=(7,))  # printer 42 isn't the account's
+        jobs = [past(f"00000{n}", start=T0 + n * HOUR) for n in range(1, 6)]
+
+        with pytest.raises(PrinterRefused, match="does not belong") as stopped:
+            run_backfill(tmp_path, jobs, api=api)
+
+        assert len(api.created) == 1
+        assert stopped.value.summary.refused == 1
+
+    def test_three_refusals_in_a_row_stop_the_printer(self, tmp_path):
+        api = RefusingApi(every=1)
+        jobs = [past(f"00000{n}", start=T0 + n * HOUR) for n in range(1, 8)]
+
+        with pytest.raises(PrinterRefused, match="3 jobs in a row"):
+            run_backfill(tmp_path, jobs, api=api)
+
+        assert len(api.created) == 3
 
     def test_a_rejected_key_stops_it(self, tmp_path):
         api = FakePrintLogApi(api_key="another-key")
@@ -352,7 +488,7 @@ class TestStopping:
         with pytest.raises(BackfillStopped, match="rejected the API key"):
             run_backfill(tmp_path, [past("00000A")], api=api)
 
-    def test_account_settings_it_cant_read_stop_it(self, tmp_path):
+    def test_a_lookup_the_api_refuses_stops_it(self, tmp_path):
         api = FakePrintLogApi()
         api.fail_next(1, status=403)
 
@@ -360,6 +496,26 @@ class TestStopping:
             run_backfill(tmp_path, [past("00000A")], api=api)
 
         assert api.created == []
+
+    def test_an_api_older_than_imported_prints_is_refused_before_any_write(self, tmp_path):
+        # It would drop `imported`: each create would unload the printer's spool, and a replay
+        # would replace the spool-linked usage of a print logged live.
+        api = FakePrintLogApi()
+        api.on_printer = False
+
+        with pytest.raises(BackfillStopped, match="update"):
+            run_backfill(tmp_path, [past("00000A")], api=api)
+
+        assert [m for m, _ in api.requests] == ["GET"]
+
+    def test_gives_up_on_an_api_that_rate_limits_it_for_hours(self, tmp_path):
+        class AlwaysLimited(FakePrintLogApi):
+            @web.middleware
+            async def _middleware(self, request, handler):
+                return web.Response(status=429, headers={"Retry-After": "600"})
+
+        with pytest.raises(BackfillStopped, match="hours"):
+            run_backfill(tmp_path, [past("00000A")], api=AlwaysLimited())
 
     def test_an_api_out_of_reach_too_long_stops_it_saying_to_run_it_again(self, tmp_path):
         api = FakePrintLogApi()
@@ -423,6 +579,22 @@ class TestMoonrakerHistory:
         assert failed.end.outcome is JobOutcome.FAILED
         assert failed.end.note == "Klipper shutdown"
 
+    def test_an_entry_it_cant_read_is_skipped_with_a_line(self, caplog):
+        fake = FakeMoonraker()
+
+        async def fill():
+            await self.add(fake, 1)
+            broken = await self.add(fake, 2)
+            del broken["job_id"]
+            await self.add(fake, 3)
+
+        asyncio.run(fill())
+
+        jobs = self.past_jobs(fake, at(T0))
+
+        assert [j.start.file_name for j in jobs] == ["part1.gcode", "part3.gcode"]
+        assert any("can't read" in r.getMessage() for r in caplog.records)
+
     def test_without_history_says_how_to_turn_it_on(self):
         with pytest.raises(PrinterUnavailable, match=r"\[history\]"):
             self.past_jobs(FakeMoonraker(history=False), at(T0))
@@ -436,17 +608,17 @@ class TestMoonrakerHistory:
 
 class TestCommand:
     @staticmethod
-    def write_config(tmp_path, api_url: str, moonraker_url: str):
+    def write_config(tmp_path, api_url: str, moonraker_url: str, extra: str = ""):
         path = tmp_path / "printlog-bridge.cfg"
         path.write_text(
             f"[bridge]\napi_url = {api_url}\napi_key = key-123\nstate_dir = {tmp_path / 'state'}\n"
             f"[printer voron]\nadapter = moonraker\nurl = {moonraker_url}\nprinter_id = 42\n"
-            "discovery = false\n",
+            "discovery = false\n" + extra,
             encoding="utf-8",
         )
         return path
 
-    def backfill(self, tmp_path, monkeypatch, args, *, with_state=True, fill=None):
+    def backfill(self, tmp_path, monkeypatch, args, *, with_state=True, fill=None, extra=""):
         monkeypatch.setattr(backfill_module, "REQUEST_INTERVAL_S", 0.0)
         api, fake = FakePrintLogApi(), FakeMoonraker()
         if with_state:
@@ -458,7 +630,7 @@ class TestCommand:
             try:
                 if fill is not None:
                     await fill(fake)
-                path = self.write_config(tmp_path, api_url, moonraker_url)
+                path = self.write_config(tmp_path, api_url, moonraker_url, extra)
                 loop = asyncio.get_running_loop()
                 # main() runs its own event loop, so run it off this one.
                 exit_code["value"] = await loop.run_in_executor(
@@ -498,11 +670,34 @@ class TestCommand:
         assert api.created == []
         assert not (tmp_path / "state" / "printers").exists()
 
-    def test_days_must_be_a_positive_number(self, tmp_path, capsys):
+    @pytest.mark.parametrize("days", ["0", "3651", "ninety"])
+    def test_days_must_be_from_1_to_3650(self, tmp_path, capsys, days):
         with pytest.raises(SystemExit) as exited:
-            main(["backfill", "--days", "0"])
+            main(["backfill", "--days", days])
 
         assert exited.value.code == 2
+        assert "1 to 3650" in capsys.readouterr().err
+
+    def test_visibility_must_be_one_it_knows(self, capsys):
+        with pytest.raises(SystemExit) as exited:
+            main(["backfill", "--visibility", "friends"])
+
+        assert exited.value.code == 2
+
+    def test_a_printer_in_finish_only_mode_is_skipped(self, tmp_path, monkeypatch, capsys):
+        now = datetime.now(timezone.utc).timestamp()
+
+        async def fill(fake):
+            job = await fake.start_job("part.gcode", notify=False, start_time=now - 86400)
+            await fake.finish_job(job, notify=False)
+
+        exit_code, api = self.backfill(
+            tmp_path, monkeypatch, [], fill=fill, extra="create_prints = false\n"
+        )
+
+        assert exit_code == 0
+        assert api.requests == []
+        assert "create_prints = false" in capsys.readouterr().out
 
     def test_defaults_to_90_days(self, tmp_path, monkeypatch, capsys):
         now = datetime.now(timezone.utc).timestamp()

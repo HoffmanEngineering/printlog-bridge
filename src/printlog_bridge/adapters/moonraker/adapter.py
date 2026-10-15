@@ -315,9 +315,23 @@ class MoonrakerAdapter(Adapter):
             except CHECK_ERRORS as e:
                 problem = f"can't reach Moonraker at {where(url, self.socket)}: {_reason(e, url)}"
             else:
-                jobs = (past_job(self.printer, job) for job in history)
-                return [job for job in jobs if job is not None]
+                return self._past_jobs(history)
         raise PrinterUnavailable(problem)
+
+    def _past_jobs(self, history: Sequence[Mapping[str, Any]]) -> list[PastJob]:
+        jobs = []
+        for entry in history:
+            try:
+                job = past_job(self.printer, entry)
+            except (KeyError, TypeError, ValueError, OverflowError) as e:
+                log.warning(
+                    "[printer %s] skipped a history entry it can't read (job %s): %s %s",
+                    self.printer, entry.get("job_id", "?"), type(e).__name__, e,
+                )  # fmt: skip
+                continue
+            if job is not None:
+                jobs.append(job)
+        return jobs
 
     async def _notifier_check(self, url: str | None) -> list[CheckResult]:
         """A warning when Moonraker still has a notifier logging prints to 3D Print Log, or

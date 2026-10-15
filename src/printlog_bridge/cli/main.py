@@ -27,8 +27,11 @@ from printlog_bridge.core.adapter import PrinterUnavailable
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.backfill import (
     DEFAULT_DAYS,
+    MAX_DAYS,
+    VISIBILITIES,
     Backfill,
     BackfillStopped,
+    PrinterRefused,
     format_summary,
     since,
 )
@@ -100,7 +103,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--days",
         type=_days,
         default=DEFAULT_DAYS,
-        help=f"how many days back to go (default {DEFAULT_DAYS})",
+        help=f"how many days back to go, 1 to {MAX_DAYS} (default {DEFAULT_DAYS})",
+    )
+    backfill.add_argument(
+        "--visibility",
+        choices=VISIBILITIES,
+        default="private",
+        help="who can see the imported prints (default private; `default` is your account's "
+        "default for new prints)",
     )
     backfill.add_argument(
         "--printer",
@@ -217,8 +227,8 @@ def _days(text: str) -> int:
         days = int(text)
     except ValueError:
         days = 0
-    if days < 1:
-        raise argparse.ArgumentTypeError(f"a number of days, 1 or more, not {text!r}")
+    if not 1 <= days <= MAX_DAYS:
+        raise argparse.ArgumentTypeError(f"a number of days from 1 to {MAX_DAYS}, not {text!r}")
     return days
 
 
@@ -247,6 +257,8 @@ def _backfill(args: argparse.Namespace) -> int:
     printers = [p for p in config.printers if not args.printer or p.name in args.printer]
     states = {}
     for printer in printers:
+        if not printer.adoption.create:
+            continue  # skipped, saying why, once the backfill starts
         state = PrinterState.peek(config.state_dir, printer.name)
         if state is None:
             print(
@@ -260,7 +272,7 @@ def _backfill(args: argparse.Namespace) -> int:
 
     print(f"printlog-bridge {__version__} backfill")
     try:
-        return asyncio.run(_backfill_printers(config, printers, states, args.days))
+        return asyncio.run(_backfill_printers(config, printers, states, args.days, args.visibility))
     except KeyboardInterrupt:
         print("Stopped. Run it again to carry on: no job is logged twice.", file=sys.stderr)
         return 130
@@ -271,14 +283,21 @@ async def _backfill_printers(
     printers: Sequence[PrinterConfig],
     states: Mapping[str, PrinterState],
     days: int,
+    visibility: str,
 ) -> int:
     assert config.api_key is not None  # check_runnable made sure
     start = since(days, datetime.now(timezone.utc))
     code = 0
     async with ApiClient(config.api_url, config.api_key) as api:
-        runner = Backfill(api)
+        runner = Backfill(api, visibility=visibility)
         for printer in printers:
             assert printer.printer_id is not None  # check_runnable made sure
+            if not printer.adoption.create:
+                print(
+                    f"[printer {printer.name}] skipped: create_prints = false, so the bridge "
+                    "creates no prints for it, and backfill doesn't either"
+                )
+                continue
             adapter, state = printer.adapter, states[printer.name]
             adapter.use_state(state)
             print(f"[printer {printer.name}] reading its job history since {start:%Y-%m-%d}")
@@ -288,10 +307,17 @@ async def _backfill_printers(
                 print(f"[printer {printer.name}] can't read its job history: {e}", file=sys.stderr)
                 code = 1
                 continue
-            target = LoggedPrinter(printer_id=printer.printer_id, source=adapter.name)
+            target = LoggedPrinter(
+                printer_id=printer.printer_id, source=adapter.name, adoption=printer.adoption
+            )
             history = adapter.history_name or adapter.name
             try:
                 summary = await runner.run(printer.name, target, state, jobs, history=history)
+            except PrinterRefused as e:
+                print(f"[printer {printer.name}] stopped: {e}", file=sys.stderr)
+                print(format_summary(printer.name, e.summary, days))
+                code = 1
+                continue
             except BackfillStopped as e:
                 print(f"[printer {printer.name}] backfill stopped: {e}", file=sys.stderr)
                 return 1
