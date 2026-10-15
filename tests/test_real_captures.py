@@ -87,6 +87,8 @@ class TestObjects:
         assert set(objects) == {
             "print_stats", "toolhead", "virtual_sdcard", "webhooks", "filament_detect",
             "exclude_object",
+            # A runout sensor per tool (#44).
+            *(f"filament_motion_sensor e{n}_filament" for n in range(4)),
         }  # fmt: skip
         assert len(status["filament_detect"]["info"]) == 4
         assert status["toolhead"]["extruder"] == "extruder"
