@@ -16,6 +16,12 @@ kept in `images/` in the state directory until it is sent. A picture never holds
 one that can't be fetched in time is skipped, and one the API refuses, or keeps failing to take,
 is dropped so the print's completion behind it goes through.
 
+Files attached to the print (a timelapse video, #42) take the same path, kept in `attachments/`
+until sent, with what sets them apart: they are a Pro feature, so the account's plan is asked
+first and nothing is fetched or uploaded without Pro; they can be large, so they are streamed to
+disk under `max_attachment_bytes` and uploaded straight to storage; and while one waits or
+uploads, other prints' events go first.
+
 A print the user made themselves (the Slic3r uploader, the Cura plugin, or by hand) is adopted
 rather than duplicated: before creating one, the bridge looks for an unclaimed print in Printing
 on the same printer, made within `adopt_window`, for the same file, claims the newest, and logs
@@ -38,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -55,8 +62,10 @@ from printlog_bridge.core.api_client import (
 )
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
+    AttachmentKind,
     FilamentChange,
     ImageKind,
+    JobAttachment,
     JobEvent,
     JobFinished,
     JobImage,
@@ -64,7 +73,15 @@ from printlog_bridge.core.events import (
     JobSlicerSettings,
     JobStarted,
 )
-from printlog_bridge.core.images import EXTENSIONS, MAX_IMAGE_BYTES, ImageUnavailable, image_type
+from printlog_bridge.core.images import (
+    EXTENSIONS,
+    MAX_IMAGE_BYTES,
+    VIDEO_EXTENSIONS,
+    FileUnavailable,
+    ImageUnavailable,
+    image_type,
+    video_type,
+)
 from printlog_bridge.core.outbox import Entry, Outbox, utc_now
 from printlog_bridge.core.slicer_settings import OUTBOX_KIND, request_body
 from printlog_bridge.core.spools import Spools
@@ -111,8 +128,11 @@ STORAGE_ERRORS = (OSError, sqlite3.Error)
 """A full or read-only disk, or an outbox another process holds locked past SQLite's timeout."""
 START, FINISH = "start", "finish"
 IMAGE_KINDS = frozenset(kind.value for kind in ImageKind)
+ATTACHMENT_KINDS = frozenset(kind.value for kind in AttachmentKind)
+FILE_KINDS = IMAGE_KINDS | ATTACHMENT_KINDS
+"""Entries whose file waits in the state directory (`images/`, `attachments/`) to be sent."""
 SLICER_SETTINGS = OUTBOX_KIND
-OPTIONAL_KINDS = IMAGE_KINDS | {SLICER_SETTINGS}
+OPTIONAL_KINDS = FILE_KINDS | {SLICER_SETTINGS}
 """Entries that must never hold up their print: given up on after `IMAGE_MAX_ATTEMPTS`."""
 NO_SLICER_SETTINGS = (405, 501)
 """What an API without the slicer settings endpoint (api#164) may answer it with. Its plain
@@ -133,6 +153,14 @@ EARLIER_READ_NOTE = (
     "isn't reflected. Check which spool this print used."
 )
 IMAGES_DIR = "images"
+ATTACHMENTS_DIR = "attachments"
+ATTACHMENT_TIMEOUT_S = 10 * 60.0
+"""How long the bridge waits on an adapter for a file to attach, such as a video it downloads."""
+DEFAULT_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+MIN_FREE_BYTES = 50 * 1024 * 1024
+"""A file to attach is never fetched into the last this much of the state directory's disk."""
+PLAN_CHECK_S = 60 * 60
+"""How long the account's plan (whether it has Pro, which attachments need) is taken as known."""
 IMAGE_TIMEOUT_S = 15.0
 """How long the bridge waits on an adapter for a picture. Adapters give up after 10 s."""
 IMAGE_MAX_ATTEMPTS = 10
@@ -180,11 +208,14 @@ class JobLogger:
         clock: Callable[[], datetime] = utc_now,
         image_timeout: float = IMAGE_TIMEOUT_S,
         spools: Spools | None = None,
+        max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+        attachment_timeout: float = ATTACHMENT_TIMEOUT_S,
     ) -> None:
         """`before_create(printer)` runs before each print is created. The bridge registers the
         printer's connection there, so the print links to it; ApiUnavailable from it holds the
         print back for the next try, anything else is logged and the print goes ahead. With
-        `spools`, each print's usage rows are linked to the spools loaded in their slots."""
+        `spools`, each print's usage rows are linked to the spools loaded in their slots. A file
+        to attach larger than `max_attachment_bytes` is skipped."""
         self.api = api
         self.spools = spools
         self.printers = dict(printers)
@@ -193,7 +224,12 @@ class JobLogger:
         self.board = board
         self.before_create = before_create
         self.image_timeout = image_timeout
+        self.max_attachment_bytes = max_attachment_bytes
+        self.attachment_timeout = attachment_timeout
         self.images_dir = state_dir / IMAGES_DIR
+        self.attachments_dir = state_dir / ATTACHMENTS_DIR
+        self._plan: tuple[bool, float] | None = None
+        """Whether the account has Pro, and when the API said (on the event loop's clock)."""
         self.outbox = Outbox.open(state_dir, clock=clock)
         self._outcomes: dict[str, tuple[str, JobOutcome]] = {}
         """Each printer's last job seen ending in this run, and how it ended, for whether its
@@ -239,10 +275,10 @@ class JobLogger:
         """Queues the event in the outbox, on disk, unless it's a replay. Never waits on the API.
 
         When the state directory can't be written (a full disk), the event is kept in memory and
-        queued, in order, once it can be, and `status` shows a warning meanwhile. A picture, or
-        the slicer settings, is skipped instead: it is fetched now or never.
+        queued, in order, once it can be, and `status` shows a warning meanwhile. A picture, the
+        slicer settings, or a file to attach, is skipped instead: it is fetched now or never.
         """
-        optional = isinstance(event, (JobImage, JobSlicerSettings))
+        optional = isinstance(event, (JobImage, JobSlicerSettings, JobAttachment))
         if self._unqueued and not optional:
             self._unqueued.append(event)  # nothing jumps ahead of what waits to be queued
             return
@@ -278,6 +314,8 @@ class JobLogger:
             await self._emit_image(state, event)
         elif isinstance(event, JobSlicerSettings):
             await self._emit_slicer_settings(state, event)
+        elif isinstance(event, JobAttachment):
+            await self._emit_attachment(state, event)
         elif isinstance(event, FilamentChange):
             self._filament_changed(state, event)
         elif isinstance(event, JobStarted):
@@ -465,14 +503,123 @@ class JobLogger:
             log.debug("%s: there is none", where)
         return data
 
-    def _remove_stray_images(self) -> None:
-        """Image files no outbox entry needs: left by a power cut between writing and queueing."""
-        if not self.images_dir.is_dir():
+    async def _emit_attachment(self, state: PrinterState, event: JobAttachment) -> None:
+        kind = event.kind.value
+        where = f"[printer {event.printer}] job {event.job_id}'s {kind}"
+        job = state.jobs.get(event.job_id)
+        if job is None or kind in job.attachments:
+            return  # a job the bridge isn't logging, or a file it already has
+        if await self._can_attach() is False:
+            log.info("%s isn't attached: attaching files to prints needs 3D Print Log Pro", where)
+            job.attachments[kind] = False
+            state.save()
             return
-        wanted = {e.payload.get("file") for e in self.outbox.entries() if e.kind in IMAGE_KINDS}
-        for path in self.images_dir.iterdir():
-            if path.name not in wanted:
-                _unlink(path)
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
+        room = shutil.disk_usage(self.attachments_dir).free - MIN_FREE_BYTES
+        limit = min(self.max_attachment_bytes, room)
+        content_type = None
+        temporary = self.attachments_dir / (
+            safe_file_name(f"{event.printer}-{event.job_id}-{kind}") + ".tmp"
+        )
+        if limit <= 0:
+            log.warning("%s is skipped: the state directory's disk is nearly full", where)
+        else:
+            try:
+                if await self._fetch_attachment(event, temporary, limit, where):
+                    with temporary.open("rb") as f:
+                        content_type = video_type(f.read(16))
+                    if content_type is None:
+                        log.info("%s isn't an MP4 video; skipping it", where)
+            finally:
+                if content_type is None:
+                    _unlink(temporary)
+        if content_type is None:
+            job.attachments[kind] = False
+            state.save()
+            return
+
+        name = temporary.stem + VIDEO_EXTENSIONS[content_type]
+        os.replace(temporary, self.attachments_dir / name)
+        self._queue(
+            event.printer,
+            event.job_id,
+            kind,
+            {
+                "file": name,
+                "name": event.file_name,
+                "content_type": content_type,
+                "size": (self.attachments_dir / name).stat().st_size,
+            },
+        )
+        # Marked only once queued, as a picture is (see _emit_image).
+        job.attachments[kind] = True
+        state.save()
+
+    async def _fetch_attachment(
+        self, event: JobAttachment, path: Path, limit: int, where: str
+    ) -> bool:
+        """Whether the adapter wrote the file to `path`: False when there's none, it fails, or
+        it takes too long."""
+        task = asyncio.ensure_future(event.fetch(path, limit))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self.attachment_timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not done:
+            task.cancel()
+            log.info("%s took longer than %gs; skipping it", where, self.attachment_timeout)
+            return False
+        try:
+            found = task.result()
+        except FileUnavailable as e:
+            log.info("%s: %s; skipping it", where, e)
+            return False
+        except Exception as e:
+            # Not the exception's text: it could hold a URL with a password.
+            log.warning("%s couldn't be fetched (%s); skipping it", where, type(e).__name__)
+            return False
+        if not found:
+            log.debug("%s: there is none", where)
+        return bool(found)
+
+    async def _can_attach(self) -> bool | None:
+        """Whether the account can attach files to prints (Pro); None when the API can't say."""
+        try:
+            return await self._has_pro()
+        except Exception as e:
+            log.debug("couldn't ask 3D Print Log for the account's plan: %s", e)
+            return None
+
+    async def _has_pro(self) -> bool:
+        """Whether the account has Pro, as the API said within `PLAN_CHECK_S`. Raises what the
+        API client raises when it has to ask and can't."""
+        now = asyncio.get_running_loop().time()
+        if self._plan is not None and now - self._plan[1] < PLAN_CHECK_S:
+            return self._plan[0]
+        plan = await self.api.subscription()
+        pro = bool(isinstance(plan, Mapping) and plan.get("isPro"))
+        self._plan = (pro, now)
+        return pro
+
+    def _extra_file(self, entry: Entry) -> Path:
+        """Where a picture's or an attachment's file waits to be sent."""
+        folder = self.attachments_dir if entry.kind in ATTACHMENT_KINDS else self.images_dir
+        return folder / str(entry.payload.get("file"))
+
+    def _remove_stray_images(self) -> None:
+        """Image and attachment files no outbox entry needs: left by a power cut between writing
+        and queueing, or a fetch cut off when the bridge stopped."""
+        entries = [e for e in self.outbox.entries() if e.kind in FILE_KINDS]
+        for folder in (self.images_dir, self.attachments_dir):
+            if not folder.is_dir():
+                continue
+            wanted = {
+                self._extra_file(e).name for e in entries if self._extra_file(e).parent == folder
+            }
+            for path in folder.iterdir():
+                if path.name not in wanted:
+                    _unlink(path)
 
     # -- sending -------------------------------------------------------------------------------
 
@@ -523,6 +670,8 @@ class JobLogger:
             due = [e for e in heads if self._due.get(e.seq, 0.0) <= now]
             if not due:
                 return min(self._due[e.seq] for e in heads) - now
+            # A print's start or end never waits behind another print's long upload.
+            due.sort(key=lambda e: e.kind in ATTACHMENT_KINDS)
             await self._send(due[0])
 
     async def _send(self, entry: Entry) -> None:
@@ -533,6 +682,8 @@ class JobLogger:
                 await self._send_start(entry)
             elif entry.kind == SLICER_SETTINGS:
                 await self._send_slicer_settings(entry)
+            elif entry.kind in ATTACHMENT_KINDS:
+                await self._send_attachment(entry)
             elif image:
                 await self._send_image(entry)
             else:
@@ -618,8 +769,8 @@ class JobLogger:
         self.outbox.remove(entry.seq)
         self._due.pop(entry.seq, None)
         self._image_tries.pop(entry.seq, None)
-        if entry.kind in IMAGE_KINDS:
-            _unlink(self.images_dir / str(entry.payload.get("file")))
+        if entry.kind in FILE_KINDS:
+            _unlink(self._extra_file(entry))
 
     def _retry_later(self, entry: Entry, problem: str, retry_after: float | None) -> None:
         loop = asyncio.get_running_loop()
@@ -654,10 +805,10 @@ class JobLogger:
             self._due.pop(entry.seq, None)
             self._image_tries.pop(entry.seq, None)
             if entry.kind in OPTIONAL_KINDS:
-                # Only the picture (or the slicer settings) is lost; the print's own events are
-                # judged on their own.
-                if entry.kind in IMAGE_KINDS:
-                    _unlink(self.images_dir / str(entry.payload.get("file")))
+                # Only the picture (or the slicer settings, or the video) is lost; the print's
+                # own events are judged on their own.
+                if entry.kind in FILE_KINDS:
+                    _unlink(self._extra_file(entry))
                 continue
             state = self.state(entry.printer)
             job = state.jobs.get(entry.job_id)
@@ -770,6 +921,43 @@ class JobLogger:
     def _no_slicer_settings(self) -> bool:
         until = self._no_slicer_settings_until
         return until is not None and self.clock() < until
+
+    async def _send_attachment(self, entry: Entry) -> None:
+        """Attaches the file: an upload URL from the API, the file to storage, then confirmed."""
+        where = f"[printer {entry.printer}] job {entry.job_id}'s {entry.kind}"
+        job = self.state(entry.printer).jobs.get(entry.job_id)
+        if job is None or job.print_id is None:
+            log.info("%s has no print to go on (the print wasn't logged); dropping it", where)
+            return
+        if not await self._has_pro():
+            log.info("%s isn't attached: attaching files to prints needs 3D Print Log Pro", where)
+            return
+        path = self._extra_file(entry)
+        if not path.is_file():
+            log.warning("%s is gone from %s; skipping it", where, self.attachments_dir)
+            return
+        payload = entry.payload
+        name, content_type = str(payload["name"]), str(payload["content_type"])
+        size = int(payload["size"])
+        files = await self.api.print_files(job.print_id)
+        if files is not None and any(
+            f.get("originalFileName") == name and f.get("sizeBytes") == size for f in files
+        ):
+            return  # attached already, and the answer to its confirm was lost
+        upload = None
+        if files is not None:
+            upload = await self.api.attachment_upload_url(job.print_id, name, content_type, size)
+        if upload is not None:
+            await self.api.upload_to_storage(str(upload["sasUrl"]), path, content_type)
+            if await self.api.confirm_attachment(
+                job.print_id, str(upload["blobPath"]), name, content_type, size
+            ):
+                self._logged(
+                    entry.printer,
+                    f"job {entry.job_id}: {entry.kind} attached to print {job.print_id}",
+                )
+                return
+        log.info("%s: print %s was deleted in 3D Print Log", where, job.print_id)
 
     async def _send_finish(self, entry: Entry) -> None:
         state = self.state(entry.printer)
@@ -1212,7 +1400,9 @@ def _finish_event(entry: Entry) -> JobFinished:
 
 def _what(event: JobEvent) -> str:
     """What an optional event brings, for a log line: `thumbnail`, `slicer settings`..."""
-    return event.kind.value if isinstance(event, JobImage) else "slicer settings"
+    if isinstance(event, (JobImage, JobAttachment)):
+        return event.kind.value
+    return "slicer settings"
 
 
 def _unlink(path: Path) -> None:

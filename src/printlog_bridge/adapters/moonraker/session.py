@@ -260,6 +260,7 @@ class MoonrakerSession:
         socket: Path | None = None,
         api_key: str | None = None,
         remote_methods: Mapping[str, RemoteMethod] | None = None,
+        notifications: Mapping[str, Callable[[Any], Awaitable[None]]] | None = None,
         backoff: Backoff | None = None,
         report: PrinterReport | None = None,
         trace: Trace | None = None,
@@ -273,6 +274,9 @@ class MoonrakerSession:
         self.socket = socket
         self.api_key = api_key
         self.remote_methods = dict(remote_methods or {})
+        self.notifications = dict(notifications or {})
+        """Handlers for other notifications by method, such as a component's own
+        (`notify_timelapse_event`), each given the notification's params."""
         self.backoff = backoff or Backoff()
         self.report = report or NullReport()
         self.trace = trace
@@ -423,6 +427,8 @@ class MoonrakerSession:
             await self._klippy_state(method[len("notify_klippy_") :])
         elif method in self.remote_methods:
             await self.remote_methods[method](params or {})
+        elif method in self.notifications:
+            await self.notifications[method](params)
 
     async def _subscribe(self, rpc: _JsonRpc) -> None:
         try:

@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Protocol, Union
 
 
@@ -154,7 +155,34 @@ class JobSlicerSettings:
     )
 
 
-JobEvent = Union[JobStarted, JobFinished, JobImage, JobSlicerSettings, FilamentChange]
+class AttachmentKind(Enum):
+    TIMELAPSE = "timelapse"
+    """The job's timelapse video (moonraker-timelapse), reported once it is rendered."""
+
+
+@dataclass(frozen=True)
+class JobAttachment:
+    """A file to attach to the job's print, a Pro feature of 3D Print Log (#42).
+
+    The sink calls `fetch(path, max_bytes)` only when it still wants the file and the account
+    can have it. `fetch` writes the file to `path`, never more than `max_bytes` of it, and
+    returns False when there is none to be had. It raises `FileUnavailable` (`core/images.py`)
+    with a message safe to log when it can't get it, or when the file is larger. Unlike a
+    picture, the event may come long after the job's end (a video is rendered first), and its
+    fetch may take minutes; the sink gives it `ATTACHMENT_TIMEOUT_S`.
+    """
+
+    printer: str
+    job_id: str
+    kind: AttachmentKind
+    file_name: str
+    """The name the attachment is given in 3D Print Log, without folders."""
+    fetch: Callable[[Path, int], Awaitable[bool]] = field(compare=False, repr=False)
+
+
+JobEvent = Union[
+    JobStarted, JobFinished, JobImage, JobSlicerSettings, JobAttachment, FilamentChange
+]
 
 
 class EventSink(Protocol):

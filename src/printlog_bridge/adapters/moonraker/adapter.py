@@ -44,6 +44,7 @@ from .session import (
 )
 from .spoolman import SpoolmanSync
 from .spools import SpoolWatcher
+from .timelapse import TimelapseWatcher
 from .u1_rfid import U1RfidReader
 
 log = logging.getLogger(__name__)
@@ -59,7 +60,9 @@ DISCOVERY_OPTIONS = frozenset(
         "discovery_networks",
     }
 )
-OPTIONS = frozenset({"url", "socket", "moonraker_api_key", "snapshots"}) | DISCOVERY_OPTIONS
+OPTIONS = (
+    frozenset({"url", "socket", "moonraker_api_key", "snapshots", "timelapse"}) | DISCOVERY_OPTIONS
+)
 MIN_DISCOVERY_INTERVAL_S = 30
 """Searches no more often than this, so a network isn't swept over and over."""
 MAX_DISCOVERY_NETWORKS = 16
@@ -88,6 +91,7 @@ class MoonrakerAdapter(Adapter):
         snapshots: bool = True,
         discovery: bool = True,
         discovery_options: Mapping[str, object] | None = None,
+        timelapse: bool = True,
     ) -> None:
         self.printer = printer
         self.url = url
@@ -95,6 +99,8 @@ class MoonrakerAdapter(Adapter):
         self.api_key = api_key
         self.snapshots = snapshots
         """Whether a frame from the printer's webcam is added to each print when it ends."""
+        self.timelapse = timelapse
+        """Whether moonraker-timelapse's video of each print is attached to it (Pro)."""
         self.discovery = discovery and url is not None
         """In remote mode, whether to find the printer again when its address changes."""
         self.spools: SpoolSink | None = None
@@ -122,6 +128,7 @@ class MoonrakerAdapter(Adapter):
 
         api_key = options.get("moonraker_api_key", "").strip() or None
         snapshots = _boolean(printer, options, "snapshots")
+        timelapse = _boolean(printer, options, "timelapse")
         discovery = _boolean(printer, options, "discovery")
         discovery_options = _discovery_options(printer, options)
 
@@ -141,6 +148,7 @@ class MoonrakerAdapter(Adapter):
                 snapshots=snapshots,
                 discovery=discovery,
                 discovery_options=discovery_options,
+                timelapse=timelapse,
             )
 
         if api_key is not None:
@@ -156,7 +164,7 @@ class MoonrakerAdapter(Adapter):
             )
 
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
-        return cls(printer, url=None, socket=socket, snapshots=snapshots)
+        return cls(printer, url=None, socket=socket, snapshots=snapshots, timelapse=timelapse)
 
     def mode(self) -> str:
         return "local" if self.url is None else "remote"
@@ -172,6 +180,8 @@ class MoonrakerAdapter(Adapter):
 
             def moved(url: str) -> None:
                 self.url = images.url = url
+                if timelapse is not None:
+                    timelapse.url = url
 
             locator = Locator(
                 self.printer,
@@ -191,7 +201,14 @@ class MoonrakerAdapter(Adapter):
             api_key=self.api_key,
             snapshots=self.snapshots,
         )
-        tracker = JobTracker(self.printer, sink, report, images)
+        timelapse = (
+            TimelapseWatcher(
+                self.printer, sink, url=self.url, socket=self.socket, api_key=self.api_key
+            )
+            if self.timelapse
+            else None
+        )
+        tracker = JobTracker(self.printer, sink, report, images, timelapse)
         listeners: list[MoonrakerListener] = [tracker]
         unwatch = None
         if self.spools is not None:
@@ -221,6 +238,9 @@ class MoonrakerAdapter(Adapter):
             report=report,
             trace=self.trace,
             locator=locator,
+            notifications=(
+                {"notify_timelapse_event": timelapse.on_event} if timelapse is not None else None
+            ),
         )
         try:
             await session.run()

@@ -4,8 +4,9 @@
 - No toolpaths leave the printer: of a G-code file only its header and its slicer settings
   block are read, by byte range, scrubbed of hosts and credentials, and nothing at all with
   `slicer_settings = false`.
-- It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS, and
-  it never listens on a port.
+- It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (with
+  Pro, also the storage 3D Print Log names for a timelapse video), and it never listens on a
+  port.
 - Secrets (the API key, Moonraker's key, passwords and tokens in URLs) never reach the log,
   the status file, `status`, `doctor` or the support bundle.
 """
@@ -26,7 +27,7 @@ import bridge_helpers as helpers
 import pytest
 import yarl
 from fake_moonraker import FakeMoonraker, eventually, gcode_metadata
-from fake_printlog_api import FakePrintLogApi
+from fake_printlog_api import SAS_SIGNATURE, FakePrintLogApi
 from fake_webcam import JPEG, FakeWebcam
 
 from printlog_bridge import __version__
@@ -47,7 +48,7 @@ API_KEY = "plk-SECRET-api-key-0001"
 MOONRAKER_KEY = "mrk-SECRET-moonraker-0002"
 PASSWORD = "SECRET-hunter2"
 WEBCAM_TOKEN = "SECRET-camtoken"
-SECRETS = (API_KEY, MOONRAKER_KEY, PASSWORD, WEBCAM_TOKEN)
+SECRETS = (API_KEY, MOONRAKER_KEY, PASSWORD, WEBCAM_TOKEN, SAS_SIGNATURE)
 WAIT_S = 20.0
 
 SLICER_SECRET = "SECRET-printhost-key"
@@ -96,6 +97,11 @@ API_CALLS = [
     ("PUT", r"/api/Printers/\d+/slots/\d+"),
     ("DELETE", r"/api/Printers/\d+/slots/\d+"),
     ("PUT", r"/api/Printers/\d+"),
+    # A timelapse video, with Pro (#42).
+    ("GET", r"/api/Subscription/me"),
+    ("GET", r"/api/Prints/\d+/files"),
+    ("POST", r"/api/Prints/\d+/files/upload-url"),
+    ("POST", r"/api/Prints/\d+/files/confirm"),
 ]
 CREATE_FIELDS = {
     "printerId", "title", "fileName", "startDate", "status", "viewStatus", "allowComments",
@@ -124,6 +130,9 @@ CONNECTION_FIELDS = {
 HOSTNAME = "klipper-host-7f3a"
 """The host name Klipper reports in `printer.info`, which never leaves the printer."""
 SLOT_FIELDS = {"filamentId", "slotLabel"}
+UPLOAD_URL_FIELDS = {"fileName", "contentType", "sizeBytes"}
+CONFIRM_FIELDS = {"blobPath", "fileName", "contentType", "sizeBytes"}
+MP4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"\x00" * 1000
 
 
 def with_password(url: str, user: str = "maker") -> str:
@@ -189,11 +198,14 @@ async def one_print(
     snapshots: bool = True,
     webcam_status: int = 200,
     slicer_settings: bool = True,
+    timelapse: bool = False,
 ):
     """A whole print, start to end, through the bridge in remote mode, with a Moonraker that
-    needs a key, a URL with a password, and a webcam that needs a password and a token."""
-    moonraker = FakeMoonraker(api_key=MOONRAKER_KEY, hostname=HOSTNAME)
+    needs a key, a URL with a password, and a webcam that needs a password and a token. With
+    `timelapse`, moonraker-timelapse renders its video, and the account has Pro."""
+    moonraker = FakeMoonraker(api_key=MOONRAKER_KEY, hostname=HOSTNAME, timelapse=timelapse)
     api = FakePrintLogApi(api_key=API_KEY)
+    api.pro = timelapse
     cam = FakeWebcam(credentials=("cam", PASSWORD), status=webcam_status)
     moonraker_url, api_url, cam_url = await moonraker.start(), await api.start(), await cam.start()
     moonraker.files["benchy.gcode"] = GCODE
@@ -236,6 +248,9 @@ async def one_print(
                 await eventually(lambda: len(api.images) == 2, WAIT_S)
             else:
                 await asyncio.sleep(0.3)
+            if timelapse:
+                await moonraker.render_timelapse("benchy.gcode", MP4)
+                await eventually(lambda: api.attachments.get(1), WAIT_S)
             # Moonraker restarts: the reason is logged and kept for `status`.
             await moonraker.drop()
             await eventually(lambda: moonraker.client_count == 1, WAIT_S)
@@ -257,6 +272,7 @@ async def one_print(
             "moonraker": yarl.URL(moonraker_url).port,
             "api": yarl.URL(api_url).port,
             "webcam": yarl.URL(cam_url).port,
+            "storage": api.store_port,
         },
     }
 
@@ -401,6 +417,39 @@ class TestWhatIsSent:
         assert "Printer voron" in text
         for secret in SECRETS:
             assert secret not in text
+
+
+def test_a_timelapse_goes_to_storage_with_only_the_listed_fields_and_no_secret(
+    tmp_path, monkeypatch
+):
+    with bridge_logs() as logs, recording_connections(monkeypatch) as contacted:
+        result = asyncio.run(one_print(tmp_path, timelapse=True))
+
+    api, ports = result["api"], result["ports"]
+    assert api.attached(1) == [MP4]
+    for method, path in api.requests:
+        assert any(method == m and re.fullmatch(pattern, path) for m, pattern in API_CALLS), (
+            f"{method} {path} isn't in docs/privacy.md"
+        )
+    for body in api.upload_requests:
+        assert set(body) == UPLOAD_URL_FIELDS
+    for body in api.confirms:
+        assert set(body) == CONFIRM_FIELDS
+    # Storage is told nothing but the file: not the API key, not Moonraker's.
+    for headers in api.blob_puts:
+        assert not {k.lower() for k in headers} & {"x-api-key", "authorization", "cookie"}
+        for secret in SECRETS[:-1]:
+            assert secret not in str(headers)
+    assert {port for _, port in contacted} == {
+        ports["moonraker"],
+        ports["api"],
+        ports["webcam"],
+        ports["storage"],
+    }
+    for secret in SECRETS:
+        assert secret not in logs.text
+        for name, text in state_files(result["state"]).items():
+            assert secret not in text, name
 
 
 def test_with_snapshots_off_the_webcam_is_never_asked(tmp_path, monkeypatch):

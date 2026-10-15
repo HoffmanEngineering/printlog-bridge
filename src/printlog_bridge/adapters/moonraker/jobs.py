@@ -45,6 +45,7 @@ from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
 from .slicer import MoonrakerSlicerFiles, slicer_metadata
 from .spools import RESPOND_MACRO, answer_script
+from .timelapse import TimelapseWatcher
 from .tools import PRINTING, ToolUsage, estimated_grams_by_slot, per_slot, slot_of
 
 log = logging.getLogger(__name__)
@@ -73,12 +74,14 @@ class JobTracker:
         sink: EventSink,
         report: PrinterReport | None = None,
         images: MoonrakerImages | None = None,
+        timelapse: TimelapseWatcher | None = None,
     ) -> None:
         self.printer = printer
         self.sink = sink
         self.report = report or NullReport()
         self.images = images
         self.slicer = MoonrakerSlicerFiles(printer, images) if images is not None else None
+        self.timelapse = timelapse
         self._error_message: str | None = None
         self._call: Call | None = None
         self._usage = ToolUsage()
@@ -94,6 +97,8 @@ class JobTracker:
     async def on_connected(self, call: Call) -> None:
         self._call = call
         self._can_respond = None
+        if self.timelapse is not None:
+            await self.timelapse.on_connected(call)
         try:
             jobs = await self._jobs_to_replay(call)
         except MoonrakerRpcError as e:
@@ -181,12 +186,15 @@ class JobTracker:
         task.add_done_callback(self._tasks.discard)
 
     async def close(self) -> None:
-        """Cancels the console prompts still being shown, and waits for them to stop."""
+        """Cancels the console prompts still being shown, and the timelapse videos still being
+        fetched, and waits for them to stop."""
         tasks = list(self._tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self.timelapse is not None:
+            await self.timelapse.close()
 
     async def on_gcode_response(self, line: str) -> None:
         pass
@@ -251,6 +259,8 @@ class JobTracker:
             tracked = self._usage.take(filename) if latest else {}
             excluded = self._excluded.take(filename) if latest else None
             await self.sink.emit(finished(self.printer, job, message, tracked, excluded))
+            if live and self.timelapse is not None:
+                self.timelapse.job_ended(start.job_id, start.file_name)
             if live and images is not None and images.snapshots and call is not None:
                 await self.sink.emit(
                     JobImage(

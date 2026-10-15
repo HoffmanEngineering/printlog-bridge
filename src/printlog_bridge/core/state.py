@@ -43,6 +43,9 @@ class JobRecord:
     print_with_settings: int | None = None
     """A print the lookup for prints to adopt said already has slicer settings (the Slic3r
     uploader's or the Cura plugin's). Adopted, it keeps them and the bridge's aren't sent."""
+    attachments: dict[str, bool] = field(default_factory=dict)
+    """Each file already fetched to attach to the print (`timelapse`), and whether it was
+    queued, so a render announced again is never fetched or attached twice."""
     claiming: int | None = None
     """The print being adopted, from just before the claim is sent until `print_id` is set, so
     a claim whose answer was lost is sent again rather than a second print created."""
