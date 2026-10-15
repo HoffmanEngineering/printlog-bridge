@@ -26,6 +26,15 @@ class Adapter(ABC):
     name: ClassVar[str]
     """What `adapter = ...` names in the config file."""
 
+    snapshots: bool | None = None
+    """Whether a frame from the printer's webcam is added to each print when it ends, for the
+    connection's heartbeat. None for an adapter that never takes one."""
+
+    def mode(self) -> str | None:
+        """How the adapter reaches the printer, `local` or `remote`, for the connection's
+        heartbeat. Optional: None for an adapter without modes. Never the address itself."""
+        return None
+
     @classmethod
     @abstractmethod
     def from_config(cls, printer: str, options: Mapping[str, str]) -> Adapter:

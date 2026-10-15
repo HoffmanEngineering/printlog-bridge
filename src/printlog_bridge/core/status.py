@@ -57,6 +57,14 @@ class PrinterReport(Protocol):
         """The printer was found at a new address (`old` and `new` are hosts, `at` when, ISO
         8601, defaulting to now)."""
 
+    def software(self, name: str, version: str) -> None:
+        """The version of the printer's `name` software (`klipper`, `moonraker`), sent with the
+        connection's heartbeat."""
+
+    def printer_model(self, model: str) -> None:
+        """The printer's model, as the slicer named it in a job's file, sent with the heartbeat.
+        Never a host name or anything the user typed for the printer."""
+
 
 class NullReport:
     """A PrinterReport that keeps nothing, for code run outside `printlog-bridge run`."""
@@ -76,9 +84,16 @@ class NullReport:
     def moved(self, old: str, new: str, at: str | None = None) -> None:
         pass
 
+    def software(self, name: str, version: str) -> None:
+        pass
+
+    def printer_model(self, model: str) -> None:
+        pass
+
 
 class StatusBoard:
     def __init__(self, state_dir: Path, clock: Clock = utc_now) -> None:
+        self.state_dir = state_dir
         self.path = state_dir / STATUS_FILE
         self.clock = clock
         self._data: dict[str, Any] = {}
@@ -105,6 +120,8 @@ class StatusBoard:
                     "last_heartbeat_at": None,
                     "warnings": {},
                     "moved": None,
+                    "software": {},
+                    "printer_model": None,
                 }
                 for name in printers
             },
@@ -209,6 +226,17 @@ class BoardReport:
         self.board.update(
             self.printer, moved={"from": old, "to": new, "at": at or self.board._now()}
         )
+
+    def software(self, name: str, version: str) -> None:
+        software = dict(self.board.get(self.printer).get("software") or {})
+        if software.get(name) == version:
+            return
+        software[name] = version
+        self.board.update(self.printer, software=software)
+
+    def printer_model(self, model: str) -> None:
+        if self.board.get(self.printer).get("printer_model") != model:
+            self.board.update(self.printer, printer_model=model)
 
     def event(self, text: str) -> None:
         self.board.update(self.printer, last_event=text, last_event_at=self.board._now())

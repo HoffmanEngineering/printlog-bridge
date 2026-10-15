@@ -690,6 +690,51 @@ def test_a_late_create_puts_back_what_was_loaded_before_it(tmp_path):
     assert second not in api.slot_spools(42).values()
 
 
+def test_a_late_create_puts_back_what_was_loaded_even_when_reading_again_fails(tmp_path):
+    """As above, but the read after the create fails: the spool loaded before it is loaded
+    again all the same, not left as the create's (#29)."""
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    first, second, third = (api.add_spool(f"Spool {n}") for n in "ABC")
+    api.user_loads(42, 0, first)
+    down = {"yes": True}
+    real_create, real_printer = api._create, api._printer
+    fail_read = {"armed": False}
+
+    async def create(request):
+        if down["yes"]:
+            return web.Response(status=503)
+        response = await real_create(request)
+        fail_read["armed"] = True  # the next printer read, the one after the create, fails
+        return response
+
+    async def printer(request):
+        if fail_read["armed"]:
+            fail_read["armed"] = False
+            return web.Response(status=503)
+        return await real_printer(request)
+
+    api._create, api._printer = create, printer
+
+    async def scenario():
+        async with (
+            fakes(tmp_path, moonraker, api) as config,
+            running(config, moonraker, backoff=FAST),
+        ):
+            await split_job(moonraker, second)
+            await moonraker.set_status(print_stats={"state": "complete"})
+            answers = len(moonraker.scripts)
+            await moonraker.respond(f"// printlog: SET_SPOOL TOOL=0 ID={third}")
+            await eventually(lambda: len(moonraker.scripts) > answers)
+            down["yes"] = False
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    # Slot 0's wins; the create's A stays loaded with no slot, as when the read works.
+    assert api.slot_spools(42)[0] == third
+    assert second not in api.slot_spools(42).values()
+
+
 def test_a_job_with_no_swaps_isnt_frozen(tmp_path):
     """Only a split is worked out once: any other job's end is read afresh on each try."""
     moonraker, api = FakeMoonraker(), FakePrintLogApi()

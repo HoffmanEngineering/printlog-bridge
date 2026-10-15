@@ -453,7 +453,44 @@ class TestStatusReport:
 
         [(_, reason)] = report.named("disconnected")
         assert "Moonraker" in reason
-        assert report.calls[-1][0] in ("connected", "printer_state")
+        # After the reconnect: connected, then Klipper's state and the versions (#37).
+        assert report.calls[-1][0] in ("connected", "printer_state", "software")
+
+    def test_reports_moonrakers_and_klippers_versions(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker() as (fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: len(report.named("software")) >= 2)
+            return report
+
+        report = asyncio.run(scenario())
+
+        assert sorted(report.named("software")) == [
+            ("software", "klipper", "v0.12.0-fake"),
+            ("software", "moonraker", "v0.9.3-fake"),
+        ]
+
+    def test_reports_klippers_version_once_it_is_ready(self):
+        async def scenario():
+            report = ReportRecorder()
+            async with (
+                fake_moonraker(klippy_state="startup") as (fake, base),
+                running(session_for(base, Recorder(), report=report)),
+            ):
+                await eventually(lambda: report.named("printer_state"))
+                before = list(report.named("software"))
+                fake.klippy_state = "ready"
+                await fake.notify("notify_klippy_ready")
+                await eventually(lambda: len(report.named("software")) >= 2)
+            return before, report
+
+        before, report = asyncio.run(scenario())
+
+        assert before == [("software", "moonraker", "v0.9.3-fake")]
+        assert ("software", "klipper", "v0.12.0-fake") in report.named("software")
 
     def test_a_refusal_is_a_warning_saying_what_to_do(self):
         async def scenario():

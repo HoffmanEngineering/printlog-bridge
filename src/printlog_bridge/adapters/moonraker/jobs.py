@@ -216,6 +216,9 @@ class JobTracker:
         self, job: Mapping[str, Any], live: bool = False, latest: bool = False
     ) -> None:
         start = started(self.printer, job)
+        model = (job.get("metadata") or {}).get("printer_model")
+        if isinstance(model, str) and model.strip():
+            self.report.printer_model(model.strip())
         if job.get("status", "in_progress") == "in_progress":
             self._job = (start.job_id, start.file_name, dict(start.estimated_filament_g_by_slot))
         elif self._job is not None and self._job[0] == start.job_id:

@@ -264,6 +264,9 @@ def test_the_next_run_starts_at_the_new_address(tmp_path):
 def test_a_different_printer_at_the_old_address_is_never_used(tmp_path):
     port = free_port()
 
+    def warnings() -> dict:
+        return read_status(tmp_path / "state")["printers"]["u1"]["warnings"]
+
     async def scenario():
         api = FakePrintLogApi()
         alice, bob = FakeMoonraker(**ALICE), FakeMoonraker(**BOB)
@@ -274,10 +277,12 @@ def test_a_different_printer_at_the_old_address_is_never_used(tmp_path):
                 await eventually(lambda: alice.subscriptions, timeout=10)
                 await alice.stop()
                 await bob.start(OLD, port)  # DHCP hands the old address to another printer
-                await eventually(lambda: "machine.system_info" in bob.calls, timeout=20)
                 await bob.start_job("not-mine.gcode")
-                await asyncio.sleep(1.5)  # time for the bridge to have used bob, if it would
-                warning = read_status(tmp_path / "state")["printers"]["u1"]["warnings"]
+                # Until the bridge has connected to bob and turned it down. Not just until bob
+                # is asked who it is: the scan asks that too, and it reaches the old address
+                # before the rest of 127.0.0.0/24, which takes seconds on Windows.
+                await eventually(lambda: "discovery" in warnings(), timeout=30)
+                warning = warnings()
 
                 await alice.start(NEW, port)  # alice turns up elsewhere
                 await eventually(lambda: len(alice.subscriptions) == 2, timeout=20)

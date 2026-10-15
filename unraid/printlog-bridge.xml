@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<!--
+  Unraid template for printlog-bridge in remote mode. Install it with
+    wget -O /boot/config/plugins/dockerMan/templates-user/my-printlog-bridge.xml \
+      https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/unraid/printlog-bridge.xml
+  then Docker > Add Container > Template > printlog-bridge. The README's "On Unraid" section has
+  the config and the API key. Unraid passes the server's time zone as TZ itself.
+-->
+<Container version="2">
+  <Name>printlog-bridge</Name>
+  <Repository>ghcr.io/hoffmanengineering/printlog-bridge:edge</Repository>
+  <Registry>https://github.com/HoffmanEngineering/printlog-bridge/pkgs/container/printlog-bridge</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/HoffmanEngineering/printlog-bridge/issues</Support>
+  <Project>https://github.com/HoffmanEngineering/printlog-bridge</Project>
+  <Overview>Logs every print from your Klipper printers to 3D Print Log (3dprintlog.com) automatically. One container watches every printer listed in printlog-bridge.cfg in the data folder, over each printer's Moonraker WebSocket. Write that config and store your API key before you start it: see the project's README, "On Unraid".</Overview>
+  <Category>Tools:</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/unraid/printlog-bridge.xml</TemplateURL>
+  <Icon/>
+  <ExtraParams>--user 99:100</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <Requires>A printlog-bridge.cfg in the data folder, and an API key from https://www.3dprintlog.com/api-keys</Requires>
+  <Config Name="Data folder" Target="/data" Default="/mnt/user/appdata/printlog-bridge" Mode="rw" Description="Holds printlog-bridge.cfg (which you write) and state/ (the outbox, the key file, the log and the support bundle). It must belong to nobody:users (99:100), the user the container runs as." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/printlog-bridge</Config>
+  <Config Name="API key" Target="PRINTLOG_API_KEY" Default="" Mode="" Description="Optional. Leave it empty to use the key stored in the data folder with store-key (README). A key here is visible to anyone who can edit this container." Type="Variable" Display="always" Required="false" Mask="true"/>
+</Container>
