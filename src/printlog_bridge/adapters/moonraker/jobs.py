@@ -280,28 +280,32 @@ def started(printer: str, job: Mapping[str, Any]) -> JobStarted:
 
 
 def file_identity(metadata: Mapping[str, Any]) -> str | None:
-    """The job's file, from its metadata as the job's history entry kept it, as 40 hex digits.
+    """The job's file, from its history entry's metadata, as 40 hex digits.
 
-    Moonraker gives a file a new random `uuid` each time it extracts the file's metadata, which
-    it does whenever a file is uploaded or changed, so the uuid names this version of the file:
-    every job of it has the same one, and a re-sliced upload a new one. Older history entries,
-    and some forks, have no uuid; then the file's `size` and `modified` time stand in for it,
-    which an upload rewrites as well. Without either, there's no identity.
+    The file's `size` and `modified` time identify it: they are what Moonraker itself checks to
+    tell whether a file changed, and an upload always sets a new modified time, so every job of
+    one file has the same identity and a re-sliced upload a new one. Moonraker's `uuid` is used
+    only when either is missing: it is new each time Moonraker extracts the metadata, which can
+    happen to an unchanged file (a real U1 gave one file two uuids between two of its jobs, and
+    mainline Moonraker clears every file's metadata when its METADATA_VERSION goes up). Without
+    any of them, there's no identity.
 
-    Only the job's own history entry is read, never the file's metadata as it is now: a job
-    replayed after the file was re-sliced would otherwise take the new file's identity. And
-    never the file itself, so its content says nothing about it. Hashed, so the uuid isn't sent
+    It is read from the job's history entry as Moonraker last saved it (at the start, and again
+    at the finish), never from the file's metadata as it is now, so a job replayed after the
+    file was re-sliced keeps its own. A file can't change while it prints. A job that started
+    before Moonraker had read the file's metadata has none, and gets no identity. The file
+    itself is never read, so its content says nothing about it. Hashed, so the uuid isn't sent
     and both kinds have the 20 bytes 3D Print Log keeps (its `fileHash`, an OctoPrint SHA-1),
     each with its own prefix so the two can't meet.
     """
+    size, modified = _finite(metadata.get("size")), _finite(metadata.get("modified"))
     uuid = metadata.get("uuid")
-    if isinstance(uuid, str) and uuid.strip():
+    if size is not None and modified is not None:
+        source = f"moonraker-file:{int(size)}:{modified!r}"
+    elif isinstance(uuid, str) and uuid.strip():
         source = f"moonraker-uuid:{uuid.strip().lower()}"
     else:
-        size, modified = _finite(metadata.get("size")), _finite(metadata.get("modified"))
-        if size is None or modified is None:
-            return None
-        source = f"moonraker-file:{int(size)}:{modified!r}"
+        return None
     return hashlib.sha256(source.encode()).hexdigest()[:40]
 
 
