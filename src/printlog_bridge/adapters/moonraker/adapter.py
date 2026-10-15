@@ -30,6 +30,7 @@ from . import discovery as lan
 from .images import MoonrakerImages
 from .jobs import JobTracker
 from .locator import Locator, last_found
+from .notifier import NotifierCheck, message, old_notifiers
 from .session import (
     ConnectionLost,
     Listeners,
@@ -37,6 +38,7 @@ from .session import (
     MoonrakerListener,
     MoonrakerRpcError,
     MoonrakerSession,
+    fetch_once,
     fetch_server_info,
     where,
 )
@@ -183,12 +185,14 @@ class MoonrakerAdapter(Adapter):
             api_key=self.api_key,
             snapshots=self.snapshots,
         )
-        listener: MoonrakerListener = JobTracker(self.printer, sink, report, images)
+        listeners: list[MoonrakerListener] = [JobTracker(self.printer, sink, report, images)]
         if self.spools is not None:
             # The U1's reader only reports on a printer with `filament_detect`; elsewhere it
             # never hears from it.
-            watcher = SpoolWatcher(self.printer, self.spools, U1RfidReader(self.printer))
-            listener = Listeners(listener, watcher)
+            listeners.append(SpoolWatcher(self.printer, self.spools, U1RfidReader(self.printer)))
+        # Last, so the jobs missed while disconnected are caught up first.
+        listeners.append(NotifierCheck(self.printer, report))
+        listener = Listeners(*listeners)
         session = MoonrakerSession(
             self.printer,
             listener=listener,
@@ -239,7 +243,8 @@ class MoonrakerAdapter(Adapter):
                     f"found at {found_at} (the config says {configured}); a DHCP reservation "
                     "keeps it in one place"
                 )
-                return [CheckResult.warn(name, f"{self._detail(info)}, {moved}")]
+                result = CheckResult.warn(name, f"{self._detail(info)}, {moved}")
+                return [result, *await self._notifier_check(found_url)]
 
         try:
             info = await self._server_info(self.url)
@@ -257,8 +262,31 @@ class MoonrakerAdapter(Adapter):
 
         detail = self._detail(info)
         if info.get("klippy_state", "unknown") != "ready":
-            return [CheckResult.warn(name, detail)]
-        return [CheckResult.ok(name, detail)]
+            result = CheckResult.warn(name, detail)
+        else:
+            result = CheckResult.ok(name, detail)
+        return [result, *await self._notifier_check(self.url)]
+
+    async def _notifier_check(self, url: str | None) -> list[CheckResult]:
+        """A warning when Moonraker still has a notifier logging prints to 3D Print Log, or
+        nothing: also when its config can't be read, which `run` doesn't need."""
+        try:
+            answer = await asyncio.wait_for(
+                fetch_once(
+                    self.printer,
+                    "server.config",
+                    url=url,
+                    socket=self.socket,
+                    api_key=self.api_key,
+                ),
+                CHECK_TIMEOUT_S,
+            )
+        except (MoonrakerAuthError, *CHECK_ERRORS):
+            return []
+        found = old_notifiers(answer) if isinstance(answer, Mapping) else []
+        if not found:
+            return []
+        return [CheckResult.warn(f"Printer {self.printer} notifier", message(found))]
 
     def _last_found(self) -> str | None:
         """For `doctor`: where discovery last found the printer, from the state file it was

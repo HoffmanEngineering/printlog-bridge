@@ -30,10 +30,10 @@ That is all. In particular:
 
 - **No G-code leaves the printer.** The bridge never reads, downloads or uploads a G-code file. The thumbnail is read from the picture Moonraker extracted into `.thumbs/`, and only from a file named as a picture (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`); anything else is skipped before it is opened. A file that isn't a picture is never sent, whatever its name. Uploading the G-code is a planned opt-in (printlog-bridge#15); until it exists, nothing uploads it.
 - **No folder names or paths.** `fileName` is the file's own name; the folders it sits in on the printer are dropped.
-- **No other printer data.** Temperatures, positions, macros, the rest of `printer.cfg` and the rest of Moonraker's history stay on the printer.
+- **No other printer data.** Temperatures, positions, macros, the rest of `printer.cfg` and the rest of Moonraker's history stay on the printer. The bridge reads Moonraker's config (`server.config`) on each connect and in `doctor`, only to find a `[notifier ...]` section that already logs prints to 3D Print Log (printlog-bridge#10). Nothing from it is sent, and the warning names only the section and its file, never its URL, which holds your API key.
 - **The webcam is asked only when a print ends**, for one frame, and never when `snapshots = false` is set for the printer.
 
-Tests: `TestSpoolCalls` assigns spools by tag and by id and checks each call and field, and that the printer is sent back as read. `TestWhatIsSent` runs a whole print through the bridge and checks every call against this table and every field against these lists, that the only images uploaded are the thumbnail and the webcam frame, and that Moonraker was never asked for the G-code file. `TestGcodeIsNeverRead` points a thumbnail at the G-code file itself, and `test_with_snapshots_off_the_webcam_is_never_asked` does what it says.
+Tests: `TestSpoolCalls` assigns spools by tag and by id and checks each call and field, and that the printer is sent back as read. `TestWhatIsSent` runs a whole print through the bridge and checks every call against this table and every field against these lists, that the only images uploaded are the thumbnail and the webcam frame, and that Moonraker was never asked for the G-code file. `TestGcodeIsNeverRead` points a thumbnail at the G-code file itself, and `test_with_snapshots_off_the_webcam_is_never_asked` does what it says. `tests/test_notifier.py` runs the bridge against a Moonraker with the old notifier set up, and checks that its URL and key reach neither the log, `status.json`, `status` nor `doctor`, and that nothing about it reaches 3D Print Log.
 
 ## Where it connects
 
@@ -83,7 +83,7 @@ What a trace holds is what Moonraker tells the bridge, and what the bridge asks 
 - the printer's list of objects, its webcams (their URLs, scrubbed), and lines printed to the console;
 - the bridge's own requests, such as which objects it subscribes to.
 
-It holds no G-code. Before a line is written, every secret the support bundle removes is removed from it: your 3D Print Log API key, Moonraker's API key, passwords in URLs and secret-looking query values (a webcam's `?token=`), any field named like a key, token, secret or password, and Moonraker's answer to a request for a oneshot token or API key. The support bundle scrubs traces a second time.
+It holds no G-code. Before a line is written, every secret the support bundle removes is removed from it: your 3D Print Log API key, Moonraker's API key, passwords in URLs and secret-looking query values (a webcam's `?token=`), any field named like a key, token, secret or password, Moonraker's answer to a request for a oneshot token or API key, and Moonraker's whole answer to `server.config`, since its notifier URLs hold tokens no scrubber can find. The support bundle scrubs traces a second time.
 
 Each printer's traces stay under 50 MB, the oldest deleted first. Recording never slows the bridge, and a disk error never stops it. Turn tracing off and delete `traces/` whenever you like.
 

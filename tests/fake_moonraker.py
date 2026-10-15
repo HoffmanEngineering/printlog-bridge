@@ -2,8 +2,8 @@
 
 It speaks just enough of the protocol for the bridge: identify, server.info,
 printer.objects.list/subscribe, printer.gcode.script, connection.register_remote_method,
-server.history.list, server.files.roots, server.files.metadata and server.webcams.list, plus
-pushing notifications (console lines among them)
+server.history.list, server.files.roots, server.files.metadata, server.webcams.list and
+server.config, plus pushing notifications (console lines among them)
 and dropping every client to simulate a restart. `start_job` and `finish_job` drive a print the
 way Moonraker's history component reports one. Over HTTP it serves the gcodes root's files
 (`GET /server/files/gcodes/<path>`), which is how a remote bridge gets a thumbnail, and
@@ -20,6 +20,7 @@ download needs the `X-Api-Key` header (401 without it) whenever an API key is se
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -83,6 +84,10 @@ class FakeMoonraker:
         self.gcodes_root = "/home/pi/printer_data/gcodes"
         self.webcams: list[dict[str, Any]] = []
         """moonraker.conf's [webcam] sections, as server.webcams.list lists them."""
+        self.config: dict[str, dict[str, Any]] = {}
+        """moonraker.conf's sections, as server.config returns them."""
+        self.config_files: list[dict[str, Any]] = []
+        """Which file each section is in, as server.config's `files` lists them."""
         self.calls: list[str] = []
         """Every method called, in order."""
         self.downloads: list[str] = []
@@ -277,6 +282,12 @@ class FakeMoonraker:
             return {"filename": filename, **self.file_metadata[filename]}
         if method == "server.webcams.list":
             return {"webcams": [dict(w) for w in self.webcams]}
+        if method == "server.config":
+            return {
+                "config": copy.deepcopy(self.config),
+                "orig": {},
+                "files": copy.deepcopy(self.config_files),
+            }
         if method == "printer.gcode.script":
             self._require_klippy()
             self.scripts.append(params["script"])

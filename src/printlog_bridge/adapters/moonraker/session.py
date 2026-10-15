@@ -132,10 +132,18 @@ async def fetch_server_info(
     printer: str, *, url: str | None, socket: Path | None, api_key: str | None
 ) -> Mapping[str, Any]:
     """One `server.info` call over the same connection `run` uses, without identifying."""
+    return await fetch_once(printer, "server.info", url=url, socket=socket, api_key=api_key)
+
+
+async def fetch_once(
+    printer: str, method: str, *, url: str | None, socket: Path | None, api_key: str | None
+) -> Any:
+    """One call, without parameters, over the same connection `run` uses, without
+    identifying."""
     transport = await _open_transport(printer, url, socket, api_key)
     rpc = _JsonRpc(transport)
     try:
-        return await rpc.call("server.info")
+        return await rpc.call(method)
     except MoonrakerRpcError as e:
         if e.is_auth_failure:
             raise rejection(printer, where(url, socket), e.message) from e
