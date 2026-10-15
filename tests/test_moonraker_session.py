@@ -453,7 +453,8 @@ class TestStatusReport:
 
         [(_, reason)] = report.named("disconnected")
         assert "Moonraker" in reason
-        assert report.calls[-1][0] in ("connected", "printer_state")
+        # After the reconnect: connected, then Klipper's state and the versions (#37).
+        assert report.calls[-1][0] in ("connected", "printer_state", "software")
 
     def test_reports_moonrakers_and_klippers_versions(self):
         async def scenario():
