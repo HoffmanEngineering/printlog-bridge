@@ -34,8 +34,11 @@ from .u1_rfid import U1RfidReader
 log = logging.getLogger(__name__)
 
 COMMAND = re.compile(r"// printlog: (SET_SPOOL|CLEAR_SPOOL)((?: +[A-Z]+=\S+)*) *")
-UNSAFE = re.compile(r"[#;*\r\n]")
-"""What Klipper takes as the start of a comment (`;` `#` `*`) or the end of a command."""
+UNSAFE = re.compile(r"[#;*\\]")
+"""What can't be in an answer: what Klipper takes as the start of a comment (`;` `#` `*`), and
+`\\`, which Klipper's shlex parse of `MSG="..."` reads as an escape (one before the closing
+quote leaves it unclosed, and the answer is a malformed command that never shows). `"` becomes
+`'`, and a line break, which would end the command, a space."""
 ANSWER_PREFIX = "printlog-bridge: "
 RESPOND_MACRO = "gcode_macro _PRINTLOG_RESPOND"
 """The Klipper object `printlog.cfg`'s answering macro is, when it's included."""
