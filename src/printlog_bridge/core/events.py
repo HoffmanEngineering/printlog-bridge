@@ -34,6 +34,10 @@ class JobStarted:
     estimated_filament_g_by_slot: Mapping[int, float] = field(default_factory=dict)
     """The slicer's estimate per slot (tool index), in grams, when the file has one per tool.
     Empty for a file with a single filament, whose estimate is the totals above."""
+    file_identity: str | None = None
+    """The job's file, as 40 lowercase hex digits (20 bytes), sent as the print's `fileHash`
+    (#40): the same for every job of the file, and new once it is re-sliced, so 3D Print Log can
+    count reprints. Never derived from the file's content. None when the printer can't tell."""
 
 
 @dataclass(frozen=True)

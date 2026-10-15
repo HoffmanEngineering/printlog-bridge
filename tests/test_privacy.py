@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -64,6 +65,8 @@ METADATA = {
     "filament_total": 1200.0,
     "filament_weight_total": 3.6,
     "slicer": "OrcaSlicer",
+    "uuid": "473a41d2-15f2-434c-aa61-d1d6ec5a4bfd",
+    "modified": 1_791_000_000.25,
     "thumbnails": [
         {"width": 300, "height": 300, "size": 9, "relative_path": ".thumbs/benchy-300x300.png"}
     ],
@@ -94,7 +97,7 @@ API_CALLS = [
 CREATE_FIELDS = {
     "printerId", "title", "fileName", "startDate", "status", "viewStatus", "allowComments",
     "externalSource", "externalId", "connectionInstanceId", "estimatedPrintTimeInSeconds",
-    "estimatedFilamentUsageMg", "filamentUsage", "notes",
+    "estimatedFilamentUsageMg", "filamentUsage", "notes", "fileHash",
 }  # fmt: skip
 COMPLETE_FIELDS = {"status", "endedAt", "printTimeInSeconds", "filamentUsage"}
 USAGE_FIELDS = {
@@ -102,7 +105,7 @@ USAGE_FIELDS = {
     "estimatedAmountMg",
 }  # fmt: skip
 LOOKUP_FIELDS = {"printerId", "createdAfter"}
-CLAIM_FIELDS = {"externalSource", "externalId", "connectionInstanceId", "startDate"}
+CLAIM_FIELDS = {"externalSource", "externalId", "connectionInstanceId", "startDate", "fileHash"}
 SLICER_FIELDS = {"configBlock", "header", "metadata"}
 SLICER_METADATA_FIELDS = {
     "slicer", "slicerVersion", "layerHeightMm", "firstLayerHeightMm", "nozzleDiameterMm",
@@ -275,6 +278,14 @@ class TestWhatIsSent:
                 assert set(row) <= USAGE_FIELDS
         for _, body in api.heartbeats:
             assert set(body) <= CONNECTION_FIELDS
+
+    def test_the_file_is_identified_without_its_content_or_moonrakers_uuid(self, run):
+        [created] = run["api"].created
+        identity = created["fileHash"]
+        assert re.fullmatch(r"[0-9a-f]{40}", identity)
+        assert METADATA["uuid"].replace("-", "") not in identity
+        for digest in (hashlib.sha1(GCODE), hashlib.sha256(GCODE)):
+            assert not digest.hexdigest().startswith(identity)
 
     def test_the_file_name_is_sent_without_its_folder(self, run):
         [created] = run["api"].created
@@ -769,7 +780,8 @@ class TestAdoptionCalls:
         api = FakePrintLogApi()
         print_id = api.user_creates("Benchy", file_name="benchy.gcode")
 
-        run(api, tmp_path, started(file_name="parts/benchy.gcode"), finished())
+        run(api, tmp_path, started(file_name="parts/benchy.gcode", file_identity="ab" * 20),
+            finished())  # fmt: skip
 
         for method, path in api.requests:
             assert any(method == m and re.fullmatch(pattern, path) for m, pattern in API_CALLS), (

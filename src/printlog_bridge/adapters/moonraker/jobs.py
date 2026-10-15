@@ -16,13 +16,18 @@ job resumes from it, prompting on the console for the new spool when it sees one
 After the thumbnail comes the job's slicer settings (#36): the summary in its metadata, and a
 way to read its file's header and settings block (`slicer.py`), which the sink uses only when
 it wants them.
+
+Each start carries an identity of the job's file (#40, `file_identity`), for 3D Print Log to count
+reprints by.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import logging
+import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -270,7 +275,34 @@ def started(printer: str, job: Mapping[str, Any]) -> JobStarted:
         estimated_filament_mm=_positive(metadata.get("filament_total")),
         estimated_filament_g=_positive(metadata.get("filament_weight_total")),
         estimated_filament_g_by_slot=estimated_grams_by_slot(metadata),
+        file_identity=file_identity(metadata),
     )
+
+
+def file_identity(metadata: Mapping[str, Any]) -> str | None:
+    """The job's file, from its metadata as the job's history entry kept it, as 40 hex digits.
+
+    Moonraker gives a file a new random `uuid` each time it extracts the file's metadata, which
+    it does whenever a file is uploaded or changed, so the uuid names this version of the file:
+    every job of it has the same one, and a re-sliced upload a new one. Older history entries,
+    and some forks, have no uuid; then the file's `size` and `modified` time stand in for it,
+    which an upload rewrites as well. Without either, there's no identity.
+
+    Only the job's own history entry is read, never the file's metadata as it is now: a job
+    replayed after the file was re-sliced would otherwise take the new file's identity. And
+    never the file itself, so its content says nothing about it. Hashed, so the uuid isn't sent
+    and both kinds have the 20 bytes 3D Print Log keeps (its `fileHash`, an OctoPrint SHA-1),
+    each with its own prefix so the two can't meet.
+    """
+    uuid = metadata.get("uuid")
+    if isinstance(uuid, str) and uuid.strip():
+        source = f"moonraker-uuid:{uuid.strip().lower()}"
+    else:
+        size, modified = _finite(metadata.get("size")), _finite(metadata.get("modified"))
+        if size is None or modified is None:
+            return None
+        source = f"moonraker-file:{int(size)}:{modified!r}"
+    return hashlib.sha256(source.encode()).hexdigest()[:40]
 
 
 def finished(
@@ -308,6 +340,14 @@ def finished(
 
 def _time(timestamp: float) -> datetime:
     return datetime.fromtimestamp(float(timestamp), timezone.utc)
+
+
+def _finite(value: Any) -> float | None:
+    """A number Moonraker gave, or None for anything else (a bool, a string, NaN)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _positive(value: Any) -> float | None:
