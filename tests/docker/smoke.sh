@@ -1,13 +1,30 @@
 #!/usr/bin/env bash
 # Smoke-tests a built image: --version, store-key, doctor, run and status inside the container,
 # against three fake Moonrakers and a fake 3D Print Log API on this computer (tests/docker/
-# serve_fakes.py), so nothing calls the real API. CI runs it (docker-smoke) after building the
-# image for linux/amd64. Needs docker, and python3 with aiohttp for the fakes.
+# serve_fakes.py), so nothing calls the real API. CI runs it (docker.yml, smoke) after building
+# the image for each platform: arm64 on an Arm runner, arm/v7 under QEMU. Needs docker, and python3
+# with aiohttp for the fakes.
 #
-# Usage: tests/docker/smoke.sh <image>
+# Usage: tests/docker/smoke.sh <image> [platform]   (the platform defaults to the image's own)
 set -euo pipefail
 
-IMAGE="${1:?usage: $0 <image>}"
+IMAGE="${1:?usage: $0 <image> [platform]}"
+# linux/amd64, linux/arm64 or linux/arm/v7 (arm64 is sometimes recorded as linux/arm64/v8).
+image_platform() {
+    docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}{{with .Variant}}/{{.}}{{end}}' \
+        | sed 's#^linux/arm64/v8$#linux/arm64#'
+}
+PLATFORM="${2:-$(image_platform)}"
+# What `uname -m` says inside the container on that platform.
+case "$PLATFORM" in
+    linux/amd64) MACHINE=x86_64 ;;
+    linux/arm64) MACHINE=aarch64 ;;
+    linux/arm/v7) MACHINE=armv7l ;;
+    *)
+        echo "no expected uname -m for $PLATFORM" >&2
+        exit 2
+        ;;
+esac
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 DATA="${WORK}/data"
@@ -35,7 +52,8 @@ check() {
 }
 # Runs the image as this user, the way Synology's `user: "<uid>:<gid>"` does, on the host's
 # network so it reaches the fakes on 127.0.0.1.
-bridge() { docker run --rm -i --network host --user "$(id -u):$(id -g)" -v "${DATA}:/data" "$IMAGE" "$@"; }
+bridge() { docker run --rm -i --platform "$PLATFORM" --network host --user "$(id -u):$(id -g)" -v "${DATA}:/data" "$IMAGE" "$@"; }
+inside() { docker run --rm --platform "$PLATFORM" "$@"; }
 report() { python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))" "$REPORT" "$1"; }
 wait_for() { # <seconds> <command...>
     local deadline=$((SECONDS + $1))
@@ -46,15 +64,17 @@ wait_for() { # <seconds> <command...>
     done
 }
 
-echo "== image"
+echo "== image ($PLATFORM)"
 docker image inspect "$IMAGE" --format 'size: {{.Size}} bytes, user: {{.Config.User}}'
+check "is built for $PLATFORM" test "$(image_platform)" = "$PLATFORM"
+check "runs on a $MACHINE CPU" test "$(inside --entrypoint uname "$IMAGE" -m)" = "$MACHINE"
 check "runs as a non-root user by default" \
-    test "$(docker run --rm --entrypoint id "$IMAGE" -u)" = 1000
+    test "$(inside --entrypoint id "$IMAGE" -u)" = 1000
 check "labels the source repository" \
     test "$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" \
     = https://github.com/HoffmanEngineering/printlog-bridge
 check "TZ sets the time zone (tzdata is in the image)" \
-    test "$(docker run --rm -e TZ=America/New_York --entrypoint python "$IMAGE" -c 'import time; print(time.tzname[0])')" = EST
+    test "$(inside -e TZ=America/New_York --entrypoint python "$IMAGE" -c 'import time; print(time.tzname[0])')" = EST
 
 echo "== --version"
 version="$(bridge --version)"
@@ -84,7 +104,7 @@ check "doctor reached all three printers" \
 check "the support bundle is in the volume" test -f "${DATA}/state/printlog-bridge-support.zip"
 
 echo "== run"
-docker run -d --name "$NAME" --network host --user "$(id -u):$(id -g)" -v "${DATA}:/data" \
+docker run -d --platform "$PLATFORM" --name "$NAME" --network host --user "$(id -u):$(id -g)" -v "${DATA}:/data" \
     --health-interval 3s --health-start-period 5s "$IMAGE" >/dev/null
 healthy() { test "$(docker inspect -f '{{.State.Health.Status}}' "$NAME")" = healthy; }
 subscribed_three() { test "$(report 'len(r["subscribed"])' 2>/dev/null)" = 3; }

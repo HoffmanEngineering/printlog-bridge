@@ -49,7 +49,10 @@ class Owners:
         self.folder = 1000
         self.folder_mode = 0o755
         self.on_file_check = None
-        monkeypatch.setattr("printlog_bridge.cli.main.os.geteuid", lambda: self.euid, raising=False)
+        # Only where there is one: Windows has no geteuid, and store-key takes its Windows path
+        # (no owners, no folder held open) when there isn't.
+        if hasattr(os, "geteuid"):
+            monkeypatch.setattr("printlog_bridge.cli.main.os.geteuid", lambda: self.euid)
         monkeypatch.setattr("printlog_bridge.cli.main._owner", self.owner)
         monkeypatch.setattr("printlog_bridge.cli.main._user_name", NAMES.get)
         monkeypatch.delenv("SUDO_UID", raising=False)
