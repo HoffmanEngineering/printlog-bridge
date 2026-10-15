@@ -101,7 +101,7 @@ async def run_bridge(
             sink.before_create = heartbeat.ensure_registered
             spools.on_swap = sink.spool_swapped
             for printer in config.printers:
-                printer.adapter.use_spools(spools)
+                printer.adapter.use_spools(spools, config.api_url)
                 if printer.printer_id is not None:
                     printer.adapter.use_state(sink.state(printer.name))
                 log.info(

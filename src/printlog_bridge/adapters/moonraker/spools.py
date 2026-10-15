@@ -60,6 +60,16 @@ def parse_command(printer: str, line: str, active: int = 0) -> SpoolCommand | No
     return SpoolCommand(printer, slot, filament_id=filament_id, tag=tag)
 
 
+async def tool_count(call: Call) -> int | None:
+    """How many extruders Klipper has, so 3D Print Log can be told how many slots; None when
+    Klipper can't say."""
+    try:
+        objects = (await call("printer.objects.list", None))["objects"]
+    except Exception:
+        return None
+    return sum(1 for name in objects if EXTRUDER.fullmatch(str(name))) or None
+
+
 def answer_script(answer: str) -> str:
     """The G-code that shows the bridge's answer on the console."""
     text = " ".join(UNSAFE.sub("", answer.replace('"', "'")).split())[:MAX_ANSWER]
@@ -138,12 +148,7 @@ class SpoolWatcher:
     async def _tool_count(self, call: Call | None) -> int | None:
         """How many extruders Klipper has, so 3D Print Log can be told how many slots."""
         if self._tools is None and call is not None:
-            try:
-                objects = (await call("printer.objects.list", None))["objects"]
-            except Exception:
-                return None
-            count = sum(1 for name in objects if EXTRUDER.fullmatch(str(name)))
-            self._tools = count or None
+            self._tools = await tool_count(call)
         return self._tools
 
     def _spawn(self, work) -> None:

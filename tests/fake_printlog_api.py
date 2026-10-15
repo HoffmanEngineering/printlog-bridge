@@ -57,6 +57,8 @@ Spools and slots (api#146, PR 158; api#147, PR 159):
 - `GET /api/Filaments/by-tag/{uid}` finds the user's spool with that tag UID, in any case and
   with `:` `-` `.` `_` or spaces between bytes (`TagUid.Normalize`): 400 for a UID that isn't
   whole hex bytes (64 hex characters at most), 404 when none of the user's spools has it.
+- `GET /api/Filaments/by-number/{n}` finds the user's spool with that `spoolNumber` (what
+  Moonraker's Spoolman integration calls its spool id): 404 when none of theirs has it.
 - `AddPrint` on a printer with one slot makes the print's spools the printer's loaded list (so a
   print with no spool unloads it); on a printer with more slots it leaves the slots alone.
 """
@@ -151,6 +153,7 @@ class FakePrintLogApi:
         app.router.add_put("/api/Printers/{id}/slots/{slot}", self._load_slot)
         app.router.add_delete("/api/Printers/{id}/slots/{slot}", self._unload_slot)
         app.router.add_get("/api/Filaments/by-tag/{uid}", self._by_tag)
+        app.router.add_get("/api/Filaments/by-number/{number}", self._by_number)
         app.router.add_post("/api/Prints", self._create)
         app.router.add_get("/api/Prints/claimable", self._claimable)
         app.router.add_post("/api/Prints/{id}/claim", self._claim)
@@ -201,11 +204,16 @@ class FakePrintLogApi:
         material: str = "PLA",
         color_hex: str | None = None,
         tags: tuple[str, ...] = (),
+        number: int | None = None,
     ) -> str:
-        """A spool in the user's inventory, as the app would add it. Returns its id."""
+        """A spool in the user's inventory, as the app would add it. Returns its id. Its
+        `spoolNumber` is `number`, or else the next after the highest so far, as the app's."""
         filament_id = str(uuid.uuid4())
+        if number is None:
+            number = 1 + max((f["spoolNumber"] for f in self.filaments.values()), default=0)
         self.filaments[filament_id] = {
             "id": filament_id,
+            "spoolNumber": number,
             "displayName": display_name,
             "materialType": material,
             "colorHex": color_hex,
@@ -377,6 +385,13 @@ class FakePrintLogApi:
             return web.Response(status=400, text="The tag UID must be hex bytes.")
         for filament in self.filaments.values():
             if uid in filament["tagUids"]:
+                return web.json_response(filament)
+        return web.Response(status=404)
+
+    async def _by_number(self, request: web.Request) -> web.Response:
+        number = request.match_info["number"]
+        for filament in self.filaments.values():
+            if number.isdigit() and filament["spoolNumber"] == int(number):
                 return web.json_response(filament)
         return web.Response(status=404)
 
