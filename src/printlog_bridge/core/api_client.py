@@ -147,6 +147,10 @@ class ApiClient:
         """The key owner's spool with this RFID/NFC tag, or None when none of theirs has it."""
         return await self._request("GET", f"/api/Filaments/by-tag/{uid}", missing_ok=True)
 
+    async def filament_by_number(self, number: int) -> dict[str, Any] | None:
+        """The key owner's spool with this `spoolNumber`, or None when none of theirs has it."""
+        return await self._request("GET", f"/api/Filaments/by-number/{number}", missing_ok=True)
+
     async def create_print(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         """The print, and whether it is new. An `externalId` already used returns the original."""
         status, print_ = await self._send("POST", "/api/Prints", body)

@@ -87,6 +87,29 @@ class TestSetSpool:
         assert "DEADBEEF" in answer
         assert "no spool" in answer.lower()
 
+    def test_spool_number_loads_the_spool_it_names(self):
+        # What a spool picked in Mainsail or Fluidd sends: Moonraker's spool id is the number.
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 2
+        api.add_spool("Galaxy Black PLA", number=11)
+        spool = api.add_spool("Silk Gold", number=12)
+
+        answer = run(api, lambda s: s.spool_command(command(1, spool_number=12)))
+
+        assert api.slot_spools(42) == {1: spool}
+        assert "Silk Gold" in answer
+        assert ("GET", "/api/Filaments/by-number/12") in api.requests
+
+    def test_unknown_spool_number_changes_nothing(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Loaded", number=1)
+        api.user_loads(42, 0, spool)
+
+        answer = run(api, lambda s: s.spool_command(command(0, spool_number=99)))
+
+        assert api.slot_spools(42) == {0: spool}
+        assert answer == "no spool in 3D Print Log has number 99; nothing changed"
+
     def test_a_tag_that_isnt_hex_is_refused_without_asking_the_api(self):
         api = FakePrintLogApi()
 
@@ -298,6 +321,36 @@ class TestSetSpool:
 
         assert "couldn't reach" in answer.lower()
         assert "again" in answer
+
+    def test_unreachable_api_on_a_pick_changes_nothing_and_queues_nothing(self):
+        # A spool picked in Mainsail while 3D Print Log can't be reached: the pick is dropped,
+        # with the reason, and never sent later.
+        api = FakePrintLogApi()
+        loaded = api.add_spool("Loaded", number=1)
+        api.add_spool("Silk Gold", number=12)
+        api.user_loads(42, 0, loaded)
+        heard = []
+
+        async def unreachable(number):
+            raise ApiUnavailable("the connection was reset")
+
+        async def scenario(spools: Spools):
+            await spools.refresh("u1")
+            spools.watch_loaded("u1", heard.append)
+            before = list(api.requests)
+            spools.api.filament_by_number = unreachable
+            answer = await spools.spool_command(command(0, spool_number=12))
+            await spools.refresh("u1")  # the API answers again
+            return answer, spools.loaded("u1"), api.requests[len(before) :]
+
+        answer, now_loaded, requests = run(api, scenario)
+
+        assert answer.startswith("couldn't reach 3D Print Log (the connection was reset)")
+        assert "nothing changed" in answer
+        assert now_loaded == {0: loaded}
+        assert len(heard) == 1  # what was already loaded, and no change since
+        assert all(method == "GET" for method, _ in requests)  # nothing sent later
+        assert api.slot_spools(42) == {0: loaded}
 
     def test_an_unknown_printer_is_refused(self):
         api = FakePrintLogApi()
@@ -866,3 +919,78 @@ def test_color_distance_is_zero_for_the_same_color_in_any_format():
     assert color_distance("#ff0000", "FF0000") == 0
     assert color_distance("#FF0000", "#00FF00") > 300
     assert color_distance("#FF0000", "not a color") is None
+
+
+class TestWatchLoaded:
+    """How an adapter hears that a printer's spools changed: Moonraker's active spool follows."""
+
+    def test_a_watcher_hears_each_change_with_each_slots_spool_number(self):
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 2
+        first = api.add_spool("Galaxy Black PLA", number=4)
+        second = api.add_spool("Silk Gold", number=7)
+        api.user_loads(42, 0, first)
+        heard: list[dict[int, int | None]] = []
+
+        def numbers(loaded):
+            heard.append({slot: f.get("spoolNumber") for slot, f in loaded.items()})
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("u1", numbers)
+            await spools.refresh("u1")
+            await spools.refresh("u1")  # nothing changed: nothing to hear
+            await spools.spool_command(command(1, filament_id=second))
+            await spools.spool_command(command(0))  # cleared
+            await spools.refresh("u1")
+
+        run(api, scenario)
+
+        assert heard == [{0: 4}, {0: 4, 1: 7}, {1: 7}]
+
+    def test_a_new_watcher_hears_what_is_already_known(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Loaded", number=4))
+        heard = []
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("u1", heard.append)  # nothing read yet: nothing to hear
+            await spools.refresh("u1")
+            spools.watch_loaded("u1", heard.append)
+
+        run(api, scenario)
+
+        assert [{s: f["spoolNumber"] for s, f in loaded.items()} for loaded in heard] == [
+            {0: 4},
+            {0: 4},
+        ]
+
+    def test_a_watcher_hears_only_its_printer_and_not_once_unwatched(self):
+        api = FakePrintLogApi()
+        api.user_loads(42, 0, api.add_spool("Loaded", number=4))
+        other, mine = [], []
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("voron", other.append)
+            unwatch = spools.watch_loaded("u1", mine.append)
+            unwatch()
+            await spools.refresh("u1")
+
+        run(api, scenario)
+
+        assert other == [] and mine == []
+
+    def test_a_watcher_that_fails_breaks_nothing(self, caplog):
+        api = FakePrintLogApi()
+        spool = api.add_spool("Loaded", number=4)
+
+        def broken(loaded):
+            raise RuntimeError("boom")
+
+        async def scenario(spools: Spools):
+            spools.watch_loaded("u1", broken)
+            return await spools.spool_command(command(0, filament_id=spool))
+
+        answer = run(api, scenario)
+
+        assert "is now Loaded" in answer
+        assert api.slot_spools(42) == {0: spool}

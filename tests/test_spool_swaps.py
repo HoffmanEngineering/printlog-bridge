@@ -173,6 +173,59 @@ def test_set_spool_during_a_pause_splits_the_tool_between_the_two_spools(tmp_pat
     assert api.slot_spools(42) == {0: second}
 
 
+def test_a_spool_picked_on_the_printer_mid_print_splits_the_same_way(tmp_path):
+    # Moonraker's Spoolman server is 3D Print Log (the fake API, at 127.0.0.1; its port aside).
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    moonraker.config["spoolman"] = {"server": "http://printer-42:secret@127.0.0.1/spoolman"}
+    first = api.add_spool("Spool A", number=1)
+    second = api.add_spool("Spool B", number=2)
+    api.user_loads(42, 0, first)
+
+    async def scenario():
+        async with fakes(tmp_path, moonraker, api) as config, running(config, moonraker):
+            job = await moonraker.start_job("vase.gcode", METADATA)
+            await eventually(lambda: api.prints)
+            await printing(moonraker, "vase.gcode")
+            await feed(moonraker, 3150.0)
+            await pause(moonraker, 0.63, 112)
+            await moonraker.pick_spool(2)
+            await eventually(lambda: recorded(tmp_path))
+            await resume(moonraker)
+            await feed(moonraker, 5000.0)
+            await moonraker.finish_job(job, filament_used=5000.0)
+            await eventually(lambda: logged(tmp_path))
+
+    asyncio.run(scenario())
+
+    rows = rows_on(api.prints[1], 0)
+    assert rows[first]["lengthInM"] == pytest.approx(3.15)
+    assert rows[second]["lengthInM"] == pytest.approx(1.85)
+    assert "T0: Spool A → Spool B at 63% (layer 112)" in api.prints[1]["notes"]
+    assert moonraker.scripts == []  # a pick isn't answered on the console
+    assert api.slot_spools(42) == {0: second}
+
+
+def test_moonraker_is_set_to_the_active_tools_spool_and_a_pick_is_not_sent_back(tmp_path):
+    moonraker, api = FakeMoonraker(), FakePrintLogApi()
+    moonraker.config["spoolman"] = {"server": "http://printer-42:secret@127.0.0.1/spoolman"}
+    first = api.add_spool("Spool A", number=1)
+    second = api.add_spool("Spool B", number=2)
+    api.user_loads(42, 0, first)
+
+    async def scenario():
+        async with fakes(tmp_path, moonraker, api) as config, running(config, moonraker):
+            await eventually(lambda: moonraker.posted_spools)  # idle: T0's spool, on connect
+            await moonraker.pick_spool(2)
+            await eventually(lambda: api.slot_spools(42) == {0: second})
+            await asyncio.sleep(0.2)
+
+    asyncio.run(scenario())
+
+    assert moonraker.posted_spools == [1]  # the pick isn't posted back
+    slot_puts = [r for r in api.requests if r == ("PUT", "/api/Printers/42/slots/0")]
+    assert len(slot_puts) == 1  # and the bridge's own post wasn't taken for a pick
+
+
 def test_a_runout_pause_resumed_without_the_macro_keeps_one_spool_and_adds_a_hint(tmp_path):
     moonraker = FakeMoonraker(objects=(*DEFAULT_OBJECTS, RUNOUT_SENSOR, RESPOND_MACRO))
     moonraker.status[RUNOUT_SENSOR] = {"filament_detected": True, "enabled": True}

@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Protocol, Union
+from typing import Any, Protocol, Union
 
 
 class JobOutcome(Enum):
@@ -172,9 +172,12 @@ class EventSink(Protocol):
 
 @dataclass(frozen=True)
 class SpoolCommand:
-    """The user assigns a spool to a slot on the printer (`PRINTLOG_SET_SPOOL`), or clears it.
+    """The user assigns a spool to a slot on the printer (`PRINTLOG_SET_SPOOL`, or a spool
+    picked in Mainsail, Fluidd or KlipperScreen through Moonraker's Spoolman integration), or
+    clears it.
 
-    Exactly one of `filament_id` and `tag` names the spool; with neither, the slot is cleared.
+    Exactly one of `filament_id`, `tag` and `spool_number` names the spool; with none, the slot
+    is cleared.
     """
 
     printer: str
@@ -184,6 +187,9 @@ class SpoolCommand:
     """The spool's id in 3D Print Log."""
     tag: str | None = None
     """The UID of an RFID/NFC tag on the spool, in any common format (`04:A2:3F:11`)."""
+    spool_number: int | None = None
+    """The spool's number in 3D Print Log (`spoolNumber`), which is what Moonraker's Spoolman
+    integration calls its spool id when it is pointed at 3D Print Log."""
     slot_count: int | None = None
     """How many slots (tools) the printer has, when the adapter knows."""
     during: JobPoint | None = None
@@ -217,3 +223,13 @@ class SpoolSink(Protocol):
 
     async def spool_reading(self, reading: SpoolReading) -> None:
         """Takes a reader's view of a slot. A tag a spool has assigns that spool to the slot."""
+
+    def watch_loaded(
+        self, printer: str, watcher: Callable[[Mapping[int, Mapping[str, Any]]], None]
+    ) -> Callable[[], None]:
+        """Tells `watcher` the printer's spool in each slot (3D Print Log's filament summary,
+        `spoolNumber` included) once known, and after each change. Returns what stops that.
+
+        Optional: adapters look it up with `getattr`, so a sink without it (a test's) is told
+        nothing and needs no stub."""
+        return lambda: None
