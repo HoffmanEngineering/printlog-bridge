@@ -42,6 +42,7 @@ from .session import (
     fetch_server_info,
     where,
 )
+from .spoolman import SpoolmanSync
 from .spools import SpoolWatcher
 from .u1_rfid import U1RfidReader
 
@@ -97,6 +98,8 @@ class MoonrakerAdapter(Adapter):
         self.discovery = discovery and url is not None
         """In remote mode, whether to find the printer again when its address changes."""
         self.spools: SpoolSink | None = None
+        self.api_url: str | None = None
+        """3D Print Log's API, for telling whether Moonraker's Spoolman server is it."""
         self.trace: Trace | None = None
         self.state: PrinterState | None = None
         self.locator_options: dict = dict(discovery_options or {})
@@ -185,11 +188,24 @@ class MoonrakerAdapter(Adapter):
             api_key=self.api_key,
             snapshots=self.snapshots,
         )
-        listeners: list[MoonrakerListener] = [JobTracker(self.printer, sink, report, images)]
+        tracker = JobTracker(self.printer, sink, report, images)
+        listeners: list[MoonrakerListener] = [tracker]
+        unwatch = None
         if self.spools is not None:
             # The U1's reader only reports on a printer with `filament_detect`; elsewhere it
-            # never hears from it.
-            listeners.append(SpoolWatcher(self.printer, self.spools, U1RfidReader(self.printer)))
+            # never hears from it. After the tracker, which knows where the job is by then.
+            watcher = SpoolWatcher(
+                self.printer, self.spools, U1RfidReader(self.printer), point=tracker.point
+            )
+            listeners.append(watcher)
+            if self.api_url is not None:
+                # A spool picked in Mainsail or Fluidd, when its Spoolman server is 3D Print Log;
+                # and Moonraker's active spool kept on the active tool's spool in 3D Print Log.
+                sync = SpoolmanSync(self.printer, self.api_url, self.spools, point=tracker.point)
+                listeners.append(sync)
+                watch = getattr(self.spools, "watch_loaded", None)
+                if watch is not None:
+                    unwatch = watch(self.printer, sync.on_loaded)
         # Last, so the jobs missed while disconnected are caught up first.
         listeners.append(NotifierCheck(self.printer, report))
         listener = Listeners(*listeners)
@@ -203,10 +219,16 @@ class MoonrakerAdapter(Adapter):
             trace=self.trace,
             locator=locator,
         )
-        await session.run()
+        try:
+            await session.run()
+        finally:
+            if unwatch is not None:
+                unwatch()
+            await tracker.close()
 
-    def use_spools(self, spools: SpoolSink) -> None:
+    def use_spools(self, spools: SpoolSink, api_url: str | None = None) -> None:
         self.spools = spools
+        self.api_url = api_url
 
     def use_trace(self, trace: Trace) -> None:
         self.trace = trace

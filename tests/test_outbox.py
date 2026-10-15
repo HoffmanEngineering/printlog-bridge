@@ -33,6 +33,20 @@ def test_an_entry_survives_a_restart(tmp_path):
     assert entry.attempts == 0
 
 
+def test_a_sent_entry_leaves_nothing_of_itself_in_the_file(tmp_path):
+    """Slicer settings (#36) stay on the printer only until they're sent: SQLite would otherwise
+    keep a deleted row's bytes in a free page, as some builds do by default."""
+    outbox = Outbox.open(tmp_path)
+    outbox.add("voron", "00000A", "slicer_settings", {"configBlock": "; a = CANARY-1\n" * 2000})
+    outbox.add("voron", "00000B", "slicer_settings", {"configBlock": "; b = CANARY-2\n"})
+    for entry in outbox.entries():
+        outbox.remove(entry.seq)
+    outbox.close()
+
+    data = (tmp_path / OUTBOX_FILE).read_bytes()
+    assert b"CANARY" not in data
+
+
 def test_the_same_event_is_queued_once(tmp_path):
     outbox = Outbox.open(tmp_path)
 

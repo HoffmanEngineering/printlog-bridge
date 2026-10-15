@@ -26,6 +26,17 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
   jpeg, png, gif, webp or bmp by the part's content type, under 10 MB, at most 5 per print
   (the free plan; 20 with Pro), each refused with 400. `isDefault` makes it the only default.
   It isn't idempotent: the same image sent twice is two images.
+- `POST /api/Prints/{id}/slicer-settings` records a connector's slicer settings (api#164, PR
+  for 3d-print-log-api#188): `{configBlock?, header?, metadata?}`. 400 (problem+json) with
+  neither, for a metadata field over its length or out of its range, for a block with no
+  `; key = value` line and no metadata, and for metadata with no `slicer` and no block; 413
+  for a `configBlock` over 512 KiB or a `header` over 64 KiB (UTF-8 bytes); 404 for a print
+  that doesn't exist or isn't the user's (creator-only); 409 for a print whose settings came
+  from a slicer plugin (its `slicer` is set and no connector recorded them). Sending again
+  replaces what an earlier send recorded. The print gets its `slicer` (and `slicerVersion`), and
+  the lookup's `hasSlicerSettings` turns true. `slicer_settings_route = False` answers 404 as an
+  API without the endpoint does (no route), and `slicer_settings_status` answers every send with
+  that status.
 - `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
   field; `kind` and `displayName` are required and `printerId` must be the user's. A print
   links to a connection only when it is created after the connection was registered.
@@ -46,6 +57,8 @@ Spools and slots (api#146, PR 158; api#147, PR 159):
 - `GET /api/Filaments/by-tag/{uid}` finds the user's spool with that tag UID, in any case and
   with `:` `-` `.` `_` or spaces between bytes (`TagUid.Normalize`): 400 for a UID that isn't
   whole hex bytes (64 hex characters at most), 404 when none of the user's spools has it.
+- `GET /api/Filaments/by-number/{n}` finds the user's spool with that `spoolNumber` (what
+  Moonraker's Spoolman integration calls its spool id): 404 when none of theirs has it.
 - `AddPrint` on a printer with one slot makes the print's spools the printer's loaded list (so a
   print with no spool unloads it); on a printer with more slots it leaves the slots alone.
 """
@@ -117,6 +130,14 @@ class FakePrintLogApi:
         """Every lookup's query."""
         self.claims: list[tuple[int, dict[str, Any]]] = []
         """Every claim body received, by print id."""
+        self.slicer_settings_route = True
+        """False answers the slicer settings endpoint 404, as an API without it does."""
+        self.slicer_settings_status: int | None = None
+        """When set, every slicer settings send is answered with this status."""
+        self.slicer_posts: list[tuple[int, dict[str, Any]]] = []
+        """Every slicer settings body received, by print id, refused ones included."""
+        self.slicer_records: dict[int, dict[str, Any]] = {}
+        """The slicer settings each print has from a connector: the last body recorded."""
         self._failures: list[tuple[int, dict[str, str]]] = []
         self._server: TestServer | None = None
 
@@ -132,6 +153,7 @@ class FakePrintLogApi:
         app.router.add_put("/api/Printers/{id}/slots/{slot}", self._load_slot)
         app.router.add_delete("/api/Printers/{id}/slots/{slot}", self._unload_slot)
         app.router.add_get("/api/Filaments/by-tag/{uid}", self._by_tag)
+        app.router.add_get("/api/Filaments/by-number/{number}", self._by_number)
         app.router.add_post("/api/Prints", self._create)
         app.router.add_get("/api/Prints/claimable", self._claimable)
         app.router.add_post("/api/Prints/{id}/claim", self._claim)
@@ -139,6 +161,7 @@ class FakePrintLogApi:
         app.router.add_patch("/api/Prints/{id}", self._patch)
         app.router.add_post("/api/Prints/{id}/complete", self._complete)
         app.router.add_post("/api/Prints/{id}/image", self._upload_image)
+        app.router.add_post("/api/Prints/{id}/slicer-settings", self._slicer_settings)
         app.router.add_put("/api/Connections/{instance}", self._put_connection)
         self._server = TestServer(app)
         await self._server.start_server()
@@ -181,11 +204,16 @@ class FakePrintLogApi:
         material: str = "PLA",
         color_hex: str | None = None,
         tags: tuple[str, ...] = (),
+        number: int | None = None,
     ) -> str:
-        """A spool in the user's inventory, as the app would add it. Returns its id."""
+        """A spool in the user's inventory, as the app would add it. Returns its id. Its
+        `spoolNumber` is `number`, or else the next after the highest so far, as the app's."""
         filament_id = str(uuid.uuid4())
+        if number is None:
+            number = 1 + max((f["spoolNumber"] for f in self.filaments.values()), default=0)
         self.filaments[filament_id] = {
             "id": filament_id,
+            "spoolNumber": number,
             "displayName": display_name,
             "materialType": material,
             "colorHex": color_hex,
@@ -357,6 +385,13 @@ class FakePrintLogApi:
             return web.Response(status=400, text="The tag UID must be hex bytes.")
         for filament in self.filaments.values():
             if uid in filament["tagUids"]:
+                return web.json_response(filament)
+        return web.Response(status=404)
+
+    async def _by_number(self, request: web.Request) -> web.Response:
+        number = request.match_info["number"]
+        for filament in self.filaments.values():
+            if number.isdigit() and filament["spoolNumber"] == int(number):
                 return web.json_response(filament)
         return web.Response(status=404)
 
@@ -610,6 +645,52 @@ class FakePrintLogApi:
         found["startDate"] = found["startDate"] or body.get("startDate")
         return web.json_response(found)
 
+    async def _slicer_settings(self, request: web.Request) -> web.Response:
+        if not self.slicer_settings_route:
+            return web.Response(status=404)
+        print_id = int(request.match_info["id"])
+        body = await request.json()
+        self.slicer_posts.append((print_id, body))
+        if self.slicer_settings_status is not None:
+            return web.Response(status=self.slicer_settings_status)
+        block, header, metadata = body.get("configBlock"), body.get("header"), body.get("metadata")
+        if not (block or "").strip() and metadata is None:
+            return _problem(400, "One or more validation errors occurred.")
+        problem = _metadata_problem(metadata or {})
+        if problem:
+            return _problem(400, problem)
+        if len((block or "").encode()) > SLICER_BLOCK_BYTES:
+            return _problem(413, "configBlock is over 512 KiB.")
+        if len((header or "").encode()) > SLICER_HEADER_BYTES:
+            return _problem(413, "header is over 64 KiB.")
+        # Parsed before the print is looked up, as `PrintSlicerSettingsService.Record` does.
+        has_settings = bool(block) and SETTING_LINE.search(block) is not None
+        slicer = (metadata or {}).get("slicer")
+        if not has_settings:
+            if metadata is None:
+                return _problem(400, "configBlock holds no slicer settings.")
+            if not (slicer or "").strip():
+                return _problem(400, "metadata.slicer is required when there is no configBlock.")
+        found = self.prints.get(print_id)
+        if found is None:
+            return _problem(404, "Not Found")
+        if found.get("slicer") and print_id not in self.slicer_records:
+            return _problem(409, "This print's slicer settings were recorded by a slicer plugin.")
+        replaced = print_id in self.slicer_records
+        self.slicer_records[print_id] = body
+        named = next((name for name in SLICERS if name in (header or "")), None)
+        found["slicer"] = (named or slicer or "other").lower()
+        found["slicerVersion"] = (metadata or {}).get("slicerVersion")
+        return web.json_response(
+            {
+                "printId": print_id,
+                "slicer": found["slicer"],
+                "slicerVersion": found["slicerVersion"],
+                "source": "configBlock" if has_settings else "metadata",
+                "replaced": replaced,
+            }
+        )
+
     async def _get(self, request: web.Request) -> web.Response:
         found = self.prints.get(int(request.match_info["id"]))
         return web.json_response(found) if found else web.Response(status=404)
@@ -702,6 +783,43 @@ def _conflict(detail: str, print_id: int | None = None) -> web.Response:
     if print_id is not None:
         problem["printId"] = print_id
     return web.json_response(problem, status=409, content_type="application/problem+json")
+
+
+SLICER_BLOCK_BYTES = 512 * 1024
+SLICER_HEADER_BYTES = 64 * 1024
+SETTING_LINE = re.compile(r"^[ \t]*;[ \t]*[A-Za-z0-9_]+[ \t]*=", re.MULTILINE)
+SLICERS = ("AnycubicSlicerNext", "OrcaSlicer", "PrusaSlicer", "BambuStudio")
+SLICER_TEXT_LIMITS = {"slicer": 50, "slicerVersion": 50, "filamentName": 200, "filamentType": 100}
+SLICER_NUMBER_LIMITS = {
+    "layerHeightMm": (0, 100),
+    "firstLayerHeightMm": (0, 100),
+    "nozzleDiameterMm": (0, 100),
+    "firstLayerNozzleTemperatureC": (-100, 1000),
+    "firstLayerBedTemperatureC": (-100, 1000),
+}
+
+
+def _metadata_problem(metadata: dict[str, Any]) -> str | None:
+    """`SlicerMetadataDto`'s `[StringLength]` and `[Range]` rules."""
+    for field, limit in SLICER_TEXT_LIMITS.items():
+        value = metadata.get(field)
+        if value is not None and (not isinstance(value, str) or len(value) > limit):
+            return f"The field {field} must be a string with a maximum length of {limit}."
+    for field, (low, high) in SLICER_NUMBER_LIMITS.items():
+        value = metadata.get(field)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return f"The JSON value for {field} could not be converted."
+        if not low <= value <= high:
+            return f"The field {field} must be between {low} and {high}."
+    return None
+
+
+def _problem(status: int, title: str) -> web.Response:
+    return web.json_response(
+        {"status": status, "title": title}, status=status, content_type="application/problem+json"
+    )
 
 
 TAG_SEPARATORS = re.compile(r"[:\-._\s]")

@@ -3,8 +3,10 @@
 The bridge reads each printer's loaded spools from 3D Print Log when it starts, every five
 minutes after, and again when a print is created or completed, so a spool changed in the app
 between prints is on the next print's usage rows. `PRINTLOG_SET_SPOOL` assigns a spool from the
-printer's console (`spool_command`), and a reader in a slot, such as the Snapmaker U1's RFID
-reader, assigns the spool whose tag it reads (`spool_reading`).
+printer's console (`spool_command`), and so does a spool picked in Mainsail, Fluidd or
+KlipperScreen when Moonraker's Spoolman integration points at 3D Print Log, by its spool number.
+A reader in a slot, such as the Snapmaker U1's RFID reader, assigns the spool whose tag it reads
+(`spool_reading`).
 
 Assigning a spool is not queued like a print: it says at once whether it worked, and a command
 that couldn't reach 3D Print Log is run again by the user rather than applied hours later, when
@@ -13,13 +15,23 @@ retried with each refresh. One that no spool has is looked up again every
 `UNKNOWN_TAG_RETRY_S` while it stays in the slot, so adding it to a spool in the app takes
 effect without a restart, and at once when the spool is pulled out and put back (#35).
 
-What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration, its
-active spool and its usage reports are left alone.
+A spool assigned to a slot while a job runs is a swap (#44): `on_swap` hears of it, with the
+point the job had reached, so the job's usage on that slot is split there.
+
+An adapter can `watch_loaded` a printer: it hears each change to what's in the printer's slots,
+whatever made it (a refresh, a command, a reader), with each slot's spool as 3D Print Log
+describes it, `spoolNumber` included. That is how Moonraker's active spool follows the active
+tool's spool when its Spoolman server is 3D Print Log (`adapters/moonraker/spoolman.py`).
+
+What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration is
+followed only when its server is 3D Print Log; a Spoolman server of the user's own, and its
+active spool and usage reports, are left alone.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import re
@@ -35,8 +47,9 @@ from printlog_bridge.core.api_client import (
     ApiUnavailable,
     AuthRejected,
 )
-from printlog_bridge.core.events import SpoolCommand, SpoolReading
+from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolReading
 from printlog_bridge.core.status import StatusBoard
+from printlog_bridge.core.swaps import SpoolSwap
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +108,10 @@ def _label(slot: int) -> str:
     return f"T{slot}"
 
 
+LoadedWatcher = Callable[[Mapping[int, Mapping[str, Any]]], None]
+"""Told a printer's spool (the API's filament summary) in each slot, when that changes."""
+
+
 def _name(filament: Mapping[str, Any]) -> str:
     return str(filament.get("displayName") or filament.get("id"))
 
@@ -133,6 +150,10 @@ class Spools:
         """Set when a retry is scheduled, to wake `run` for it."""
         self._locks: dict[str, asyncio.Lock] = {}
         self._failing = False
+        self._watchers: dict[str, list[LoadedWatcher]] = {}
+        self.on_swap: Callable[[SpoolSwap], bool] | None = None
+        """Told of each spool assigned to a slot while a job runs; True when that job's usage
+        is split there (the job logger's `spool_swapped`)."""
 
     # -- what's loaded -------------------------------------------------------------------------
 
@@ -142,6 +163,22 @@ class Spools:
 
     def slot_count(self, printer: str) -> int | None:
         return self._slot_counts.get(printer)
+
+    def watch_loaded(self, printer: str, watcher: LoadedWatcher) -> Callable[[], None]:
+        """Tells `watcher` the printer's spool in each slot now, when it has been read, and
+        again after each change to it. Returns what stops that.
+
+        The watcher is called in the middle of whatever changed the slots: it must not block,
+        and what it raises is logged and goes no further."""
+        self._watchers.setdefault(printer, []).append(watcher)
+        if printer in self._loaded:
+            self._tell(watcher, printer, self._loaded[printer])
+
+        def unwatch() -> None:
+            with contextlib.suppress(ValueError):
+                self._watchers.get(printer, []).remove(watcher)
+
+        return unwatch
 
     async def current(self, printer: str) -> dict[int, str]:
         """The spool in each slot, read again now; what was last read when that fails."""
@@ -249,7 +286,21 @@ class Spools:
         if count <= 1 and 0 not in loaded and unslotted:
             # A single-tool printer's spool loaded the old way, with no slot, is in slot 0.
             loaded[0] = dict(unslotted[0])
+        self._set_loaded(printer, loaded)
+
+    def _set_loaded(self, printer: str, loaded: dict[int, dict[str, Any]]) -> None:
+        """Keeps what's in the printer's slots, and tells its watchers when that changed."""
+        changed = self._loaded.get(printer) != loaded
         self._loaded[printer] = loaded
+        if changed:
+            for watcher in list(self._watchers.get(printer, [])):
+                self._tell(watcher, printer, loaded)
+
+    def _tell(self, watcher: LoadedWatcher, printer: str, loaded: Mapping[int, Any]) -> None:
+        try:
+            watcher({slot: dict(f) for slot, f in loaded.items()})
+        except Exception:
+            log.exception("[printer %s] a watcher of its spools failed", printer)
 
     # -- PRINTLOG_SET_SPOOL --------------------------------------------------------------------
 
@@ -262,7 +313,10 @@ class Spools:
             return f"there is no T{command.slot}: tools are numbered 0 to {MAX_SLOTS - 1}"
         try:
             async with self._lock(command.printer):
+                before = self._before(command.printer, command.slot)
                 answer = await self._carry_out(command, printer_id)
+                if self._swapped(command.printer, command.slot, before, command.during):
+                    answer += f". This print's {slot} usage is split here"
         except AuthRejected:
             answer = (
                 "3D Print Log rejected the bridge's API key; nothing changed. Check it with "
@@ -287,9 +341,11 @@ class Spools:
 
     async def _carry_out(self, command: SpoolCommand, printer_id: int) -> str:
         slot = _label(command.slot)
-        if command.filament_id is None and command.tag is None:
+        if command.filament_id is None and command.tag is None and command.spool_number is None:
             await self.api.unload_slot(printer_id, command.slot)
-            self._loaded.setdefault(command.printer, {}).pop(command.slot, None)
+            loaded = dict(self._loaded.get(command.printer, {}))
+            loaded.pop(command.slot, None)
+            self._set_loaded(command.printer, loaded)
             return f"{slot} has no spool in 3D Print Log now"
         if command.tag is not None:
             uid = normalize_tag(command.tag)
@@ -304,6 +360,14 @@ class Spools:
                     f"no spool in 3D Print Log has tag {uid}; nothing changed. Add the tag to "
                     "the spool in the app, then run it again."
                 )
+            filament_id = str(spool["id"])
+        elif command.spool_number is not None:
+            spool = await self.api.filament_by_number(command.spool_number)
+            if spool is None:
+                # A deleted spool, or a number from another Spoolman: nothing to load, and
+                # nothing asks again until the next pick.
+                number = command.spool_number
+                return f"no spool in 3D Print Log has number {number}; nothing changed"
             filament_id = str(spool["id"])
         else:
             filament_id = str(command.filament_id)
@@ -401,9 +465,11 @@ class Spools:
                     return
                 filament_id = str(spool["id"])
                 if self.loaded(reading.printer).get(reading.slot) != filament_id:
+                    before = self._before(reading.printer, reading.slot)
                     await self._load(
                         reading.printer, printer_id, reading.slot, filament_id, reading.slot_count
                     )
+                    self._swapped(reading.printer, reading.slot, before, reading.during)
                     what = f"{slot} is now {_name(spool)}, from its tag {uid}"
                     log.info("[printer %s] %s", reading.printer, what)
                     self._event(reading.printer, what)
@@ -470,6 +536,32 @@ class Spools:
 
     # -- helpers -------------------------------------------------------------------------------
 
+    def _before(self, printer: str, slot: int) -> Mapping[str, Any] | None | bool:
+        """The slot's spool before a change, None for none, or False when the printer's spools
+        were never read, so what was there isn't known."""
+        if printer not in self._loaded:
+            return False
+        return self._loaded[printer].get(slot)
+
+    def _swapped(
+        self,
+        printer: str,
+        slot: int,
+        before: Mapping[str, Any] | None | bool,
+        during: JobPoint | None,
+    ) -> bool:
+        """Tells `on_swap` when the slot's spool changed while a job ran. Whether it split it.
+        Not when the spool before isn't known: there'd be nothing to split from."""
+        if before is False:
+            return False
+        after = self._loaded.get(printer, {}).get(slot)
+        old = None if before is None else str(before["id"])
+        new = None if after is None else str(after["id"])
+        if during is None or self.on_swap is None or old == new:
+            return False
+        names = (None if f is None else _name(f) for f in (before, after))
+        return self.on_swap(SpoolSwap(printer, slot, old, new, *names, during=during))
+
     def _lock(self, printer: str) -> asyncio.Lock:
         if printer not in self._locks:
             self._locks[printer] = asyncio.Lock()
@@ -484,6 +576,8 @@ def _describe(command: SpoolCommand) -> str:
     slot = _label(command.slot)
     if command.tag is not None:
         return f"set {slot} to the spool with tag {command.tag}"
+    if command.spool_number is not None:
+        return f"set {slot} to spool number {command.spool_number}"
     if command.filament_id is not None:
         return f"set {slot} to spool {command.filament_id}"
     return f"clear {slot}"

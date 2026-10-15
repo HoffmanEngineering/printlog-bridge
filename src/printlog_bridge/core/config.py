@@ -13,7 +13,7 @@ url = http://voron.local:7125
 ```
 
 `adopt_prints`, `create_prints` and `adopt_window` go in `[bridge]` for every printer, or in a
-`[printer]` section for that one (see `Adoption`).
+`[printer]` section for that one (see `Adoption`), and so does `slicer_settings`.
 
 The API key is looked up in this order: the `PRINTLOG_API_KEY` environment variable, the key
 file `<state_dir>/api_key` (which `printlog-bridge store-key` and install.sh write, mode 600),
@@ -95,6 +95,9 @@ class PrinterConfig:
     printer_id: int | None = None
     """The printer's id in 3D Print Log, which its prints are logged to. Pairing will set it."""
     adoption: Adoption = field(default_factory=Adoption)
+    slicer_settings: bool = True
+    """`slicer_settings`: send each print's slicer settings, read from the header and the
+    settings block of its file (#36). False: the file is never read."""
 
 
 class ApiKeySource(Enum):
@@ -200,8 +203,9 @@ def load_config(
     api_key, source = _api_key(env, state_dir / API_KEY_FILE, config_api_key)
 
     adoption = _adoption("[bridge]", bridge, Adoption())
+    slicer_settings = _slicer_settings("[bridge]", bridge, True)
     printers = [
-        _load_printer(section, parser[section], adapters, adoption)
+        _load_printer(section, parser[section], adapters, adoption, slicer_settings)
         for section in parser.sections()
         if section != "bridge"
     ]
@@ -359,6 +363,7 @@ def _load_printer(
     options: configparser.SectionProxy,
     adapters: Mapping[str, type[Adapter]],
     adoption: Adoption | None = None,
+    slicer_settings: bool = True,
 ) -> PrinterConfig:
     kind, _, name = section.partition(" ")
     if kind != PRINTER_PREFIX:
@@ -372,6 +377,9 @@ def _load_printer(
     adoption = _adoption(f"[printer {name}]", values, adoption or Adoption())
     for option in ADOPTION_OPTIONS:
         values.pop(option, None)
+    slicer_settings = _slicer_settings(
+        f"[printer {name}]", {"slicer_settings": values.pop("slicer_settings", "")}, slicer_settings
+    )
     adapter_name = values.pop("adapter", DEFAULT_ADAPTER).strip()
     adapter_type = adapters.get(adapter_name)
     if adapter_type is None:
@@ -380,7 +388,9 @@ def _load_printer(
             f"[printer {name}]: unknown adapter {adapter_name!r} (available: {known})"
         )
 
-    return PrinterConfig(name, adapter_type.from_config(name, values), printer_id, adoption)
+    return PrinterConfig(
+        name, adapter_type.from_config(name, values), printer_id, adoption, slicer_settings
+    )
 
 
 def _adoption(where: str, options: Mapping[str, str], base: Adoption) -> Adoption:
@@ -415,6 +425,16 @@ def _adoption(where: str, options: Mapping[str, str], base: Adoption) -> Adoptio
             "be logged. Finish-only mode is create_prints = false with adopt_prints = true."
         )
     return adoption
+
+
+def _slicer_settings(where: str, options: Mapping[str, str], default: bool) -> bool:
+    text = (options.get("slicer_settings") or "").strip()
+    if not text:
+        return default
+    value = BOOLEANS.get(text.lower())
+    if value is None:
+        raise ConfigError(f"{where} slicer_settings must be true or false, not {text!r}")
+    return value
 
 
 def _printer_id(printer: str, value: str | None) -> int | None:

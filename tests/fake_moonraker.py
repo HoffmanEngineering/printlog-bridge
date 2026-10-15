@@ -2,11 +2,14 @@
 
 It speaks just enough of the protocol for the bridge: identify, server.info,
 printer.objects.list/subscribe, printer.gcode.script, connection.register_remote_method,
-server.history.list, server.files.roots, server.files.metadata, server.webcams.list and
-server.config, plus pushing notifications (console lines among them)
-and dropping every client to simulate a restart. `start_job` and `finish_job` drive a print the
-way Moonraker's history component reports one. Over HTTP it serves the gcodes root's files
-(`GET /server/files/gcodes/<path>`), which is how a remote bridge gets a thumbnail, and
+server.history.list, server.files.roots, server.files.metadata, server.webcams.list, server.config
+and server.spoolman.get_spool_id/post_spool_id, plus pushing notifications (console lines and
+spool picks among them) and dropping every client to simulate a restart. `start_job` and
+`finish_job` drive a print the way Moonraker's history component reports one. Over HTTP it
+serves the gcodes root's files (`GET /server/files/gcodes/<path>`), which is how a remote bridge
+gets a thumbnail and a G-code file's header and settings block, with a `Range` header served as
+Moonraker's Tornado file handler serves it (206 and `Content-Range`, 200 for a range that is the
+whole file, 416 past the end), and
 `/server/info`, `/machine/system_info`, `/printer/info` and `/printer/objects/list`, which is how
 discovery recognises it. `start(host=..., port=...)` serves it at a chosen address, so a test
 can move it from 127.0.0.87 to 127.0.0.91, as a printer given a new address by DHCP.
@@ -22,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -85,12 +89,25 @@ class FakeMoonraker:
         self.webcams: list[dict[str, Any]] = []
         """moonraker.conf's [webcam] sections, as server.webcams.list lists them."""
         self.config: dict[str, dict[str, Any]] = {}
-        """moonraker.conf's sections, as server.config returns them."""
+        """moonraker.conf's sections, as server.config returns them. With a `spoolman` section
+        the spoolman component is loaded, and its methods exist."""
         self.config_files: list[dict[str, Any]] = []
         """Which file each section is in, as server.config's `files` lists them."""
+        self.spool_id: int | None = None
+        """The spoolman component's active spool."""
+        self.spoolman_loaded = True
+        """False is a `spoolman` section whose component didn't load: its methods don't exist."""
+        self.posted_spools: list[int] = []
+        """Every spool id set through server.spoolman.post_spool_id, in order."""
+        self._announce: list[tuple[str, dict]] = []
+        """Notifications a method sends to every client, before it answers."""
         self.calls: list[str] = []
         """Every method called, in order."""
         self.downloads: list[str] = []
+        self.ranges: list[tuple[str, str | None]] = []
+        """Every download's path and its `Range` header (None without one), in order."""
+        self.ignore_range = False
+        """True answers every download with the whole file, as a proxy that drops `Range`."""
         self.identified: list[dict] = []
         self.subscriptions: list[dict] = []
         self.registered: list[str] = []
@@ -164,7 +181,34 @@ class FakeMoonraker:
             return web.Response(status=401)
         if path not in self.files:
             return web.Response(status=404)
-        return web.Response(body=self.files[path], content_type="image/png")
+        data = self.files[path]
+        content_type = "image/png" if path.endswith(".png") else "text/plain"
+        header = request.headers.get("Range")
+        self.ranges.append((path, header))
+        span = None if header is None or self.ignore_range else _parse_range(header)
+        if span is None:
+            return web.Response(body=data, content_type=content_type)
+        # tornado.web.StaticFileHandler.get, as Moonraker's FileRequestHandler runs it.
+        start, end = span
+        size = len(data)
+        if start is not None and start < 0:
+            start = max(0, start + size)
+        past = start is not None and (start >= size or (end is not None and start >= end))
+        if past or end == 0:
+            return web.Response(
+                status=416, headers={"Content-Range": f"bytes */{size}"}, content_type="text/plain"
+            )
+        if end is not None and end > size:
+            end = size
+        first, stop = start or 0, end if end is not None else size
+        if stop - first == size:
+            return web.Response(body=data, content_type=content_type)
+        return web.Response(
+            status=206,
+            body=data[first:stop],
+            headers={"Content-Range": f"bytes {first}-{stop - 1}/{size}"},
+            content_type=content_type,
+        )
 
     async def _http_get(self, request: web.Request) -> web.Response:
         self.http_requests.append(request.path)
@@ -214,6 +258,7 @@ class FakeMoonraker:
         try:
             result = self._dispatch(method, params, conn)
         except _RpcError as e:
+            self._announce.clear()
             await send(
                 {
                     "jsonrpc": "2.0",
@@ -222,6 +267,9 @@ class FakeMoonraker:
                 }
             )
             return
+        announce, self._announce = self._announce, []
+        for name, payload in announce:
+            await self.notify(name, payload)
         await send({"jsonrpc": "2.0", "result": result, "id": request.get("id")})
 
     def _dispatch(self, method: str, params: dict, conn: dict) -> Any:
@@ -288,6 +336,18 @@ class FakeMoonraker:
                 "orig": {},
                 "files": copy.deepcopy(self.config_files),
             }
+        if method == "server.spoolman.get_spool_id":
+            self._require_spoolman()
+            return {"spool_id": self.spool_id}
+        if method == "server.spoolman.post_spool_id":
+            self._require_spoolman()
+            spool_id = params.get("spool_id")
+            self.posted_spools.append(spool_id)
+            if spool_id != self.spool_id:
+                # Moonraker tells every client, the one that set it too; not when it's unchanged.
+                self.spool_id = spool_id
+                self._announce.append(("notify_active_spool_set", {"spool_id": spool_id}))
+            return {"spool_id": spool_id}
         if method == "printer.gcode.script":
             self._require_klippy()
             self.scripts.append(params["script"])
@@ -313,6 +373,10 @@ class FakeMoonraker:
         if limit > 0:
             jobs = jobs[start : start + limit]
         return {"count": len(jobs), "jobs": [dict(j) for j in jobs]}
+
+    def _require_spoolman(self) -> None:
+        if "spoolman" not in self.config or not self.spoolman_loaded:
+            raise _RpcError(-32601, "Method not found")
 
     def _require_klippy(self) -> None:
         if self.klippy_state != "ready":
@@ -407,6 +471,11 @@ class FakeMoonraker:
         """Klipper prints a line to the console, as `action_respond_info` does."""
         await self.notify("notify_gcode_response", line)
 
+    async def pick_spool(self, spool_id: int | None) -> None:
+        """A spool is picked (or cleared) in Mainsail, Fluidd or KlipperScreen."""
+        self.spool_id = spool_id
+        await self.notify("notify_active_spool_set", {"spool_id": spool_id})
+
     async def call_remote_method(self, method: str, params: dict) -> None:
         for send in list(self._clients):
             await send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -419,6 +488,63 @@ class FakeMoonraker:
     @property
     def client_count(self) -> int:
         return len(self._clients)
+
+
+def _parse_range(header: str) -> tuple[int | None, int | None] | None:
+    """`tornado.httputil._parse_request_range`: `(start, end)`, end exclusive; a negative start
+    counts from the end. None for a header it doesn't understand, which is then ignored."""
+    unit, _, value = header.partition("=")
+    if unit.strip() != "bytes":
+        return None
+    first, dash, last = value.partition("-")
+    if not dash:
+        return None
+    try:
+        start = int(first.strip()) if first.strip() else None
+        end = int(last.strip()) if last.strip() else None
+    except ValueError:
+        return None
+    if end is not None:
+        if start is None:
+            if end != 0:
+                start, end = -end, None
+        else:
+            end += 1
+    return start, end
+
+
+def gcode_metadata(data: bytes, moonraker: str = "9e676eb") -> dict[str, Any]:
+    """`size`, `gcode_start_byte` and `gcode_end_byte` as Moonraker's metadata gives them for a
+    G-code file (`BaseSlicer.parse_gcode_start_byte` and `parse_gcode_end_byte`): where the first
+    line that starts with a G or M command begins, and where the line after the last one does.
+
+    Moonraker 9e676eb counts in bytes. `moonraker="v0.9.3"` gives what v0.9.3 (and older) does:
+    it reads the file in text mode, so it counts characters, with each `\\r\\n` read as one, and
+    `gcode_end_byte` (`size` less the characters after it) lands past the real end by every byte
+    of non-ASCII text and every `\\r` that follows."""
+    read_size = 1024 * 1024
+    if moonraker == "v0.9.3":
+        text = data.decode().replace("\r\n", "\n").replace("\r", "\n")  # universal newlines
+        header, footer = text[:read_size], text[-read_size:]
+        metadata: dict[str, Any] = {"size": len(data)}
+        match = re.search(r"\n[MG]\d+\s.*\n", header)
+        if match is not None:
+            metadata["gcode_start_byte"] = match.start()
+        match = re.search(r"\n.*\s\d+[MG]\n", footer[::-1])
+        if match is not None:
+            metadata["gcode_end_byte"] = len(data) - match.start()
+        return metadata
+    text = data[:read_size].decode(errors="ignore")
+    footer = data[-read_size:].decode(errors="ignore") if len(data) > read_size else text
+    metadata = {"size": len(data)}
+    match = re.search(r"\n[MG]\d+\s.*\n", text)
+    if match is not None:
+        metadata["gcode_start_byte"] = len(text[: match.start()].encode())
+    reverse = footer[::-1]
+    match = re.search(r"\n.*\s\d+[MG]\n", reverse)
+    if match is not None:
+        metadata["gcode_end_byte"] = len(data) - len(reverse[: match.start()].encode())
+    return metadata
 
 
 class _RpcError(Exception):

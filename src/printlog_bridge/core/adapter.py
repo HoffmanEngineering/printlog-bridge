@@ -48,9 +48,13 @@ class Adapter(ABC):
         dropped connection; return only when cancelled.
         """
 
-    def use_spools(self, spools: SpoolSink) -> None:  # noqa: B027 - optional, does nothing
+    def use_spools(  # noqa: B027 - optional, does nothing
+        self, spools: SpoolSink, api_url: str | None = None
+    ) -> None:
         """Called before `run` with where to send spool commands and slot readings, for an
-        adapter whose printer has them (PRINTLOG_SET_SPOOL, an RFID reader). Optional."""
+        adapter whose printer has them (PRINTLOG_SET_SPOOL, an RFID reader), and where 3D Print
+        Log's API is, so it can tell the printer's own integrations that point at 3D Print Log
+        (Moonraker's Spoolman) from those that don't. Optional."""
 
     def use_trace(self, trace: Trace) -> None:  # noqa: B027 - optional, does nothing
         """Called before `run` when `trace = true`: record every message to and from the

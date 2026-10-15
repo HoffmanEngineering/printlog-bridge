@@ -3,7 +3,8 @@
 Local mode uses Moonraker's Unix socket, where each message ends with an ETX byte. Remote mode
 uses its WebSocket. Either way the bridge identifies as an agent, so it appears in Moonraker's
 extensions list, then subscribes to the printer objects a job needs and passes status and
-history notifications to a listener.
+history notifications to a listener, and the spool picked through Moonraker's Spoolman
+integration (`notify_active_spool_set`).
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from printlog_bridge.core.images import mask_url, scrub_url
 from printlog_bridge.core.status import NullReport, PrinterReport
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
+from .changes import SENSOR_FIELDS, is_sensor
+
 log = logging.getLogger(__name__)
 
 CLIENT_NAME = "printlog-bridge"
@@ -38,7 +41,7 @@ ETX = b"\x03"
 
 SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "print_stats": None,
-    "toolhead": ["extruder"],  # the active tool
+    "toolhead": ["extruder", "position"],  # the active tool; the extruder's unloads (#44)
     "virtual_sdcard": None,
     "webhooks": None,
 }
@@ -72,6 +75,20 @@ class MoonrakerListener(Protocol):
     async def on_gcode_response(self, line: str) -> None:
         """Klipper printed a line to the console (`notify_gcode_response`)."""
 
+    async def on_active_spool(self, spool_id: int | None) -> None:
+        """Moonraker's Spoolman integration has another active spool (`notify_active_spool_set`),
+        picked in Mainsail, Fluidd or KlipperScreen, or None when it was cleared.
+
+        Optional: a listener without it never hears of one, so the listeners that have no use
+        for Spoolman don't each need a method that does nothing.
+        """
+
+
+async def _active_spool(listener: MoonrakerListener, spool_id: int | None) -> None:
+    on_active_spool = getattr(listener, "on_active_spool", None)
+    if on_active_spool is not None:
+        await on_active_spool(spool_id)
+
 
 class Listeners:
     """Several listeners as one, each told everything in turn."""
@@ -98,6 +115,10 @@ class Listeners:
     async def on_gcode_response(self, line: str) -> None:
         for listener in self.listeners:
             await listener.on_gcode_response(line)
+
+    async def on_active_spool(self, spool_id: int | None) -> None:
+        for listener in self.listeners:
+            await _active_spool(listener, spool_id)
 
 
 class MoonrakerAuthError(Exception):
@@ -387,6 +408,11 @@ class MoonrakerSession:
         elif method == "notify_gcode_response":
             for line in params or []:
                 await self.listener.on_gcode_response(str(line))
+        elif method == "notify_active_spool_set":
+            spool = params[0] if params and isinstance(params[0], Mapping) else {}
+            spool_id = spool.get("spool_id")
+            if spool_id is None or (isinstance(spool_id, int) and not isinstance(spool_id, bool)):
+                await _active_spool(self.listener, spool_id)
         elif method == "notify_klippy_ready":
             await self._subscribe(rpc)
         elif method in ("notify_klippy_shutdown", "notify_klippy_disconnected"):
@@ -399,6 +425,8 @@ class MoonrakerSession:
             available = set((await rpc.call("printer.objects.list"))["objects"])
             objects = dict(SUBSCRIPTION)
             objects.update({k: v for k, v in OPTIONAL_SUBSCRIPTION.items() if k in available})
+            # Runout sensors, which are named: `filament_switch_sensor <name>` (#44).
+            objects.update({k: list(SENSOR_FIELDS) for k in sorted(available) if is_sensor(k)})
             result = await rpc.call("printer.objects.subscribe", {"objects": objects})
         except MoonrakerRpcError as e:
             # Klipper went away between ready and subscribe; its next ready notification retries.
