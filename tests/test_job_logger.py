@@ -62,6 +62,7 @@ async def logging_to(
     image_timeout: float | None = None,
     spools: bool = False,
     adoption: Adoption | None = None,
+    slicer_settings: bool = True,
     max_attachment_bytes: int | None = None,
     **printers: int,
 ):
@@ -83,7 +84,10 @@ async def logging_to(
                 client,
                 {
                     name: LoggedPrinter(
-                        printer_id=printer_id, source="moonraker", adoption=adoption or Adoption()
+                        printer_id=printer_id,
+                        source="moonraker",
+                        adoption=adoption or Adoption(),
+                        slicer_settings=slicer_settings,
                     )
                     for name, printer_id in targets.items()
                 },
@@ -114,6 +118,8 @@ def run(
     backoff=FAST_BACKOFF,
     spools: bool = False,
     adoption: Adoption | None = None,
+    slicer_settings: bool = True,
+    image_timeout: float | None = None,
     max_attachment_bytes: int | None = None,
     **printers: int,
 ):
@@ -130,6 +136,8 @@ def run(
             backoff=backoff,
             spools=spools,
             adoption=adoption,
+            slicer_settings=slicer_settings,
+            image_timeout=image_timeout,
             max_attachment_bytes=max_attachment_bytes,
             **printers,
         ) as logger:
@@ -749,6 +757,28 @@ class TestConnection:
         [print_] = api.prints.values()
         assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
         assert [r for r in api.requests if r[0] == "POST"] == [("POST", "/api/Prints")]
+
+    def test_a_print_waits_for_its_connection_when_the_line_comes_back_mid_attempt(self, tmp_path):
+        """The same, with the connection cut rather than answered with a 503."""
+        api = FakePrintLogApi()
+        api.offline = True
+        register = heartbeat_registration(tmp_path)
+
+        def register_then_reconnect(client, board):
+            ensure_registered = register(client, board)
+
+            async def hook(printer):
+                try:
+                    await ensure_registered(printer)
+                finally:
+                    api.offline = False  # back between the registration and the create
+
+            return hook
+
+        report_run(api, tmp_path, started(), register=register_then_reconnect)
+
+        [print_] = api.prints.values()
+        assert print_["connectionId"] == api.connections[print_["connectionInstanceId"]]["id"]
 
     def test_a_refused_registration_still_logs_the_print(self, tmp_path):
         """Refused is not unreachable: sending it again won't change the answer, so the print

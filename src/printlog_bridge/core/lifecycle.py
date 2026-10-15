@@ -31,6 +31,12 @@ logged. See `_adopt`.
 A spool assigned to a slot while the job runs (`Spools.on_swap`, #44) is kept in the job's state
 with the point it was assigned at, and the slot's usage is split between the spools there when
 the job ends. See `swaps.py`.
+
+The slicer settings of the job's file (#36) go through the outbox too, once per job, after its
+start: read from the printer when the adapter reports them, scrubbed (`slicer_settings.py`), and
+sent once the print exists. Like a picture, they never hold up their print: an answer that says
+they can't or needn't be recorded (400, 404, 409, 413) drops them, and so do too many failures.
+A print adopted with settings of its own (the uploader's, the Cura plugin's) keeps them.
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from printlog_bridge.core.api_client import (
     ApiClient,
@@ -63,6 +69,7 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobSlicerSettings,
     JobStarted,
 )
 from printlog_bridge.core.images import (
@@ -75,6 +82,7 @@ from printlog_bridge.core.images import (
     video_type,
 )
 from printlog_bridge.core.outbox import Entry, Outbox, utc_now
+from printlog_bridge.core.slicer_settings import OUTBOX_KIND, request_body
 from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState, safe_file_name
 from printlog_bridge.core.status import BoardReport, StatusBoard
@@ -93,6 +101,7 @@ from printlog_bridge.core.swaps import (
 from printlog_bridge.core.titles import same_file, title_from_file_name
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 PRINTING = 2
 STATUS_FOR = {JobOutcome.COMPLETED: 3, JobOutcome.CANCELLED: 4, JobOutcome.FAILED: 5}
@@ -119,8 +128,17 @@ STORAGE_ERRORS = (OSError, sqlite3.Error)
 START, FINISH = "start", "finish"
 IMAGE_KINDS = frozenset(kind.value for kind in ImageKind)
 ATTACHMENT_KINDS = frozenset(kind.value for kind in AttachmentKind)
-EXTRA_KINDS = IMAGE_KINDS | ATTACHMENT_KINDS
-"""Entries that never hold up their print: one that can't be sent is dropped."""
+FILE_KINDS = IMAGE_KINDS | ATTACHMENT_KINDS
+"""Entries whose file waits in the state directory (`images/`, `attachments/`) to be sent."""
+SLICER_SETTINGS = OUTBOX_KIND
+OPTIONAL_KINDS = FILE_KINDS | {SLICER_SETTINGS}
+"""Entries that must never hold up their print: given up on after `IMAGE_MAX_ATTEMPTS`."""
+NO_SLICER_SETTINGS = (405, 501)
+"""What an API without the slicer settings endpoint (api#164) may answer it with. Its plain
+404 can't be told from a print that's gone, so that only drops the one print's."""
+NO_SLICER_SETTINGS_FOR = timedelta(hours=24)
+"""How long none are read or sent after such an answer: it may as well be a maintenance page
+as an API older than the endpoint, and either can change."""
 IMAGES_DIR = "images"
 ATTACHMENTS_DIR = "attachments"
 ATTACHMENT_TIMEOUT_S = 10 * 60.0
@@ -154,6 +172,8 @@ class LoggedPrinter:
     """The API's `externalSource`: the adapter's name, such as `moonraker`."""
     adoption: Adoption = Adoption()
     """Whether to adopt the user's own print for a job, and whether to create one otherwise."""
+    slicer_settings: bool = True
+    """Whether to read and send each job's slicer settings (`slicer_settings`)."""
 
 
 def backoff_delay(attempts: int, base: float, cap: float) -> float:
@@ -216,6 +236,10 @@ class JobLogger:
         self._storage_failures = 0
         """Writes to the state directory that failed in a row."""
         self._no_lookup_logged = False
+        self.clock = clock
+        self._no_slicer_settings_until: datetime | None = None
+        """The API answered that it has no slicer settings endpoint: none are read or sent until
+        then (`NO_SLICER_SETTINGS_FOR`)."""
 
     def close(self) -> None:
         self.outbox.close()
@@ -238,31 +262,31 @@ class JobLogger:
         """Queues the event in the outbox, on disk, unless it's a replay. Never waits on the API.
 
         When the state directory can't be written (a full disk), the event is kept in memory and
-        queued, in order, once it can be, and `status` shows a warning meanwhile. A picture or a
-        file to attach is skipped instead: it is fetched now or never.
+        queued, in order, once it can be, and `status` shows a warning meanwhile. A picture, the
+        slicer settings, or a file to attach, is skipped instead: it is fetched now or never.
         """
-        extra = isinstance(event, (JobImage, JobAttachment))
-        if self._unqueued and not extra:
+        optional = isinstance(event, (JobImage, JobSlicerSettings, JobAttachment))
+        if self._unqueued and not optional:
             self._unqueued.append(event)  # nothing jumps ahead of what waits to be queued
             return
-        if extra and any(
+        if optional and any(
             (e.printer, e.job_id) == (event.printer, event.job_id) for e in self._unqueued
         ):
             # Queued now, it would go ahead of its job's start or end: a thumbnail before the
             # print exists is dropped, and a snapshot before the end misses its outcome.
             log.warning(
                 "[printer %s] job %s's %s is skipped: the outbox can't be written",
-                event.printer, event.job_id, event.kind.value,
+                event.printer, event.job_id, _what(event),
             )  # fmt: skip
             return
         try:
             await self._emit(event)
         except STORAGE_ERRORS as e:
             self._storage_failed(e)
-            if extra:
+            if optional:
                 log.warning(
                     "[printer %s] job %s's %s is skipped: the outbox can't be written",
-                    event.printer, event.job_id, event.kind.value,
+                    event.printer, event.job_id, _what(event),
                 )  # fmt: skip
             else:
                 self._unqueued.append(event)
@@ -275,6 +299,8 @@ class JobLogger:
         state = self.state(event.printer)
         if isinstance(event, JobImage):
             await self._emit_image(state, event)
+        elif isinstance(event, JobSlicerSettings):
+            await self._emit_slicer_settings(state, event)
         elif isinstance(event, JobAttachment):
             await self._emit_attachment(state, event)
         elif isinstance(event, FilamentChange):
@@ -414,16 +440,39 @@ class JobLogger:
         job.images[kind] = True
         state.save()
 
+    async def _emit_slicer_settings(self, state: PrinterState, event: JobSlicerSettings) -> None:
+        if not self.printers[event.printer].slicer_settings:
+            return  # turned off: the file is never read
+        job = state.jobs.get(event.job_id)
+        if job is None or job.finished or job.slicer_settings or self._no_slicer_settings():
+            return  # a job not logged, logged before (a replay), or read already
+        file = None
+        if event.read is not None:
+            where = f"[printer {event.printer}] job {event.job_id}'s slicer settings"
+            file = await self._wait_for(event.read, where)
+        body = request_body(event.metadata, file)
+        if body is not None:
+            self._queue(event.printer, event.job_id, SLICER_SETTINGS, body)
+        else:
+            log.debug("[printer %s] job %s: no slicer settings", event.printer, event.job_id)
+        # Marked only once queued, as a picture is.
+        job.slicer_settings = True
+        state.save()
+
     async def _fetch(self, event: JobImage) -> bytes | None:
         """The adapter's picture, or None when there's none, it fails, or it takes too long."""
-        task = asyncio.ensure_future(event.fetch())
+        where = f"[printer {event.printer}] job {event.job_id}'s {event.kind.value}"
+        return await self._wait_for(event.fetch, where)
+
+    async def _wait_for(self, fetch: Callable[[], Awaitable[T]], where: str) -> T | None:
+        """What the adapter's `fetch` gives, or None when it fails or takes too long."""
+        task = asyncio.ensure_future(fetch())
         try:
             # asyncio.wait, not wait_for, which can swallow a cancel before Python 3.12.
             done, _ = await asyncio.wait({task}, timeout=self.image_timeout)
         except asyncio.CancelledError:
             task.cancel()
             raise
-        where = f"[printer {event.printer}] job {event.job_id}'s {event.kind.value}"
         if not done:
             task.cancel()
             log.info("%s took longer than %gs; skipping it", where, self.image_timeout)
@@ -548,7 +597,7 @@ class JobLogger:
     def _remove_stray_images(self) -> None:
         """Image and attachment files no outbox entry needs: left by a power cut between writing
         and queueing, or a fetch cut off when the bridge stopped."""
-        entries = [e for e in self.outbox.entries() if e.kind in EXTRA_KINDS]
+        entries = [e for e in self.outbox.entries() if e.kind in FILE_KINDS]
         for folder in (self.images_dir, self.attachments_dir):
             if not folder.is_dir():
                 continue
@@ -614,14 +663,16 @@ class JobLogger:
 
     async def _send(self, entry: Entry) -> None:
         loop = asyncio.get_running_loop()
-        image = entry.kind in EXTRA_KINDS  # a picture or an attachment: dropped, not retried
+        image = entry.kind in OPTIONAL_KINDS  # given up on rather than holding up the print
         try:
             if entry.kind == START:
                 await self._send_start(entry)
-            elif entry.kind in IMAGE_KINDS:
-                await self._send_image(entry)
+            elif entry.kind == SLICER_SETTINGS:
+                await self._send_slicer_settings(entry)
             elif entry.kind in ATTACHMENT_KINDS:
                 await self._send_attachment(entry)
+            elif image:
+                await self._send_image(entry)
             else:
                 await self._send_finish(entry)
         except AuthRejected:
@@ -705,7 +756,7 @@ class JobLogger:
         self.outbox.remove(entry.seq)
         self._due.pop(entry.seq, None)
         self._image_tries.pop(entry.seq, None)
-        if entry.kind in EXTRA_KINDS:
+        if entry.kind in FILE_KINDS:
             _unlink(self._extra_file(entry))
 
     def _retry_later(self, entry: Entry, problem: str, retry_after: float | None) -> None:
@@ -740,9 +791,11 @@ class JobLogger:
             )  # fmt: skip
             self._due.pop(entry.seq, None)
             self._image_tries.pop(entry.seq, None)
-            if entry.kind in EXTRA_KINDS:
-                # Only the picture is lost; the print's own events are judged on their own.
-                _unlink(self._extra_file(entry))
+            if entry.kind in OPTIONAL_KINDS:
+                # Only the picture (or the slicer settings, or the video) is lost; the print's
+                # own events are judged on their own.
+                if entry.kind in FILE_KINDS:
+                    _unlink(self._extra_file(entry))
                 continue
             state = self.state(entry.printer)
             job = state.jobs.get(entry.job_id)
@@ -802,6 +855,59 @@ class JobLogger:
         self._logged(
             entry.printer, f"job {entry.job_id}: {entry.kind} added to print {job.print_id}"
         )
+
+    async def _send_slicer_settings(self, entry: Entry) -> None:
+        """Records the job's slicer settings on its print. An answer that sending again won't
+        change ends it here; anything worth retrying is raised to `_send`."""
+        where = f"[printer {entry.printer}] job {entry.job_id}'s slicer settings"
+        job = self.state(entry.printer).jobs.get(entry.job_id)
+        if job is None or job.print_id is None:
+            log.info("%s have no print to go on (the print wasn't logged); dropping them", where)
+            return
+        if job.print_with_settings is not None and job.print_with_settings == job.print_id:
+            log.info(
+                "%s aren't sent: print %s already has the slicer's own (the Slic3r uploader's or "
+                "the Cura plugin's)",
+                where, job.print_id,
+            )  # fmt: skip
+            return
+        if self._no_slicer_settings():
+            return
+        try:
+            status = await self.api.post_slicer_settings(job.print_id, entry.payload)
+        except ApiRejected as e:
+            # The API's own words, which never quote what was sent.
+            log.warning("%s weren't recorded: %s", where, e)
+            return
+        except ApiUnavailable as e:
+            if e.status not in NO_SLICER_SETTINGS:
+                raise
+            self._no_slicer_settings_until = self.clock() + NO_SLICER_SETTINGS_FOR
+            log.warning(
+                "[printer %s] 3D Print Log doesn't take slicer settings (%s), so none are read "
+                "or sent for %s; then the bridge tries again",
+                entry.printer, e, f"{NO_SLICER_SETTINGS_FOR.total_seconds() / 3600:g} hours",
+            )  # fmt: skip
+            return
+        if status == 409:
+            log.info(
+                "%s aren't recorded: print %s already has the slicer's own (the Slic3r "
+                "uploader's or the Cura plugin's)",
+                where, job.print_id,
+            )  # fmt: skip
+        elif status == 404:
+            log.info(
+                "%s weren't recorded: print %s is gone, or 3D Print Log doesn't take them yet",
+                where, job.print_id,
+            )  # fmt: skip
+        else:
+            self._logged(
+                entry.printer, f"job {entry.job_id}: slicer settings added to print {job.print_id}"
+            )
+
+    def _no_slicer_settings(self) -> bool:
+        until = self._no_slicer_settings_until
+        return until is not None and self.clock() < until
 
     async def _send_attachment(self, entry: Entry) -> None:
         """Attaches the file: an upload URL from the API, the file to storage, then confirmed."""
@@ -988,6 +1094,8 @@ class JobLogger:
             )  # fmt: skip
         for candidate in candidates:
             job.claiming = int(candidate["id"])
+            if candidate.get("hasSlicerSettings"):
+                job.print_with_settings = job.claiming
             state.save()
             claimed = await self._claim(state, printer, job_id, job, job.claiming, claim)
             if claimed is not None:
@@ -1221,6 +1329,13 @@ def _finish_event(entry: Entry) -> JobFinished:
         filament_mm={int(slot): mm for slot, mm in (payload.get("filament_mm") or {}).items()},
         note=payload.get("note"),
     )
+
+
+def _what(event: JobEvent) -> str:
+    """What an optional event brings, for a log line: `thumbnail`, `slicer settings`..."""
+    if isinstance(event, (JobImage, JobAttachment)):
+        return event.kind.value
+    return "slicer settings"
 
 
 def _unlink(path: Path) -> None:

@@ -1,18 +1,23 @@
 """Getting a picture of a print from the printer: a file or a URL, bounded in size and time.
 
-Adapters use these to fetch a job's slicer thumbnail or a webcam snapshot, and, streamed to disk
-with `download_file` and `copy_file`, a file to attach to the print (a timelapse video). None may
-hold up logging the print, so every fetch has a time limit and a size limit, and fails with
-`ImageUnavailable` (`FileUnavailable` for a file), never anything else. Webcam URLs (and
-Moonraker's, in remote mode) can carry a password or a token, so a URL only ever reaches a
-message, the log or the status file through `mask_url`, and an error that might repeat one
-through `scrub_url`.
+Adapters use these to fetch a job's slicer thumbnail or a webcam snapshot. Neither may hold up
+logging the print, so every fetch has a time limit and a size limit, and fails with
+`ImageUnavailable`, never anything else. `fetch_range` and `read_range` get one byte range of a
+file (the header and the settings block of a job's G-code, #36) the same way, and never more
+than that range: they fail with `RangeUnavailable`. `download_file` and `copy_file` stream a
+file to attach to the print (a timelapse video) to disk, within a size limit, and fail with
+`FileUnavailable`.
+
+Webcam URLs (and Moonraker's, in remote mode) can carry a password or a token, so a URL only ever
+reaches a message, the log or the status file through `mask_url`, and an error that might repeat
+one through `scrub_url`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -52,6 +57,11 @@ class FileUnavailable(Exception):
 
 class ImageUnavailable(FileUnavailable):
     """The picture couldn't be had. The message is safe to log: it never holds a password."""
+
+
+class RangeUnavailable(Exception):
+    """The byte range couldn't be had, or the file isn't the size it was said to be. The message
+    is safe to log: it never holds a password."""
 
 
 def image_type(data: bytes) -> str | None:
@@ -138,7 +148,12 @@ async def _download(
     max_bytes: int,
     headers: Mapping[str, str] | None,
 ) -> bytearray:
-    async with session.get(url, headers=dict(headers or {})) as response:
+    # With a key (Moonraker's, for a thumbnail), never redirected: the key would go along to
+    # wherever the redirect points. A webcam's snapshot URL carries no header of ours (aiohttp
+    # drops basic auth on a redirect to another host), and some cameras redirect to the frame.
+    async with session.get(
+        url, headers=dict(headers or {}), allow_redirects=not headers
+    ) as response:
         if response.status != 200:
             raise ImageUnavailable(f"{shown} answered {response.status}")
         if response.content_length is not None and response.content_length > max_bytes:
@@ -173,6 +188,82 @@ async def read_image_file(path: Path, *, max_bytes: int = MAX_IMAGE_BYTES) -> by
     return data
 
 
+async def fetch_range(
+    url: str,
+    start: int,
+    end: int,
+    *,
+    size: int,
+    timeout: float,
+    headers: Mapping[str, str] | None = None,
+) -> bytes:
+    """GETs bytes `start` to `end` (exclusive) of a file that is `size` bytes long, with a
+    `Range` header, and never reads past them.
+
+    The answer must be that range of a file of that size (206 and its `Content-Range`), or the
+    whole file when the range is all of it (200). A server that ignores the range would send
+    the whole file, so then nothing is read."""
+    shown = mask_url(url)
+    wanted = end - start
+    try:
+        # Not one parenthesized `async with`: Python 3.9's documented grammar has none.
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers={"User-Agent": f"printlog-bridge/{__version__}"},
+        )
+        # Never redirected: Moonraker's key would go along to wherever the redirect points.
+        request = session.get(
+            url,
+            headers={**(headers or {}), "Range": f"bytes={start}-{end - 1}"},
+            allow_redirects=False,
+        )
+        async with session, request as response:
+            if response.status == 206:
+                content_range = response.headers.get("Content-Range", "")
+                if content_range != f"bytes {start}-{end - 1}/{size}":
+                    raise RangeUnavailable(
+                        f"{shown} sent bytes {content_range or '(unsaid)'}, not "
+                        f"{start}-{end - 1} of {size}: the file isn't the one the job printed"
+                    )
+            elif response.status == 200:
+                if start != 0 or end != size or response.content_length not in (None, size):
+                    raise RangeUnavailable(f"{shown} ignored the range; nothing was read")
+            else:
+                raise RangeUnavailable(f"{shown} answered {response.status}")
+            data = bytearray()
+            async for chunk in response.content.iter_chunked(_CHUNK):
+                data.extend(chunk)
+                if len(data) > wanted:
+                    raise RangeUnavailable(f"{shown} sent more than the {wanted} bytes asked for")
+    except asyncio.TimeoutError:
+        raise RangeUnavailable(f"{shown} didn't answer within {timeout:g}s") from None
+    except (aiohttp.ClientError, OSError, ValueError) as e:
+        raise RangeUnavailable(f"can't reach {shown}: {scrub_url(e, url)}") from None
+    if len(data) != wanted:
+        raise RangeUnavailable(f"{shown} sent {len(data)} of the {wanted} bytes asked for")
+    return bytes(data)
+
+
+async def read_range(path: Path, start: int, end: int, expected_size: int) -> bytes:
+    """Reads bytes `start` to `end` (exclusive) of a file, which must be `expected_size` bytes
+    long (otherwise it isn't the file the job printed), and nothing else of it."""
+
+    def read() -> bytes:
+        with path.open("rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if size != expected_size:
+                raise RangeUnavailable(
+                    f"{path} is {size} bytes, not {expected_size}: it isn't the one the job printed"
+                )
+            f.seek(start)
+            return f.read(end - start)
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, read)
+    except OSError as e:
+        raise RangeUnavailable(f"can't read {path}: {e.strerror or e}") from None
+
+
 async def download_file(
     url: str,
     path: Path,
@@ -181,18 +272,18 @@ async def download_file(
     max_bytes: int,
     headers: Mapping[str, str] | None = None,
 ) -> None:
-    """GETs a file into `path`, streamed to disk. A user and password in the URL are sent as
-    basic auth. Raises FileUnavailable, leaving no file behind, when it fails or is larger than
-    `max_bytes`."""
+    """GETs a file into `path`, streamed to disk. Raises FileUnavailable, leaving no file
+    behind, when it fails or is larger than `max_bytes`."""
     shown = mask_url(url)
     try:
-        async with (
-            aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                headers={"User-Agent": f"printlog-bridge/{__version__}"},
-            ) as session,
-            session.get(url, headers=dict(headers or {})) as response,
-        ):
+        # Not one parenthesized `async with`: Python 3.9's documented grammar has none.
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers={"User-Agent": f"printlog-bridge/{__version__}"},
+        )
+        # Never redirected: Moonraker's key would go along to wherever the redirect points.
+        request = session.get(url, headers=dict(headers or {}), allow_redirects=False)
+        async with session, request as response:
             if response.status != 200:
                 raise FileUnavailable(f"{shown} answered {response.status}")
             if response.content_length is not None and response.content_length > max_bytes:

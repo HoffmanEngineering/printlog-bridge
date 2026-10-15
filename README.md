@@ -181,7 +181,16 @@ PRINTLOG_SET_SPOOL ID=<spool id>         ; the active tool has this spool
 PRINTLOG_CLEAR_SPOOL TOOL=1              ; T1 has no spool
 ```
 
-`TOOL` is 0 for T0 or a single-tool printer; without it, it's the active tool. A tag is the UID stored on the spool in 3D Print Log, in any common format (`04:a2:3f:11` is `04A23F11`). The bridge answers on the console within a second or two, and adds slots to the printer in 3D Print Log when it has fewer than its tools. The macros only print a line for the bridge to read, so they never fail and never stop a print, even with the bridge offline: if no answer comes, run it again once the bridge is back. Assign spools before a print starts; a print keeps the spools it started with, and you can change them on the print in the app. The bridge never touches Moonraker's Spoolman integration, its active spool or what it reports.
+`TOOL` is 0 for T0 or a single-tool printer; without it, it's the active tool. A tag is the UID stored on the spool in 3D Print Log, in any common format (`04:a2:3f:11` is `04A23F11`). The bridge answers on the console within a second or two, and adds slots to the printer in 3D Print Log when it has fewer than its tools. The macros only print a line for the bridge to read, so they never fail and never stop a print, even with the bridge offline: if no answer comes, run it again once the bridge is back. Assign spools before a print starts; a print keeps the spools it started with, and you can change them on the print in the app. Moonraker's Spoolman integration is left alone unless it points at 3D Print Log (see [Spoolman](#spoolman)).
+
+#### Spoolman
+
+3D Print Log answers Spoolman's API, so Moonraker's `[spoolman]` can point at it and Mainsail, Fluidd and KlipperScreen list your 3D Print Log spools in their spool pickers, by spool number. When it does, the bridge keeps Moonraker's active spool and the tool slots in 3D Print Log in step, both ways. It does this only when the host in `[spoolman] server` is the host of the bridge's `api_url` (case doesn't matter; a user name, password or port in the address is ignored). With a Spoolman server of your own, spool numbers are that server's and mean nothing in 3D Print Log, so the bridge leaves it alone and logs one line saying so. A Moonraker with no `[spoolman]` section, or without the Spoolman component, is fine; the bridge ignores it.
+
+- **Printer to app.** A spool you pick in Mainsail, Fluidd or KlipperScreen, or with `SET_ACTIVE_SPOOL`, is loaded into the active tool's slot in 3D Print Log. Picked during a print, it's a swap, split where it happened, as `PRINTLOG_SET_SPOOL` is. Clearing the active spool changes nothing. A number 3D Print Log doesn't know is logged and changes nothing. Nothing is queued while 3D Print Log is unreachable: pick it again once it is.
+- **App to printer.** When the active tool changes, or when the active tool's slot gets another spool (in the app, with `PRINTLOG_SET_SPOOL`, or from the U1's RFID reader), the bridge sets Moonraker's active spool to it. A change made in the app reaches Moonraker when the bridge next reads your spools from 3D Print Log: within 5 minutes, or sooner when a print starts or ends. An empty slot, or a spool with no number, leaves Moonraker's as it was. When the bridge connects it does this only if the printer isn't printing or paused, so a print already running keeps reporting its usage on the spool it started on.
+
+So on a toolchanger, the Snapmaker U1 included, Moonraker's active spool follows each tool change with no macros.
 
 #### Changing spools mid-print
 
@@ -207,7 +216,7 @@ Until pairing lands, the bridge signs in with a personal API key from [3dprintlo
 
 ## Privacy and security
 
-The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail and, unless you turn snapshots off, one webcam frame when it ends; with Pro and moonraker-timelapse, also the print's timelapse video. It never reads or uploads G-code. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (with a timelapse, also the file storage 3D Print Log names for it; and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
+The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail, its slicer settings with hosts and credentials blanked (unless you turn them off), and, unless you turn snapshots off, one webcam frame when it ends; with Pro and moonraker-timelapse, also the print's timelapse video. Of the G-code file it reads only the header and the settings block after the G-code, never the toolpaths, and it never uploads the file. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (with a timelapse, also the file storage 3D Print Log names for it; and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
 
 ## Config
 
@@ -243,6 +252,17 @@ Times take `90`, `90s`, `3m` or `1h`.
 
 The surest fix is still a DHCP reservation on the router, which keeps the printer at one address. To list the Moonraker printers on your network, with a `[printer]` section for each ready to paste into the config, run `printlog-bridge discover` (`--subnet 192.168.1.0/24` picks the network to scan; by default it scans the configured printers' networks and this computer's own).
 
+### Moving from Moonraker's notifier
+
+If you set up 3D Print Log's Moonraker notifier before the bridge (a `[notifier ...]` section in `moonraker.conf` whose `url` posts to `api.3dprintlog.com`), both would log each print. The bridge reads Moonraker's config each time it connects, and while such a section is there it warns in its log, in `status` and in `doctor`, naming the section and its file:
+
+```
+  Warnings:
+    - Moonraker's [notifier 3d_print_log] in moonraker.conf also logs prints to 3D Print Log, so each print can be logged twice. The bridge logs them itself: remove that section (its [notifier ...] line and every line up to the next section) and restart Moonraker.
+```
+
+The bridge never edits `moonraker.conf` itself. Once you remove the section and restart Moonraker, the bridge reconnects and the warning goes away. It never shows the notifier's URL, which holds your API key.
+
 ### Prints you made yourself
 
 If you create the print yourself, with the [Slic3r uploader](https://github.com/HoffmanEngineering/Slic3rPostProcessingUploader), the Cura plugin or by hand, the bridge logs the job to that print instead of creating a second one. When a job starts it looks for one of your prints that is:
@@ -263,6 +283,12 @@ adopt_window = 12h     ; 90m, 2d; a bare number is hours
 ```
 
 Finish-only mode is for uploader users who only want the bridge to report how each print ended. The bridge looks for a print to adopt again when the job ends, so a print uploaded after the job started is still found. Without a match, the job is skipped with a line in the log.
+
+### Slicer settings
+
+Each print records the slicer settings it was sliced with, as the Cura plugin and the Slic3r uploader do: the bridge sends the settings block the slicer wrote at the end of the file (OrcaSlicer, PrusaSlicer, Anycubic Slicer Next and their forks write one), the file's header, which names the slicer and its version, and the summary Moonraker read from the file (slicer, layer heights, nozzle, filament, first layer temperatures). 3D Print Log adds them to the print's notes. They are read once, when the job starts, by byte range: only the start of the file up to the G-code and its end after the G-code, never the toolpaths. Before they leave the printer, the values of every setting naming a host or holding a credential (`print_host`, `printhost_apikey`, passwords, tokens, `post_process`...) are blanked. They go through the outbox like the print's other events, and never hold up logging the print: when the file can't be read, Moonraker's summary is sent alone, and when 3D Print Log can't take them, they are dropped. A print you made with the Slic3r uploader or the Cura plugin keeps the settings those recorded.
+
+Set `slicer_settings = false` in `[bridge]`, or in a printer's section for that one, to turn this off; the G-code file is then never read. [docs/privacy.md](docs/privacy.md) says exactly what is read and sent.
 
 ### Recording a trace
 

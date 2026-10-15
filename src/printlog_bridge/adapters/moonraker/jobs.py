@@ -12,6 +12,10 @@ no snapshot: the camera would show the bed as it is now, not as the job left it.
 While a job runs, the tracker also knows how far it has got (`point`), which a spool assigned
 mid-print is split at (#44), and reports a pause for a filament change (`changes.py`) once the
 job resumes from it, prompting on the console for the new spool when it sees one.
+
+After the thumbnail comes the job's slicer settings (#36): the summary in its metadata, and a
+way to read its file's header and settings block (`slicer.py`), which the sink uses only when
+it wants them.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from printlog_bridge.core.events import (
     JobImage,
     JobOutcome,
     JobPoint,
+    JobSlicerSettings,
     JobStarted,
 )
 from printlog_bridge.core.status import NullReport, PrinterReport
@@ -38,6 +43,7 @@ from .changes import FilamentChanges
 from .excluded import ExcludedObjects
 from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
+from .slicer import MoonrakerSlicerFiles, slicer_metadata
 from .spools import RESPOND_MACRO, answer_script
 from .timelapse import TimelapseWatcher
 from .tools import PRINTING, ToolUsage, estimated_grams_by_slot, per_slot, slot_of
@@ -74,6 +80,7 @@ class JobTracker:
         self.sink = sink
         self.report = report or NullReport()
         self.images = images
+        self.slicer = MoonrakerSlicerFiles(printer, images) if images is not None else None
         self.timelapse = timelapse
         self._error_message: str | None = None
         self._call: Call | None = None
@@ -230,6 +237,17 @@ class JobTracker:
                     start.job_id,
                     ImageKind.THUMBNAIL,
                     functools.partial(images.thumbnail, call, job),
+                )
+            )
+        if call is not None:
+            read = functools.partial(self.slicer.read, call, job) if self.slicer else None
+            metadata = job.get("metadata")
+            await self.sink.emit(
+                JobSlicerSettings(
+                    self.printer,
+                    start.job_id,
+                    slicer_metadata(metadata) if isinstance(metadata, Mapping) else None,
+                    read,
                 )
             )
         if job.get("status", "in_progress") != "in_progress":
