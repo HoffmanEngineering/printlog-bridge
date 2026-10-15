@@ -14,7 +14,13 @@ from session_helpers import running
 from printlog_bridge.adapters.moonraker.images import MoonrakerImages, snapshot_url
 from printlog_bridge.adapters.moonraker.jobs import JobTracker
 from printlog_bridge.adapters.moonraker.session import Backoff, MoonrakerSession
-from printlog_bridge.core.events import ImageKind, JobFinished, JobImage, JobStarted
+from printlog_bridge.core.events import (
+    ImageKind,
+    JobFinished,
+    JobImage,
+    JobSlicerSettings,
+    JobStarted,
+)
 from printlog_bridge.core.images import ImageUnavailable
 
 
@@ -267,7 +273,7 @@ class TestJobTracker:
                 fake.webcams = [{"name": "cam", "enabled": True, "snapshot_url": f"{cam_url}/s"}]
                 async with tracking(sink, fake, url):
                     job = await fake.start_job("benchy.gcode", METADATA)
-                    await eventually(lambda: len(sink.events) == 2)
+                    await eventually(lambda: len(sink.events) == 3)
                     await fake.finish_job(job, "error")
                     await eventually(lambda: ImageKind.SNAPSHOT in sink.images)
             return sink
@@ -275,8 +281,8 @@ class TestJobTracker:
         sink = asyncio.run(scenario())
 
         assert sink.kinds() == [
-            "JobStarted", "thumbnail",  # added
-            "JobStarted", "thumbnail", "JobFinished", "snapshot",  # finished
+            "JobStarted", "thumbnail", "JobSlicerSettings",  # added
+            "JobStarted", "thumbnail", "JobSlicerSettings", "JobFinished", "snapshot",  # finished
         ]  # fmt: skip
         assert sink.images == {ImageKind.THUMBNAIL: png("benchy"), ImageKind.SNAPSHOT: JPEG}
 
@@ -315,6 +321,7 @@ class TestJobTracker:
 
         assert [type(e) for e in sink.events if not isinstance(e, JobImage)] == [
             JobStarted,
+            JobSlicerSettings,
             JobFinished,
         ]
         assert camera_requests == []
