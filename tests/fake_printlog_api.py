@@ -37,6 +37,9 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
   the lookup's `hasSlicerSettings` turns true. `slicer_settings_route = False` answers 404 as an
   API without the endpoint does (no route), and `slicer_settings_status` answers every send with
   that status.
+- `POST /api/Prints` with `imported: true` (a history backfill, printlog-bridge#8) takes only a
+  finished status and usage rows that name no spool, each refused with 400. It leaves the
+  printer's loaded spools alone, and a pair already used returns that print unchanged (200).
 - `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
   field; `kind` and `displayName` are required and `printerId` must be the user's. A print
   links to a connection only when it is created after the connection was registered.
@@ -434,6 +437,12 @@ class FakePrintLogApi:
                 status=400, text="Selected printer does not belong to currently logged in user."
             )
 
+        imported = body.get("imported") is True
+        if imported and body.get("status") not in FINISHED:
+            return _problem(400, "An imported print must have a finished status.")
+        if imported and any(_spool(r) for r in body.get("filamentUsage") or []):
+            return _problem(400, "An imported print's usage rows may not name a filament.")
+
         source, external_id = body.get("externalSource"), body.get("externalId")
         existing = next(
             (
@@ -443,6 +452,8 @@ class FakePrintLogApi:
             ),
             None,
         )
+        if existing is not None and imported:
+            return web.json_response(existing, status=200)  # a backfill changes nothing
         if existing is not None:
             reopens = existing["status"] in FINISHED and body.get("status") in (1, PRINTING)
             if body.get("status") and not reopens:
@@ -457,7 +468,7 @@ class FakePrintLogApi:
         spools = [_spool(r) for r in body.get("filamentUsage") or []]
         if any(f and f not in self.filaments for f in spools):
             return web.Response(status=403, text="User does not have access to filament.")
-        if self.slot_counts.get(body["printerId"], 1) <= 1:
+        if self.slot_counts.get(body["printerId"], 1) <= 1 and not imported:
             # The print's spools become the printer's loaded list; not on a multi-slot printer.
             # `setLoadedFilament`: a spool already loaded keeps its row, slot and loaded time.
             wanted = list(dict.fromkeys(f for f in spools if f))
