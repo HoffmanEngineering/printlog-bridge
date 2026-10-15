@@ -246,6 +246,17 @@ Times take `90`, `90s`, `3m` or `1h`.
 
 The surest fix is still a DHCP reservation on the router, which keeps the printer at one address. To list the Moonraker printers on your network, with a `[printer]` section for each ready to paste into the config, run `printlog-bridge discover` (`--subnet 192.168.1.0/24` picks the network to scan; by default it scans the configured printers' networks and this computer's own).
 
+### Moving from Moonraker's notifier
+
+If you set up 3D Print Log's Moonraker notifier before the bridge (a `[notifier ...]` section in `moonraker.conf` whose `url` posts to `api.3dprintlog.com`), both would log each print. The bridge reads Moonraker's config each time it connects, and while such a section is there it warns in its log, in `status` and in `doctor`, naming the section and its file:
+
+```
+  Warnings:
+    - Moonraker's [notifier 3d_print_log] in moonraker.conf also logs prints to 3D Print Log, so each print can be logged twice. The bridge logs them itself: remove that section (its [notifier ...] line and every line up to the next section) and restart Moonraker.
+```
+
+The bridge never edits `moonraker.conf` itself. Once you remove the section and restart Moonraker, the bridge reconnects and the warning goes away. It never shows the notifier's URL, which holds your API key.
+
 ### Prints you made yourself
 
 If you create the print yourself, with the [Slic3r uploader](https://github.com/HoffmanEngineering/Slic3rPostProcessingUploader), the Cura plugin or by hand, the bridge logs the job to that print instead of creating a second one. When a job starts it looks for one of your prints that is:

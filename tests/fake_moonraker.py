@@ -91,6 +91,8 @@ class FakeMoonraker:
         self.config: dict[str, dict[str, Any]] = {}
         """moonraker.conf's sections, as server.config returns them. With a `spoolman` section
         the spoolman component is loaded, and its methods exist."""
+        self.config_files: list[dict[str, Any]] = []
+        """Which file each section is in, as server.config's `files` lists them."""
         self.spool_id: int | None = None
         """The spoolman component's active spool."""
         self.spoolman_loaded = True
@@ -329,7 +331,11 @@ class FakeMoonraker:
         if method == "server.webcams.list":
             return {"webcams": [dict(w) for w in self.webcams]}
         if method == "server.config":
-            return {"config": copy.deepcopy(self.config), "orig": {}, "files": []}
+            return {
+                "config": copy.deepcopy(self.config),
+                "orig": {},
+                "files": copy.deepcopy(self.config_files),
+            }
         if method == "server.spoolman.get_spool_id":
             self._require_spoolman()
             return {"spool_id": self.spool_id}
