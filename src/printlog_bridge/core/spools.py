@@ -72,6 +72,16 @@ COLOR = re.compile(r"#?([0-9A-Fa-f]{6})")
 FORBIDDEN = 403
 PRINTER_FIELDS_NOT_SENT = frozenset({"images", "loadedFilaments", "category", "slotCount"})
 """What `GET /api/Printers/{id}` returns that its `PUT` takes in another shape, or not at all."""
+BAD_REQUEST = 400
+REQUIRED_PRINTER_FIELDS = (("make", "Make"), ("model", "Model"), ("name", "Name"))
+"""What the printer `PUT` requires (`[Required]`, not empty), with what the app calls each."""
+
+
+class SlotsNotAdded(ApiRejected):
+    """3D Print Log won't take the printer with more slots. The message says what to do."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status=BAD_REQUEST)
 
 
 def normalize_tag(uid: str) -> str | None:
@@ -152,6 +162,9 @@ class Spools:
         """
         self._rescheduled: asyncio.Event | None = None
         """Set when a retry is scheduled, to wake `run` for it."""
+        self._refused_growth: dict[str, tuple[tuple[Any, ...], str]] = {}
+        """Each printer whose slot-growing PUT the API refused: what the printer was then
+        (`_growth_key`), and what to tell the user. Not sent again until that changes."""
         self._locks: dict[str, asyncio.Lock] = {}
         self._failing = False
         self._watchers: dict[str, list[LoadedWatcher]] = {}
@@ -187,9 +200,16 @@ class Spools:
     async def current(self, printer: str) -> dict[int, str]:
         """The spool in each slot, read again now; what was last read when that fails."""
         try:
-            await self.refresh(printer)
+            return await self.fresh(printer)
         except Exception as e:
             log.debug("[printer %s] couldn't read its spools: %s", printer, e)
+        return self.loaded(printer)
+
+    async def fresh(self, printer: str) -> dict[int, str]:
+        """The spool in each slot, read again now. Raises what the read raised when it fails,
+        rather than answer with what was last read, up to `interval` old: on a single-tool
+        printer, a print created with a spool unloaded in the app since then loads it again."""
+        await self.refresh(printer)
         return self.loaded(printer)
 
     async def refresh(self, printer: str) -> None:
@@ -199,7 +219,10 @@ class Spools:
             return
         detail = await self.api.get_printer(printer_id)
         if detail is None:
-            return  # doctor and the heartbeat say why; nothing here can be assigned either
+            # Deleted, or not the key owner's: doctor and the heartbeat say why. It has no
+            # spools to link, rather than the ones last read.
+            self._loaded.pop(printer, None)
+            return
         self._remember(printer, detail.get("loadedFilaments") or [], detail.get("slotCount"))
 
     async def refresh_all(self) -> None:
@@ -326,6 +349,8 @@ class Spools:
                 "3D Print Log rejected the bridge's API key; nothing changed. Check it with "
                 "`printlog-bridge doctor`."
             )
+        except SlotsNotAdded as e:
+            answer = f"nothing changed: {e}"
         except ApiRejected as e:
             if e.status == FORBIDDEN:
                 answer = "that spool isn't one of yours in 3D Print Log; nothing changed"
@@ -418,20 +443,48 @@ class Spools:
         if printer not in self._slot_counts:
             await self.refresh(printer)
         if slot >= self._slot_counts.get(printer, 1):
-            await self._grow(printer, printer_id, min(MAX_SLOTS, max(slot + 1, slot_count or 0)))
+            count = min(MAX_SLOTS, max(slot + 1, slot_count or 0))
+            await self._grow(printer, printer_id, slot, count)
         rows = await self.api.load_slot(printer_id, slot, filament_id, _label(slot))
         self._remember(printer, rows)
         return self._loaded.get(printer, {}).get(slot) or {"id": filament_id}
 
-    async def _grow(self, printer: str, printer_id: int, count: int) -> None:
-        """Sets the printer's `slotCount`, which the API only takes by replacing the printer:
-        everything else it has is sent back as read, and its loaded spools stay loaded."""
+    async def _grow(self, printer: str, printer_id: int, slot: int, count: int) -> None:
+        """Sets the printer's `slotCount`, for `slot`. The API takes it only by replacing the
+        printer (there is no PATCH, and loading a slot doesn't add one), so everything else
+        the printer has is sent back as read, and its loaded spools stay loaded.
+
+        What that can't keep: `beamDiameter`, which the GET doesn't return, is cleared; and a
+        spool loaded or unloaded in the app between the GET and the PUT is undone or loaded
+        again with no slot. Raises SlotsNotAdded, saying what to do in the app, when the API
+        would refuse the printer or does."""
         detail = await self.api.get_printer(printer_id)
         if detail is None:
             raise ApiRejected(f"printer {printer_id} isn't in 3D Print Log", status=404)
         if int(detail.get("slotCount") or 1) >= count:
             self._slot_counts[printer] = int(detail["slotCount"])
             return
+        needed = f"{_label(slot)} needs the printer to have {count} slots in 3D Print Log"
+        empty = [
+            label
+            for key, label in REQUIRED_PRINTER_FIELDS
+            if not str(detail.get(key) or "").strip()
+        ]
+        if empty:
+            # Sent as it is, the API refuses it with a 400 that names a field, not what to do.
+            one = len(empty) == 1
+            raise SlotsNotAdded(
+                f"{needed}, and the bridge can't add them while its {_join(empty)} "
+                f"{'is' if one else 'are'} empty. Fill {'it' if one else 'them'} in on the "
+                f"printer in the app, or set its slots to {count} there, then run it again"
+            )
+        key = _growth_key(detail)
+        refused = self._refused_growth.get(printer)
+        if refused is not None and refused[0] == key:
+            # Refused before, and nothing the API checks has changed: a PUT would be refused
+            # again, while replacing the whole printer (racing the app, clearing beamDiameter).
+            raise SlotsNotAdded(refused[1])
+        self._refused_growth.pop(printer, None)
         body = {k: v for k, v in detail.items() if k not in PRINTER_FIELDS_NOT_SENT}
         body["id"] = printer_id
         body["slotCount"] = count
@@ -443,7 +496,18 @@ class Spools:
             for row in detail.get("loadedFilaments") or []
             if (row.get("filament") or {}).get("id")
         ]
-        updated = await self.api.put_printer(printer_id, body)
+        try:
+            updated = await self.api.put_printer(printer_id, body)
+        except ApiRejected as e:
+            if e.status != BAD_REQUEST:
+                raise
+            # The action first: the API's reason can be long, and the console shows 300 characters.
+            message = (
+                f"{needed}, and it refused them. Set its slots to {count} on the printer in the "
+                f"app, then run it again ({e})"
+            )
+            self._refused_growth[printer] = (key, message)
+            raise SlotsNotAdded(message) from e
         log.info("[printer %s] set its slot count in 3D Print Log to %d", printer, count)
         self._slot_counts[printer] = int((updated or {}).get("slotCount") or count)
 
@@ -610,6 +674,19 @@ def _unmapped(spool: SpoolmanSpool) -> str:
     return (
         f"no material in 3D Print Log has {named} or {its} {', '.join(tags)}; nothing "
         "changed. Link it in the app, or add the tag to the material."
+    )
+
+
+def _join(words: list[str]) -> str:
+    """`a`, `a and b`, `a, b and c`."""
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+
+
+def _growth_key(detail: Mapping[str, Any]) -> tuple[Any, ...]:
+    """What, changed on the printer, may have the API take a slot-growing PUT it refused: its
+    slot count and its own fields (its loaded spools aren't checked)."""
+    return tuple(
+        (k, repr(v)) for k, v in sorted(detail.items()) if k not in ("loadedFilaments", "images")
     )
 
 

@@ -55,6 +55,12 @@ class ReportRecorder:
     def printer_state(self, state: str) -> None:
         self.calls.append(("printer_state", state))
 
+    def software(self, name: str, version: str) -> None:
+        self.calls.append(("software", name, version))
+
+    def printer_model(self, model: str) -> None:
+        self.calls.append(("printer_model", model))
+
     def warn(self, topic: str, message: str | None) -> None:
         if message is None:
             self.warnings.pop(topic, None)

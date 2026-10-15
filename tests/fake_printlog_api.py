@@ -51,9 +51,14 @@ Spools and slots (api#146, PR 158; api#147, PR 159):
   outside `0..slotCount-1` or a label over 20 characters, 403 for a spool that isn't the
   user's, 404 for a printer that doesn't exist. Returns the loaded list.
 - `DELETE /api/Printers/{id}/slots/{slot}` unloads the slot: 204, also when it was empty.
-- `PUT /api/Printers/{id}` replaces the printer. `slotCount` (1-64) is kept when left out, and
-  the loaded spools become the ones sent, by id: a spool kept keeps its slot and loaded time, a
-  spool left out is unloaded. `make`, `model` and `name` are required.
+- `PUT /api/Printers/{id}` replaces the printer (`AddPrinterDTO`): every field left out is
+  cleared, as AutoMapper maps a missing one to null, except `slotCount` (1-64) and `category`,
+  which are kept. The loaded spools become the ones sent, by id: a spool kept keeps its slot and
+  loaded time, a spool left out is unloaded, and one sent that wasn't loaded is loaded with no
+  slot. `make`, `model` and `name` are required (`[Required]`, 400 when empty). There is no
+  PATCH and no other way to change `slotCount` (api main, Oct 2026).
+- The `GET` (`PrinterDetailDto`) has no `beamDiameter`, which the `PUT` takes, so a client
+  can't send it back and a `PUT` clears it (`beam_diameter`).
 - `GET /api/Filaments/by-tag/{uid}` finds the user's spool with that tag UID, in any case and
   with `:` `-` `.` `_` or spaces between bytes (`TagUid.Normalize`): 400 for a UID that isn't
   whole hex bytes (64 hex characters at most), 404 when none of the user's spools has it.
@@ -76,6 +81,28 @@ from typing import Any
 
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+
+PRINTER_FIELDS = (
+    "make",
+    "model",
+    "name",
+    "description",
+    "nozzleDiameter",
+    "filamentDiameter",
+    "beamDiameter",
+    "isActive",
+    "bedWidthMm",
+    "bedHeightMm",
+    "bedDepthMm",
+    "screenResolutionXPixels",
+    "screenResolutionYPixels",
+    "hasHeatedBed",
+    "hasHeatedChamber",
+    "wattageW",
+)
+"""What a printer `PUT` (`AddPrinterDTO`) sets, beyond its id, slots, spools and category."""
+NOT_IN_PRINTER_DETAIL = ("beamDiameter",)
+"""What the `PUT` takes that the `GET` (`PrinterDetailDto`) doesn't return."""
 
 PRINTING = 2
 FINISHED = (3, 4, 5, 6)  # Success, Cancelled, Failed, PartialSuccess
@@ -102,6 +129,9 @@ class FakePrintLogApi:
         self.connections: dict[str, dict[str, Any]] = {}
         self.heartbeats: list[tuple[str, dict[str, Any]]] = []
         """Every PUT /api/Connections body received, by instance id."""
+        self.latest_agent_version: str | None = None
+        """The `latestAgentVersion` connections answer with: the newest bridge release, which
+        the API reads from GitHub, or None when it doesn't know one."""
         self.images: dict[int, bytes] = {}
         """Every image's bytes, by image id. A print's `images` lists their ids and defaults."""
         self.max_images = 5
@@ -124,7 +154,8 @@ class FakePrintLogApi:
         """Every PUT /api/Printers/{id}/slots/{slot} body received."""
         self._loaded_at = itertools.count(1)
         self._printer_fields: dict[int, dict[str, Any]] = {}
-        """What the last PUT /api/Printers/{id} set, beyond slots and spools."""
+        """Each printer's own fields (`PRINTER_FIELDS` and its category's nickname), when the
+        user or a PUT has set them."""
         self._ids = itertools.count(1)
         self._image_ids = itertools.count(1)
         self.lookup = True
@@ -296,21 +327,39 @@ class FakePrintLogApi:
             return web.Response(status=404)
         return web.json_response(self._printer_detail(printer_id))
 
+    def _fields(self, printer_id: int) -> dict[str, Any]:
+        fields = {k: None for k in PRINTER_FIELDS}
+        fields.update(
+            make="Snapmaker",
+            model="U1",
+            name=f"Printer {printer_id}",
+            nozzleDiameter=0.4,
+            filamentDiameter=1.75,
+            isActive=True,
+            category="FDM",
+        )
+        fields.update(self._printer_fields.get(printer_id, {}))
+        return fields
+
+    def user_edits_printer(self, printer_id: int, **fields: Any) -> None:
+        """What the user sets on the printer in the app (`category` is its nickname)."""
+        self._printer_fields.setdefault(printer_id, {}).update(fields)
+
+    def beam_diameter(self, printer_id: int) -> float | None:
+        """The printer's `beamDiameter`, which only a PUT sets and no GET shows."""
+        return self._fields(printer_id)["beamDiameter"]
+
     def _printer_detail(self, printer_id: int) -> dict[str, Any]:
-        detail = {
-            "id": printer_id,
-            "make": "Snapmaker",
-            "model": "U1",
-            "name": f"Printer {printer_id}",
-            "description": None,
-            "nozzleDiameter": 0.4,
-            "filamentDiameter": 1.75,
-            "isActive": True,
-            "category": {"nickname": "FDM"},
-            "slotCount": self.slot_counts.get(printer_id, 1),
-            "loadedFilaments": self._loaded_list(printer_id),
-        }
-        detail.update(self._printer_fields.get(printer_id, {}))
+        fields = self._fields(printer_id)
+        detail: dict[str, Any] = {"id": printer_id}
+        detail.update(
+            (k, v)
+            for k, v in fields.items()
+            if k in PRINTER_FIELDS and k not in NOT_IN_PRINTER_DETAIL
+        )
+        detail["category"] = {"nickname": fields["category"]}
+        detail["slotCount"] = self.slot_counts.get(printer_id, 1)
+        detail["loadedFilaments"] = self._loaded_list(printer_id)
         return detail
 
     async def _put_printer(self, request: web.Request) -> web.Response:
@@ -323,7 +372,7 @@ class FakePrintLogApi:
             return web.Response(status=404)
         for field in ("make", "model", "name"):
             if not (body.get(field) or "").strip():
-                return web.Response(status=400, text=f"The {field} field is required.")
+                return web.Response(status=400, text=f"The {field.title()} field is required.")
         count = body.get("slotCount")
         if count is not None:
             if not 1 <= count <= 64:
@@ -336,11 +385,10 @@ class FakePrintLogApi:
         kept = [r for r in rows if r["filamentId"] in wanted]
         held = {r["filamentId"] for r in kept}
         rows[:] = kept + [self._loaded_row(None, None, f) for f in wanted if f not in held]
-        self._printer_fields[printer_id] = {
-            k: v
-            for k, v in body.items()
-            if k not in ("id", "slotCount", "loadedFilaments", "category")
-        }
+        fields = {k: body.get(k) for k in PRINTER_FIELDS}
+        fields["isActive"] = bool(body.get("isActive"))
+        fields["category"] = body.get("category") or self._fields(printer_id)["category"]
+        self._printer_fields[printer_id] = fields
         return web.json_response(self._printer_detail(printer_id))
 
     async def _loaded_filament(self, request: web.Request) -> web.Response:
@@ -531,6 +579,7 @@ class FakePrintLogApi:
             "agentVersion": body.get("agentVersion"),
             "printerId": body.get("printerId"),
             "status": 1,
+            "latestAgentVersion": self.latest_agent_version,
         }
         self.connections[instance_id] = connection
         return web.json_response(connection, status=200 if existing else 201)

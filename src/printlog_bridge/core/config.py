@@ -119,6 +119,8 @@ class BridgeConfig:
     """`api_key` in `[bridge]`, even when another source wins: doctor warns about it."""
     trace: bool = False
     """Record every message to and from each printer in `state_dir/traces` (core/trace.py)."""
+    update_check: bool = True
+    """Say in the log, `status` and `doctor` when 3D Print Log reports a newer bridge (#39)."""
 
     def api_url_warning(self) -> str | None:
         """What to say, every time, when `api_url` is plain http to another computer, which
@@ -221,6 +223,7 @@ def load_config(
         source,
         config_api_key,
         trace=_trace(bridge.get("trace"), env.get(TRACE_ENV)),
+        update_check=_flag(bridge.get("update_check") or "true", "update_check"),
     )
 
 

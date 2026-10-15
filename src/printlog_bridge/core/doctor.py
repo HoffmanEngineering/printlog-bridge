@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from printlog_bridge import __version__
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.api_client import ApiClient, ApiUnavailable, AuthRejected
 from printlog_bridge.core.checks import CheckResult, Status
@@ -21,6 +22,8 @@ from printlog_bridge.core.config import (
     load_config,
 )
 from printlog_bridge.core.state import PrinterState
+from printlog_bridge.core.status import read_status
+from printlog_bridge.core.updates import is_newer, update_notice
 
 API_KEYS_PAGE = "https://www.3dprintlog.com/api-keys"
 PRINTERS_PAGE = "https://www.3dprintlog.com/printers/"
@@ -52,6 +55,7 @@ async def diagnose(
     results.append(
         CheckResult.ok("Config", f"{config.path} ({count} printer{'' if count == 1 else 's'})")
     )
+    results.append(_check_version(config))
     api_url_warning = config.api_url_warning()
     if api_url_warning is not None:
         results.append(CheckResult.warn("API URL", api_url_warning))
@@ -93,6 +97,20 @@ def format_report(results: Sequence[CheckResult]) -> str:
     else:
         lines.append(f"No problems found{warning_note}.")
     return "\n".join(lines)
+
+
+def _check_version(config: BridgeConfig) -> CheckResult:
+    """This bridge's version, and whether 3D Print Log has told the running bridge of a newer
+    one. Read from the status file, so doctor itself asks nobody."""
+    name = "Version"
+    if not config.update_check:
+        return CheckResult.ok(name, __version__)
+    latest = (read_status(config.state_dir) or {}).get("latest_version")
+    if is_newer(latest):
+        return CheckResult.warn(name, update_notice(latest))
+    if isinstance(latest, str) and not is_newer(__version__, latest):
+        return CheckResult.ok(name, f"{__version__}, the latest")
+    return CheckResult.ok(name, __version__)
 
 
 def _check_state_dir(state_dir: Path) -> CheckResult:
