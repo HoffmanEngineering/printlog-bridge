@@ -59,6 +59,16 @@ COLOR = re.compile(r"#?([0-9A-Fa-f]{6})")
 FORBIDDEN = 403
 PRINTER_FIELDS_NOT_SENT = frozenset({"images", "loadedFilaments", "category", "slotCount"})
 """What `GET /api/Printers/{id}` returns that its `PUT` takes in another shape, or not at all."""
+BAD_REQUEST = 400
+REQUIRED_PRINTER_FIELDS = (("make", "Make"), ("model", "Model"), ("name", "Name"))
+"""What the printer `PUT` requires (`[Required]`, not empty), with what the app calls each."""
+
+
+class SlotsNotAdded(ApiRejected):
+    """3D Print Log won't take the printer with more slots. The message says what to do."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status=BAD_REQUEST)
 
 
 def normalize_tag(uid: str) -> str | None:
@@ -278,6 +288,8 @@ class Spools:
                 "3D Print Log rejected the bridge's API key; nothing changed. Check it with "
                 "`printlog-bridge doctor`."
             )
+        except SlotsNotAdded as e:
+            answer = f"nothing changed: {e}"
         except ApiRejected as e:
             if e.status == FORBIDDEN:
                 answer = "that spool isn't one of yours in 3D Print Log; nothing changed"
@@ -342,20 +354,42 @@ class Spools:
         if printer not in self._slot_counts:
             await self.refresh(printer)
         if slot >= self._slot_counts.get(printer, 1):
-            await self._grow(printer, printer_id, min(MAX_SLOTS, max(slot + 1, slot_count or 0)))
+            count = min(MAX_SLOTS, max(slot + 1, slot_count or 0))
+            await self._grow(printer, printer_id, slot, count)
         rows = await self.api.load_slot(printer_id, slot, filament_id, _label(slot))
         self._remember(printer, rows)
         return self._loaded.get(printer, {}).get(slot) or {"id": filament_id}
 
-    async def _grow(self, printer: str, printer_id: int, count: int) -> None:
-        """Sets the printer's `slotCount`, which the API only takes by replacing the printer:
-        everything else it has is sent back as read, and its loaded spools stay loaded."""
+    async def _grow(self, printer: str, printer_id: int, slot: int, count: int) -> None:
+        """Sets the printer's `slotCount`, for `slot`. The API takes it only by replacing the
+        printer (there is no PATCH, and loading a slot doesn't add one), so everything else
+        the printer has is sent back as read, and its loaded spools stay loaded.
+
+        What that can't keep: `beamDiameter`, which the GET doesn't return, is cleared; and a
+        spool loaded or unloaded in the app between the GET and the PUT is undone or loaded
+        again with no slot. Raises SlotsNotAdded, saying what to do in the app, when the API
+        would refuse the printer or does."""
         detail = await self.api.get_printer(printer_id)
         if detail is None:
             raise ApiRejected(f"printer {printer_id} isn't in 3D Print Log", status=404)
         if int(detail.get("slotCount") or 1) >= count:
             self._slot_counts[printer] = int(detail["slotCount"])
             return
+        needed = f"{_label(slot)} needs the printer to have {count} slots in 3D Print Log"
+        empty = [
+            label
+            for key, label in REQUIRED_PRINTER_FIELDS
+            if not str(detail.get(key) or "").strip()
+        ]
+        if empty:
+            # Sent as it is, the API refuses it with a 400 that names a field, not what to do.
+            fields = " and ".join(empty)
+            raise SlotsNotAdded(
+                f"{needed}, and the bridge can't add them while its {fields} "
+                f"{'is' if len(empty) == 1 else 'are'} empty. Fill "
+                f"{'it' if len(empty) == 1 else 'them'} in on the printer in the app, or set "
+                f"its slots to {count} there, then run it again"
+            )
         body = {k: v for k, v in detail.items() if k not in PRINTER_FIELDS_NOT_SENT}
         body["id"] = printer_id
         body["slotCount"] = count
@@ -367,7 +401,16 @@ class Spools:
             for row in detail.get("loadedFilaments") or []
             if (row.get("filament") or {}).get("id")
         ]
-        updated = await self.api.put_printer(printer_id, body)
+        try:
+            updated = await self.api.put_printer(printer_id, body)
+        except ApiRejected as e:
+            if e.status != BAD_REQUEST:
+                raise
+            # The action first: the API's reason can be long, and the console shows 300 characters.
+            raise SlotsNotAdded(
+                f"{needed}, and it refused them. Set its slots to {count} on the printer in the "
+                f"app, then run it again ({e})"
+            ) from e
         log.info("[printer %s] set its slot count in 3D Print Log to %d", printer, count)
         self._slot_counts[printer] = int((updated or {}).get("slotCount") or count)
 

@@ -7,9 +7,11 @@ import contextlib
 import logging
 
 import pytest
+from aiohttp import web
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
 
+from printlog_bridge.adapters.moonraker.spools import MAX_ANSWER
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.events import SpoolCommand, SpoolReading
 from printlog_bridge.core.spools import (
@@ -137,6 +139,96 @@ class TestSetSpool:
 
         assert api.slot_counts[42] == 3
         assert api.slot_spools(42) == {2: spool}
+
+    @pytest.mark.parametrize(
+        ("empty", "named"),
+        [
+            ({"make": ""}, "its Make is empty"),
+            ({"model": None}, "its Model is empty"),
+            ({"make": " ", "model": ""}, "its Make and Model are empty"),
+        ],
+    )
+    def test_growing_a_printer_with_no_make_or_model_says_what_to_fill_in(self, empty, named):
+        """The API needs them to save the printer, so it would refuse the slots unexplained."""
+        api = FakePrintLogApi()
+        api.user_edits_printer(42, **empty)
+        spool = api.add_spool()
+
+        answer = run(api, lambda s: s.spool_command(command(3, filament_id=spool, slot_count=4)))
+
+        assert api.printer_puts == []  # not sent: the API would refuse it
+        assert api.slot_counts.get(42, 1) == 1
+        assert api.slot_spools(42) == {}
+        assert "nothing changed" in answer
+        assert named in answer
+        assert "4 slots" in answer
+        assert "in the app" in answer
+        assert "refused it" not in answer
+        assert len(answer) <= MAX_ANSWER  # shown whole on the console
+
+    def test_a_reader_beyond_a_printer_with_no_model_logs_what_to_fill_in(self, caplog):
+        api = FakePrintLogApi()
+        api.user_edits_printer(42, model="")
+        api.add_spool(tags=("04A23F11",))
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            run(api, lambda s: s.spool_reading(reading(2, tag="04A23F11", slot_count=4)))
+
+        assert api.printer_puts == []
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "its Model is empty" in warning
+        assert "in the app" in warning
+
+    def test_growing_keeps_every_field_the_printer_had(self):
+        """The PUT replaces the printer: whatever it read comes back as it was."""
+        api = FakePrintLogApi()
+        api.user_edits_printer(
+            42,
+            description="Toolchanger",
+            nozzleDiameter=0.6,
+            filamentDiameter=2.85,
+            isActive=False,
+            bedWidthMm=270.0,
+            bedHeightMm=270.0,
+            bedDepthMm=270.0,
+            hasHeatedBed=True,
+            hasHeatedChamber=False,
+            wattageW=350.0,
+            beamDiameter=0.08,
+            category="IDEX",
+        )
+        kept = api.add_spool("Kept")
+        api.user_loads(42, 0, kept)
+        spool = api.add_spool()
+        before = api._printer_detail(42)
+
+        run(api, lambda s: s.spool_command(command(3, filament_id=spool, slot_count=4)))
+
+        after = api._printer_detail(42)
+        for field in set(before) - {"slotCount", "loadedFilaments"}:
+            assert after[field] == before[field], field
+        assert after["slotCount"] == 4
+        assert api.slot_spools(42) == {0: kept, 3: spool}
+        # The one it can't keep: the GET has no beamDiameter, so the PUT clears it. Only a printer
+        # PATCH (or a slot-count endpoint) on the API would leave it alone.
+        assert api.beam_diameter(42) is None
+
+    def test_any_other_refusal_to_grow_says_to_set_the_slots_in_the_app(self):
+        api = FakePrintLogApi()
+        spool = api.add_spool()
+
+        async def refuse(_request):
+            return web.Response(status=400, text="Printer Category not found")
+
+        api._put_printer = refuse
+
+        answer = run(api, lambda s: s.spool_command(command(3, filament_id=spool, slot_count=4)))
+
+        assert api.slot_spools(42) == {}
+        assert "nothing changed" in answer
+        assert "Printer Category not found" in answer
+        assert "4 slots" in answer
+        assert "in the app" in answer
 
     def test_a_slot_within_the_count_leaves_the_printer_alone(self):
         api = FakePrintLogApi()
