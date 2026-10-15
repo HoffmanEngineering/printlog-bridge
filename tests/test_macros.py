@@ -47,9 +47,11 @@ def run_macro(name: str, params: dict[str, str], active: str = "extruder") -> li
     return lines
 
 
-# Klipper's GCodeDispatch.extended_r and _get_extended_params (klippy/gcode.py): how it reads the
-# parameters of a command like _PRINTLOG_RESPOND MSG="...". A line it can't split with shlex is a
-# "Malformed command" error, and the answer never shows.
+# How Klipper reads the parameters of a command like _PRINTLOG_RESPOND MSG="..." (klippy/gcode.py).
+# A line it can't split is a "Malformed command" error, and the answer never shows. Two versions:
+# the releases (v0.12, v0.13) match `extended_r` and then `shlex.split`; master, since 2025, takes
+# `get_raw_command_parameters()` into a `shlex.shlex` with `#` and `;` as commenters outside
+# quotes, and `*` only as a checksum marker.
 KLIPPER_EXTENDED = re.compile(
     r"^\s*(?:N[0-9]+\s*)?"
     r"(?P<cmd>[a-zA-Z_][a-zA-Z0-9_]+)(?:\s+|$)"
@@ -58,13 +60,33 @@ KLIPPER_EXTENDED = re.compile(
 )
 
 
-def klipper_params(script: str) -> dict[str, str]:
-    """The parameters Klipper gives the macro a one-line script runs, as it parses them."""
-    assert "\n" not in script
+def klipper_release_params(script: str) -> dict[str, str]:
     match = KLIPPER_EXTENDED.match(script)
     assert match is not None, script
     pairs = [arg.split("=", 1) for arg in shlex.split(match.group("args"))]
     return {key.upper(): value for key, value in pairs}
+
+
+def klipper_master_params(script: str) -> dict[str, str]:
+    line = script.strip()
+    command = line.split(None, 1)[0].upper()
+    start = len(command)
+    if line[start : start + 1].isspace():
+        start += 1
+    lexer = shlex.shlex(line[start:], posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#;"
+    pairs = [arg.split("=", 1) for arg in lexer]
+    return {key.upper(): value for key, value in pairs}
+
+
+def klipper_params(script: str) -> dict[str, str]:
+    """The parameters Klipper gives the macro a one-line script runs, read by both versions,
+    which must agree."""
+    assert "\n" not in script
+    params = klipper_release_params(script)
+    assert klipper_master_params(script) == params
+    return params
 
 
 def commands(lines: list[str]) -> list[SpoolCommand]:
@@ -121,9 +143,10 @@ def test_the_bridges_answer_is_shown_and_isnt_taken_for_a_command():
 @pytest.mark.parametrize(
     ("name", "shown"),
     [
-        ("Spool\\", "Spool"),  # a backslash before the closing quote leaves it unclosed
-        ("Back\\\\slash", "Backslash"),  # shlex turns two into one
-        ("Back\\slash", "Backslash"),
+        ("Spool\\", "Spool/"),  # a backslash before the closing quote leaves it unclosed
+        ("Back\\\\slash", "Back//slash"),  # shlex would turn two into one
+        ("Back\\slash", "Back/slash"),
+        ("C:\\Spools\\PLA red", "C:/Spools/PLA red"),  # a Windows path stays readable
         ('Say "hi"', "Say 'hi'"),
         ("It's mine", "It's mine"),
         ("Gold; #2 *new*", "Gold 2 new"),
