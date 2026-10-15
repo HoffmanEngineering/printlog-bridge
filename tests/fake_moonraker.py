@@ -15,6 +15,11 @@ Authorization copies real Moonraker (checked against v0.9): the WebSocket upgrad
 succeeds, the Unix socket is trusted, and a WebSocket is authorized by an `X-Api-Key` header on
 the upgrade or an `api_key` in identify. Until then every method fails with -32602. A file
 download needs the `X-Api-Key` header (401 without it) whenever an API key is set.
+
+With `timelapse=True` it has moonraker-timelapse (checked against its component, Oct 2026): the
+`timelapse` component in `server.info`, a `timelapse` root holding its videos (also served over
+HTTP, `GET /server/files/timelapse/<name>`), and `render_timelapse`, which announces a render
+with `notify_timelapse_event` as the component does.
 """
 
 from __future__ import annotations
@@ -53,8 +58,15 @@ class FakeMoonraker:
         mac: str | None = "2c:cf:67:00:00:01",
         instance_id: str | None = "6f1c1b5e-0000-4000-8000-000000000001",
         hostname: str = "voron",
+        timelapse: bool = False,
     ) -> None:
         self.klippy_state = klippy_state
+        self.timelapse = timelapse
+        """Whether moonraker-timelapse is installed (`[timelapse]` in moonraker.conf)."""
+        self.timelapse_files: dict[str, bytes] = {}
+        """Its videos, by name."""
+        self.timelapse_root = "/home/pi/timelapse"
+        self.timelapse_downloads: list[str] = []
         self.objects = list(objects)
         self.api_key = api_key
         self.reject_upgrade = reject_upgrade
@@ -105,6 +117,7 @@ class FakeMoonraker:
         app = web.Application()
         app.router.add_get("/websocket", self._websocket)
         app.router.add_get("/server/files/gcodes/{path:.+}", self._download)
+        app.router.add_get("/server/files/timelapse/{path:.+}", self._download_video)
         for path in ("/server/info", "/machine/system_info", "/printer/info",
                      "/printer/objects/list"):  # fmt: skip
             app.router.add_get(path, self._http_get)
@@ -160,6 +173,15 @@ class FakeMoonraker:
         if path not in self.files:
             return web.Response(status=404)
         return web.Response(body=self.files[path], content_type="image/png")
+
+    async def _download_video(self, request: web.Request) -> web.Response:
+        path = request.match_info["path"]
+        self.timelapse_downloads.append(path)
+        if self.api_key is not None and request.headers.get("X-Api-Key") != self.api_key:
+            return web.Response(status=401)
+        if not self.timelapse or path not in self.timelapse_files:
+            return web.Response(status=404)
+        return web.Response(body=self.timelapse_files[path], content_type="video/mp4")
 
     async def _http_get(self, request: web.Request) -> web.Response:
         self.http_requests.append(request.path)
@@ -266,10 +288,15 @@ class FakeMoonraker:
         if method == "server.history.list":
             return self._history_list(params)
         if method == "server.files.roots":
-            return [
+            roots = [
                 {"name": "config", "path": "/home/pi/printer_data/config", "permissions": "rw"},
                 {"name": "gcodes", "path": self.gcodes_root, "permissions": "rw"},
             ]
+            if self.timelapse:
+                roots.append(
+                    {"name": "timelapse", "path": self.timelapse_root, "permissions": "rw"}
+                )
+            return roots
         if method == "server.files.metadata":
             filename = params.get("filename")
             if filename not in self.file_metadata:
@@ -308,7 +335,14 @@ class FakeMoonraker:
             raise _RpcError(503, "Klippy Host not connected")
 
     def _server_info(self) -> dict:
-        return {"klippy_state": self.klippy_state, "moonraker_version": "v0.9.3-fake"}
+        components = ["file_manager", "history", "job_state", "webcam", "extensions"]
+        if self.timelapse:
+            components.append("timelapse")
+        return {
+            "klippy_state": self.klippy_state,
+            "moonraker_version": "v0.9.3-fake",
+            "components": components,
+        }
 
     def _system_info(self) -> dict:
         info: dict[str, Any] = {
@@ -385,6 +419,35 @@ class FakeMoonraker:
         )
         if notify:
             await self.notify("notify_history_changed", {"action": "finished", "job": dict(job)})
+
+    async def render_timelapse(
+        self,
+        printfile: str = "benchy.gcode",
+        video: bytes = b"",
+        *,
+        name: str | None = None,
+        status: str = "success",
+    ) -> str:
+        """moonraker-timelapse renders the frames of a print of `printfile` (without folders)
+        into `video`, and announces it. Returns the video's name."""
+        name = name or f"timelapse_{printfile}_2026-10-15_12-00-00.mp4"
+        await self.notify(
+            "notify_timelapse_event",
+            {"action": "render", "status": "started", "framecount": "120",
+             "settings": {"framerate": 30, "crf": 23, "pixelformat": "yuv420p"}},
+        )  # fmt: skip
+        await self.notify(
+            "notify_timelapse_event", {"action": "render", "status": "running", "progress": 50}
+        )
+        event: dict[str, Any] = {"action": "render", "framecount": "120", "status": status}
+        if status == "success":
+            self.timelapse_files[name] = video
+            event.update(filename=name, printfile=printfile, previewimage=name[:-4] + ".jpg")
+            event["msg"] = f"Rendering Video successful: {name}"
+        else:
+            event["msg"] = "Rendering Video failed"
+        await self.notify("notify_timelapse_event", event)
+        return name
 
     async def set_status(self, **objects: dict[str, Any]) -> None:
         """Klipper reports new values, sent as a status update."""

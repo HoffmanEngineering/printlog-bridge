@@ -13,7 +13,8 @@ url = http://voron.local:7125
 ```
 
 `adopt_prints`, `create_prints` and `adopt_window` go in `[bridge]` for every printer, or in a
-`[printer]` section for that one (see `Adoption`).
+`[printer]` section for that one (see `Adoption`). `max_attachment_mb` in `[bridge]` caps the
+files attached to prints (a timelapse video).
 
 The API key is looked up in this order: the `PRINTLOG_API_KEY` environment variable, the key
 file `<state_dir>/api_key` (which `printlog-bridge store-key` and install.sh write, mode 600),
@@ -65,6 +66,9 @@ _DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*(s|m|h)?$")
 _UNITS = {None: 1, "s": 1, "m": 60, "h": 3600}
 ADOPTION_OPTIONS = ("adopt_prints", "create_prints", "adopt_window")
 DEFAULT_ADOPT_WINDOW_S = 12 * 60 * 60
+DEFAULT_MAX_ATTACHMENT_MB = 100
+MAX_ATTACHMENT_MB = 200
+"""The API refuses a file attachment over 200 MB."""
 _WINDOW = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$")
 _WINDOW_UNITS = {"s": 1, "m": 60, "h": 60 * 60, "d": 24 * 60 * 60, "": 60 * 60}
 
@@ -116,6 +120,8 @@ class BridgeConfig:
     """`api_key` in `[bridge]`, even when another source wins: doctor warns about it."""
     trace: bool = False
     """Record every message to and from each printer in `state_dir/traces` (core/trace.py)."""
+    max_attachment_mb: int = DEFAULT_MAX_ATTACHMENT_MB
+    """A file to attach to a print (a timelapse video) larger than this is skipped."""
 
     def api_url_warning(self) -> str | None:
         """What to say, every time, when `api_url` is plain http to another computer, which
@@ -217,7 +223,20 @@ def load_config(
         source,
         config_api_key,
         trace=_trace(bridge.get("trace"), env.get(TRACE_ENV)),
+        max_attachment_mb=_max_attachment_mb(bridge.get("max_attachment_mb")),
     )
+
+
+def _max_attachment_mb(option: str | None) -> int:
+    text = (option or "").strip()
+    if not text:
+        return DEFAULT_MAX_ATTACHMENT_MB
+    if not text.isdigit() or not 1 <= int(text) <= MAX_ATTACHMENT_MB:
+        raise ConfigError(
+            f"[bridge] max_attachment_mb must be a number of megabytes from 1 to "
+            f"{MAX_ATTACHMENT_MB} (3D Print Log's limit), not {text!r}"
+        )
+    return int(text)
 
 
 def _trace(option: str | None, variable: str | None) -> bool:

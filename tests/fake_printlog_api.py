@@ -26,6 +26,16 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
   jpeg, png, gif, webp or bmp by the part's content type, under 10 MB, at most 5 per print
   (the free plan; 20 with Pro), each refused with 400. `isDefault` makes it the only default.
   It isn't idempotent: the same image sent twice is two images.
+- File attachments (Pro): `GET /api/Subscription/me` says `isPro` (`pro`).
+  `POST /api/Prints/{id}/files/upload-url` with `{fileName, contentType, sizeBytes}` answers a
+  `sasUrl` on a separate fake blob store and the `blobPath` to confirm: 403 without Pro, 400 for
+  a `sizeBytes` outside 1 byte to 200 MB, a sixth file on the print, or an extension other than
+  `.gcode`, `.stl`, `.3mf`, `.obj` and `.mp4` (`.mp4` with the API PR for printlog-bridge#42).
+  The store takes `PUT <sasUrl>` only with `x-ms-blob-type: BlockBlob`, as Azure does, and
+  needs no API key. `POST /api/Prints/{id}/files/confirm` with
+  `{blobPath, fileName, sizeBytes, contentType}` adds the attachment without looking at the
+  store, as the API does, so confirming twice is two attachments. `GET /api/Prints/{id}/files`
+  lists them.
 - `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
   field; `kind` and `displayName` are required and `printerId` must be the user's. A print
   links to a connection only when it is created after the connection was registered.
@@ -65,6 +75,11 @@ PRINTING = 2
 FINISHED = (3, 4, 5, 6)  # Success, Cancelled, Failed, PartialSuccess
 IMAGE_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_FILE_BYTES = 200 * 1024 * 1024
+ATTACHMENT_EXTENSIONS = (".gcode", ".stl", ".3mf", ".obj", ".mp4")
+ATTACHMENT_CONTAINER = "printattachments"
+SAS_SIGNATURE = "SECRET-sas-signature"
+"""The `sig` of every upload URL: whoever has it can write to the store, so it's never logged."""
 CONNECTOR_OWNED = (
     "printTimeInSeconds",
     "estimatedPrintTimeInSeconds",
@@ -117,8 +132,29 @@ class FakePrintLogApi:
         """Every lookup's query."""
         self.claims: list[tuple[int, dict[str, Any]]] = []
         """Every claim body received, by print id."""
+        self.pro = False
+        """Whether the key owner has Pro, which file attachments need."""
+        self.max_files = 5
+        self.attachments: dict[int, list[dict[str, Any]]] = {}
+        """Each print's attached files, as `GET /files` lists them."""
+        self.upload_requests: list[dict[str, Any]] = []
+        """Every upload-url body received."""
+        self.confirms: list[dict[str, Any]] = []
+        """Every confirm body received."""
+        self.confirm_cut = False
+        """While True, a confirm is carried out but cut off before its answer."""
+        self.blobs: dict[str, bytes] = {}
+        """What the store holds, by blob path (`printattachments/<print>/<name>`)."""
+        self.blob_puts: list[dict[str, str]] = []
+        """The headers of every PUT the store received."""
+        self.blob_status: int | None = None
+        """When set, the store answers every PUT with this status."""
+        self._attachment_ids = itertools.count(1)
         self._failures: list[tuple[int, dict[str, str]]] = []
         self._server: TestServer | None = None
+        self._store: TestServer | None = None
+        self.store_port: int | None = None
+        """The fake blob store's port, once started."""
 
     # -- serving -------------------------------------------------------------------------------
 
@@ -139,14 +175,25 @@ class FakePrintLogApi:
         app.router.add_patch("/api/Prints/{id}", self._patch)
         app.router.add_post("/api/Prints/{id}/complete", self._complete)
         app.router.add_post("/api/Prints/{id}/image", self._upload_image)
+        app.router.add_get("/api/Prints/{id}/files", self._files)
+        app.router.add_post("/api/Prints/{id}/files/upload-url", self._upload_url)
+        app.router.add_post("/api/Prints/{id}/files/confirm", self._confirm)
+        app.router.add_get("/api/Subscription/me", self._subscription)
         app.router.add_put("/api/Connections/{instance}", self._put_connection)
         self._server = TestServer(app)
         await self._server.start_server()
+        store = web.Application()
+        store.router.add_put("/{path:.+}", self._put_blob)
+        self._store = TestServer(store)
+        await self._store.start_server()
+        self.store_port = self._store.port
         return str(self._server.make_url("")).rstrip("/")
 
     async def close(self) -> None:
         if self._server is not None:
             await self._server.close()
+        if self._store is not None:
+            await self._store.close()
 
     @web.middleware
     async def _middleware(self, request: web.Request, handler):
@@ -530,6 +577,95 @@ class FakePrintLogApi:
             {k: row[k] for k in ("id", "isDefault", "displayOrder")}, status=201
         )
 
+    async def _subscription(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "status": "active" if self.pro else None,
+                "isPro": self.pro,
+                "maxFilesPerPrint": self.max_files if self.pro else 0,
+                "maxFileStorageBytes": 50 * 1024**3 if self.pro else 0,
+                "usedFileStorageBytes": sum(
+                    f["sizeBytes"] for files in self.attachments.values() for f in files
+                ),
+            }
+        )
+
+    async def _files(self, request: web.Request) -> web.Response:
+        print_id = int(request.match_info["id"])
+        if print_id not in self.prints:
+            return web.Response(status=404)
+        return web.json_response(self.attachments.get(print_id, []))
+
+    async def _upload_url(self, request: web.Request) -> web.Response:
+        print_id = int(request.match_info["id"])
+        body = await request.json()
+        self.upload_requests.append(body)
+        problem = _file_problem(body)
+        if problem:
+            return web.Response(status=400, text=problem)
+        if print_id not in self.prints:
+            return web.Response(status=404)
+        if not self.pro:
+            return web.Response(status=403, text="File attachments require a Pro subscription.")
+        if len(self.attachments.get(print_id, [])) >= self.max_files:
+            return web.Response(
+                status=400, text=f"Maximum of {self.max_files} files per print allowed."
+            )
+        name = str(body["fileName"])
+        extension = name[name.rfind(".") :].lower() if "." in name else ""
+        if extension not in ATTACHMENT_EXTENSIONS:
+            return web.Response(status=400, text=f"File type '{extension}' is not supported.")
+        blob = f"{print_id}/{uuid.uuid4()}{extension}"
+        assert self._store is not None
+        sas = self._store.make_url(f"/{ATTACHMENT_CONTAINER}/{blob}").with_query(
+            {"sv": "2025-05-05", "sp": "cw", "sig": SAS_SIGNATURE}
+        )
+        return web.json_response({"sasUrl": str(sas), "blobPath": f"{ATTACHMENT_CONTAINER}/{blob}"})
+
+    async def _put_blob(self, request: web.Request) -> web.Response:
+        self.blob_puts.append(dict(request.headers))
+        if self.blob_status is not None:
+            return web.Response(status=self.blob_status)
+        if request.query.get("sig") != SAS_SIGNATURE:
+            return web.Response(status=403, text="AuthenticationFailed")
+        if request.headers.get("x-ms-blob-type") != "BlockBlob":
+            return web.Response(status=400, text="MissingRequiredHeader")
+        self.blobs[request.match_info["path"]] = await request.read()
+        return web.Response(status=201)
+
+    async def _confirm(self, request: web.Request) -> web.Response:
+        print_id = int(request.match_info["id"])
+        body = await request.json()
+        self.confirms.append(body)
+        problem = _file_problem(body) or (None if body.get("blobPath") else "BlobPath is required.")
+        if problem:
+            return web.Response(status=400, text=problem)
+        if print_id not in self.prints:
+            return web.Response(status=404)
+        if not self.pro:
+            return web.Response(status=403, text="File attachments require a Pro subscription.")
+        if not str(body["blobPath"]).startswith(ATTACHMENT_CONTAINER + "/"):
+            return web.Response(status=400, text="Invalid blob path.")
+        files = self.attachments.setdefault(print_id, [])
+        row = {
+            "id": next(self._attachment_ids),
+            "originalFileName": body["fileName"],
+            "sizeBytes": body["sizeBytes"],
+            "contentType": body["contentType"],
+            "displayOrder": len(files),
+            "blobPath": body["blobPath"],  # not in the API's answer; for the tests
+        }
+        files.append(row)
+        if self.confirm_cut:
+            if request.transport is not None:
+                request.transport.close()
+            raise web.HTTPServiceUnavailable()  # never reaches the bridge: the line is cut
+        return web.json_response({k: v for k, v in row.items() if k != "blobPath"})
+
+    def attached(self, print_id: int) -> list[bytes]:
+        """What's in the store for each file attached to the print, in order."""
+        return [self.blobs.get(f["blobPath"], b"") for f in self.attachments.get(print_id, [])]
+
     def default_image(self, print_id: int) -> bytes | None:
         """The bytes of the image shown for the print, if it has one."""
         for image in self.prints[print_id]["images"]:
@@ -695,6 +831,18 @@ def _merge_actual_usage(
             match["source"] = _source(incoming)
             for field in ("amountMg", "lengthInM", "volumeMl"):
                 match[field] = incoming.get(field)
+
+
+def _file_problem(body: dict[str, Any]) -> str | None:
+    """What the API's model validation refuses in an upload-url or confirm body."""
+    if not body.get("fileName") or len(str(body["fileName"])) > 255:
+        return "FileName is required (255 characters at most)."
+    if not body.get("contentType") or len(str(body["contentType"])) > 100:
+        return "ContentType is required (100 characters at most)."
+    size = body.get("sizeBytes")
+    if not isinstance(size, int) or not 1 <= size <= MAX_FILE_BYTES:
+        return "SizeBytes must be between 1 and 209715200."
+    return None
 
 
 def _conflict(detail: str, print_id: int | None = None) -> web.Response:

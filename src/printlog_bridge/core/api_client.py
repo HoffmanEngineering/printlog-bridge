@@ -11,16 +11,22 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from types import TracebackType
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.core.images import mask_url, scrub_url
 
 REQUEST_TIMEOUT_S = 15
 UPLOAD_TIMEOUT_S = 30
 """An image upload carries up to 10 MB, so it gets longer than other requests."""
+MIN_UPLOAD_BYTES_PER_S = 64 * 1024
+"""An attachment's upload gets `UPLOAD_TIMEOUT_S` plus its size at this rate (512 kbit/s), so
+100 MB has about 27 minutes on a slow uplink before it is given up and tried again."""
 
 
 class ApiError(Exception):
@@ -205,6 +211,88 @@ class ApiClient:
             timeout=UPLOAD_TIMEOUT_S,
         )
         return None if status == 404 else body
+
+    async def subscription(self) -> dict[str, Any]:
+        """The key owner's plan: `isPro`, `maxFilesPerPrint`, the storage they have and use."""
+        return await self._request("GET", "/api/Subscription/me")
+
+    async def print_files(self, print_id: int) -> list[dict[str, Any]] | None:
+        """The files attached to the print. None when the print is gone."""
+        body = await self._request("GET", f"/api/Prints/{print_id}/files", missing_ok=True)
+        return None if body is None else [f for f in body if isinstance(f, Mapping)]
+
+    async def attachment_upload_url(
+        self, print_id: int, file_name: str, content_type: str, size: int
+    ) -> dict[str, Any] | None:
+        """Where to upload a file for the print (`sasUrl`, good for 15 minutes) and the
+        `blobPath` to confirm it with. None when the print is gone.
+
+        Raises ApiRejected without Pro (403), or for a file the API won't take (400): a type it
+        doesn't accept, too large, one file too many, or no storage left."""
+        return await self._request(
+            "POST",
+            f"/api/Prints/{print_id}/files/upload-url",
+            json={"fileName": file_name, "contentType": content_type, "sizeBytes": size},
+            missing_ok=True,
+        )
+
+    async def confirm_attachment(
+        self, print_id: int, blob_path: str, file_name: str, content_type: str, size: int
+    ) -> dict[str, Any] | None:
+        """Attaches the file uploaded to `blob_path` to the print. None when the print is gone."""
+        return await self._request(
+            "POST",
+            f"/api/Prints/{print_id}/files/confirm",
+            json={
+                "blobPath": blob_path,
+                "fileName": file_name,
+                "contentType": content_type,
+                "sizeBytes": size,
+            },
+            missing_ok=True,
+        )
+
+    async def upload_to_storage(self, url: str, path: Path, content_type: str) -> None:
+        """PUTs the file to the storage URL `attachment_upload_url` gave, streamed from disk.
+
+        Storage is another service (Azure Blob Storage), so the API key never goes with it, and
+        the URL's signature, which lets anyone write there, never reaches a message. The URL
+        must be https, unless the API itself is plain http (a development API)."""
+        shown = mask_url(url)
+        if urlsplit(url).scheme != "https" and urlsplit(self.base_url).scheme == "https":
+            raise ApiRejected(f"the API gave an upload address that isn't https: {shown}")
+        size = path.stat().st_size
+        timeout = UPLOAD_TIMEOUT_S + size / MIN_UPLOAD_BYTES_PER_S
+        try:
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": f"printlog-bridge/{__version__}"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as session:
+                with path.open("rb") as f:
+                    async with session.put(
+                        url,
+                        data=f,
+                        headers={
+                            "x-ms-blob-type": "BlockBlob",
+                            "Content-Type": content_type,
+                            "Content-Length": str(size),
+                        },
+                    ) as response:
+                        if response.status in (400, 403, 404, 413):
+                            raise ApiRejected(
+                                f"storage refused the upload ({response.status})",
+                                status=response.status,
+                            )
+                        if response.status >= 300:
+                            raise ApiUnavailable(
+                                f"storage answered {response.status} to the upload",
+                                _retry_after(response.headers.get("Retry-After"), None),
+                                status=response.status,
+                            )
+        except aiohttp.ClientError as e:
+            raise ApiUnavailable(f"can't reach storage: {scrub_url(e, url)}") from None
+        except asyncio.TimeoutError:
+            raise ApiUnavailable(f"storage didn't take the upload within {timeout:g}s") from None
 
     async def put_connection(self, instance_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Registers the connection, or sends its heartbeat. Each call replaces every field."""

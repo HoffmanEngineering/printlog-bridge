@@ -1,15 +1,18 @@
 """Getting a picture of a print from the printer: a file or a URL, bounded in size and time.
 
-Adapters use these to fetch a job's slicer thumbnail or a webcam snapshot. Neither may hold up
-logging the print, so every fetch has a time limit and a size limit, and fails with
-`ImageUnavailable`, never anything else. Webcam URLs (and Moonraker's, in remote mode) can carry
-a password or a token, so a URL only ever reaches a message, the log or the status file through
-`mask_url`, and an error that might repeat one through `scrub_url`.
+Adapters use these to fetch a job's slicer thumbnail or a webcam snapshot, and, streamed to disk
+with `download_file` and `copy_file`, a file to attach to the print (a timelapse video). None may
+hold up logging the print, so every fetch has a time limit and a size limit, and fails with
+`ImageUnavailable` (`FileUnavailable` for a file), never anything else. Webcam URLs (and
+Moonraker's, in remote mode) can carry a password or a token, so a URL only ever reaches a
+message, the log or the status file through `mask_url`, and an error that might repeat one
+through `scrub_url`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -43,7 +46,11 @@ _ESCAPE = re.compile(r"(%[0-9A-Fa-f]{2})")
 _CHUNK = 64 * 1024
 
 
-class ImageUnavailable(Exception):
+class FileUnavailable(Exception):
+    """The file couldn't be had. The message is safe to log: it never holds a password."""
+
+
+class ImageUnavailable(FileUnavailable):
     """The picture couldn't be had. The message is safe to log: it never holds a password."""
 
 
@@ -69,6 +76,16 @@ EXTENSIONS = {
     "image/webp": ".webp",
     "image/bmp": ".bmp",
 }
+
+
+VIDEO_EXTENSIONS = {"video/mp4": ".mp4"}
+
+
+def video_type(head: bytes) -> str | None:
+    """The content type of a video the bridge attaches (MP4), from the file's first bytes."""
+    if head[4:8] == b"ftyp":
+        return "video/mp4"
+    return None
 
 
 def mask_url(url: str) -> str:
@@ -154,6 +171,78 @@ async def read_image_file(path: Path, *, max_bytes: int = MAX_IMAGE_BYTES) -> by
     if image_type(data) is None:
         raise ImageUnavailable(f"{path} is not an image the API accepts")
     return data
+
+
+async def download_file(
+    url: str,
+    path: Path,
+    *,
+    timeout: float,
+    max_bytes: int,
+    headers: Mapping[str, str] | None = None,
+) -> None:
+    """GETs a file into `path`, streamed to disk. A user and password in the URL are sent as
+    basic auth. Raises FileUnavailable, leaving no file behind, when it fails or is larger than
+    `max_bytes`."""
+    shown = mask_url(url)
+    try:
+        async with (
+            aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                headers={"User-Agent": f"printlog-bridge/{__version__}"},
+            ) as session,
+            session.get(url, headers=dict(headers or {})) as response,
+        ):
+            if response.status != 200:
+                raise FileUnavailable(f"{shown} answered {response.status}")
+            if response.content_length is not None and response.content_length > max_bytes:
+                raise FileUnavailable(f"{shown} is larger than {max_bytes} bytes")
+            size = 0
+            with path.open("wb") as f:
+                async for chunk in response.content.iter_chunked(_CHUNK):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise FileUnavailable(f"{shown} is larger than {max_bytes} bytes")
+                    f.write(chunk)
+    except BaseException as e:
+        _remove(path)
+        if isinstance(e, asyncio.TimeoutError):
+            raise FileUnavailable(f"{shown} didn't send the file within {timeout:g}s") from None
+        if isinstance(e, (aiohttp.ClientError, OSError, ValueError)):
+            raise FileUnavailable(f"can't reach {shown}: {scrub_url(e, url)}") from None
+        raise
+
+
+async def copy_file(source: Path, path: Path, *, max_bytes: int) -> None:
+    """Copies a file into `path`, refusing one larger than `max_bytes` before copying it.
+    Raises FileUnavailable, leaving no file behind, when it fails."""
+
+    def copy() -> None:
+        if source.stat().st_size > max_bytes:
+            raise FileUnavailable(f"{source} is larger than {max_bytes} bytes")
+        size = 0
+        with source.open("rb") as reader, path.open("wb") as writer:
+            while True:
+                chunk = reader.read(_CHUNK)
+                if not chunk:
+                    return
+                size += len(chunk)
+                if size > max_bytes:  # it grew while being copied
+                    raise FileUnavailable(f"{source} is larger than {max_bytes} bytes")
+                writer.write(chunk)
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, copy)
+    except BaseException as e:
+        _remove(path)
+        if isinstance(e, OSError):
+            raise FileUnavailable(f"can't read {source}: {e.strerror or e}") from None
+        raise
+
+
+def _remove(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()
 
 
 def scrub_url(error: BaseException, url: str | None) -> str:

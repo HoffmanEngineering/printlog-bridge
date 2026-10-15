@@ -10,21 +10,24 @@ from pathlib import Path
 
 import pytest
 from fake_moonraker import eventually
-from fake_printlog_api import FakePrintLogApi
+from fake_printlog_api import SAS_SIGNATURE, FakePrintLogApi
 
 from printlog_bridge.core.api_client import ApiClient
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import (
+    AttachmentKind,
     ImageKind,
+    JobAttachment,
     JobFinished,
     JobImage,
     JobOutcome,
     JobStarted,
     SpoolReading,
 )
+from printlog_bridge.core.images import FileUnavailable
 from printlog_bridge.core.lifecycle import JobLogger, LoggedPrinter, backoff_delay
-from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, Outbox, read_waiting
+from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, Outbox, read_entries, read_waiting
 from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.state import JobRecord, PrinterState
 from printlog_bridge.core.status import StatusBoard, read_status
@@ -59,6 +62,7 @@ async def logging_to(
     image_timeout: float | None = None,
     spools: bool = False,
     adoption: Adoption | None = None,
+    max_attachment_bytes: int | None = None,
     **printers: int,
 ):
     """A JobLogger sending to `api`. With `spools`, it links each print to the loaded spools."""
@@ -68,6 +72,8 @@ async def logging_to(
         options["clock"] = clock
     if image_timeout is not None:
         options["image_timeout"] = image_timeout
+    if max_attachment_bytes is not None:
+        options["max_attachment_bytes"] = max_attachment_bytes
     try:
         async with ApiClient(base, api.api_key) as client:
             targets = printers or {"voron": 42}
@@ -108,6 +114,7 @@ def run(
     backoff=FAST_BACKOFF,
     spools: bool = False,
     adoption: Adoption | None = None,
+    max_attachment_bytes: int | None = None,
     **printers: int,
 ):
     """Emits `events` in order, sending each before the next, as a restart of the bridge would.
@@ -118,7 +125,13 @@ def run(
 
     async def scenario():
         async with logging_to(
-            api, state_dir, backoff=backoff, spools=spools, adoption=adoption, **printers
+            api,
+            state_dir,
+            backoff=backoff,
+            spools=spools,
+            adoption=adoption,
+            max_attachment_bytes=max_attachment_bytes,
+            **printers,
         ) as logger:
             try:
                 await drain(logger, timeout)  # what the last run left in the outbox
@@ -1126,6 +1139,177 @@ class TestImages:
         [print_] = api.prints.values()
         assert print_["status"] == 3
         assert print_["images"] == []
+
+
+MP4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"\x00" * 2000
+VIDEO = "timelapse_shelf_bracket.gcode_2026-10-15_12-00-00.mp4"
+
+
+def timelapse(
+    data: bytes | None = MP4, job_id: str = "00000A", fetched: list | None = None
+) -> JobAttachment:
+    async def fetch(path: Path, max_bytes: int) -> bool:
+        if fetched is not None:
+            fetched.append(max_bytes)
+        if data is None:
+            return False
+        if len(data) > max_bytes:
+            raise FileUnavailable(f"{VIDEO} is larger than {max_bytes} bytes")
+        path.write_bytes(data)
+        return True
+
+    return JobAttachment("voron", job_id, AttachmentKind.TIMELAPSE, VIDEO, fetch)
+
+
+def pro(api: FakePrintLogApi) -> FakePrintLogApi:
+    api.pro = True
+    return api
+
+
+def attachment_requests(api: FakePrintLogApi) -> list:
+    return [r for r in api.requests if "/files" in r[1]]
+
+
+class TestAttachments:
+    def test_the_video_is_attached_once_with_its_name_type_and_size(self, tmp_path):
+        api = pro(FakePrintLogApi())
+        fetched: list = []
+
+        run(api, tmp_path, started(), finished(), timelapse(fetched=fetched), timelapse())
+        run(api, tmp_path, timelapse(fetched=fetched))  # after a restart
+
+        [attached] = api.attachments[1]
+        assert attached["originalFileName"] == VIDEO
+        assert attached["contentType"] == "video/mp4"
+        assert attached["sizeBytes"] == len(MP4)
+        assert api.attached(1) == [MP4]
+        assert len(fetched) == 1
+        assert list((tmp_path / "attachments").iterdir()) == []
+
+    def test_it_goes_to_storage_without_the_api_key(self, tmp_path):
+        api = pro(FakePrintLogApi())
+
+        run(api, tmp_path, started(), finished(), timelapse())
+
+        [put] = api.blob_puts
+        assert "X-Api-Key" not in put and api.api_key not in str(put)
+        assert put["x-ms-blob-type"] == "BlockBlob"
+        assert put["Content-Type"] == "video/mp4"
+        assert put["Content-Length"] == str(len(MP4))
+
+    def test_without_pro_it_is_never_fetched_and_nothing_is_uploaded(self, tmp_path):
+        api = FakePrintLogApi()
+        fetched: list = []
+
+        run(api, tmp_path, started(), finished(), timelapse(fetched=fetched))
+
+        assert fetched == []
+        assert attachment_requests(api) == []
+        assert api.blob_puts == []
+
+    def test_one_queued_while_the_api_was_down_waits_and_is_attached_once(self, tmp_path):
+        api = pro(FakePrintLogApi())
+
+        run(
+            api, tmp_path, started(), finished(),
+            lambda a: setattr(a, "offline", True), timelapse(), timeout=0.2,
+        )  # fmt: skip
+        assert not api.attachments
+        api.offline = False
+        run(api, tmp_path)  # the bridge starts again
+
+        assert api.attached(1) == [MP4]
+
+    def test_one_queued_before_pro_ended_is_not_uploaded(self, tmp_path):
+        api = pro(FakePrintLogApi())
+
+        run(
+            api, tmp_path, started(), finished(),
+            lambda a: setattr(a, "offline", True), timelapse(), timeout=0.2,
+        )  # fmt: skip
+        api.offline = False
+        api.pro = False
+        run(api, tmp_path)
+
+        assert api.upload_requests == []
+        assert api.blob_puts == []
+        assert list((tmp_path / "attachments").iterdir()) == []
+
+    def test_a_video_over_the_limit_is_skipped(self, tmp_path):
+        api = pro(FakePrintLogApi())
+        fetched: list = []
+
+        run(
+            api, tmp_path, started(), finished(), timelapse(fetched=fetched),
+            max_attachment_bytes=len(MP4) - 1,
+        )  # fmt: skip
+
+        assert fetched == [len(MP4) - 1]
+        assert attachment_requests(api) == []
+
+    def test_a_file_that_is_not_an_mp4_is_skipped(self, tmp_path):
+        api = pro(FakePrintLogApi())
+
+        run(api, tmp_path, started(), finished(), timelapse(data=b"<html>not a video</html>"))
+
+        assert attachment_requests(api) == []
+        assert list((tmp_path / "attachments").iterdir()) == []
+
+    def test_a_lost_answer_to_the_confirm_does_not_attach_it_twice(self, tmp_path):
+        api = pro(FakePrintLogApi())
+        api.confirm_cut = True
+
+        run(api, tmp_path, started(), finished(), timelapse())
+
+        assert len(api.confirms) == 1
+        assert len(api.attachments[1]) == 1
+
+    def test_one_storage_refuses_is_dropped_and_the_print_is_left_alone(self, tmp_path, caplog):
+        api = pro(FakePrintLogApi())
+        api.blob_status = 403
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            run(api, tmp_path, started(), finished(), timelapse())
+
+        assert api.confirms == []
+        assert api.prints[1]["status"] == 3
+        assert "storage refused the upload (403)" in caplog.text
+        assert read_entries(tmp_path) == []
+
+    def test_the_upload_urls_signature_is_never_logged(self, tmp_path, caplog):
+        api = pro(FakePrintLogApi())
+        api.blob_status = 500
+
+        with caplog.at_level(logging.DEBUG, logger="printlog_bridge"):
+            run(api, tmp_path, started(), finished(), timelapse(), timeout=1.0)
+
+        assert "storage answered 500" in caplog.text
+        assert SAS_SIGNATURE not in caplog.text
+
+    def test_one_the_api_refuses_is_dropped(self, tmp_path, caplog):
+        api = pro(FakePrintLogApi())
+        api.max_files = 0
+
+        with caplog.at_level(logging.INFO, logger="printlog_bridge"):
+            run(api, tmp_path, started(), finished(), timelapse())
+
+        assert "Maximum of 0 files per print" in caplog.text
+        assert api.blob_puts == []
+        assert read_entries(tmp_path) == []
+
+    def test_another_prints_start_due_with_it_goes_first(self, tmp_path):
+        api = pro(FakePrintLogApi())
+        api.offline = True
+        run(
+            api, tmp_path, started(), finished(), timelapse(), started("00000B"), timeout=0.1,
+        )  # fmt: skip
+        api.offline = False
+
+        run(api, tmp_path)  # the internet is back: everything is due at once
+
+        sent = [path for method, path in api.requests if method == "POST" or "/files" in path]
+        assert sent.index("/api/Prints", 1) < sent.index("/api/Prints/1/files")
+        assert api.attached(1) == [MP4]
 
 
 class BrokenDisk:

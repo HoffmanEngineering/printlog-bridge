@@ -79,6 +79,7 @@ async def run_bridge(
                 backoff=backoff,
                 board=board,
                 spools=spools,
+                max_attachment_bytes=config.max_attachment_mb * 1024 * 1024,
             )
             heartbeat = Heartbeat(
                 api,

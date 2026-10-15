@@ -37,6 +37,9 @@ class JobRecord:
     images: dict[str, bool] = field(default_factory=dict)
     """Each picture already fetched for the job (`thumbnail`, `snapshot`), and whether there
     was one to add, so a replayed job isn't fetched again."""
+    attachments: dict[str, bool] = field(default_factory=dict)
+    """Each file already fetched to attach to the print (`timelapse`), and whether it was
+    queued, so a render announced again is never fetched or attached twice."""
     claiming: int | None = None
     """The print being adopted, from just before the claim is sent until `print_id` is set, so
     a claim whose answer was lost is sent again rather than a second print created."""
