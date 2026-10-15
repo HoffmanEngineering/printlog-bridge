@@ -126,6 +126,9 @@ class FakePrintLogApi:
         self.connections: dict[str, dict[str, Any]] = {}
         self.heartbeats: list[tuple[str, dict[str, Any]]] = []
         """Every PUT /api/Connections body received, by instance id."""
+        self.latest_agent_version: str | None = None
+        """The `latestAgentVersion` connections answer with: the newest bridge release, which
+        the API reads from GitHub, or None when it doesn't know one."""
         self.images: dict[int, bytes] = {}
         """Every image's bytes, by image id. A print's `images` lists their ids and defaults."""
         self.max_images = 5
@@ -561,6 +564,7 @@ class FakePrintLogApi:
             "agentVersion": body.get("agentVersion"),
             "printerId": body.get("printerId"),
             "status": 1,
+            "latestAgentVersion": self.latest_agent_version,
         }
         self.connections[instance_id] = connection
         return web.json_response(connection, status=200 if existing else 201)

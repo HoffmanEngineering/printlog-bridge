@@ -10,6 +10,9 @@ shows a connection as stale after 15 minutes without a heartbeat.
 
 Each heartbeat also carries the printer's health (#37): its software's versions, the outbox's
 backlog, and the problems logged since the last heartbeat. docs/privacy.md lists every field.
+
+3D Print Log answers each heartbeat with the newest bridge release (`latestAgentVersion`), which
+goes in the status file for `status` and `doctor`, and in the log once per version (#39).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailab
 from printlog_bridge.core.health import ProblemLog, Problems, utc_now
 from printlog_bridge.core.outbox import read_waiting
 from printlog_bridge.core.status import StatusBoard
+from printlog_bridge.core.updates import is_newer, update_notice
 
 log = logging.getLogger(__name__)
 
@@ -65,15 +69,18 @@ class Heartbeat:
         interval: float = HEARTBEAT_INTERVAL_S,
         problems: ProblemLog | None = None,
         clock: Callable[[], datetime] = utc_now,
+        update_check: bool = True,
     ) -> None:
         self.api = api
         self.connections = {c.printer: c for c in connections}
         self.board = board
         self.interval = interval
+        self.update_check = update_check
         self.problems = problems
         """Where the problems each heartbeat reports are counted; None reports none."""
         self.clock = clock
         self._registered: set[str] = set()
+        self._announced: set[str] = set()
 
     async def run(self) -> None:
         """Beats for every printer now and then every `interval`, until cancelled."""
@@ -98,7 +105,7 @@ class Heartbeat:
         problems = self.problems.problems(printer) if self.problems else NO_PROBLEMS
         body = self._body(connection, problems)
         try:
-            await self.api.put_connection(connection.instance_id, body)
+            answer = await self.api.put_connection(connection.instance_id, body)
         except AuthRejected:
             problem = (
                 "3D Print Log rejected the API key, so the printer shows as offline and its jobs "
@@ -129,9 +136,23 @@ class Heartbeat:
                 self.problems.reported(printer, problems.count)
             report.heartbeat()
             report.warn(TOPIC, None)
+            self._heard_latest(answer)
             return True
         report.warn(TOPIC, problem)
         return False
+
+    def _heard_latest(self, answer: object) -> None:
+        """Keeps the newest release the API reported, and logs it the first time it is newer
+        than this bridge. Every printer's check-in answers the same, so it is logged once."""
+        if not self.update_check:
+            return
+        latest = answer.get("latestAgentVersion") if isinstance(answer, dict) else None
+        if not isinstance(latest, str) or not latest.strip():
+            latest = None
+        self.board.latest_version(latest)
+        if latest is not None and is_newer(latest) and latest not in self._announced:
+            self._announced.add(latest)
+            log.info("%s", update_notice(latest))
 
     def _body(self, connection: Connection, problems: Problems) -> dict[str, Any]:
         """Everything a heartbeat sends. Every field is listed in docs/privacy.md, and none may

@@ -120,6 +120,7 @@ async def _run(
                 ],
                 board,
                 interval=heartbeat_interval,
+                update_check=config.update_check,
                 problems=problems,
             )
             sink.before_create = heartbeat.ensure_registered
