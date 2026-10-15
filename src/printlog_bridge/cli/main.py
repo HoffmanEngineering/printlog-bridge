@@ -16,17 +16,29 @@ import sys
 import tempfile
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
 from printlog_bridge.cli.discover import discover, format_found, subnets_to_scan
+from printlog_bridge.core.adapter import PrinterUnavailable
+from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.backfill import (
+    DEFAULT_DAYS,
+    Backfill,
+    BackfillStopped,
+    format_summary,
+    since,
+)
 from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import (
     API_KEY_ENV,
+    BridgeConfig,
     ConfigError,
+    PrinterConfig,
     clean_key,
     clear_config_api_key,
     find_config,
@@ -35,6 +47,8 @@ from printlog_bridge.core.config import (
     write_key_file,
 )
 from printlog_bridge.core.doctor import API_KEYS_PAGE, diagnose, format_report
+from printlog_bridge.core.lifecycle import LoggedPrinter
+from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import format_status
 from printlog_bridge.core.support import BUNDLE_NAME, write_support_bundle
 
@@ -77,7 +91,25 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument(
         "--no-zeroconf", action="store_true", help="only scan; don't ask over mDNS"
     )
-    for command in (doctor, run, status, store_key, discover):
+    backfill = commands.add_parser(
+        "backfill",
+        help="log the prints in each printer's job history from before the bridge watched it, "
+        "as imported prints that don't change inventory",
+    )
+    backfill.add_argument(
+        "--days",
+        type=_days,
+        default=DEFAULT_DAYS,
+        help=f"how many days back to go (default {DEFAULT_DAYS})",
+    )
+    backfill.add_argument(
+        "--printer",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="only the [printer NAME] section; repeat for more (default: every printer)",
+    )
+    for command in (doctor, run, status, store_key, discover, backfill):
         command.add_argument(
             "--config",
             type=Path,
@@ -102,6 +134,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _store_key(args.config)
     if args.command == "discover":
         return _discover(args)
+    if args.command == "backfill":
+        return _backfill(args)
 
     parser.print_usage(sys.stderr)
     return 2
@@ -176,6 +210,95 @@ def _discover(args: argparse.Namespace) -> int:
     found = asyncio.run(discover(networks, port=args.port, zeroconf=zeroconf))
     print(format_found(found, networks, config, zeroconf=zeroconf))
     return 0 if found else 1
+
+
+def _days(text: str) -> int:
+    try:
+        days = int(text)
+    except ValueError:
+        days = 0
+    if days < 1:
+        raise argparse.ArgumentTypeError(f"a number of days, 1 or more, not {text!r}")
+    return days
+
+
+def _backfill(args: argparse.Namespace) -> int:
+    """Logs each printer's past jobs (`core/backfill.py`). Reads the bridge's state, never
+    writes it, so it can run while the bridge does."""
+    env = dict(os.environ)
+    home = Path.home()
+    config_path = find_config(args.config, env=env, home=home)
+    try:
+        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        check_runnable(config)
+    except ConfigError as e:
+        print(f"printlog-bridge: {e}", file=sys.stderr)
+        print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
+        return 2
+    names = [p.name for p in config.printers]
+    unknown = [name for name in args.printer if name not in names]
+    if unknown:
+        print(
+            f"printlog-bridge: no [printer {unknown[0]}] in {config.path} "
+            f"(it has {', '.join(names) or 'none'})",
+            file=sys.stderr,
+        )
+        return 2
+    printers = [p for p in config.printers if not args.printer or p.name in args.printer]
+    states = {}
+    for printer in printers:
+        state = PrinterState.peek(config.state_dir, printer.name)
+        if state is None:
+            print(
+                f"printlog-bridge: the bridge hasn't run for [printer {printer.name}] yet, so it "
+                "has no id for its prints. Start it once (`printlog-bridge run`, or its "
+                "service), then run backfill.",
+                file=sys.stderr,
+            )
+            return 2
+        states[printer.name] = state
+
+    print(f"printlog-bridge {__version__} backfill")
+    try:
+        return asyncio.run(_backfill_printers(config, printers, states, args.days))
+    except KeyboardInterrupt:
+        print("Stopped. Run it again to carry on: no job is logged twice.", file=sys.stderr)
+        return 130
+
+
+async def _backfill_printers(
+    config: BridgeConfig,
+    printers: Sequence[PrinterConfig],
+    states: Mapping[str, PrinterState],
+    days: int,
+) -> int:
+    assert config.api_key is not None  # check_runnable made sure
+    start = since(days, datetime.now(timezone.utc))
+    code = 0
+    async with ApiClient(config.api_url, config.api_key) as api:
+        runner = Backfill(api)
+        for printer in printers:
+            assert printer.printer_id is not None  # check_runnable made sure
+            adapter, state = printer.adapter, states[printer.name]
+            adapter.use_state(state)
+            print(f"[printer {printer.name}] reading its job history since {start:%Y-%m-%d}")
+            try:
+                jobs = await adapter.past_jobs(start)
+            except PrinterUnavailable as e:
+                print(f"[printer {printer.name}] can't read its job history: {e}", file=sys.stderr)
+                code = 1
+                continue
+            target = LoggedPrinter(printer_id=printer.printer_id, source=adapter.name)
+            history = adapter.history_name or adapter.name
+            try:
+                summary = await runner.run(printer.name, target, state, jobs, history=history)
+            except BackfillStopped as e:
+                print(f"[printer {printer.name}] backfill stopped: {e}", file=sys.stderr)
+                return 1
+            print(format_summary(printer.name, summary, days))
+            if summary.refused:
+                code = 1
+    return code
 
 
 def _store_key(explicit_config: Path | None) -> int:

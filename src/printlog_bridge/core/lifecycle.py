@@ -966,15 +966,7 @@ class JobLogger:
 
     async def _account_defaults(self) -> tuple[int, bool]:
         if self._defaults is None:
-            settings = {
-                s.get("userSettingTypeId"): str(s.get("value") or "")
-                for s in await self.api.user_settings()
-            }
-            view_status = VIEW_STATUSES.get(
-                settings.get(DEFAULT_VIEW_STATUS_SETTING, "").lower(), PRIVATE
-            )
-            allow_comments = settings.get(LAST_ALLOW_COMMENTS_SETTING, "").lower() == "true"
-            self._defaults = (view_status, allow_comments)
+            self._defaults = await account_defaults(self.api)
         return self._defaults
 
     # -- end -----------------------------------------------------------------------------------
@@ -1091,6 +1083,16 @@ class JobLogger:
         report = self._report(entry.printer)
         if report is not None:
             report.warn(API_TOPIC, f"job {entry.job_id} isn't logged yet: {problem}")
+
+
+async def account_defaults(api: ApiClient) -> tuple[int, bool]:
+    """The visibility and whether comments are allowed, as the web app's new-print form starts."""
+    settings = {
+        s.get("userSettingTypeId"): str(s.get("value") or "") for s in await api.user_settings()
+    }
+    view_status = VIEW_STATUSES.get(settings.get(DEFAULT_VIEW_STATUS_SETTING, "").lower(), PRIVATE)
+    allow_comments = settings.get(LAST_ALLOW_COMMENTS_SETTING, "").lower() == "true"
+    return view_status, allow_comments
 
 
 def _adoptable(print_: Mapping[str, Any], printer_id: int, since: datetime, file_name: str) -> bool:

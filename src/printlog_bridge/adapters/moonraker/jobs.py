@@ -36,6 +36,7 @@ from printlog_bridge.core.events import (
     JobPoint,
     JobSlicerSettings,
     JobStarted,
+    PastJob,
 )
 from printlog_bridge.core.status import NullReport, PrinterReport
 
@@ -51,6 +52,9 @@ log = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
 HISTORY_TOPIC = "history"
+
+HISTORY_OFF = "Moonraker's job history is off"
+TURN_HISTORY_ON = "Add a [history] section to moonraker.conf and restart Moonraker."
 
 STOPPED = "Moonraker stopped during the print"
 OUTCOMES: Mapping[str, tuple[JobOutcome, str | None]] = {
@@ -99,10 +103,7 @@ class JobTracker:
         except MoonrakerRpcError as e:
             if e.code != -32601:  # anything but "Method not found"
                 raise
-            problem = (
-                "Moonraker's job history is off, so no print can be logged. Add a [history] "
-                "section to moonraker.conf and restart Moonraker."
-            )
+            problem = f"{HISTORY_OFF}, so no print can be logged. {TURN_HISTORY_ON}"
             log.error("[printer %s] %s", self.printer, problem)
             self.report.warn(HISTORY_TOPIC, problem)
             return
@@ -199,18 +200,9 @@ class JobTracker:
             latest = await call("server.history.list", {"limit": 1, "order": "desc"})
             return [j for j in latest["jobs"] if j.get("status") == "in_progress"]
 
-        # `since` keeps jobs that started strictly after it. A second's margin keeps the job
-        # at the resume point, whose time has made a round trip through a datetime.
-        since = resume.timestamp() - 1
-        jobs: list[Mapping[str, Any]] = []
-        while True:
-            page = await call(
-                "server.history.list",
-                {"since": since, "order": "asc", "limit": PAGE_SIZE, "start": len(jobs)},
-            )
-            jobs.extend(page["jobs"])
-            if len(page["jobs"]) < PAGE_SIZE:
-                return jobs
+        # A second's margin keeps the job at the resume point, whose time has made a round
+        # trip through a datetime.
+        return await read_history(call, resume.timestamp() - 1)
 
     async def _report(
         self, job: Mapping[str, Any], live: bool = False, latest: bool = False
@@ -257,6 +249,32 @@ class JobTracker:
                         functools.partial(images.snapshot, call),
                     )
                 )
+
+
+async def read_history(call: Call, since: float) -> list[Mapping[str, Any]]:
+    """Every job in history that started strictly after `since` (a timestamp on the printer's
+    clock), oldest first, a page at a time."""
+    jobs: list[Mapping[str, Any]] = []
+    while True:
+        page = await call(
+            "server.history.list",
+            {"since": since, "order": "asc", "limit": PAGE_SIZE, "start": len(jobs)},
+        )
+        jobs.extend(page["jobs"])
+        if len(page["jobs"]) < PAGE_SIZE:
+            return jobs
+
+
+def past_job(printer: str, job: Mapping[str, Any]) -> PastJob | None:
+    """A finished job from history, for a backfill, or None for one still in progress. Its
+    usage is history's total for the job, `filament_used`."""
+    if job.get("status", "in_progress") == "in_progress":
+        return None
+    return PastJob(
+        start=started(printer, job),
+        end=finished(printer, job),
+        file_exists=job.get("exists") is not False,
+    )
 
 
 def started(printer: str, job: Mapping[str, Any]) -> JobStarted:

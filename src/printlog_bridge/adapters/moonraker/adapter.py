@@ -11,16 +11,17 @@ import asyncio
 import logging
 import re
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
 
-from printlog_bridge.core.adapter import Adapter
+from printlog_bridge.core.adapter import Adapter, PrinterUnavailable
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError, parse_duration
-from printlog_bridge.core.events import EventSink, SpoolSink
+from printlog_bridge.core.events import EventSink, PastJob, SpoolSink
 from printlog_bridge.core.images import scrub_url
 from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import PrinterReport
@@ -28,7 +29,7 @@ from printlog_bridge.core.trace import Trace
 
 from . import discovery as lan
 from .images import MoonrakerImages
-from .jobs import JobTracker
+from .jobs import HISTORY_OFF, TURN_HISTORY_ON, JobTracker, past_job, read_history
 from .locator import Locator, last_found
 from .notifier import NotifierCheck, message, old_notifiers
 from .session import (
@@ -40,6 +41,7 @@ from .session import (
     MoonrakerSession,
     fetch_once,
     fetch_server_info,
+    one_shot,
     where,
 )
 from .spoolman import SpoolmanSync
@@ -78,6 +80,7 @@ URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
 class MoonrakerAdapter(Adapter):
     name = "moonraker"
+    history_name = "Moonraker"
 
     def __init__(
         self,
@@ -288,6 +291,33 @@ class MoonrakerAdapter(Adapter):
         else:
             result = CheckResult.ok(name, detail)
         return [result, *await self._notifier_check(self.url)]
+
+    async def past_jobs(self, since: datetime) -> Sequence[PastJob]:
+        """Every finished job in Moonraker's history that started after `since`, oldest first,
+        read over a connection of its own (the bridge may be running). Where the printer was
+        last found is tried first, as `run` does."""
+        found_at = self._last_found()
+        urls = [lan.with_host(self.url, found_at)] if found_at and self.url else []
+        urls.append(self.url)
+        problem = ""
+        for url in urls:
+            try:
+                async with one_shot(
+                    self.printer, url=url, socket=self.socket, api_key=self.api_key
+                ) as call:
+                    history = await read_history(call, since.timestamp())
+            except MoonrakerAuthError as e:
+                raise PrinterUnavailable(str(e)) from e
+            except MoonrakerRpcError as e:
+                if e.code == -32601:  # "Method not found"
+                    raise PrinterUnavailable(f"{HISTORY_OFF}. {TURN_HISTORY_ON}") from e
+                problem = f"Moonraker at {where(url, self.socket)}: {scrub_url(e, url)}"
+            except CHECK_ERRORS as e:
+                problem = f"can't reach Moonraker at {where(url, self.socket)}: {_reason(e, url)}"
+            else:
+                jobs = (past_job(self.printer, job) for job in history)
+                return [job for job in jobs if job is not None]
+        raise PrinterUnavailable(problem)
 
     async def _notifier_check(self, url: str | None) -> list[CheckResult]:
         """A warning when Moonraker still has a notifier logging prints to 3D Print Log, or

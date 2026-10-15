@@ -161,14 +161,29 @@ async def fetch_once(
 ) -> Any:
     """One call, without parameters, over the same connection `run` uses, without
     identifying."""
+    async with one_shot(printer, url=url, socket=socket, api_key=api_key) as call:
+        return await call(method, None)
+
+
+@contextlib.asynccontextmanager
+async def one_shot(
+    printer: str, *, url: str | None, socket: Path | None, api_key: str | None
+) -> AsyncIterator[Call]:
+    """A connection of its own for a few calls, the same kind `run` uses, without identifying,
+    so it doesn't take the agent name a running bridge holds. Closed on leaving."""
     transport = await _open_transport(printer, url, socket, api_key)
     rpc = _JsonRpc(transport)
+
+    async def call(method: str, params: Mapping[str, Any] | None = None) -> Any:
+        try:
+            return await rpc.call(method, params)
+        except MoonrakerRpcError as e:
+            if e.is_auth_failure:
+                raise rejection(printer, where(url, socket), e.message) from e
+            raise
+
     try:
-        return await rpc.call(method)
-    except MoonrakerRpcError as e:
-        if e.is_auth_failure:
-            raise rejection(printer, where(url, socket), e.message) from e
-        raise
+        yield call
     finally:
         await rpc.close()
         await transport.close()
