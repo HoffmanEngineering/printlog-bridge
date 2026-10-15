@@ -40,6 +40,10 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
 - `POST /api/Prints` with `imported: true` (a history backfill, printlog-bridge#8) takes only a
   finished status and usage rows that name no spool, each refused with 400. It leaves the
   printer's loaded spools alone, and a pair already used returns that print unchanged (200).
+- `GET /api/Prints/on-printer?printerId=&from=&to=&afterId=&limit=` lists the user's prints on
+  the printer whose `startDate` (or, without one, `createdDate`) is in [from, to), by id, as
+  `PrintOnPrinterDto`; another user's printer is an empty list. `on_printer = False` answers it
+  400, as an API older than `imported` does (the path falls through to `GET /api/Prints/{id}`).
 - `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
   field; `kind` and `displayName` are required and `printerId` must be the user's. A print
   links to a connection only when it is created after the connection was registered.
@@ -129,6 +133,8 @@ class FakePrintLogApi:
         self._image_ids = itertools.count(1)
         self.lookup = True
         """False answers the lookup for prints to adopt 400, as an API without it does."""
+        self.on_printer = True
+        """False answers the on-printer lookup 400, as an API without `imported` does."""
         self.lookups: list[dict[str, str]] = []
         """Every lookup's query."""
         self.claims: list[tuple[int, dict[str, Any]]] = []
@@ -159,6 +165,7 @@ class FakePrintLogApi:
         app.router.add_get("/api/Filaments/by-number/{number}", self._by_number)
         app.router.add_post("/api/Prints", self._create)
         app.router.add_get("/api/Prints/claimable", self._claimable)
+        app.router.add_get("/api/Prints/on-printer", self._on_printer)
         app.router.add_post("/api/Prints/{id}/claim", self._claim)
         app.router.add_get("/api/Prints/{id}", self._get)
         app.router.add_patch("/api/Prints/{id}", self._patch)
@@ -583,6 +590,39 @@ class FakePrintLogApi:
                 return self.images[image["id"]]
         return None
 
+    async def _on_printer(self, request: web.Request) -> web.Response:
+        if not self.on_printer:
+            return _problem(400, "One or more validation errors occurred.")
+        query = request.query
+        printer_id = int(query["printerId"])
+        start, end = _when(query["from"]), _when(query["to"])
+        after = int(query.get("afterId", 0))
+        limit = int(query.get("limit", 100))
+        if not 1 <= limit <= 500:
+            return _problem(400, "limit must be between 1 and 500.")
+        if printer_id not in self.printers:
+            return web.json_response([])
+        found = [
+            {
+                key: p.get(key)
+                for key in (
+                    "id",
+                    "title",
+                    "fileName",
+                    "status",
+                    "startDate",
+                    "createdDate",
+                    "externalSource",
+                    "externalId",
+                )
+            }  # fmt: skip
+            for p in sorted(self.prints.values(), key=lambda p: p["id"])
+            if p["printerId"] == printer_id
+            and p["id"] > after
+            and start <= _when(p.get("startDate") or p["createdDate"]) < end
+        ]
+        return web.json_response(found[:limit])
+
     async def _claimable(self, request: web.Request) -> web.Response:
         if not self.lookup:
             return web.Response(status=400, text="The value 'claimable' is not valid.")
@@ -825,6 +865,11 @@ def _metadata_problem(metadata: dict[str, Any]) -> str | None:
         if not low <= value <= high:
             return f"The field {field} must be between {low} and {high}."
     return None
+
+
+def _when(text: str) -> datetime:
+    when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
 
 
 def _problem(status: int, title: str) -> web.Response:
