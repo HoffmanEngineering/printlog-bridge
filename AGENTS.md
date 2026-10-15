@@ -39,7 +39,7 @@ skipped by default.
 
 Public repo; `main` is protected. Branch, PR against `main`, wait for CI, squash merge (`/ship`).
 Every merge to `main` publishes `ghcr.io/hoffmanengineering/printlog-bridge:edge`; a `v*` tag
-publishes a versioned image. Push tags only when Chris asks. Branches are deleted on merge, so a
+publishes a versioned image. Push tags only when Chris asks. A bridge release that needs an API change ships after the API's release: `backfill` needs the API's `imported` prints and `GET /api/Prints/on-printer` (it stops cleanly against an older API, but nothing works until the API is out). Branches are deleted on merge, so a
 stacked PR is retargeted to `main` automatically.
 
 ## Commits and PRs

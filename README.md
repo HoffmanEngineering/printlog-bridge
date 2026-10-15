@@ -323,19 +323,28 @@ The bridge logs the prints it sees from the moment it starts. To add the ones Mo
 printlog-bridge backfill --days 90   # in Docker: docker exec printlog-bridge printlog-bridge backfill
 ```
 
-It reads each printer's history over a connection of its own (`--printer NAME` for one printer, `--days` for how far back; 90 by default), and creates each finished job as a print in 3D Print Log, at most one request a second, waiting whenever 3D Print Log asks it to slow down. It shows each job as it goes, then a summary:
+It reads each printer's history over a connection of its own (`--printer NAME` for one printer, `--days` for how far back, 1 to 3650; 90 by default), and creates each finished job as a print in 3D Print Log, at most one request a second, waiting whenever 3D Print Log asks it to slow down. It shows each job as it goes, then a summary:
 
 ```
 [printer voron] 37 finished jobs in the last 90 days:
-  31 created
-  4 already in 3D Print Log
+  29 created
+  6 already in 3D Print Log
   2 skipped: the file no longer exists on the printer
 Imported prints don't change your spools' remaining filament or what's loaded on the printer: their usage happened before, and would count against spools added since.
+A print you deleted in 3D Print Log comes back when the bridge no longer remembers its job (it keeps the last 20): delete it again, or backfill fewer days.
 ```
 
 A backfilled print is finished, has the job's total filament on one row (not split by tool, and linked to no spool), and says "Imported from Moonraker history" in its notes. Its usage doesn't change any spool's remaining filament, and creating it doesn't change what's loaded on the printer: link a spool to its row in the app if you want it counted. A job whose file is no longer on the printer is skipped.
 
-Running it twice, or while the bridge runs, logs no job twice: each print carries the job's external ID, as the bridge's own do. Jobs the running bridge logs itself (the ones from where it resumes reading the history) are left to it, and a job it already logged is left exactly as it is. The bridge has to have run once for the printer first, for the id its prints carry; backfill only reads its state, never writes it. Stopped part way (Ctrl-C, or 3D Print Log out of reach for several minutes), run it again to carry on.
+Backfilled prints are **private**, whatever your account's default, so a few hundred old prints don't all land in the public feed at once. `--visibility unlisted`, `public`, or `default` (your account's default for new prints) changes that.
+
+Running it twice, or while the bridge runs, logs no job twice. Before creating anything it lists the prints already on the printer around those dates. A job the bridge logged (live, or in an earlier backfill) is found by its external ID and left exactly as it is. A print you logged yourself, with the Slic3r uploader, the Cura plugin or by hand, counts as the job of the same file (by file name, or title) that ran within `adopt_window` of it, so it isn't imported a second time; each print stands for one job. Jobs the running bridge logs itself (the ones from where it resumes reading the history) are left to it. The bridge has to have run once for the printer first, for the id its prints carry; backfill only reads its state, never writes it. A printer with `create_prints = false` is skipped: finish-only mode never creates a print.
+
+Stopped part way (Ctrl-C, 3D Print Log out of reach for several minutes, or still rate limiting it after 4 hours), run it again to carry on. When 3D Print Log refuses a printer's jobs (the printer isn't your account's, or three jobs in a row), that printer stops and the next one goes on.
+
+The bridge only remembers the last 20 jobs it logged. A print it logged live that you since deleted in 3D Print Log is no longer there to find, so backfill creates it again; delete it again, or backfill fewer days.
+
+Backfill needs a 3D Print Log API that takes imported prints. Against an older one it stops before sending anything, saying to try again once 3D Print Log is updated.
 
 ### Slicer settings
 

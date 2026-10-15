@@ -79,6 +79,8 @@ API_CALLS = [
     # Adopting a print the user made themselves (#43).
     ("GET", r"/api/Prints/claimable"),
     ("POST", r"/api/Prints/\d+/claim"),
+    # Backfill (#8): the prints already on the printer.
+    ("GET", r"/api/Prints/on-printer"),
     ("GET", r"/api/Prints/\d+"),
     ("PATCH", r"/api/Prints/\d+"),
     ("POST", r"/api/Prints/\d+/complete"),
@@ -834,8 +836,15 @@ class TestBackfillCalls:
             assert any(method == m and re.fullmatch(pattern, path) for m, pattern in API_CALLS), (
                 f"{method} {path} isn't in docs/privacy.md"
             )
+        assert set(api.requests) == {
+            ("GET", "/api/Prints/on-printer"),
+            ("GET", "/api/Users/me/user-settings"),
+            ("POST", "/api/Prints"),
+        }
+        assert set(moonraker.calls) == {"server.history.list"}
         [body] = api.created
         assert set(body) <= self.BACKFILL_FIELDS
+        assert "fileHash" not in body
         assert all(set(row) <= USAGE_FIELDS for row in body["filamentUsage"])
         assert body["fileName"] == "benchy.gcode"
         assert moonraker.identified == []  # never takes the agent name the bridge holds
