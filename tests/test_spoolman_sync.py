@@ -606,9 +606,17 @@ class HeldPosts(FakeMoonraker):
 
     def __init__(self, **options) -> None:
         super().__init__(**options)
-        self.release = asyncio.Event()
+        self._release: asyncio.Event | None = None
         self.held = False
         self._held: set[asyncio.Task] = set()
+
+    @property
+    def release(self) -> asyncio.Event:
+        # Made on first use, inside the test's loop: Python 3.9 binds an Event to the current
+        # loop when it's made, and there is none outside `asyncio.run`.
+        if self._release is None:
+            self._release = asyncio.Event()
+        return self._release
 
     async def _handle(self, request, send, conn) -> None:
         if request.get("method") != "server.spoolman.post_spool_id":
