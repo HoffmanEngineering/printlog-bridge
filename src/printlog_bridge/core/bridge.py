@@ -99,6 +99,7 @@ async def run_bridge(
                 interval=heartbeat_interval,
             )
             sink.before_create = heartbeat.ensure_registered
+            spools.on_swap = sink.spool_swapped
             for printer in config.printers:
                 printer.adapter.use_spools(spools)
                 if printer.printer_id is not None:

@@ -50,6 +50,14 @@ class JobRecord:
     """The print was the user's (an uploader's), adopted rather than created by the bridge."""
     had_picture: bool = False
     """The adopted print already had a picture, which the thumbnail mustn't replace."""
+    swaps: list[dict[str, Any]] = field(default_factory=list)
+    """Each spool assigned to one of the job's slots while it ran, and where (`swaps.py`), so
+    the slot's usage is split there when the job ends, even after a restart."""
+    filament_changes: list[dict[str, Any]] = field(default_factory=list)
+    """Each pause for a filament change (a runout, an unload) the job was resumed from."""
+    completion: dict[str, Any] | None = None
+    """The usage rows and notes worked out the first time the job's end was sent, sent the
+    same way on every retry so a split slot is never counted twice."""
 
 
 class PrinterState:
