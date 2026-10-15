@@ -168,6 +168,28 @@ class ApiClient:
         )
         return [p for p in body or [] if isinstance(p, Mapping)]
 
+    async def prints_on_printer(
+        self,
+        printer_id: int,
+        start: datetime,
+        end: datetime,
+        after_id: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """The key owner's prints on the printer whose start date (or created date, without one)
+        is in [start, end), by id, after `after_id` (for `backfill`). Raises ApiRejected with
+        400 from an API without the lookup, which also doesn't take `imported` prints."""
+        params = {
+            "printerId": str(printer_id),
+            "from": start.isoformat(),
+            "to": end.isoformat(),
+            "limit": str(limit),
+        }
+        if after_id is not None:
+            params["afterId"] = str(after_id)
+        body = await self._request("GET", "/api/Prints/on-printer", params=params)
+        return [p for p in body or [] if isinstance(p, Mapping)]
+
     async def claim_print(self, print_id: int, body: Mapping[str, Any]) -> dict[str, Any] | None:
         """Claims the print for this connector's job: sets its `externalSource`, `externalId`,
         connection, and `startDate` when it has none (api#165). Claiming it again with the same

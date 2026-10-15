@@ -157,6 +157,17 @@ class JobSlicerSettings:
 JobEvent = Union[JobStarted, JobFinished, JobImage, JobSlicerSettings, FilamentChange]
 
 
+@dataclass(frozen=True)
+class PastJob:
+    """A finished job from the printer's own history, for `printlog-bridge backfill` (#8)."""
+
+    start: JobStarted
+    end: JobFinished
+    """How it ended. `filament_mm` adds up to everything the job fed."""
+    file_exists: bool = True
+    """Whether the job's file is still on the printer."""
+
+
 class EventSink(Protocol):
     async def emit(self, event: JobEvent) -> None:
         """Handles one event. A replayed event (same printer and job_id) is recognised."""

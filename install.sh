@@ -256,6 +256,7 @@ finish() {
         "$bin" doctor --config "$CONFIG" || true
         echo
         say "printlog-bridge is installed and running. Its status: ${bin} status"
+        echo "  To also log the prints in Moonraker's history from before today: ${bin} backfill --days 90"
     else
         say "printlog-bridge is installed. To start logging prints:"
         if [ "$has_key" = 0 ]; then
@@ -266,6 +267,7 @@ finish() {
         fi
         echo "  Then restart printlog-bridge there, or: sudo systemctl restart ${SERVICE}"
         echo "  Check it with: ${bin} doctor"
+        echo "  Once it has run, to also log the prints in Moonraker's history: ${bin} backfill --days 90"
     fi
 }
 

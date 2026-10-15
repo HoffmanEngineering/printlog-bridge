@@ -111,17 +111,22 @@ class PrinterState:
         """The printer's state as it is on disk, or None when there isn't a readable one.
 
         Unlike `load`, this never writes: a missing file isn't created and a broken one isn't
-        moved aside, so `doctor` can look while the bridge is running. It holds only
-        `instance_id` and `discovery`, and `save()` refuses it.
+        moved aside, so `doctor` and `backfill` can look while the bridge is running, and
+        `save()` refuses it.
         """
         path = state_dir / "printers" / f"{safe_file_name(printer)}.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             discovery = data.get("discovery")
+            known = {f.name for f in fields(JobRecord)}
+            jobs = {
+                job_id: JobRecord(**{k: v for k, v in job.items() if k in known})
+                for job_id, job in (data.get("jobs") or {}).items()
+            }
             return cls(
                 path,
                 data["instance_id"],
-                {},  # not read: saving it back would lose them, so it can't be saved
+                jobs,
                 discovery if isinstance(discovery, dict) else {},
                 read_only=True,
             )

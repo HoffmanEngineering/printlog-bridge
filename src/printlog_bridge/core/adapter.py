@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING, ClassVar
 
 from printlog_bridge.core.checks import CheckResult
-from printlog_bridge.core.events import EventSink, SpoolSink
+from printlog_bridge.core.events import EventSink, PastJob, SpoolSink
 from printlog_bridge.core.status import PrinterReport
 
 if TYPE_CHECKING:
     from printlog_bridge.core.state import PrinterState
     from printlog_bridge.core.trace import Trace
+
+
+class PrinterUnavailable(Exception):
+    """The printer's history couldn't be read. The message says why, for the user."""
 
 
 class Adapter(ABC):
@@ -25,6 +30,10 @@ class Adapter(ABC):
 
     name: ClassVar[str]
     """What `adapter = ...` names in the config file."""
+
+    history_name: ClassVar[str] = ""
+    """What the user calls where the printer keeps its job history, such as "Moonraker", for
+    the note on a backfilled print ("Imported from Moonraker history")."""
 
     @classmethod
     @abstractmethod
@@ -66,6 +75,13 @@ class Adapter(ABC):
         something of its own between runs in `state.discovery` (and calls `state.save()`), such
         as where it last found the printer. `doctor` also calls it before `check`, with the
         state read-only (`PrinterState.peek`): its `save()` raises. Optional."""
+
+    async def past_jobs(self, since: datetime) -> Sequence[PastJob]:
+        """The printer's finished jobs that started after `since`, oldest first, for
+        `printlog-bridge backfill`. Called on its own, without `run`, while the bridge itself
+        may be running; it must not disturb that. Raise `PrinterUnavailable` saying why when
+        the history can't be read. Optional: an adapter without it can't backfill."""
+        raise PrinterUnavailable(f"the {self.name} adapter can't read a printer's job history")
 
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:
