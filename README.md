@@ -171,7 +171,7 @@ On a printer with more than one tool (a toolchanger, an IDEX, a Snapmaker U1), e
 
 ### Spools
 
-Each tool's usage row is linked to the spool loaded in its slot in 3D Print Log (in the web or Android app, on the printer's page). The bridge reads the loaded spools when it starts, every 5 minutes, and again when each print starts and ends, so changing a spool in the app between prints is on the next print. On a single-tool printer, a print also keeps its spool loaded in 3D Print Log; so when the read as a print starts fails, the print is logged once a read works, not with the spool read earlier, which may have been unloaded in the app since.
+Each tool's usage row is linked to the spool loaded in its slot in 3D Print Log (in the web or Android app, on the printer's page). The bridge reads the loaded spools when it starts, every 5 minutes, and again when each print starts and ends, so changing a spool in the app between prints is on the next print. On a single-tool printer, a print also keeps its spool loaded in 3D Print Log; so when the read as a print starts fails, the print waits up to an hour for a read that works rather than use the spool read earlier, which may have been unloaded in the app since. After that it's logged with the earlier read, and a note on the print says so.
 
 From the printer's console or a macro, with [`klipper/printlog.cfg`](klipper/printlog.cfg) included (`install.sh` does it; in remote mode copy it to the printer's config folder and add `[include printlog.cfg]` yourself, where the printer allows it):
 

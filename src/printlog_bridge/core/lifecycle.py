@@ -47,6 +47,7 @@ from typing import Any, TypeVar
 
 from printlog_bridge.core.api_client import (
     ApiClient,
+    ApiError,
     ApiRejected,
     ApiUnavailable,
     AuthRejected,
@@ -119,6 +120,18 @@ NO_SLICER_SETTINGS = (405, 501)
 NO_SLICER_SETTINGS_FOR = timedelta(hours=24)
 """How long none are read or sent after such an answer: it may as well be a maintenance page
 as an API older than the endpoint, and either can change."""
+SPOOL_READ_HOLD = timedelta(hours=1)
+"""How long a print waits, from when its event was queued, for a read of its printer's spools
+that works, before it's created with the ones read earlier (#29). Long enough to ride out a
+blip, a deploy or a rate limit, at several retries of the backoff; short enough that a printer
+read that keeps failing while the create works (the GET is far heavier) doesn't hold every print
+on that printer until the outbox gives up on it after 30 days. From when it was queued, so it
+holds across restarts and doesn't depend on how long the print runs."""
+EARLIER_READ_NOTE = (
+    "Spool check: 3D Print Log couldn't tell the bridge which spools were loaded when this print "
+    "was logged, so its spools are from an earlier read; a spool changed in the app since then "
+    "isn't reflected. Check which spool this print used."
+)
 IMAGES_DIR = "images"
 IMAGE_TIMEOUT_S = 15.0
 """How long the bridge waits on an adapter for a picture. Adapters give up after 10 s."""
@@ -663,7 +676,7 @@ class JobLogger:
         if job.finished or job.print_id is not None:
             return  # already sent, and the power went before the outbox heard
         print_ = await self._create(
-            self.printers[entry.printer], state, entry.printer, entry.job_id, job
+            self.printers[entry.printer], state, entry.printer, entry.job_id, job, entry.queued_at
         )
         if print_ is None:
             self._logged(
@@ -770,15 +783,21 @@ class JobLogger:
         if job.finished:
             return
         event = _finish_event(entry)
-        await self._complete(self.printers[entry.printer], state, event, job)
+        await self._complete(self.printers[entry.printer], state, event, job, entry.queued_at)
 
     # -- start ---------------------------------------------------------------------------------
 
     async def _create(
-        self, target: LoggedPrinter, state: PrinterState, printer: str, job_id: str, job: JobRecord
+        self,
+        target: LoggedPrinter,
+        state: PrinterState,
+        printer: str,
+        job_id: str,
+        job: JobRecord,
+        queued_at: datetime,
     ) -> dict[str, Any] | None:
         """The job's print: one of the user's adopted, else a new one. None in finish-only mode
-        when there's none to adopt."""
+        when there's none to adopt. `queued_at` is when the event creating it was queued."""
         start = job.start
         if self.before_create is not None:
             try:
@@ -816,16 +835,14 @@ class JobLogger:
         current: dict[int, str] = {}
         if self.spools is not None:
             # A print created after a swap (3D Print Log was down until then) starts with the
-            # spools the job started with, not the ones loaded now. Read now or not at all: a
-            # failed read holds the print to be tried again, as before_create's does, since on
-            # a single-tool printer the create makes its spools the loaded ones, and a spool
-            # from an older read may have been unloaded in the app since (#29). Linking none
-            # instead would unload a spool that is still there.
-            current = await self.spools.fresh(printer)
+            # spools the job started with, not the ones loaded now.
+            current, earlier = await self._spools_for_create(printer, queued_at)
             loaded = before_swaps(current, job.swaps)
             single_tool = (self.spools.slot_count(printer) or 1) <= 1
             _link_loaded(rows, loaded, single_tool=single_tool)
             notes = self.spools.mismatches(printer, [row["slot"] for row in rows] or [0])
+            if earlier and any(row.get("filament") for row in rows):
+                notes.append(EARLIER_READ_NOTE)
             if notes:
                 body["notes"] = "\n\n".join(notes)
         if rows:
@@ -834,9 +851,44 @@ class JobLogger:
         print_, _ = await self.api.create_print(body)
         job.print_id = int(print_["id"])
         state.save()
-        if single_tool and job.swaps:
+        if single_tool and job.swaps and not earlier:
+            # Not with an earlier read: putting back what it had could load a spool again that
+            # was unloaded in the app since.
             await self._restore_loaded(target, printer, current)
         return print_
+
+    async def _spools_for_create(
+        self, printer: str, queued_at: datetime
+    ) -> tuple[dict[int, str], bool]:
+        """The spools to create a print with, and whether they're from an earlier read.
+
+        Read now, if at all possible: on a single-tool printer the create makes its spools the
+        loaded ones, and a spool from an earlier read (up to 5 minutes old) may have been
+        unloaded in the app since (#29); linking none would unload one that's still there. So
+        when 3D Print Log can't be reached the print is held to be tried again, as
+        before_create's ApiUnavailable holds it, for SPOOL_READ_HOLD. After that, or for an
+        answer the bridge can't make sense of, it goes ahead with the earlier read. Any other
+        ApiError (a rejected key) would refuse the create the same way, so it's raised."""
+        assert self.spools is not None
+        try:
+            return await self.spools.fresh(printer), False
+        except ApiUnavailable as e:
+            if self.clock() - queued_at < SPOOL_READ_HOLD:
+                raise
+            log.warning(
+                "[printer %s] couldn't read its spools from 3D Print Log since the print was "
+                "queued, %s ago (%s); logging it with the ones read earlier",
+                printer, self.clock() - queued_at, e,
+            )  # fmt: skip
+        except ApiError:
+            raise
+        except Exception:
+            log.warning(
+                "[printer %s] couldn't make sense of its spools from 3D Print Log; logging the "
+                "print with the ones read earlier",
+                printer, exc_info=True,
+            )  # fmt: skip
+        return self.spools.loaded(printer), True
 
     async def _restore_loaded(
         self, target: LoggedPrinter, printer: str, before: Mapping[int, str]
@@ -846,11 +898,17 @@ class JobLogger:
         what was loaded then, which may be a spool set since for the next job."""
         assert self.spools is not None
         try:
-            now = await self.spools.current(printer)
+            now: dict[int, str] | None = await self.spools.fresh(printer)
+        except Exception as e:
+            # Not what was last read: that's `before`, so nothing would be put back. Loading a
+            # slot's spool again is harmless when it's there; a slot to empty isn't known.
+            log.debug("[printer %s] couldn't read its spools after the create: %s", printer, e)
+            now = None
+        try:
             for slot, spool in sorted(before.items()):
-                if now.get(slot) != spool:
+                if now is None or now.get(slot) != spool:
                     await self.api.load_slot(target.printer_id, slot, spool, f"T{slot}")
-            for slot in sorted(set(now) - set(before)):
+            for slot in sorted(set(now or {}) - set(before)):
                 await self.api.unload_slot(target.printer_id, slot)
             if now != dict(before):
                 await self.spools.refresh(printer)
@@ -984,11 +1042,16 @@ class JobLogger:
     # -- end -----------------------------------------------------------------------------------
 
     async def _complete(
-        self, target: LoggedPrinter, state: PrinterState, event: JobFinished, job: JobRecord
+        self,
+        target: LoggedPrinter,
+        state: PrinterState,
+        event: JobFinished,
+        job: JobRecord,
+        queued_at: datetime,
     ) -> None:
         if job.print_id is None:
             print_: dict[str, Any] | None = await self._create(
-                target, state, event.printer, event.job_id, job
+                target, state, event.printer, event.job_id, job, queued_at
             )
             if print_ is None:
                 job.finished = True
