@@ -23,9 +23,13 @@ whatever made it (a refresh, a command, a reader), with each slot's spool as 3D 
 describes it, `spoolNumber` included. That is how Moonraker's active spool follows the active
 tool's spool when its Spoolman server is 3D Print Log (`adapters/moonraker/spoolman.py`).
 
+A spool active in the user's own Spoolman server (#38) is assigned by the material linked to
+its Spoolman id, else by a tag Spoolman has for it; with neither, the answer says how to link
+it, and nothing changes.
+
 What the bridge does here only ever touches 3D Print Log. Moonraker's Spoolman integration is
-followed only when its server is 3D Print Log; a Spoolman server of the user's own, and its
-active spool and usage reports, are left alone.
+synced both ways only when its server is 3D Print Log; a Spoolman server of the user's own is
+only read, and its active spool and usage reports are left alone.
 """
 
 from __future__ import annotations

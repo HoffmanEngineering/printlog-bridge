@@ -424,6 +424,13 @@ class TestWithThePrintLogApi:
 
         self.run(fake, api, steps)
 
+        # Of the Spoolman spool, 3D Print Log is sent its id and tag, and nothing else.
+        assert [path for _, path in api.requests if "/Filaments/" in path] == [
+            "/api/Filaments/by-spoolman-id/12",
+            "/api/Filaments/by-tag/04A23F11",
+        ]
+        assert [set(body) for body in api.slot_puts] == [{"filamentId", "slotLabel"}]
+
     def test_an_unmapped_spool_gets_a_hint_and_no_assignment(self, caplog):
         fake, api = own_spoolman(), FakePrintLogApi()
         loaded = api.add_spool("Loaded")
