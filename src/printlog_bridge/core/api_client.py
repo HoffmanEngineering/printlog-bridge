@@ -20,7 +20,8 @@ from printlog_bridge import __version__
 
 REQUEST_TIMEOUT_S = 15
 UPLOAD_TIMEOUT_S = 30
-"""An image upload carries up to 10 MB, so it gets longer than other requests."""
+"""An image upload carries up to 10 MB, and slicer settings up to 576 KB, so they get longer
+than other requests."""
 
 
 class ApiError(Exception):
@@ -146,6 +147,10 @@ class ApiClient:
         """The key owner's spool with this RFID/NFC tag, or None when none of theirs has it."""
         return await self._request("GET", f"/api/Filaments/by-tag/{uid}", missing_ok=True)
 
+    async def filament_by_number(self, number: int) -> dict[str, Any] | None:
+        """The key owner's spool with this `spoolNumber`, or None when none of theirs has it."""
+        return await self._request("GET", f"/api/Filaments/by-number/{number}", missing_ok=True)
+
     async def create_print(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         """The print, and whether it is new. An `externalId` already used returns the original."""
         status, print_ = await self._send("POST", "/api/Prints", body)
@@ -205,6 +210,24 @@ class ApiClient:
             timeout=UPLOAD_TIMEOUT_S,
         )
         return None if status == 404 else body
+
+    async def post_slicer_settings(self, print_id: int, body: Mapping[str, Any]) -> int:
+        """Records the print's slicer settings (api#164): `configBlock`, `header`, `metadata`.
+        Sending again replaces what an earlier send recorded.
+
+        Returns the status: 2xx when recorded, 409 when the print's settings came from a slicer
+        plugin (the Cura plugin, the Slic3r uploader), which the API keeps, and 404 when the
+        print is gone, or the API is older than the endpoint. Raises ApiRejected for 400 (nothing
+        usable) and 413 (over the API's size caps), and ApiUnavailable for anything else."""
+        status, _ = await self._send(
+            "POST",
+            f"/api/Prints/{print_id}/slicer-settings",
+            body,
+            missing_ok=True,
+            conflict_ok=True,
+            timeout=UPLOAD_TIMEOUT_S,
+        )
+        return status
 
     async def put_connection(self, instance_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         """Registers the connection, or sends its heartbeat. Each call replaces every field."""

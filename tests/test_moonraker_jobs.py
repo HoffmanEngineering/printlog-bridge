@@ -11,7 +11,7 @@ from session_helpers import ReportRecorder, running
 
 from printlog_bridge.adapters.moonraker.jobs import JobTracker
 from printlog_bridge.adapters.moonraker.session import Backoff, MoonrakerSession
-from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted
+from printlog_bridge.core.events import JobFinished, JobOutcome, JobSlicerSettings, JobStarted
 
 FAST = Backoff(initial=0.01, maximum=0.05)
 T0 = 1_791_000_000.0  # 2026-10-03, on the printer's clock
@@ -23,7 +23,8 @@ class RecordingSink:
         self.resume = resume
 
     async def emit(self, event) -> None:
-        self.events.append(event)
+        if not isinstance(event, JobSlicerSettings):  # test_moonraker_slicer.py has those
+            self.events.append(event)
 
     async def resume_after(self, printer: str) -> datetime | None:
         return self.resume

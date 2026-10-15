@@ -186,6 +186,9 @@ def _connect(path: Path) -> sqlite3.Connection:
     try:
         # The default rollback journal with synchronous=FULL: a commit is on disk when it returns.
         db.execute("PRAGMA synchronous = FULL")
+        # A sent entry's content is overwritten, not left in a free page: slicer settings (#36)
+        # stay on the printer only until they are sent.
+        db.execute("PRAGMA secure_delete = ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
             log.warning(

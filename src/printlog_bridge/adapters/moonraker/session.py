@@ -3,7 +3,8 @@
 Local mode uses Moonraker's Unix socket, where each message ends with an ETX byte. Remote mode
 uses its WebSocket. Either way the bridge identifies as an agent, so it appears in Moonraker's
 extensions list, then subscribes to the printer objects a job needs and passes status and
-history notifications to a listener.
+history notifications to a listener, and the spool picked through Moonraker's Spoolman
+integration (`notify_active_spool_set`).
 """
 
 from __future__ import annotations
@@ -74,6 +75,20 @@ class MoonrakerListener(Protocol):
     async def on_gcode_response(self, line: str) -> None:
         """Klipper printed a line to the console (`notify_gcode_response`)."""
 
+    async def on_active_spool(self, spool_id: int | None) -> None:
+        """Moonraker's Spoolman integration has another active spool (`notify_active_spool_set`),
+        picked in Mainsail, Fluidd or KlipperScreen, or None when it was cleared.
+
+        Optional: a listener without it never hears of one, so the listeners that have no use
+        for Spoolman don't each need a method that does nothing.
+        """
+
+
+async def _active_spool(listener: MoonrakerListener, spool_id: int | None) -> None:
+    on_active_spool = getattr(listener, "on_active_spool", None)
+    if on_active_spool is not None:
+        await on_active_spool(spool_id)
+
 
 class Listeners:
     """Several listeners as one, each told everything in turn."""
@@ -100,6 +115,10 @@ class Listeners:
     async def on_gcode_response(self, line: str) -> None:
         for listener in self.listeners:
             await listener.on_gcode_response(line)
+
+    async def on_active_spool(self, spool_id: int | None) -> None:
+        for listener in self.listeners:
+            await _active_spool(listener, spool_id)
 
 
 class MoonrakerAuthError(Exception):
@@ -134,10 +153,18 @@ async def fetch_server_info(
     printer: str, *, url: str | None, socket: Path | None, api_key: str | None
 ) -> Mapping[str, Any]:
     """One `server.info` call over the same connection `run` uses, without identifying."""
+    return await fetch_once(printer, "server.info", url=url, socket=socket, api_key=api_key)
+
+
+async def fetch_once(
+    printer: str, method: str, *, url: str | None, socket: Path | None, api_key: str | None
+) -> Any:
+    """One call, without parameters, over the same connection `run` uses, without
+    identifying."""
     transport = await _open_transport(printer, url, socket, api_key)
     rpc = _JsonRpc(transport)
     try:
-        return await rpc.call("server.info")
+        return await rpc.call(method)
     except MoonrakerRpcError as e:
         if e.is_auth_failure:
             raise rejection(printer, where(url, socket), e.message) from e
@@ -383,6 +410,11 @@ class MoonrakerSession:
         elif method == "notify_gcode_response":
             for line in params or []:
                 await self.listener.on_gcode_response(str(line))
+        elif method == "notify_active_spool_set":
+            spool = params[0] if params and isinstance(params[0], Mapping) else {}
+            spool_id = spool.get("spool_id")
+            if spool_id is None or (isinstance(spool_id, int) and not isinstance(spool_id, bool)):
+                await _active_spool(self.listener, spool_id)
         elif method == "notify_klippy_ready":
             await self._subscribe(rpc)
         elif method in ("notify_klippy_shutdown", "notify_klippy_disconnected"):

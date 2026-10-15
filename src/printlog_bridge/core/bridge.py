@@ -90,7 +90,10 @@ async def _run(
                 api,
                 {
                     p.name: LoggedPrinter(
-                        printer_id=p.printer_id, source=p.adapter.name, adoption=p.adoption
+                        printer_id=p.printer_id,
+                        source=p.adapter.name,
+                        adoption=p.adoption,
+                        slicer_settings=p.slicer_settings,
                     )
                     for p in config.printers
                     if p.printer_id is not None
@@ -110,8 +113,7 @@ async def _run(
                         printer_id=p.printer_id,
                         mode=p.adapter.mode(),
                         snapshots=p.adapter.snapshots,
-                        # Nothing reads a file's slicer settings until #36.
-                        slicer_settings=False,
+                        slicer_settings=p.slicer_settings,
                     )
                     for p in config.printers
                     if p.printer_id is not None
@@ -123,7 +125,7 @@ async def _run(
             sink.before_create = heartbeat.ensure_registered
             spools.on_swap = sink.spool_swapped
             for printer in config.printers:
-                printer.adapter.use_spools(spools)
+                printer.adapter.use_spools(spools, config.api_url)
                 if printer.printer_id is not None:
                     printer.adapter.use_state(sink.state(printer.name))
                 log.info(

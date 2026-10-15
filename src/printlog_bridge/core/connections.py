@@ -53,7 +53,7 @@ class Connection:
     snapshots: bool | None = None
     """Whether a webcam frame is added to each print; None for an adapter without webcams."""
     slicer_settings: bool = False
-    """Whether each print's slicer settings are sent (#36)."""
+    """Whether each print's slicer settings are sent (`slicer_settings`)."""
 
 
 class Heartbeat:

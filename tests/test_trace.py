@@ -158,6 +158,22 @@ class TestSecrets:
             2:
         ] == ["<redacted>", "<redacted>"]
 
+    def test_moonrakers_config_answer_is_removed(self, tmp_path):
+        # An Apprise URL holds its token in the host or path, where no scrubber looks for one.
+        recorded(
+            tmp_path,
+            ("send", '{"jsonrpc": "2.0", "method": "server.config", "id": 9}'),
+            (
+                "recv",
+                '{"jsonrpc": "2.0", "result": {"config": {"notifier telegram": '
+                '{"url": "tgram://123:SECRET/456", "events": "*"}}}, "id": 9}',
+            ),
+        )
+
+        text = trace_files(tmp_path, "u1")[0].read_text(encoding="utf-8")
+        assert "SECRET" not in text
+        assert lines(trace_files(tmp_path, "u1")[0])[1]["msg"]["result"] == "<redacted>"
+
 
 class TestLimits:
     def test_files_are_split_and_the_oldest_removed_to_stay_under_the_cap(self, tmp_path):
