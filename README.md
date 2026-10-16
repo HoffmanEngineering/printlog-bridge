@@ -61,8 +61,9 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
 
 ### On a Synology NAS (Container Manager)
 
-1. **Make the folder.** In File Station, make `docker/printlog-bridge` (on a NAS with one volume, that's `/volume1/docker/printlog-bridge`).
-2. **Write the config** as `printlog-bridge.cfg` in that folder, with a `[printer <name>]` section per printer:
+1. **Install Container Manager.** In DSM, open Package Center, search for **Container Manager** and choose **Install**. When it asks you to configure the bridge network, keep the default (`172.17.0.1/16`): it's the network between containers, and the bridge still reaches your printers and 3D Print Log through the NAS. Change it only if your home network itself uses `172.17.x.x` addresses. Steps 4, 6 and 7 use SSH: turn it on in Control Panel > Terminal & SNMP. (Container Manager is DSM 7.2's name; DSM 7.0 and 7.1 call the package **Docker** and have no Project tab, so use the `docker run` command under [Anywhere else](#anywhere-else-any-linux-host) over SSH.)
+2. **Make the folder.** In File Station, make `docker/printlog-bridge` (on a NAS with one volume, that's `/volume1/docker/printlog-bridge`). Then let your own user write to it: right-click it > Properties > Permission > Create, pick your DSM user, allow Read and Write, apply it to this folder, child folders and child files, and Save. The `docker` share lets you write through the administrators group, but the container runs with only the user and group in `user:` (step 5), so without this entry the bridge can read its config but not create `state/` (`Permission denied: '/data/state'`).
+3. **Write the config** as `printlog-bridge.cfg` in that folder, with a `[printer <name>]` section per printer:
    ```ini
    [printer voron]
    printer_id = 41
@@ -77,8 +78,8 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
    url = http://192.168.1.52:7125
    ```
    Use the printers' IP addresses (give each a fixed one in your router): names like `voron.local` usually don't resolve inside a container. Moonraker sees the bridge coming from the NAS's address, so if a printer has `[authorization]` on, add the NAS to its `trusted_clients`, or set `moonraker_api_key` in that printer's section.
-3. **Pick the user.** The container should run as the DSM user that owns the folder. Over SSH, `id <your DSM user>` shows its numbers, such as `uid=1026 ... gid=100(users)`; put them in `user:` below. (Without `user:`, the container runs as `1000:1000` and needs the folder to be writable by that uid.)
-4. **Create the project.** Container Manager > Project > Create, with the folder above as its path and [`docker-compose.yml`](docker-compose.yml) as its file:
+4. **Pick the user.** The container should run as the DSM user that owns the folder. Over SSH, `id <your DSM user>` shows its numbers, such as `uid=1026 ... gid=100(users)`; put them in `user:` below. (Without `user:`, the container runs as `1000:1000` and needs the folder to be writable by that uid.)
+5. **Create the project.** Container Manager > Project > Create, with the folder above as its path and [`docker-compose.yml`](docker-compose.yml) as its file:
    ```yaml
    services:
      printlog-bridge:
@@ -87,19 +88,19 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
        restart: unless-stopped
        user: "1026:100"
        environment:
-         TZ: Europe/Berlin
+         TZ: America/New_York # optional: your time zone, for the times in the log
        volumes:
          - /volume1/docker/printlog-bridge:/data
    ```
-   `restart: unless-stopped` brings it back after a crash and after the NAS restarts. `TZ` (a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)) sets the times in its log; `status` and 3D Print Log use UTC either way.
-5. **Give it the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys), one of two ways:
+   `restart: unless-stopped` brings it back after a crash and after the NAS restarts. `TZ` is optional: set it to your own time zone (a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), such as `America/Chicago` or `Europe/London`) so the times in the log match your clock. Without it they're in UTC. It changes nothing else: `status` and 3D Print Log use UTC either way.
+6. **Give it the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys), one of two ways:
    - Store it in the folder, where only that user can read it. Over SSH:
      ```sh
      sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
        ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
      ```
    - Or add `PRINTLOG_API_KEY: <key>` under `environment:`. That's simpler, but anyone who can manage containers on the NAS can read it in the container's settings.
-6. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge status`). Over SSH:
+7. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge-health`, a lighter `printlog-bridge status` that Docker runs every minute). Over SSH:
    ```sh
    sudo docker exec printlog-bridge printlog-bridge doctor   # checks the config, the key and every printer
    sudo docker exec printlog-bridge printlog-bridge status   # what each printer is doing
@@ -112,7 +113,7 @@ If the config needs fixing (no key, a printer without `printer_id`), the bridge 
 
 Unraid has no Compose out of the box, so use the template in [`unraid/printlog-bridge.xml`](unraid/printlog-bridge.xml). It runs the container as `nobody:users` (99:100), the owner of Unraid's appdata, with the folder `/mnt/user/appdata/printlog-bridge` at `/data`. Unraid passes its own time zone to the container. In the web terminal (the `>_` icon at the top right):
 
-1. **Make the folder and write the config**, with a `[printer <name>]` section per printer, as in step 2 of the Synology steps:
+1. **Make the folder and write the config**, with a `[printer <name>]` section per printer, as in step 3 of the Synology steps:
    ```sh
    mkdir -p /mnt/user/appdata/printlog-bridge
    nano /mnt/user/appdata/printlog-bridge/printlog-bridge.cfg
@@ -139,7 +140,7 @@ To run the bridge on the printer's own Pi, use `install.sh` above instead. Docke
 ```sh
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker "$USER"   # then log out and back in
-mkdir ~/printlog-bridge            # write printlog-bridge.cfg in it (Synology step 2)
+mkdir ~/printlog-bridge            # write printlog-bridge.cfg in it (Synology step 3)
 docker run --rm -it -v ~/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
 ```
 
@@ -151,7 +152,7 @@ The same `docker-compose.yml` works after changing the folder and `user:`. Witho
 
 ```sh
 docker run -d --name printlog-bridge --restart unless-stopped \
-  -e TZ=Europe/Berlin -v "$PWD/printlog-bridge:/data" \
+  -e TZ=America/New_York -v "$PWD/printlog-bridge:/data" \
   ghcr.io/hoffmanengineering/printlog-bridge:edge
 docker exec printlog-bridge printlog-bridge doctor
 ```
@@ -172,7 +173,7 @@ Set `update_check = false` in `[bridge]` to turn the notice off. The heartbeat s
 
 To update:
 
-- **Docker, with Compose:** in the folder with `docker-compose.yml`, run `docker compose pull && docker compose up -d` (on a Synology NAS, over SSH, with `sudo`).
+- **Docker, with Compose:** in the folder with the Compose file, run `docker compose pull && docker compose up -d`. On a Synology NAS, over SSH: `cd /volume1/docker/printlog-bridge && sudo docker compose pull && sudo docker compose up -d` (Container Manager saves the project's file there as `compose.yaml`). The project then runs the new image, with the same config and state.
 - **Docker, without Compose:** `docker pull ghcr.io/hoffmanengineering/printlog-bridge:edge`, then `docker rm -f printlog-bridge` and the same `docker run` as before. Your config and state are in `/data`, so nothing is lost.
 - **On the printer (local mode):** update printlog-bridge in Mainsail's or Fluidd's update panel, where `install.sh` added it. Moonraker's update manager follows `main`, so it can be newer than the last release. Over SSH, `git -C ~/printlog-bridge pull && ~/printlog-bridge/install.sh --yes` does the same.
 
