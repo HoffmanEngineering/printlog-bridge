@@ -42,7 +42,7 @@ One container watches every printer in its config over the network, through each
 | `latest`, `1.2`, `1.2.3` | releases |
 | `edge` | the newest commit on `main` |
 
-There's no release yet, so only `edge` exists for now; the examples below use it. Switch to `latest` once there is one.
+The examples below use `latest`, the newest release. `edge` gets each change as soon as it's merged, before it's released, so use it only to try a fix early.
 
 Everything the bridge keeps is in one folder, mounted at `/data`:
 
@@ -83,7 +83,7 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
    ```yaml
    services:
      printlog-bridge:
-       image: ghcr.io/hoffmanengineering/printlog-bridge:edge
+       image: ghcr.io/hoffmanengineering/printlog-bridge:latest
        container_name: printlog-bridge
        restart: unless-stopped
        user: "1026:100"
@@ -97,7 +97,7 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
    - Store it in the folder, where only that user can read it. Over SSH:
      ```sh
      sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
-       ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
+       ghcr.io/hoffmanengineering/printlog-bridge:latest store-key
      ```
    - Or add `PRINTLOG_API_KEY: <key>` under `environment:`. That's simpler, but anyone who can manage containers on the NAS can read it in the container's settings.
 7. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge-health`, a lighter `printlog-bridge status` that Docker runs every minute). Over SSH:
@@ -122,7 +122,7 @@ Unraid has no Compose out of the box, so use the template in [`unraid/printlog-b
 2. **Store the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys):
    ```sh
    docker run --rm -it --user 99:100 -v /mnt/user/appdata/printlog-bridge:/data \
-     ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
+     ghcr.io/hoffmanengineering/printlog-bridge:latest store-key
    ```
    (Or leave this out and put the key in the template's API key field. That's simpler, but anyone who can edit the container can read it.)
 3. **Add the template:**
@@ -141,7 +141,7 @@ To run the bridge on the printer's own Pi, use `install.sh` above instead. Docke
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker "$USER"   # then log out and back in
 mkdir ~/printlog-bridge            # write printlog-bridge.cfg in it (Synology step 3)
-docker run --rm -it -v ~/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
+docker run --rm -it -v ~/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge:latest store-key
 ```
 
 Then start it with the `docker run -d` command below, or with `docker compose up -d` and [`docker-compose.yml`](docker-compose.yml) after changing its folder to `~/printlog-bridge` and removing the `user:` line. The first user on Raspberry Pi OS is uid 1000, the same as the image's own user, so it needs no `user:`.
@@ -153,7 +153,7 @@ The same `docker-compose.yml` works after changing the folder and `user:`. Witho
 ```sh
 docker run -d --name printlog-bridge --restart unless-stopped \
   -e TZ=America/New_York -v "$PWD/printlog-bridge:/data" \
-  ghcr.io/hoffmanengineering/printlog-bridge:edge
+  ghcr.io/hoffmanengineering/printlog-bridge:latest
 docker exec printlog-bridge printlog-bridge doctor
 ```
 
@@ -174,7 +174,7 @@ Set `update_check = false` in `[bridge]` to turn the notice off. The heartbeat s
 To update:
 
 - **Docker, with Compose:** in the folder with the Compose file, run `docker compose pull && docker compose up -d`. On a Synology NAS, over SSH: `cd /volume1/docker/printlog-bridge && sudo docker compose pull && sudo docker compose up -d` (Container Manager saves the project's file there as `compose.yaml`). The project then runs the new image, with the same config and state.
-- **Docker, without Compose:** `docker pull ghcr.io/hoffmanengineering/printlog-bridge:edge`, then `docker rm -f printlog-bridge` and the same `docker run` as before. Your config and state are in `/data`, so nothing is lost.
+- **Docker, without Compose:** `docker pull ghcr.io/hoffmanengineering/printlog-bridge:latest`, then `docker rm -f printlog-bridge` and the same `docker run` as before. Your config and state are in `/data`, so nothing is lost.
 - **On the printer (local mode):** update printlog-bridge in Mainsail's or Fluidd's update panel, where `install.sh` added it. Moonraker's update manager follows `main`, so it can be newer than the last release. Over SSH, `git -C ~/printlog-bridge pull && ~/printlog-bridge/install.sh --yes` does the same.
 
 ## Try it
