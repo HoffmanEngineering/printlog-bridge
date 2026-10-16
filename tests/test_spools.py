@@ -155,8 +155,8 @@ class TestSetSpool:
 
         assert api.slot_spools(42) == {0: spool}
         assert answer == (
-            "no material in 3D Print Log has Spoolman spool 12 (Polymaker PLA Red); nothing "
-            "changed. Link it in the app."
+            "no material in 3D Print Log is linked to Spoolman spool 12 (Polymaker PLA Red) "
+            "yet; nothing changed. Load the spool on T0 in 3D Print Log."
         )
 
     def test_unmapped_spoolman_spool_with_a_tag_says_the_tag_would_do(self):
@@ -169,8 +169,9 @@ class TestSetSpool:
 
         assert api.slot_spools(42) == {}
         assert answer == (
-            "no material in 3D Print Log has Spoolman spool 12 or its tag 04A23F11; nothing "
-            "changed. Link it in the app, or add the tag to the material."
+            "no material in 3D Print Log is linked to Spoolman spool 12 or its tag 04A23F11 "
+            "yet; nothing changed. Load the spool on T0 in 3D Print Log, or add the tag to "
+            "the material."
         )
 
     def test_an_api_without_spoolman_ids_still_maps_by_tag(self):
