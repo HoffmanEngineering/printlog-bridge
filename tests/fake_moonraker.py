@@ -136,6 +136,9 @@ class FakeMoonraker:
         """Every G-code script run through printer.gcode.script."""
         self.upgrade_headers: list[dict[str, str]] = []
         self._clients: dict[Send, Callable[[], Awaitable[None]]] = {}
+        self._conns: dict[Send, dict] = {}
+        """Each connection's state, by its `send`: `subscription` is the objects its last
+        printer.objects.subscribe asked for."""
         self._ids = 0
         self._agents: set[str] = set()
         self._server: TestServer | None = None
@@ -187,12 +190,14 @@ class FakeMoonraker:
             await ws.send_str(json.dumps(message))
 
         self._clients[send] = ws.close
+        self._conns[send] = conn
         try:
             async for msg in ws:
                 if msg.type is WSMsgType.TEXT:
                     await self._handle(json.loads(msg.data), send, conn)
         finally:
             self._clients.pop(send, None)
+            self._conns.pop(send, None)
             self._agents.discard(conn.get("agent"))
         return ws
 
@@ -269,6 +274,7 @@ class FakeMoonraker:
 
         self._clients[send] = close
         conn = {"authorized": True}
+        self._conns[send] = conn
         try:
             while True:
                 try:
@@ -278,6 +284,7 @@ class FakeMoonraker:
                 await self._handle(json.loads(data[:-1]), send, conn)
         finally:
             self._clients.pop(send, None)
+            self._conns.pop(send, None)
             self._agents.discard(conn.get("agent"))
             writer.close()
 
@@ -338,6 +345,9 @@ class FakeMoonraker:
             self._require_klippy()
             objects = params["objects"]
             self.subscriptions.append(objects)
+            # Moonraker registers the subscription with the answer, in one step (see
+            # `set_status`): every later update follows the answer, none comes before it.
+            conn["subscription"] = objects
             status = {}
             for name, fields in objects.items():
                 current = self.status.get(name, {})
@@ -560,10 +570,34 @@ class FakeMoonraker:
         return name
 
     async def set_status(self, **objects: dict[str, Any]) -> None:
-        """Klipper reports new values, sent as a status update."""
+        """Klipper reports new values, sent as a status update to each connection that has
+        subscribed, with just the objects and fields it subscribed to.
+
+        This is what Moonraker's `KlippyConnection` does (checked against its master, Oct
+        2026): `_process_status_update` sends only to the connections in `subscriptions`, and
+        `_request_subscripton` adds a connection there only once Klippy has answered its
+        subscribe. A connection never gets an update from before its subscription's answer,
+        which already holds those values. Sending one anyway would replay old values on top
+        of newer ones.
+        """
         for name, fields in objects.items():
             self.status.setdefault(name, {}).update(fields)
-        await self.notify("notify_status_update", objects, time.monotonic())
+        eventtime = time.monotonic()
+        for send, conn in list(self._conns.items()):
+            subscription = conn.get("subscription")
+            if subscription is None:
+                continue
+            update = {}
+            for name, fields in objects.items():
+                if name not in subscription:
+                    continue
+                wanted = subscription[name]
+                kept = {f: v for f, v in fields.items() if wanted is None or f in wanted}
+                if kept:
+                    update[name] = kept
+            if update:
+                message = {"jsonrpc": "2.0", "method": "notify_status_update"}
+                await send({**message, "params": [update, eventtime]})
 
     async def respond(self, line: str) -> None:
         """Klipper prints a line to the console, as `action_respond_info` does."""
