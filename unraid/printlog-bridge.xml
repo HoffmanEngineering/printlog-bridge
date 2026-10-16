@@ -8,7 +8,7 @@
 -->
 <Container version="2">
   <Name>printlog-bridge</Name>
-  <Repository>ghcr.io/hoffmanengineering/printlog-bridge:edge</Repository>
+  <Repository>ghcr.io/hoffmanengineering/printlog-bridge:latest</Repository>
   <Registry>https://github.com/HoffmanEngineering/printlog-bridge/pkgs/container/printlog-bridge</Registry>
   <Network>bridge</Network>
   <MyIP/>
