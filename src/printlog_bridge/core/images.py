@@ -27,9 +27,7 @@ from urllib.parse import (
     quote_plus,
     unquote,
     unquote_plus,
-    urlencode,
     urlsplit,
-    urlunsplit,
 )
 
 import aiohttp
@@ -37,10 +35,14 @@ import aiohttp
 from printlog_bridge import __version__
 from printlog_bridge.core.secrets import URL_USERINFO, mask_query_values
 
+# mask_url lives in core.urls so the config loads without aiohttp; it's imported here for the
+# callers that already take it from this module.
+from printlog_bridge.core.urls import SECRET_QUERY as _SECRET_QUERY
+from printlog_bridge.core.urls import mask_url
+
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 """The API refuses larger images ("Image must be under 10MB")."""
 
-_SECRET_QUERY = re.compile(r"(token|key|pass|pwd|secret|auth|sig|user)", re.IGNORECASE)
 MAX_ERROR_CHARS = 2000
 """How much of an error's message `scrub_url` keeps: enough for a log line, and a bound on the
 work, since the message can come from the network (Moonraker's errors, up to a 4 MB frame)."""
@@ -96,25 +98,6 @@ def video_type(head: bytes) -> str | None:
     if head[4:8] == b"ftyp":
         return "video/mp4"
     return None
-
-
-def mask_url(url: str) -> str:
-    """The URL with any user and password, and query values that look like secrets, hidden."""
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "<an invalid URL>"
-    netloc = parts.netloc
-    if "@" in netloc:
-        netloc = "***@" + netloc.rsplit("@", 1)[1]
-    query = parts.query
-    if query:
-        pairs = parse_qsl(query, keep_blank_values=True)
-        if any(_SECRET_QUERY.search(k) for k, _ in pairs):
-            query = urlencode(
-                [(k, "***" if _SECRET_QUERY.search(k) else v) for k, v in pairs], safe="*"
-            )
-    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
 
 
 async def fetch_image(

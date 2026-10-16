@@ -41,7 +41,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from printlog_bridge.core.adapter import Adapter
-from printlog_bridge.core.images import mask_url
+from printlog_bridge.core.urls import mask_url
 
 DEFAULT_API_URL = "https://api.3dprintlog.com"
 ALLOW_HTTP_ON_LAN_ENV = "PRINTLOG_ALLOW_HTTP_ON_LAN"
@@ -181,18 +181,7 @@ def load_config(
 ) -> BridgeConfig:
     """`text` is the config's contents when the caller has already read them (store-key, which
     checks who owns the file it read); otherwise they are read from `path`."""
-    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
-    try:
-        if text is not None:
-            parser.read_string(text, source=str(path))
-        else:
-            with path.open(encoding="utf-8-sig") as f:
-                parser.read_file(f)
-    except FileNotFoundError:
-        raise ConfigError(f"Config file not found: {path}") from None
-    except configparser.Error as e:
-        raise ConfigError(f"{path}: {e}") from None
-
+    parser = _parse(path, text)
     bridge = parser["bridge"] if parser.has_section("bridge") else {}
 
     allow_http_on_lan = _flag(bridge.get("allow_http_on_lan", ""), "allow_http_on_lan") or _flag(
@@ -200,12 +189,7 @@ def load_config(
     )
     api_url = _api_url(bridge.get("api_url", DEFAULT_API_URL), allow_http_on_lan)
 
-    state_dir_option = bridge.get("state_dir", "").strip() or (env.get(STATE_DIR_ENV) or "").strip()
-    state_dir = (
-        _expand(state_dir_option, home)
-        if state_dir_option
-        else home / ".local" / "share" / "printlog-bridge"
-    )
+    state_dir = _state_dir(bridge, env, home)
 
     config_api_key = (bridge.get("api_key") or "").strip() or None
     api_key, source = _api_key(env, state_dir / API_KEY_FILE, config_api_key)
@@ -477,6 +461,33 @@ def _printer_id(printer: str, value: str | None) -> int | None:
             f"in 3D Print Log (https://www.3dprintlog.com/printers/<number>), not {text!r}"
         )
     return int(text)
+
+
+def state_dir_of(path: Path, env: Mapping[str, str], home: Path) -> Path:
+    """The state directory the config at `path` uses, read without loading its printers: for the
+    container's health check, which must not import the adapters (and aiohttp with them)."""
+    parser = _parse(path, None)
+    return _state_dir(parser["bridge"] if parser.has_section("bridge") else {}, env, home)
+
+
+def _parse(path: Path, text: str | None) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+    try:
+        if text is not None:
+            parser.read_string(text, source=str(path))
+        else:
+            with path.open(encoding="utf-8-sig") as f:
+                parser.read_file(f)
+    except FileNotFoundError:
+        raise ConfigError(f"Config file not found: {path}") from None
+    except configparser.Error as e:
+        raise ConfigError(f"{path}: {e}") from None
+    return parser
+
+
+def _state_dir(bridge: Mapping[str, str], env: Mapping[str, str], home: Path) -> Path:
+    option = bridge.get("state_dir", "").strip() or (env.get(STATE_DIR_ENV) or "").strip()
+    return _expand(option, home) if option else home / ".local" / "share" / "printlog-bridge"
 
 
 def _expand(value: str, home: Path) -> Path:
