@@ -126,6 +126,26 @@ def test_only_this_user_can_read_the_key_file(tmp_path):
     assert (tmp_path / "state" / "api_key").stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+def test_the_key_file_is_this_users_alone_even_where_the_folder_ignores_the_mode(
+    tmp_path, monkeypatch
+):
+    # A Synology share's inherited ACL ignores the mode a file is created with: on a real NAS
+    # the key file came out readable by everyone the share lets read ("mode 777"), until a
+    # chmod replaced the ACL with mode 600.
+    real_open = os.open
+
+    def acl_open(path, flags, mode=0o777, *args, **kwargs):
+        return real_open(path, flags, 0o666, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", acl_open)
+    path = write_config(tmp_path, "api_key = k-inline\n")
+
+    assert main(["store-key", "--config", str(path)]) == 0
+
+    assert (tmp_path / "state" / "api_key").stat().st_mode & 0o777 == 0o600
+
+
 def test_never_replaces_a_stored_key_with_a_different_one_left_in_the_config(tmp_path, capsys):
     path = write_config(tmp_path, "api_key = k-old\n")
     (tmp_path / "state").mkdir()

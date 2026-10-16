@@ -375,6 +375,14 @@ def write_key_file(path: Path, key: str) -> None:
     with contextlib.suppress(FileNotFoundError):
         temporary.unlink()
     fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # A folder that hands down an ACL ignores that mode: on a Synology share the file came out
+    # readable by everyone the share lets read. An explicit chmod replaces the ACL with mode 600.
+    if hasattr(os, "fchmod"):
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            raise
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
         f.write(clean_key(key) + "\n")
     os.replace(str(temporary), str(path))
