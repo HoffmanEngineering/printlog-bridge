@@ -87,11 +87,11 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
        restart: unless-stopped
        user: "1026:100"
        environment:
-         TZ: Europe/Berlin
+         TZ: America/New_York # optional: your time zone, for the times in the log
        volumes:
          - /volume1/docker/printlog-bridge:/data
    ```
-   `restart: unless-stopped` brings it back after a crash and after the NAS restarts. `TZ` (a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)) sets the times in its log; `status` and 3D Print Log use UTC either way.
+   `restart: unless-stopped` brings it back after a crash and after the NAS restarts. `TZ` is optional: set it to your own time zone (a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), such as `America/Chicago` or `Europe/London`) so the times in the log match your clock. Without it they're in UTC. It changes nothing else: `status` and 3D Print Log use UTC either way.
 5. **Give it the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys), one of two ways:
    - Store it in the folder, where only that user can read it. Over SSH:
      ```sh
@@ -151,7 +151,7 @@ The same `docker-compose.yml` works after changing the folder and `user:`. Witho
 
 ```sh
 docker run -d --name printlog-bridge --restart unless-stopped \
-  -e TZ=Europe/Berlin -v "$PWD/printlog-bridge:/data" \
+  -e TZ=America/New_York -v "$PWD/printlog-bridge:/data" \
   ghcr.io/hoffmanengineering/printlog-bridge:edge
 docker exec printlog-bridge printlog-bridge doctor
 ```

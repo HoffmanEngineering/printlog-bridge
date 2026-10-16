@@ -10,7 +10,9 @@ services:
     # Leave it out to run as the image's own user, 1000:1000.
     user: "1026:100"
     environment:
-      TZ: Europe/Berlin # times in the log; status and 3D Print Log use UTC either way
+      # Optional: your time zone, so the times in the log match your clock (UTC without it).
+      # status and 3D Print Log use UTC either way.
+      TZ: America/New_York
       # The API key, if you'd rather not store it in /data/state/api_key with `store-key`:
       # PRINTLOG_API_KEY: ...
       # Record every Moonraker message in /data/state/traces, to report a problem (README):
