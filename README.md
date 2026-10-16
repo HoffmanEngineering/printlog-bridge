@@ -62,7 +62,7 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
 ### On a Synology NAS (Container Manager)
 
 1. **Install Container Manager.** In DSM, open Package Center, search for **Container Manager** and choose **Install**. When it asks you to configure the bridge network, keep the default (`172.17.0.1/16`): it's the network between containers, and the bridge still reaches your printers and 3D Print Log through the NAS. Change it only if your home network itself uses `172.17.x.x` addresses. Steps 4, 6 and 7 use SSH: turn it on in Control Panel > Terminal & SNMP. (Container Manager is DSM 7.2's name; DSM 7.0 and 7.1 call the package **Docker** and have no Project tab, so use the `docker run` command under [Anywhere else](#anywhere-else-any-linux-host) over SSH.)
-2. **Make the folder.** In File Station, make `docker/printlog-bridge` (on a NAS with one volume, that's `/volume1/docker/printlog-bridge`).
+2. **Make the folder.** In File Station, make `docker/printlog-bridge` (on a NAS with one volume, that's `/volume1/docker/printlog-bridge`). Then let your own user write to it: right-click it > Properties > Permission > Create, pick your DSM user, allow Read and Write, apply it to this folder, child folders and child files, and Save. The `docker` share lets you write through the administrators group, but the container runs with only the user and group in `user:` (step 5), so without this entry the bridge can read its config but not create `state/` (`Permission denied: '/data/state'`).
 3. **Write the config** as `printlog-bridge.cfg` in that folder, with a `[printer <name>]` section per printer:
    ```ini
    [printer voron]
