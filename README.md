@@ -100,7 +100,7 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
        ghcr.io/hoffmanengineering/printlog-bridge:edge store-key
      ```
    - Or add `PRINTLOG_API_KEY: <key>` under `environment:`. That's simpler, but anyone who can manage containers on the NAS can read it in the container's settings.
-7. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge status`). Over SSH:
+7. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge-health`, a lighter `printlog-bridge status` that Docker runs every minute). Over SSH:
    ```sh
    sudo docker exec printlog-bridge printlog-bridge doctor   # checks the config, the key and every printer
    sudo docker exec printlog-bridge printlog-bridge status   # what each printer is doing
@@ -173,7 +173,7 @@ Set `update_check = false` in `[bridge]` to turn the notice off. The heartbeat s
 
 To update:
 
-- **Docker, with Compose:** in the folder with `docker-compose.yml`, run `docker compose pull && docker compose up -d` (on a Synology NAS, over SSH, with `sudo`).
+- **Docker, with Compose:** in the folder with the Compose file, run `docker compose pull && docker compose up -d`. On a Synology NAS, over SSH: `cd /volume1/docker/printlog-bridge && sudo docker compose pull && sudo docker compose up -d` (Container Manager saves the project's file there as `compose.yaml`). The project then runs the new image, with the same config and state.
 - **Docker, without Compose:** `docker pull ghcr.io/hoffmanengineering/printlog-bridge:edge`, then `docker rm -f printlog-bridge` and the same `docker run` as before. Your config and state are in `/data`, so nothing is lost.
 - **On the printer (local mode):** update printlog-bridge in Mainsail's or Fluidd's update panel, where `install.sh` added it. Moonraker's update manager follows `main`, so it can be newer than the last release. Over SSH, `git -C ~/printlog-bridge pull && ~/printlog-bridge/install.sh --yes` does the same.
 
