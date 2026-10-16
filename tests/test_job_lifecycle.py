@@ -82,6 +82,10 @@ def test_a_four_tool_print_is_logged_per_tool_and_adds_up_to_the_total(tmp_path)
                 rows = api.prints[1]["filamentUsage"]
                 [tool_1] = [r for r in rows if r["slot"] == 1]
                 tool_1["filament"] = {"id": "spool-blue"}  # the user links tool 1's spool
+                # The print can be logged from the history the bridge reads on connecting,
+                # before it has subscribed to Klipper's status: until then Moonraker sends it
+                # none, and the steps below would reach it only as their sum.
+                await eventually(lambda: moonraker.subscriptions)
                 await moonraker.set_status(
                     print_stats={"state": "printing", "filename": "u1/dragon.gcode",
                                  "filament_used": 0.0}
@@ -90,7 +94,7 @@ def test_a_four_tool_print_is_logged_per_tool_and_adds_up_to_the_total(tmp_path)
                     await moonraker.set_status(
                         toolhead={"extruder": tool}, print_stats={"filament_used": used}
                     )
-                await asyncio.sleep(0.2)
+                # No wait needed: the job's end comes on the same connection, after them.
                 await moonraker.finish_job(job, filament_used=12040.0)
                 await eventually(lambda: api.prints[1]["status"] != 2)
             return api
