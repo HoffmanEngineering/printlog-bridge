@@ -402,7 +402,7 @@ class Spools:
         elif command.spoolman is not None:
             spool = await self._spoolman_material(command.spoolman)
             if spool is None:
-                return _unmapped(command.spoolman)
+                return _unmapped(command.spoolman, command.slot)
             filament_id = str(spool["id"])
         else:
             filament_id = str(command.filament_id)
@@ -664,16 +664,20 @@ def _tags(spool: SpoolmanSpool) -> list[str]:
     return list(dict.fromkeys(uid for uid in uids if uid is not None))
 
 
-def _unmapped(spool: SpoolmanSpool) -> str:
+def _unmapped(spool: SpoolmanSpool, slot: int) -> str:
     """The answer for a Spoolman spool no material in 3D Print Log is linked to."""
     named = f"Spoolman spool {spool.id}" + (f" ({spool.name})" if spool.name else "")
     tags = _tags(spool)
     if not tags:
-        return f"no material in 3D Print Log has {named}; nothing changed. Link it in the app."
+        return (
+            f"no material in 3D Print Log is linked to {named} yet; nothing changed. "
+            f"Load the spool on {_label(slot)} in 3D Print Log."
+        )
     its = "its tag" if len(tags) == 1 else "its tags"
     return (
-        f"no material in 3D Print Log has {named} or {its} {', '.join(tags)}; nothing "
-        "changed. Link it in the app, or add the tag to the material."
+        f"no material in 3D Print Log is linked to {named} or {its} {', '.join(tags)} yet; "
+        f"nothing changed. Load the spool on {_label(slot)} in 3D Print Log, or add the tag "
+        "to the material."
     )
 
 

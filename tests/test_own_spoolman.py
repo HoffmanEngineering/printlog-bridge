@@ -446,7 +446,7 @@ class TestWithThePrintLogApi:
         assert api.slot_spools(42) == {0: loaded}
         assert api.slot_puts == []
         assert (
-            "no material in 3D Print Log has Spoolman spool 13 (Polymaker PolyTerra PLA Blue); "
-            "nothing changed. Link it in the app." in caplog.text
+            "no material in 3D Print Log is linked to Spoolman spool 13 (Polymaker PolyTerra PLA "
+            "Blue) yet; nothing changed. Load the spool on T0 in 3D Print Log." in caplog.text
         )
         assert_nothing_written(fake)
