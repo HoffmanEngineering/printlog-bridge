@@ -1,135 +1,100 @@
+"""`printlog-bridge-health`, the Docker health check: the same verdict as `status`, without
+importing aiohttp (Docker runs it every minute)."""
+
 from __future__ import annotations
 
-import logging
+import json
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-from printlog_bridge.core.health import MAX_PROBLEM_CHARS, ProblemLog, scrub_problem
+from printlog_bridge.adapters import ADAPTERS
+from printlog_bridge.cli import health
+from printlog_bridge.core.config import CONFIG_PATH_ENV, STATE_DIR_ENV, load_config
+from printlog_bridge.core.status import STATUS_FILE, format_status
 
-NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
-PRINTERS = ("voron", "u1")
+PRINTER = "[printer voron]\nprinter_id = 42\nurl = http://192.168.1.50:7125\n"
 
 
-class TestScrubProblem:
-    def scrub(self, message: str, secrets=()) -> str:
-        return scrub_problem(message, PRINTERS, secrets)
+def write_config(tmp_path: Path, bridge: str = "") -> Path:
+    path = tmp_path / "printlog-bridge.cfg"
+    path.write_text(f"[bridge]\n{bridge}\n{PRINTER}", encoding="utf-8")
+    return path
 
-    def test_drops_the_printer_prefix(self):
-        assert self.scrub("[printer voron] couldn't subscribe") == "couldn't subscribe"
 
-    @pytest.mark.parametrize(
-        "message, gone",
-        [
-            ("Moonraker at http://***@u1.local:7125: closed", "u1.local"),
-            ("Moonraker at ws://192.168.1.40:7125/websocket didn't answer", "192.168.1.40"),
-            ("can't reach 10.0.0.7 now", "10.0.0.7"),
-            ("can't reach [fe80::1ff:fe23:4567:890a]:7125", "fe80::1ff:fe23:4567:890a"),
-            ("can't reach fd12:3456:789a::1 now", "fd12:3456:789a::1"),
-            ("Cannot connect to host lava:7125 ssl:default", "lava"),
-            ("Moonraker at /home/pi/printer_data/comms/moonraker.sock closed", "/home/pi"),
-            ("couldn't remove C:\\Users\\maker\\state\\x.png: busy", "maker"),
-            ("ignoring a thumbnail that isn't a picture: 'my benchy v2.gcode'", "benchy"),
-            ('the file "Calibration Cube" is gone', "Calibration Cube"),
-            ("job 00001A's thumbnail: benchy.gcode is gone", "benchy"),
-            ("3D Print Log at api.3dprintlog.com answered 503", "3dprintlog"),
-            ("a spool for printer voron isn't known", "voron"),
-        ],
+def write_status(state_dir: Path, updated: timedelta, stopped: bool = False) -> None:
+    now = datetime.now(timezone.utc)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    status = {
+        "version": "0.1.0",
+        "pid": 1,
+        "started_at": (now - timedelta(hours=1)).isoformat(),
+        "updated_at": (now - updated).isoformat(),
+        "stopped_at": now.isoformat() if stopped else None,
+        "printers": {},
+    }
+    (state_dir / STATUS_FILE).write_text(json.dumps(status), encoding="utf-8")
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path)))
+    monkeypatch.setenv(STATE_DIR_ENV, str(tmp_path / "state"))
+    return tmp_path
+
+
+def test_never_imports_aiohttp_or_the_adapters():
+    code = (
+        "import sys, printlog_bridge.cli.health; "
+        "print(sorted(m for m in sys.modules "
+        "if m == 'aiohttp' or m.startswith('printlog_bridge.adapters')))"
     )
-    def test_removes_hosts_addresses_paths_and_file_names(self, message, gone):
-        assert gone not in self.scrub(message)
-
-    def test_removes_known_secrets_and_passwords_in_urls(self):
-        scrubbed = self.scrub(
-            "rejected plk-SECRET-1 for user:hunter2@printer", secrets=["plk-SECRET-1"]
-        )
-        assert "plk-SECRET-1" not in scrubbed
-        assert "hunter2" not in scrubbed
-
-    def test_keeps_what_went_wrong(self):
-        scrubbed = self.scrub(
-            "[printer voron] Moonraker at http://u1.local:7125: Cannot connect to host "
-            "u1.local:7125 ssl:default [Connection refused]"
-        )
-        assert scrubbed.startswith("Moonraker at <url>: Cannot connect to host <host>")
-        assert "[Connection refused]" in scrubbed
-
-    def test_keeps_version_numbers_and_status_codes(self):
-        assert self.scrub("the API answered 503 (v1.2.3)") == "the API answered 503 (v1.2.3)"
-
-    def test_is_cut_to_a_limit(self):
-        scrubbed = self.scrub("x" * 1000)
-        assert len(scrubbed) == MAX_PROBLEM_CHARS
-        assert scrubbed.endswith("…")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"
 
 
-def record(message: str, *args, level: int = logging.WARNING) -> logging.LogRecord:
-    return logging.LogRecord("printlog_bridge.test", level, __file__, 1, message, args, None)
+@pytest.mark.parametrize(
+    ("updated", "stopped", "expected"),
+    [
+        (timedelta(seconds=10), False, 0),  # running
+        (timedelta(minutes=10), False, 1),  # stale: crashed, or hung
+        (timedelta(seconds=10), True, 1),  # stopped
+    ],
+)
+def test_agrees_with_status(env, capsys, updated, stopped, expected):
+    write_status(env / "state", updated, stopped)
+
+    assert health.main() == expected
+    config = load_config(
+        env / "printlog-bridge.cfg",
+        adapters=ADAPTERS,
+        env={STATE_DIR_ENV: str(env / "state")},
+        home=env,
+    )
+    assert format_status(config)[1] == expected
 
 
-class TestProblemLog:
-    def log(self, **kwargs) -> ProblemLog:
-        return ProblemLog(PRINTERS, clock=lambda: NOW, **kwargs)
+def test_not_running_before_the_first_run(env, capsys):
+    assert health.main() == 1
+    assert "hasn't run yet" in capsys.readouterr().out
 
-    def test_counts_each_printers_warnings_and_errors(self):
-        problems = self.log()
-        problems.handle(record("[printer %s] couldn't subscribe: %s", "voron", "gone"))
-        problems.handle(record("[printer %s] job lost", "voron", level=logging.ERROR))
-        problems.handle(record("[printer %s] reconnecting", "u1", level=logging.INFO))
 
-        voron = problems.problems("voron")
-        assert voron.count == 2
-        assert voron.last == "job lost"
-        assert voron.last_at == NOW
-        assert problems.problems("u1").count == 0
-        assert problems.problems("u1").last is None
+def test_the_config_state_dir_wins_over_the_environment(tmp_path, monkeypatch):
+    # As in load_config: the image sets PRINTLOG_BRIDGE_STATE_DIR, and a state_dir in the
+    # config wins over it.
+    mine = tmp_path / "mine"
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(write_config(tmp_path, f"state_dir = {mine}\n")))
+    monkeypatch.setenv(STATE_DIR_ENV, str(tmp_path / "image-default"))
+    write_status(mine, timedelta(seconds=10))
 
-    def test_a_message_naming_its_printer_in_an_argument_is_that_printers(self):
-        problems = self.log()
-        problems.handle(record("%s wasn't added to its print", "[printer u1] job 0001's snapshot"))
+    assert health.main() == 0
 
-        assert problems.problems("u1").count == 1
-        assert problems.problems("voron").count == 0
 
-    def test_a_problem_naming_no_printer_is_every_printers(self):
-        problems = self.log()
-        problems.handle(record("couldn't write %s (%s)", "/data/state/status.json", "disk full"))
+def test_a_missing_config_is_unhealthy(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(tmp_path / "nope.cfg"))
 
-        for printer in PRINTERS:
-            assert problems.problems(printer).count == 1
-            assert problems.problems(printer).last == "couldn't write <path> (disk full)"
-
-    def test_the_last_problem_is_scrubbed(self):
-        problems = self.log(secrets=["plk-SECRET-1"])
-        problems.handle(
-            record("[printer %s] key %s refused by %s", "voron", "plk-SECRET-1", "http://x:1")
-        )
-
-        assert problems.problems("voron").last == "key <redacted> refused by <url>"
-
-    def test_reported_takes_off_only_what_was_sent(self):
-        clock = [NOW]
-        problems = ProblemLog(PRINTERS, clock=lambda: clock[0])
-        problems.handle(record("[printer %s] one", "voron"))
-        problems.handle(record("[printer %s] two", "voron"))
-        sent = problems.problems("voron")
-        clock[0] = NOW + timedelta(minutes=1)
-        problems.handle(record("[printer %s] three", "voron"))  # while the check-in was sent
-
-        problems.reported("voron", sent.count)
-
-        after = problems.problems("voron")
-        assert after.count == 1
-        assert after.last == "three"
-        assert after.last_at == NOW + timedelta(minutes=1)
-
-    def test_the_last_problem_outlives_the_check_in(self):
-        problems = self.log()
-        problems.handle(record("[printer %s] one", "voron"))
-        problems.reported("voron", 1)
-
-        assert problems.problems("voron").count == 0
-        assert problems.problems("voron").last == "one"
-
-    def test_a_printer_it_does_not_know_has_no_problems(self):
-        assert self.log().problems("nope").count == 0
+    assert health.main() == 2
+    assert "Config file not found" in capsys.readouterr().err

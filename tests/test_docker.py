@@ -37,10 +37,10 @@ def test_runs_as_a_non_root_user():
     assert users[-1].split(":")[0] not in ("root", "0"), users[-1]
 
 
-def test_runs_the_bridge_and_checks_its_health_with_status():
+def test_runs_the_bridge_and_checks_its_health_with_the_light_health_command():
     assert 'ENTRYPOINT ["printlog-bridge"]' in DOCKERFILE
     assert 'CMD ["run"]' in DOCKERFILE
-    assert 'CMD ["printlog-bridge", "status"]' in DOCKERFILE
+    assert 'CMD ["printlog-bridge-health"]' in DOCKERFILE
 
 
 def test_the_image_never_bakes_in_an_api_key():

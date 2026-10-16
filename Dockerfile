@@ -51,9 +51,11 @@ USER 1000:1000
 WORKDIR /data
 VOLUME ["/data"]
 
-# `status` exits 0 only while the bridge runs (its status file is fresh and it hasn't stopped).
+# Exits 0 only while the bridge runs (its status file is fresh and it hasn't stopped), by the same
+# rule as `printlog-bridge status`. A lighter command than `status`, which imports aiohttp and
+# cost a NAS about a second of CPU every minute.
 HEALTHCHECK --interval=60s --timeout=20s --start-period=30s --retries=3 \
-    CMD ["printlog-bridge", "status"]
+    CMD ["printlog-bridge-health"]
 
 ENTRYPOINT ["printlog-bridge"]
 CMD ["run"]

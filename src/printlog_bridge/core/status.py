@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -254,6 +254,12 @@ def read_status(state_dir: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def is_running(status: Mapping[str, Any], now: datetime) -> bool:
+    """Whether the bridge that wrote `status` still runs: it hasn't stopped, and it touched the
+    file lately. `status` and the container's health check both go by this."""
+    return status.get("stopped_at") is None and now - _time(status["updated_at"]) <= RUNNING_WITHIN
+
+
 def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[str, int]:
     """`printlog-bridge status`: the report, and the exit code (0 only while the bridge runs)."""
     now = now or utc_now()
@@ -266,9 +272,7 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
             1,
         )
 
-    running = (
-        status.get("stopped_at") is None and now - _time(status["updated_at"]) <= RUNNING_WITHIN
-    )
+    running = is_running(status, now)
     if running:
         lines = [
             f"Bridge: running since {_clock(status['started_at'])} "
