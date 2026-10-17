@@ -37,8 +37,9 @@ NEW = "127.0.0.91"
 FAST = {"after": 0, "interval": 0, "zeroconf": False}
 """Look for the printer as soon as it goes missing, every time, and only by scanning."""
 
-ALICE = {"mac": "2c:cf:67:00:00:01", "instance_id": "alice", "hostname": "alice"}
-BOB = {"mac": "2c:cf:67:00:00:02", "instance_id": "bob", "hostname": "bob"}
+ALICE = {"mac": "2c:cf:67:00:00:01", "hostname": "alice"}
+BOB = {"mac": "2c:cf:67:00:00:02", "hostname": "bob"}
+"""Two printers that, like every Moonraker, report the same instance id: its service name."""
 
 
 def free_port() -> int:
@@ -51,7 +52,7 @@ def free_port() -> int:
 
 
 SYSTEM_INFO = {
-    "instance_ids": {"moonraker": "uuid-1", "klipper": "k"},
+    "instance_ids": {"moonraker": "moonraker", "klipper": "klipper"},
     "network": {
         "lo": {"mac_address": "00:00:00:00:00:00", "ip_addresses": []},
         "eth0": {"mac_address": "", "ip_addresses": []},
@@ -70,17 +71,26 @@ class TestFingerprint:
     def test_from_system_info(self):
         fp = Fingerprint.from_system_info(SYSTEM_INFO)
 
-        assert fp.instance_id == "uuid-1"
         assert fp.macs == {"2c:cf:67:aa:bb:cc"}
         assert fp.addresses == ("192.168.1.87",)
 
-    def test_a_shared_mac_or_instance_id_is_the_same_printer(self):
-        fp = Fingerprint("uuid-1", frozenset({"aa"}))
+    def test_a_shared_mac_is_the_same_printer(self):
+        fp = Fingerprint(frozenset({"aa", "bb"}))
 
-        assert fp.matches(Fingerprint("uuid-2", frozenset({"aa"})))  # Moonraker reinstalled
-        assert fp.matches(Fingerprint("uuid-1", frozenset({"bb"})))  # same data, new board
-        assert not fp.matches(Fingerprint("uuid-2", frozenset({"bb"})))
+        assert fp.matches(Fingerprint(frozenset({"bb", "cc"})))  # a new Wi-Fi adapter
+        assert not fp.matches(Fingerprint(frozenset({"cc"})))
         assert not Fingerprint().matches(Fingerprint())
+
+    def test_the_instance_id_says_nothing_about_which_printer(self):
+        # A Snapmaker U1 and an Infimech EX, as they answered: Moonraker's instance id is its
+        # service name, "moonraker" on both, so only the MACs tell them apart.
+        u1 = {"instance_ids": {"moonraker": "moonraker", "klipper": "klipper"},
+              "network": {"wlan0": {"mac_address": "40:fd:f3:4a:7c:b0"}}}  # fmt: skip
+        ex = {"instance_ids": {"moonraker": "moonraker", "klipper": "klipper"},
+              "network": {"wlan0": {"mac_address": "d0:31:10:6a:2d:5c"}}}  # fmt: skip
+
+        assert not Fingerprint.from_system_info(u1).matches(Fingerprint.from_system_info(ex))
+        assert not Fingerprint.from_system_info({"instance_ids": u1["instance_ids"]})
 
     def test_round_trips_through_json(self):
         fp = Fingerprint.from_system_info(SYSTEM_INFO)
@@ -229,7 +239,7 @@ def test_a_printer_that_changes_address_is_found_and_logging_continues(tmp_path)
     assert f"Address: moved from {OLD} to {NEW}" in text
     state = state_of(tmp_path)
     assert state.discovery["address"] == NEW
-    assert state.discovery["fingerprint"]["instance_id"] == "alice"
+    assert state.discovery["fingerprint"]["macs"] == [ALICE["mac"]]
     assert f"{OLD}:{port}" in (tmp_path / "printlog-bridge.cfg").read_text()  # unchanged
 
 
@@ -345,10 +355,26 @@ def test_changing_the_url_in_the_config_forgets_what_was_found(tmp_path):
 def test_no_password_in_the_url_reaches_the_state_file(tmp_path):
     url = "http://pi:hunter2@192.168.1.87:7125"
     locator = Locator("u1", configured_url=url, state=state_of(tmp_path))
-    locator._moved(url, disc.with_host(url, "192.168.1.91"), Fingerprint("a"))
+    locator._moved(url, disc.with_host(url, "192.168.1.91"), Fingerprint(frozenset({"aa"})))
 
     assert locator.url == "http://pi:hunter2@192.168.1.91:7125"
     assert "hunter2" not in (tmp_path / "state" / "printers" / "u1.json").read_text()
+
+
+def test_a_fingerprint_with_only_an_instance_id_is_learned_again(tmp_path):
+    # What an older bridge remembered of a printer that reported no MAC: nothing to go by.
+    url = "http://192.168.1.87:7125"
+    locator = Locator("u1", configured_url=url, state=state_of(tmp_path))
+    locator.state.discovery["fingerprint"] = {"instance_id": "moonraker", "macs": []}
+
+    async def call(method, params):
+        return {"system_info": {"network": {"wlan0": {"mac_address": "2c:cf:67:00:00:09"}}}}
+
+    assert locator.fingerprint is None
+    assert not locator.due(down_for=3600, wrong=True)
+    asyncio.run(locator.verify(call))  # doesn't raise WrongPrinter
+
+    assert state_of(tmp_path).discovery["fingerprint"]["macs"] == ["2c:cf:67:00:00:09"]
 
 
 def test_the_moonraker_key_goes_only_to_an_address_that_answers_as_moonraker():
@@ -362,7 +388,7 @@ def test_the_moonraker_key_goes_only_to_an_address_that_answers_as_moonraker():
 
     found, printer = asyncio.run(scenario())
 
-    assert found.fingerprint.instance_id == "alice"
+    assert found.fingerprint.macs == {ALICE["mac"]}
     assert not found.unauthorized
     # Asked without the key first; sent it only once Moonraker asked for authorization.
     assert printer.http_requests[:2] == ["/server/info", "/server/info"]

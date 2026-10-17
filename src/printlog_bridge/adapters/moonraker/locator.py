@@ -93,8 +93,11 @@ class Locator:
 
     @property
     def fingerprint(self) -> Fingerprint | None:
+        """Who the printer is, once known. None too for what an older bridge remembered
+        without a MAC address: nothing to tell this printer from another by."""
         data = self.state.discovery.get("fingerprint")
-        return Fingerprint.from_json(data) if isinstance(data, Mapping) else None
+        known = Fingerprint.from_json(data) if isinstance(data, Mapping) else None
+        return known or None
 
     def started(self) -> None:
         """Tells the report about a move found by an earlier run."""
@@ -118,9 +121,9 @@ class Locator:
         if not seen:
             if not self._unidentifiable:
                 log.warning(
-                    "[printer %s] Moonraker reports neither a MAC address nor an instance id, "
-                    "so the bridge can't find this printer if its address changes. Give it a "
-                    "DHCP reservation on the router.",
+                    "[printer %s] Moonraker reports no MAC address, so the bridge can't find "
+                    "this printer if its address changes. Give it a DHCP reservation on the "
+                    "router.",
                     self.printer,
                 )
             self._unidentifiable = True
