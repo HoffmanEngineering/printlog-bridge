@@ -61,7 +61,7 @@ class FakeMoonraker:
         reject_upgrade: bool = False,
         history: bool = True,
         mac: str | None = "2c:cf:67:00:00:01",
-        instance_id: str | None = "6f1c1b5e-0000-4000-8000-000000000001",
+        instance_id: str | None = "moonraker",
         hostname: str = "voron",
         timelapse: bool = False,
     ) -> None:
@@ -80,7 +80,9 @@ class FakeMoonraker:
         """False is a moonraker.conf without [history]: its methods don't exist."""
         self.mac = mac
         self.instance_id = instance_id
-        """With `mac`, who this printer is (`machine.system_info`); None leaves it out."""
+        """`machine.system_info`'s `instance_ids.moonraker`; None leaves it out. Real Moonraker
+        reports its service name there, the same on every printer, so only `mac` tells two
+        printers apart."""
         self.hostname = hostname
         self.http_requests: list[str] = []
         """Every plain HTTP path asked for, other than the WebSocket."""

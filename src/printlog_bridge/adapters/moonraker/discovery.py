@@ -49,9 +49,9 @@ _NO_MAC = {"", "00:00:00:00:00:00"}
 @dataclass(frozen=True)
 class Fingerprint:
     """What identifies a Moonraker host whatever its address: its network interfaces' MAC
-    addresses and Moonraker's own instance id (a UUID it keeps in its data folder)."""
+    addresses. Not `instance_ids` in `machine.system_info`: that names Moonraker's service
+    ("moonraker"), the same on every printer, so it would take any printer for this one."""
 
-    instance_id: str | None = None
     macs: frozenset[str] = frozenset()
     addresses: tuple[str, ...] = ()
     """The IPv4 addresses the host reports. Not identity: where to look for it next time."""
@@ -59,8 +59,6 @@ class Fingerprint:
     @classmethod
     def from_system_info(cls, info: Mapping[str, Any]) -> Fingerprint:
         """From `machine.system_info`'s `system_info`."""
-        instance_ids = info.get("instance_ids") or {}
-        instance_id = instance_ids.get("moonraker") if isinstance(instance_ids, Mapping) else None
         macs = set()
         addresses = []
         network = info.get("network") or {}
@@ -77,29 +75,26 @@ class Fingerprint:
                     and not address.get("is_link_local")
                 ):
                     addresses.append(str(address.get("address")))
-        return cls(str(instance_id) if instance_id else None, frozenset(macs), tuple(addresses))
+        return cls(frozenset(macs), tuple(addresses))
 
     def __bool__(self) -> bool:
-        return bool(self.instance_id or self.macs)
+        return bool(self.macs)
 
     def matches(self, other: Fingerprint) -> bool:
-        """The same machine: the same Moonraker instance, or a network interface in common (so
-        a reinstalled Moonraker on the same board, or the same Moonraker data on a new board,
-        is still recognised)."""
-        same_instance = self.instance_id is not None and self.instance_id == other.instance_id
-        return same_instance or bool(self.macs & other.macs)
+        """The same machine: a network interface in common (so a printer with a new Wi-Fi
+        adapter, but its Ethernet still, is recognised)."""
+        return bool(self.macs & other.macs)
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "instance_id": self.instance_id,
             "macs": sorted(self.macs),
             "addresses": list(self.addresses),
         }
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> Fingerprint:
+        # An older bridge also wrote "instance_id"; it identifies nothing, so it is ignored.
         return cls(
-            data.get("instance_id") or None,
             frozenset(data.get("macs") or ()),
             tuple(data.get("addresses") or ()),
         )
