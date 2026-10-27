@@ -400,6 +400,17 @@ class TestMetadata:
         assert slicer_metadata({}) is None
         assert slicer_metadata({"size": 10, "thumbnails": []}) is None
 
+    def test_an_unknown_slicer_is_no_slicer(self):
+        # Moonraker's word for a slicer it can't identify, such as QIDI Studio's (#81).
+        metadata = slicer_metadata(
+            {"slicer": "Unknown", "slicer_version": "UNKNOWN", "layer_height": 0.2}
+        )
+
+        assert metadata == SlicerMetadata(layer_height_mm=0.2)
+        assert slicer_metadata({"slicer": "unknown"}) is None
+        body = request_body(metadata, None)
+        assert body is None or "slicer" not in body.get("metadata", {})
+
     def test_odd_values_are_left_out(self):
         metadata = slicer_metadata({"slicer": 3, "layer_height": "x", "nozzle_diameter": True})
         assert metadata is None
