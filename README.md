@@ -4,6 +4,8 @@ An open-source bridge agent that watches Klipper/Moonraker printers and logs eve
 
 It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1.
 
+It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers).
+
 > Status: early development. `run` logs each print when it starts and completes it when it ends, with its outcome, duration and filament used, adds the slicer's thumbnail and a webcam snapshot (and, with Pro, the moonraker-timelapse video), and keeps what it can't send yet until 3D Print Log is reachable again. On a multi-tool printer the filament is split per tool. See the [issues](https://github.com/HoffmanEngineering/printlog-bridge/issues) and milestones for the roadmap.
 
 ## Requirements
@@ -291,6 +293,27 @@ Each printer is a `[printer <name>]` section, so one bridge can watch several. S
 In remote mode, if Moonraker has `[authorization]` enabled and the bridge's host isn't in `trusted_clients`, set `moonraker_api_key` in the printer's section to Moonraker's API key. The local socket is always trusted, so local mode never needs one. Moonraker accepts one bridge per printer; a second one waits until the first stops.
 
 Each print gets the largest thumbnail the slicer embedded in its file (OrcaSlicer, PrusaSlicer, Cura and SuperSlicer all embed one) as its picture when it starts. When it ends, the bridge also adds one frame from the printer's first webcam (its `snapshot_url` in Mainsail or Fluidd); for a failed print that frame becomes the picture shown. Set `snapshots = false` in the printer's section to never ask the webcam for anything. Pictures wait in the outbox with the print's other events (the image files in `images/` in the state directory), and never hold up logging the print: one that takes longer than 10 seconds, is over 10 MB or that 3D Print Log refuses (a print holds 5 pictures on the free plan) is skipped. A Moonraker or webcam address with a password or token in it is shown with them hidden, in the log, `status` and `doctor`.
+
+### Bambu Lab printers
+
+`adapter = bambu` watches a Bambu Lab printer the way Bambu Studio does in LAN mode: the printer's own MQTT broker (TLS, port 8883) for its status, and its FTPS server (port 990) for the job's 3MF, from which it takes the slicer's grams per filament, the plate's thumbnail and the slicer settings. It runs anywhere on the printer's network (Docker, a NAS, a Pi), and never sends the printer a command or writes a file to it.
+
+```ini
+[printer x1c]
+adapter = bambu
+printer_id = 44
+host = 192.168.1.50
+serial = 01S00C123456789
+access_code = 12345678
+```
+
+1. On the printer, turn on **LAN Only Mode** and then **Developer Mode** (X1 and H2: Settings > LAN Only; P1: Settings > WLAN; A1: Settings > LAN Only Mode). Since Bambu's 2025 "Authorization Control" firmware, third-party software needs both to read the printer's status and files; Bambu Studio keeps working in LAN mode, but Bambu Handy and the cloud don't.
+2. The **access code** is on the same page. The **serial** is on the printer's device information page, on its sticker, in Bambu Studio's device list, or in `printlog-bridge discover`, which lists the Bambu printers that announce themselves on your network.
+3. Keep the config where nothing serves it: the access code lets anyone on your network control the printer. It is treated like a key (never logged, traced or bundled), and `doctor` warns when it's in a folder Moonraker serves.
+
+Each job is logged when it starts printing (after the printer has heated and leveled; its start time is the printer's), with the slicer's estimates from the 3MF, and completed when it ends: finished, cancelled (from the screen or the slicer) or failed (with the printer's error code in the print's notes). Usage is the slicer's grams per filament, scaled by how far a cancelled or failed job got, and marked as an estimate in 3D Print Log, since the printer doesn't measure what it feeds. With an AMS, each filament is logged on its tray's slot: slot 0 is the external spool, slots 1-4 the first AMS's trays A1-A4, 5-8 the second's, and so on (17-24 for AMS HT units, 25 for the H2D's second external spool). The AMS's RFID readings (a Bambu spool's tag, material and color) are passed on like any slot reader's, so a spool with that tag in 3D Print Log is assigned to its tray.
+
+Without the 3MF (`ftps = false`, Developer Mode off, or a file the printer no longer has), prints are logged with their outcome and times but no filament usage. Bambu's local connection keeps no job history, so **a job that starts and ends while the bridge is down isn't logged**; one that ends while it's down is logged when it's back, from what the printer still shows. The printer's TLS certificate is self-signed by Bambu: the bridge pins the one it sees first and refuses a different one (set `tls_fingerprint` to accept a new printer). This adapter is built from Bambu's and the community's documentation of the protocol and hasn't been checked against a recorded session yet; if something looks wrong, run with `trace = true` and attach the support bundle to an issue.
 
 ### Timelapse videos (Pro)
 
