@@ -50,7 +50,7 @@ Everything the bridge keeps is in one folder, mounted at `/data`:
 
 | Path | What it is |
 | --- | --- |
-| `/data/printlog-bridge.cfg` | the config, which you write |
+| `/data/printlog-bridge.cfg` | the config: your printers. The bridge writes a starter one when there is none |
 | `/data/state/device_token`, `device_id` | the bridge's device token and its id, once you pair it |
 | `/data/state/api_key` | the API key, if you store one with `store-key` instead |
 | `/data/state/outbox.sqlite3`, `images/` | job events and pictures not sent yet |
@@ -60,86 +60,33 @@ Everything the bridge keeps is in one folder, mounted at `/data`:
 
 The image sets `PRINTLOG_BRIDGE_CONFIG=/data/printlog-bridge.cfg` and `PRINTLOG_BRIDGE_STATE_DIR=/data/state`; a `state_dir` in the config's `[bridge]` still wins, so leave it out.
 
-The container runs as a normal user, never root: `1000:1000` unless you give it another one. It opens no ports.
+**The first start.** With no API key or device token, the bridge pairs itself: its log shows a QR code, the address and the code (a new one each time one expires) until you approve it. With no printers yet, it then writes a starter `printlog-bridge.cfg` in the folder, with a commented example for each kind of printer, and waits, healthy, instead of exiting. Add a `[printer <name>]` section per printer to that file (over the network, File Station or the Unraid share; uncomment an example and change it) and save it: the bridge starts watching within a few seconds, with no restart. `printlog-bridge discover`, run in the container's console, lists the printers on your network with a section for each to paste in. Use the printers' IP addresses (give each a fixed one in your router): names like `voron.local` usually don't resolve inside a container. A printer still needs its `printer_id` (the number at the end of its page in 3D Print Log); until it has one, the log says so and lists your printers.
+
+**Who it runs as.** The container starts as root only to give the folder to the user the bridge runs as, then switches to that user before doing anything else, for `docker exec` commands too: `PUID`/`PGID` when you set them, otherwise the folder's own owner, or the image's user `1000:1000` when root owns the folder. So the folder needs no permission set up by hand. A container started with `user: "<uid>:<gid>"` (installs from before this) runs as that user, as before. It opens no ports.
 
 ### On a Synology NAS (Container Manager)
 
-1. **Install Container Manager.** In DSM, open Package Center, search for **Container Manager** and choose **Install**. When it asks you to configure the bridge network, keep the default (`172.17.0.1/16`): it's the network between containers, and the bridge still reaches your printers and 3D Print Log through the NAS. Change it only if your home network itself uses `172.17.x.x` addresses. Steps 4, 6 and 7 use SSH: turn it on in Control Panel > Terminal & SNMP. (Container Manager is DSM 7.2's name; DSM 7.0 and 7.1 call the package **Docker** and have no Project tab, so use the `docker run` command under [Anywhere else](#anywhere-else-any-linux-host) over SSH.)
-2. **Make the folder.** In File Station, make `docker/printlog-bridge` (on a NAS with one volume, that's `/volume1/docker/printlog-bridge`). Then let your own user write to it: right-click it > Properties > Permission > Create, pick your DSM user, allow Read and Write, apply it to this folder, child folders and child files, and Save. The `docker` share lets you write through the administrators group, but the container runs with only the user and group in `user:` (step 5), so without this entry the bridge can read its config but not create `state/` (`Permission denied: '/data/state'`).
-3. **Write the config** as `printlog-bridge.cfg` in that folder, with a `[printer <name>]` section per printer:
-   ```ini
-   [printer voron]
-   printer_id = 41
-   url = http://192.168.1.50:7125
+1. In DSM, open Package Center and install **Container Manager** (keep the default bridge network it offers).
+2. Container Manager > **Project** > **Create**: name it `printlog-bridge`, set its path to a new folder (**Set path** > **Create folder**, such as `docker/printlog-bridge`), choose **Create compose.yaml** and paste [`docker-compose.yml`](docker-compose.yml). Change `TZ` to your [time zone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) if you like, then **Next** and **Done**.
+3. Open Container > **printlog-bridge** > **Log**, and scan the QR code with your phone (or open the address shown and type the code). Sign in to 3D Print Log and approve the bridge.
+4. In File Station, open `docker/printlog-bridge/printlog-bridge.cfg`, add your printers and save. To list the printers on your network, run `printlog-bridge discover` in Container > printlog-bridge > **Terminal** > **Create**, or `sudo docker exec printlog-bridge printlog-bridge discover` over SSH.
 
-   [printer u1]
-   printer_id = 42
-   url = http://192.168.1.51:7125
-
-   [printer infimech]
-   printer_id = 43
-   url = http://192.168.1.52:7125
-   ```
-   Use the printers' IP addresses (give each a fixed one in your router): names like `voron.local` usually don't resolve inside a container. Moonraker sees the bridge coming from the NAS's address, so if a printer has `[authorization]` on, add the NAS to its `trusted_clients`, or set `moonraker_api_key` in that printer's section.
-4. **Pick the user.** The container should run as the DSM user that owns the folder. Over SSH, `id <your DSM user>` shows its numbers, such as `uid=1026 ... gid=100(users)`; put them in `user:` below. (Without `user:`, the container runs as `1000:1000` and needs the folder to be writable by that uid.)
-5. **Create the project.** Container Manager > Project > Create, with the folder above as its path and [`docker-compose.yml`](docker-compose.yml) as its file:
-   ```yaml
-   services:
-     printlog-bridge:
-       image: ghcr.io/hoffmanengineering/printlog-bridge:latest
-       container_name: printlog-bridge
-       restart: unless-stopped
-       user: "1026:100"
-       environment:
-         TZ: America/New_York # optional: your time zone, for the times in the log
-       volumes:
-         - /volume1/docker/printlog-bridge:/data
-   ```
-   `restart: unless-stopped` brings it back after a crash and after the NAS restarts. `TZ` is optional: set it to your own time zone (a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), such as `America/Chicago` or `Europe/London`) so the times in the log match your clock. Without it they're in UTC. It changes nothing else: `status` and 3D Print Log use UTC either way.
-6. **Pair it with your account.** Over SSH:
-   ```sh
-   sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
-     ghcr.io/hoffmanengineering/printlog-bridge:latest pair
-   ```
-   It shows a QR code and a short code: scan the QR code with your phone (or open the address it shows and type the code), sign in to 3D Print Log and approve the bridge. It stores the bridge's device token in the folder, where only that user can read it, and lists your printers for any `[printer]` without a `printer_id`. You can skip this step: started without an API key or device token, the bridge pairs by itself and shows the QR code in its log (Container Manager > Container > printlog-bridge > Log), then carries on once you approve it. Pairing is off on 3D Print Log until its app can list and remove paired bridges; until then `pair` says so, and you use an API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) instead, one of two ways:
-   - Store it in the folder, where only that user can read it. Over SSH:
-     ```sh
-     sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
-       ghcr.io/hoffmanengineering/printlog-bridge:latest store-key
-     ```
-   - Or add `PRINTLOG_API_KEY: <key>` under `environment:`. That's simpler, but anyone who can manage containers on the NAS can read it in the container's settings.
-7. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge-health`, a lighter `printlog-bridge status` that Docker runs every minute). Over SSH:
-   ```sh
-   sudo docker exec printlog-bridge printlog-bridge doctor   # checks the config, the sign-in and every printer
-   sudo docker exec printlog-bridge printlog-bridge status   # what each printer is doing
-   ```
-   `doctor` leaves the support bundle at `/volume1/docker/printlog-bridge/state/printlog-bridge-support.zip`, which you can download from File Station.
-
-If the config needs fixing (no key and pairing off, a printer without `printer_id`), the bridge says what to fix in the container's log and exits, and the restart policy tries again every few seconds until you fix it. After editing `printlog-bridge.cfg`, restart the container.
+The container shows as healthy while the bridge runs. `printlog-bridge doctor` (in the same Terminal) checks the config, the sign-in and every printer, and leaves the support bundle in the folder's `state/`, which you can download from File Station; `printlog-bridge status` shows what each printer is doing. The project folder is the bridge's: it runs as the DSM user who made it. DSM 7.0 and 7.1 call the package **Docker** and have no Project tab: use the `docker run` command under [Anywhere else](#anywhere-else-any-linux-host) over SSH. If pairing is off on 3D Print Log, the log says so: put `PRINTLOG_API_KEY: <key>` from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) under `environment:` (anyone who can manage containers on the NAS can read it there), or store it in the folder with `printlog-bridge store-key` in the Terminal.
 
 ### On Unraid
 
-Unraid has no Compose out of the box, so use the template in [`unraid/printlog-bridge.xml`](unraid/printlog-bridge.xml). It runs the container as `nobody:users` (99:100), the owner of Unraid's appdata, with the folder `/mnt/user/appdata/printlog-bridge` at `/data`. Unraid passes its own time zone to the container. In the web terminal (the `>_` icon at the top right):
+1. In the **Apps** tab, search for **printlog-bridge** and install it. The defaults are fine: the data folder is `/mnt/user/appdata/printlog-bridge`, it runs as `nobody:users` (99:100, `PUID`/`PGID`), and on the host's network. Set **Bridge name** if you like.
+2. Docker tab > the printlog-bridge icon > **Logs**: scan the QR code to pair it.
+3. Add your printers to `printlog-bridge.cfg` in the data folder (the `appdata` share) and save. The icon's **Console** runs `printlog-bridge discover`, `doctor` and `status`.
 
-1. **Make the folder and write the config**, with a `[printer <name>]` section per printer, as in step 3 of the Synology steps:
-   ```sh
-   mkdir -p /mnt/user/appdata/printlog-bridge
-   nano /mnt/user/appdata/printlog-bridge/printlog-bridge.cfg
-   chown -R nobody:users /mnt/user/appdata/printlog-bridge
-   ```
-2. **Pair it** (scan the QR code it shows, as in step 6 of the Synology steps), or skip this and let the container pair itself on its first start, with the QR code in its log:
-   ```sh
-   docker run --rm -it --user 99:100 -v /mnt/user/appdata/printlog-bridge:/data \
-     ghcr.io/hoffmanengineering/printlog-bridge:latest pair
-   ```
-   While pairing is off on 3D Print Log, store an API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) instead: the same command with `store-key` in place of `pair`. (Or put the key in the template's API key field. That's simpler, but anyone who can edit the container can read it.)
-3. **Add the template:**
-   ```sh
-   wget -O /boot/config/plugins/dockerMan/templates-user/my-printlog-bridge.xml \
-     https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/unraid/printlog-bridge.xml
-   ```
-   Then Docker > Add Container > Template, pick **printlog-bridge** under the user templates, and Apply. Turn on its Autostart so it comes back after the array starts.
-4. **Check it** with `docker exec printlog-bridge printlog-bridge doctor` and `... status`, as on Synology. The Docker tab shows the container as healthy once the bridge runs.
+Until it's listed in the Apps tab, add the template [`unraid/printlog-bridge.xml`](unraid/printlog-bridge.xml) by hand, in the web terminal (`>_`):
+
+```sh
+wget -O /boot/config/plugins/dockerMan/templates-user/my-printlog-bridge.xml \
+  https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/unraid/printlog-bridge.xml
+```
+
+Then Docker > **Add Container** > Template: **printlog-bridge**, and Apply. A container from the earlier template, which ran with `--user 99:100`, keeps working as it is.
 
 ### On a Raspberry Pi
 
@@ -148,31 +95,29 @@ To run the bridge on the printer's own Pi, use `install.sh` above instead. Docke
 ```sh
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker "$USER"   # then log out and back in
-mkdir ~/printlog-bridge            # write printlog-bridge.cfg in it (Synology step 3)
-docker run --rm -it -v ~/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge:latest pair
+mkdir ~/printlog-bridge && cd ~/printlog-bridge
+curl -fsSLO https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/docker-compose.yml
+docker compose up -d && docker compose logs -f   # scan the QR code, then add printers to printlog-bridge.cfg here
 ```
-
-(`store-key` in place of `pair` stores an API key instead, while pairing is off on 3D Print Log.)
-
-Then start it with the `docker run -d` command below, or with `docker compose up -d` and [`docker-compose.yml`](docker-compose.yml) after changing its folder to `~/printlog-bridge` and removing the `user:` line. The first user on Raspberry Pi OS is uid 1000, the same as the image's own user, so it needs no `user:`.
 
 ### Anywhere else (any Linux host)
 
-The same `docker-compose.yml` works after changing the folder and `user:`. Without Compose:
+[`docker-compose.yml`](docker-compose.yml) in an empty folder and `docker compose up -d` there, as on a Pi. Without Compose:
 
 ```sh
-docker run -d --name printlog-bridge --restart unless-stopped \
+docker run -d --name printlog-bridge --restart unless-stopped --network host \
   -e TZ=America/New_York -v "$PWD/printlog-bridge:/data" \
   ghcr.io/hoffmanengineering/printlog-bridge:latest
 docker logs -f printlog-bridge   # the first time: scan the QR code to pair it
+docker exec printlog-bridge printlog-bridge discover   # your printers, to add to printlog-bridge/printlog-bridge.cfg
 docker exec printlog-bridge printlog-bridge doctor
 ```
 
-Started with no API key or device token, the container pairs itself: its log shows a QR code, the address and the code, and a new one each time one expires, until you approve it. Then it carries on (a `[printer]` without `printer_id` still needs one: the log lists your printers). To pair (or pair again) in a terminal instead, run `docker run --rm -it -v "$PWD/printlog-bridge:/data" ghcr.io/hoffmanengineering/printlog-bridge:latest pair`, or `docker compose run --rm printlog-bridge pair` next to the Compose file; then `docker restart printlog-bridge`. Set `PRINTLOG_BRIDGE_NAME` on the container to choose the name 3D Print Log shows for it (otherwise `printlog-bridge on <container id>`).
+To pair (or pair again) in a terminal instead, run `docker run --rm -it -v "$PWD/printlog-bridge:/data" ghcr.io/hoffmanengineering/printlog-bridge:latest pair`, or `docker compose run --rm printlog-bridge pair` next to the Compose file; then `docker restart printlog-bridge`. Set `PRINTLOG_BRIDGE_NAME` on the container to choose the name 3D Print Log shows for it (otherwise `printlog-bridge on <host name>`). While pairing is off on 3D Print Log, store an API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) the same way with `store-key` in place of `pair`, or set `PRINTLOG_API_KEY`.
 
-To find your printers' addresses for the config, run `docker run --rm <image> discover --subnet 192.168.1.0/24` with your LAN's network: with Docker's default (bridge) networking the container sees its own network, not your LAN's, so it needs telling which one to scan. Finding a printer again after its address changes works with bridge networking too; only the zeroconf shortcut needs host networking (`network_mode: host`), and the scan covers for it.
+`discover` finds Bambu Lab printers only on the host's network (`--network host`, `network_mode: host`), which the examples above use. With Docker's default (bridge) networking the container sees its own network, not your LAN's, so give `discover` your LAN with `--subnet 192.168.1.0/24`; finding a printer again after its address changes works either way.
 
-Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`).
+Any command runs the same way (`docker exec printlog-bridge printlog-bridge <command>`, or `docker run --rm -v ...:/data <image> <command>`). A broken config (a typo, a value the bridge can't read) still makes it exit and say what to fix in its log; the restart policy tries again every few seconds until you fix it.
 
 ## Run it as a Home Assistant app
 
@@ -462,7 +407,7 @@ python -m venv .venv
 
 CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`.
 
-The Docker workflow builds the image for each platform and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run`, `status` and `pair` inside the container, as a non-root user, against three fake Moonrakers, a fake 3D Print Log API and a fake Auth0 on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. amd64 and arm64 run natively (arm64 on GitHub's Arm runner), arm/v7 under QEMU. It then pushes all three to GHCR from `main` (`edge`) and from `v*` tags, and `tests/docker/check_published.sh` checks the result without logging in: the tag pulls, has every platform, and each one starts. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev` (add `--platform linux/arm/v7` to the build, and `linux/arm/v7` after the image, to try another platform under QEMU).
+The Docker workflow builds the image for each platform and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run`, `status` and `pair` inside the container run with `--user` (as installs from before the image handed over its folder itself), then a new install with no config and a root-owned folder, and `PUID`/`PGID`, against three fake Moonrakers, a fake 3D Print Log API and a fake Auth0 on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. amd64 and arm64 run natively (arm64 on GitHub's Arm runner), arm/v7 under QEMU. It then pushes all three to GHCR from `main` (`edge`) and from `v*` tags, and `tests/docker/check_published.sh` checks the result without logging in: the tag pulls, has every platform, and each one starts. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev` (add `--platform linux/arm/v7` to the build, and `linux/arm/v7` after the image, to try another platform under QEMU).
 
 `tests/fixtures/moonraker/` holds REAL answers from a Snapmaker U1 and an Infimech EX, which `tests/test_real_captures.py` runs the adapter against. `tests/trace_replay.py` replays a trace as Moonraker, so a recorded print becomes a regression test: see `tests/test_trace_replay.py`, which replays a SYNTHETIC U1 print from `tests/fixtures/traces/`.
 
