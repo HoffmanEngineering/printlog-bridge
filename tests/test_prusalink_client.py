@@ -128,6 +128,7 @@ def test_a_stream_stops_where_the_reader_does():
     async def scenario():
         async with printer() as (fake, url):
             fake.files["BIG.BGC"] = b"x" * 2_000_000
+            fake.chunk_delay = 0.002
             client = PrusaLinkClient(url, password=PASSWORD)
             try:
                 seen = 0
@@ -143,4 +144,4 @@ def test_a_stream_stops_where_the_reader_does():
 
     seen, sent = run(scenario())
     assert seen >= 100_000
-    assert sent < 2_000_000
+    assert sent < 1_000_000

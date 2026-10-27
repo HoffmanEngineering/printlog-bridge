@@ -16,6 +16,7 @@ Built from Prusa's published sources, not a recorded printer (#17):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -192,6 +193,10 @@ class FakePrusaLink:
         self.downloads: list[str] = []
         self.unauthorized = 0
         self.downloaded_bytes = 0
+        self.chunk_delay = 0.0
+        """A pause after each 4 KB of a download, as a printer's network would make: without
+        one, loopback socket buffers (megabytes on Linux) take a whole test file at once, so
+        `downloaded_bytes` can't show where the bridge stopped reading."""
         self._nonces: set[str] = set()
         self._runner: web.AppRunner | None = None
         self.port = 0
@@ -369,6 +374,8 @@ class FakePrusaLink:
             for n in range(0, len(data), 4096):
                 await response.write(data[n : n + 4096])
                 self.downloaded_bytes += min(4096, len(data) - n)
+                if self.chunk_delay:
+                    await asyncio.sleep(self.chunk_delay)
         except (ConnectionResetError, RuntimeError):
             pass  # the bridge stopped reading
         return response

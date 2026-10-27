@@ -99,6 +99,7 @@ class TestRead:
         async def scenario():
             async with files_on_a_printer() as (fake, files):
                 fake.print_file(7, "BENCHY.BGC", data)
+                fake.chunk_delay = 0.002
                 found = await files.read(job_of(fake))
                 await asyncio.sleep(0.1)
                 return found, fake.downloaded_bytes
