@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -148,18 +149,106 @@ def test_run_without_credentials_says_where_to_get_them_when_it_cant_pair(
     assert "https://www.3dprintlog.com/api-keys" in err
 
 
-def test_run_without_a_printer_id_names_the_printer(tmp_path, capsys):
+async def _start_run(env: dict, *args: str) -> asyncio.subprocess.Process:
+    return await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "printlog_bridge", "run", *args,
+        stderr=asyncio.subprocess.PIPE, env={**os.environ, **env},
+    )  # fmt: skip
+
+
+class Lines:
+    """What a running bridge has written to stderr so far."""
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self.text = ""
+        self.task = asyncio.ensure_future(self._read(process))
+
+    async def _read(self, process: asyncio.subprocess.Process) -> None:
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                return
+            self.text += line.decode(errors="replace")
+
+
+async def _stop(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is None:
+        process.kill()
+        await process.wait()
+
+
+def test_run_with_no_config_waits_for_printers_then_watches_them(tmp_path):
+    """A new container: no config at all. The bridge (already holding an API key) writes a
+    starter config, says what to add, stays up, and starts once a printer is added."""
+    config, state = tmp_path / "printlog-bridge.cfg", tmp_path / "state"
+    env = {
+        "PRINTLOG_BRIDGE_CONFIG": str(config),
+        "PRINTLOG_BRIDGE_STATE_DIR": str(state),
+        "PRINTLOG_API_KEY": "k",
+    }
+
+    async def scenario():
+        fake = FakeMoonraker()
+        base = await fake.start()
+        process = await _start_run(env)
+        out = Lines(process)
+        try:
+            await eventually(lambda: "No printers to watch yet" in out.text, timeout=20)
+            assert config.exists()
+            status = read_status(state)
+            assert status is not None and status["stopped_at"] is None
+            assert status["setup_problem"]
+            assert process.returncode is None
+            config.write_text(
+                # The heartbeat goes to a closed port, not to the real API.
+                f"[bridge]\napi_url = http://127.0.0.1:9\n[printer u1]\nprinter_id = 42\n"
+                f"url = {base}\n",
+                encoding="utf-8",
+            )
+            await eventually(lambda: fake.subscriptions, timeout=20)
+            return out.text
+        finally:
+            await _stop(process)
+            await fake.close()
+
+    text = asyncio.run(scenario())
+
+    assert "starter config" in text
+    assert "starting to watch u1" in text
+    assert "Traceback" not in text
+
+
+def test_run_without_a_printer_id_names_the_printer_and_waits(tmp_path):
     config = write_config(
         tmp_path,
         "api_key = k\n[printer voron]\nprinter_id = 42\nurl = http://voron:7125\n"
         "[printer u1]\nurl = http://u1:7125\n",
     )
 
-    assert main(["run", "--config", str(config)]) == 2
+    async def scenario():
+        process = await _start_run({}, "--config", str(config))
+        out = Lines(process)
+        try:
+            await eventually(lambda: "has no printer_id" in out.text, timeout=20)
+            await asyncio.sleep(0.5)
+            assert process.returncode is None
+            return out.text
+        finally:
+            await _stop(process)
 
-    err = capsys.readouterr().err
-    assert "[printer u1] has no printer_id" in err
-    assert "voron" not in err
+    text = asyncio.run(scenario())
+
+    assert "[printer u1] has no printer_id" in text
+    assert "[printer voron]" not in text
+
+
+def test_status_and_pair_work_before_there_is_a_config(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PRINTLOG_BRIDGE_CONFIG", str(tmp_path / "printlog-bridge.cfg"))
+    monkeypatch.setenv("PRINTLOG_BRIDGE_STATE_DIR", str(tmp_path / "state"))
+
+    assert main(["status"]) == 1
+
+    assert "hasn't run yet" in capsys.readouterr().out
 
 
 def test_run_with_a_bad_config_says_why_and_fails(tmp_path, capsys):

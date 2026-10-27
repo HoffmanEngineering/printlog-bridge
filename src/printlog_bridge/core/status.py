@@ -124,6 +124,7 @@ class StatusBoard:
             "latest_version": None,
             "credentials": credentials,
             "credentials_problem": None,
+            "setup_problem": None,
             "printers": {
                 name: {
                     "connection": "starting",
@@ -165,6 +166,13 @@ class StatusBoard:
         None once it's fixed."""
         if self._data.get("credentials_problem") != problem:
             self._data["credentials_problem"] = problem
+            self._write()
+
+    def setup_problem(self, problem: str | None) -> None:
+        """Why the bridge waits instead of watching printers (none configured yet:
+        core/first_run.py), or None."""
+        if self._data.get("setup_problem") != problem:
+            self._data["setup_problem"] = problem
             self._write()
 
     def latest_version(self, version: str | None) -> None:
@@ -315,6 +323,8 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
             "may have crashed. Check its log."
         ]
     lines.append(_credentials_line(config, status, running))
+    if running and status.get("setup_problem"):
+        lines.append(f"Setup: waiting for printers: {status['setup_problem']}")
     update = _update_line(config, status, running)
     if update:
         lines.append(update)
