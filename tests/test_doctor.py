@@ -348,9 +348,7 @@ class TestApiKeyStorage:
         assert "OctoPrint" in check.detail
         assert "state_dir" in check.detail
 
-    def test_a_folder_named_like_klippers_is_fine_for_an_adapter_without_moonraker(
-        self, tmp_path
-    ):
+    def test_a_folder_named_like_klippers_is_fine_for_an_adapter_without_moonraker(self, tmp_path):
         check = self.key_check(
             tmp_path / "printer_data" / "config", "api_key = k\n", adapter=FakeAdapter
         )
