@@ -7,3 +7,6 @@ build/
 dist/
 .install-record.json
 .install-macros.json
+
+# Local uv lockfile; dependencies are pinned in requirements.txt
+uv.lock
