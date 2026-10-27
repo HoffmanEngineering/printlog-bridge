@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import json
+import math
 import os
 import re
 import time
@@ -205,7 +206,10 @@ def write_pending_pairing(
 ) -> None:
     """Keeps the code a pairing waits on in the state directory, until `clear_pending_pairing`,
     for `printlog-bridge status` (which `docker exec` can run, unlike the local page's memory).
-    Mode 600, like the token it leads to."""
+    Mode 600, like the token it leads to. A non-finite `expires_in` raises ValueError: the file
+    would never expire."""
+    if not math.isfinite(expires_in):
+        raise ValueError(f"a pairing code must expire (expires_in {expires_in})")
     write_private_file(
         state_dir / PENDING_PAIRING_FILE,
         json.dumps(
@@ -242,6 +246,6 @@ def read_pending_pairing(
     expires = data.get("expiresAt")
     if not isinstance(code, str) or not _USER_CODE.fullmatch(code) or not _approval_url(uri):
         return None
-    if not isinstance(expires, (int, float)) or now() >= expires:
+    if not isinstance(expires, (int, float)) or not math.isfinite(expires) or now() >= expires:
         return None
     return PendingPairing(code, str(uri), complete if _approval_url(complete) else None)

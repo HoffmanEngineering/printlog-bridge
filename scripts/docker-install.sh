@@ -224,20 +224,51 @@ write_compose() {
         "      - ./data:/data"
 }
 
-# Whether DIR is a folder this script may use: its own (its marked compose.yaml), or one with
-# nothing in it but data/ and compose.override.yaml. The container takes over data/ (it hands
-# every file in it to the bridge's user), so never a folder with anything else in it.
+# The uid that owns a path (by number; nothing in its name is parsed).
+owner_of() {
+    # shellcheck disable=SC2012 # one path, its uid column only
+    ls -nd "$1" | awk '{ print $3 }'
+}
+
+# Whether the folder holds only entries with the names given.
+holds_only() { # <folder> <name>...
+    folder="$1"
+    shift
+    for entry in "$folder"/* "$folder"/.[!.]* "$folder"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        found=no
+        for allowed in "$@"; do
+            if [ "$name" = "$allowed" ]; then found=yes; fi
+        done
+        [ "$found" = yes ] || return 1
+    done
+    return 0
+}
+
+# Whether DIR holds this script's own compose.yaml.
+dir_is_marked() {
+    [ -f "${DIR}/compose.yaml" ] && [ ! -L "${DIR}/compose.yaml" ] && grep -qxF "$MARKER" "${DIR}/compose.yaml"
+}
+
+# Whether DIR is a folder this script may use. The container takes over data/ (it hands every
+# file in it to the bridge's user, as root), so data/ must be a real folder, never a link: in
+# DIR this script made, or else this user's own and empty, or holding only what the README's
+# move from a setup by hand puts there (printlog-bridge.cfg and state/).
 dir_is_ours() {
-    if [ -f "${DIR}/compose.yaml" ] && grep -qxF "$MARKER" "${DIR}/compose.yaml"; then
+    if [ -L "${DIR}/data" ] || [ -L "${DIR}/compose.override.yaml" ]; then
+        fail "printlog-bridge: ${DIR}/data or compose.override.yaml is a symbolic link." \
+            "The bridge takes over data/, so it must be a folder of its own, and the override a file."
+    fi
+    if dir_is_marked; then
         return 0
     fi
-    for entry in "$DIR"/* "$DIR"/.[!.]* "$DIR"/..?*; do
-        [ -e "$entry" ] || [ -L "$entry" ] || continue
-        case "${entry##*/}" in
-        data | compose.override.yaml) ;;
-        *) return 1 ;;
-        esac
-    done
+    holds_only "$DIR" data compose.override.yaml || return 1
+    if [ -e "${DIR}/data" ]; then
+        [ -d "${DIR}/data" ] || return 1
+        [ "$(owner_of "${DIR}/data")" = "$(id -u)" ] || return 1
+        holds_only "${DIR}/data" printlog-bridge.cfg state || return 1
+    fi
     return 0
 }
 
@@ -252,11 +283,8 @@ check_dir() {
     fi
     if [ -e "$DIR" ] || [ -L "$DIR" ]; then
         [ -d "$DIR" ] || fail "printlog-bridge: ${DIR} isn't a folder."
-        # The owner's uid (one folder, by number: nothing in its name is parsed). Root, with
-        # --root, may use any folder.
-        # shellcheck disable=SC2012
-        owner="$(ls -nd "$DIR" | awk '{ print $3 }')"
-        if [ "$(id -u)" != 0 ] && [ "$owner" != "$(id -u)" ]; then
+        # Root, with --root, may use any folder.
+        if [ "$(id -u)" != 0 ] && [ "$(owner_of "$DIR")" != "$(id -u)" ]; then
             fail "printlog-bridge: ${DIR} isn't yours, so this script won't hand it to the bridge." \
                 "Choose a folder of your own with --dir."
         fi
@@ -280,7 +308,9 @@ prepare_dir() {
     fi
     if ! dir_is_ours; then
         fail "printlog-bridge: ${DIR} isn't empty, and this script didn't make it." \
-            "The bridge takes over the folder it's given, so choose a new one with --dir."
+            "The bridge takes over the folder it's given, so choose a new one with --dir. (A data/" \
+            "folder of yours holding only printlog-bridge.cfg and state/, moved from a setup by" \
+            "hand, is fine.)"
     fi
     if wd="$(dk inspect --type container --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$CONTAINER" 2>/dev/null)" &&
         [ "$wd" != "$DIR" ]; then
@@ -360,8 +390,11 @@ wait_for_bridge() {
             return 0
         fi
         if [ -n "$code" ] && [ "$code" != "$shown" ]; then
-            # shellcheck disable=SC2086 # three words: code, address, link
+            # Three words: code, address, link. With globbing off, so a * stays a *.
+            set -f
+            # shellcheck disable=SC2086
             show_pairing $code
+            set +f
             shown="$code"
             if [ "$WAIT" = no ]; then return 0; fi
             say "" "Waiting for you to approve it (Ctrl-C stops waiting; the bridge keeps running)..."
@@ -497,6 +530,13 @@ main() {
     case "$TAG" in
     "" | [!A-Za-z0-9_]* | *[!A-Za-z0-9_.-]*) fail "printlog-bridge: \"${TAG}\" isn't an image tag." ;;
     esac
+    # Without slashes at its end, so `/newdir/` is checked as the top-level folder it is.
+    while :; do
+        case "$DIR" in
+        ?*/) DIR="${DIR%/}" ;;
+        *) break ;;
+        esac
+    done
     if [ -z "$DIR" ]; then
         [ -n "${HOME:-}" ] || fail "printlog-bridge: HOME isn't set; choose a folder with --dir."
         DIR="${HOME}/printlog-bridge"

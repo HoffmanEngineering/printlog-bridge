@@ -12,6 +12,7 @@ from dataclasses import replace
 
 import pytest
 from test_pairing import pair, run
+from test_run import root_logging, write_config  # noqa: F401 (a fixture)
 from test_status import NOW, Clock, board, config
 
 from printlog_bridge.cli.main import main
@@ -23,7 +24,7 @@ from printlog_bridge.core.device import (
     read_pending_pairing,
     write_pending_pairing,
 )
-from printlog_bridge.core.pairing import PairingDenied
+from printlog_bridge.core.pairing import PairingDenied, PairingUnavailable
 from printlog_bridge.core.status import format_status, pairing_state
 
 URI = "https://auth.3dprintlog.com/activate"
@@ -170,3 +171,48 @@ def test_status_shows_the_code_while_the_bridge_waits_for_it(tmp_path):
     text, _ = format_status(config(tmp_path), now=NOW)
 
     assert f"Pairing code: QWER-TYUI, to enter at {URI} (or open {COMPLETE})" in text
+
+
+class TestStaleCodes:
+    """A bridge killed while it paired (SIGKILL, out of memory, a power cut) leaves its file."""
+
+    def test_pairing_clears_a_code_left_by_an_earlier_run(self, tmp_path):
+        write_pending_pairing(tmp_path, "DEAD-CODE", URI, None, 900)
+
+        async def scenario(api, auth0, api_url):
+            call, _, _ = pair(api_url, tmp_path)
+            with pytest.raises(PairingUnavailable):
+                await call
+
+        run(scenario, pairing_on=False)
+        assert not (tmp_path / PENDING_PAIRING_FILE).exists()
+
+    @pytest.mark.usefixtures("root_logging")
+    def test_run_clears_it_when_it_starts(self, tmp_path, capsys):
+        state = tmp_path / "state"
+        write_pending_pairing(state, "DEAD-CODE", URI, None, 900)
+        config = write_config(tmp_path, "api_url = http://127.0.0.1:9\n")
+
+        main(["run", "--config", str(config)])
+
+        assert not (state / PENDING_PAIRING_FILE).exists()
+
+
+@pytest.mark.parametrize("expires_in", [float("nan"), float("inf"), float("-inf")])
+def test_a_code_that_never_expires_isnt_kept(tmp_path, expires_in):
+    with pytest.raises(ValueError):
+        write_pending_pairing(tmp_path, "QWER-TYUI", URI, None, expires_in)
+    assert not (tmp_path / PENDING_PAIRING_FILE).exists()
+
+
+@pytest.mark.parametrize("expires_at", ["NaN", "Infinity", "-Infinity"])
+def test_a_file_that_never_expires_reads_as_nothing(tmp_path, expires_at):
+    (tmp_path / PENDING_PAIRING_FILE).write_text(
+        '{"userCode": "QWER-TYUI", "verificationUri": "'
+        + URI
+        + '", "expiresAt": '
+        + expires_at
+        + "}",
+        encoding="utf-8",
+    )
+    assert read_pending_pairing(tmp_path) is None

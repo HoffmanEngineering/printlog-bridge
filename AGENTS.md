@@ -66,7 +66,8 @@ skipped by default.
   `releases/latest/download/docker-install.sh`, which `docker.yml`'s `release-script` job attaches
   to each `v*` release with `DEFAULT_TAG=latest` replaced by the version (keep that line as is).
   It never asks for an API key. It mounts only `<dir>/data` (never the folder with the Compose
-  files, which the user runs again), refuses a folder it didn't make that isn't empty, `$HOME`,
+  files, which the user runs again), refuses a folder it didn't make that isn't empty (but for a `data/` of the user's with only
+  `printlog-bridge.cfg` and `state/`), a symlinked `data/` or override, `$HOME`,
   top-level folders and running as root (without `--root`), and reads the pairing code from
   `printlog-bridge status --pairing` (`core/device.py`'s `pairing_pending.json`), never from the
   log. `tests/install/docker_install_smoke.sh` runs it against a fake `docker`; a new tool the

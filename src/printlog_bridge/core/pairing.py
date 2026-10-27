@@ -422,6 +422,8 @@ async def pair(
     `show` gets each code to approve; `say` what happened to it. With `keep_trying` (the first
     run of an unattended bridge), a code that expires or is denied is followed by a new one, for
     as long as it takes; otherwise the PairingError is raised."""
+    # A code left by a run that was killed while it paired is dead: never show it.
+    clear_pending_pairing(state_dir)
     async with aiohttp.ClientSession(
         headers={"User-Agent": f"printlog-bridge/{__version__}", "Accept": "application/json"},
         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S),
@@ -477,7 +479,7 @@ def _keep_pending(state_dir: Path, authorization: DeviceAuthorization) -> None:
             authorization.verification_uri_complete,
             authorization.expires_in,
         )
-    except OSError as e:
+    except (OSError, ValueError) as e:
         log.warning("Can't keep the pairing code in %s: %s", state_dir, e)
 
 

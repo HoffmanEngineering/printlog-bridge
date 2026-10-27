@@ -39,6 +39,7 @@ from printlog_bridge.core.config import (
     read_key_file,
     write_key_file,
 )
+from printlog_bridge.core.device import clear_pending_pairing
 from printlog_bridge.core.doctor import API_KEYS_PAGE, diagnose, format_report
 from printlog_bridge.core.first_run import (
     setup_problem,
@@ -591,6 +592,8 @@ def _run(explicit_config: Path | None) -> int:
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
         return 2
     configure_logging(config.state_dir)
+    # A pairing code left by a run that was killed while it paired is dead.
+    clear_pending_pairing(config.state_dir)
     # From the start, so it shows the code to approve while the bridge pairs.
     page = start_local_page(config, load, env, home)
     try:

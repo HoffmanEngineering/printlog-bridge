@@ -22,6 +22,7 @@ for tool in sh awk cat date grep id ls mkdir mv readlink sed sleep tr; do
 done
 REAL_UNAME="$(command -v uname)"
 REAL_ID="$(command -v id)"
+REAL_LS="$(command -v ls)"
 
 # The fakes. State for the fake Docker lives in $FAKE (one folder per scenario).
 FAKEBIN="${WORK}/fakebin"
@@ -125,6 +126,19 @@ case "\$1" in
 esac
 EOF
 chmod +x "${ROOTBIN}/id"
+# A fake ls that says root owns any data/ folder, for a data/ that isn't the user's.
+FOREIGNBIN="${WORK}/foreignbin"
+mkdir -p "$FOREIGNBIN"
+cp "${FAKEBIN}"/* "$FOREIGNBIN/"
+cat >"${FOREIGNBIN}/ls" <<EOF
+#!/bin/sh
+for last in "\$@"; do :; done
+case "\$last" in
+*/data) echo "drwxr-xr-x 2 0 0 4096 Oct 27 10:00 \$last" ;;
+*) exec "${REAL_LS}" "\$@" ;;
+esac
+EOF
+chmod +x "${FOREIGNBIN}/ls"
 # The same fakes without docker, sudo or systemctl, for the scenarios that need them missing.
 BARE="${WORK}/bare"
 mkdir -p "$BARE"
@@ -359,6 +373,62 @@ install --dir "${HOME}/moved"
 check "a folder holding only data/ (moved from a setup by hand) is fine" \
     sh -c "test $status -eq 0 && test -f '${HOME}/moved/compose.yaml'"
 check "and keeps that data" grep -qx '\[bridge\]' "${HOME}/moved/data/printlog-bridge.cfg"
+
+scenario "data/ folders it won't take" data-folders
+echo 1 >"${FAKE}/healthy_after"
+mkdir -p "${HOME}/elsewhere/precious"
+printf 'x' >"${HOME}/elsewhere/precious/file"
+mkdir -p "${HOME}/abs"
+ln -s "${HOME}/elsewhere" "${HOME}/abs/data"
+rm -f "${FAKE}/container" # no container from the last try
+install --dir "${HOME}/abs"
+check "a data/ that links elsewhere" sh -c "test $status -ne 0 && test ! -e '${HOME}/abs/compose.yaml'"
+check "says why" says "symbolic link"
+mkdir -p "${HOME}/up"
+ln -s .. "${HOME}/up/data"
+rm -f "${FAKE}/container" # no container from the last try
+install --dir "${HOME}/up"
+check "a data/ that links to .." sh -c "test $status -ne 0 && test ! -e '${HOME}/up/compose.yaml'"
+mkdir -p "${HOME}/override"
+ln -s "${HOME}/elsewhere/precious/file" "${HOME}/override/compose.override.yaml"
+rm -f "${FAKE}/container" # no container from the last try
+install --dir "${HOME}/override"
+check "a compose.override.yaml that links elsewhere" \
+    sh -c "test $status -ne 0 && test ! -e '${HOME}/override/compose.yaml'"
+mkdir -p "${HOME}/full/data"
+printf 'x' >"${HOME}/full/data/thesis.pdf"
+rm -f "${FAKE}/container" # no container from the last try
+install --dir "${HOME}/full"
+check "a data/ with other files in it" sh -c "test $status -ne 0 && test ! -e '${HOME}/full/compose.yaml'"
+mkdir -p "${HOME}/theirs/data"
+BIN="$FOREIGNBIN"
+rm -f "${FAKE}/container" # no container from the last try
+install --dir "${HOME}/theirs"
+check "a data/ that isn't this user's" sh -c "test $status -ne 0 && test ! -e '${HOME}/theirs/compose.yaml'"
+BIN="$FAKEBIN"
+rm -f "${FAKE}/container" # no container from the last try
+install --dir "${HOME}/theirs"
+check "the same data/, when it is this user's, is fine" test "$status" -eq 0
+mv "${HOME}/theirs/data" "${HOME}/theirs/data.old"
+ln -s "${HOME}/elsewhere" "${HOME}/theirs/data"
+: >"${FAKE}/calls.log"
+install --dir "${HOME}/theirs"
+check "even in its own folder, a data/ that became a link"     sh -c "test $status -ne 0 && ! grep -q 'compose up' '${FAKE}/calls.log'"
+
+scenario "a link the shell could expand" glob
+echo 1 >"${FAKE}/healthy_after"
+echo "pending QWER-TYUI https://auth.3dprintlog.com/a*" >"${FAKE}/pairing"
+mkdir -p "${WORK}/cwd/https:/auth.3dprintlog.com/activate-me"
+cd "${WORK}/cwd"
+install --no-wait
+cd "$REPO"
+check "is shown as it is" says "https://auth.3dprintlog.com/a*"
+check "not as a file name it matches" sh -c "! grep -q activate-me '${WORK}/out.txt'"
+
+scenario "a folder with a slash at its end" slash
+BIN="$ROOTBIN"
+install --root --dir "/plb-new-$$/"
+check "is checked without it (a top-level folder)" says "system folder"
 
 scenario "as root" root
 echo 1 >"${FAKE}/healthy_after"

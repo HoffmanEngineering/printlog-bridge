@@ -195,6 +195,11 @@ jobs:
     # user runs installs the image released with it and only changes with a release, plus its
     # SHA-256 for those who check it. Only after verify, so the image it names can be pulled.
     # tests/install/docker_install_smoke.sh runs the same sed. Any failure fails the job.
+    #
+    # A release this job makes starts as a draft and is published once both files are on it, so
+    # it is never the latest without them. It is marked latest only when its tag is the highest
+    # release tag (a backport or an older tag run again isn't). Uploading to a release that
+    # already exists replaces the files (--clobber): for those few seconds, its address can 404.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [publish, verify]
     runs-on: ubuntu-latest
@@ -202,6 +207,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # every tag, to tell whether this one is the highest
       - id: attach
         name: Attach docker-install.sh and its checksum to the release
         env:
@@ -214,21 +221,38 @@ jobs:
           sed "s/^DEFAULT_TAG=latest\$/DEFAULT_TAG=${VERSION}/" scripts/docker-install.sh >dist/docker-install.sh
           grep -qx "DEFAULT_TAG=${VERSION}" dist/docker-install.sh
           (cd dist && sha256sum docker-install.sh >docker-install.sh.sha256)
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            prerelease=""
-            case "$TAG" in *-*) prerelease="--prerelease" ;; esac
-            gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" $prerelease
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/docker-install.sh dist/docker-install.sh.sha256 --clobber
+          else
+            flags=(--verify-tag --generate-notes --title "$TAG" --draft)
+            latest_flag=--latest=false
+            case "$TAG" in
+              *-*) flags+=(--prerelease) ;;
+              *)
+                highest="$(git tag --list 'v*' | grep -v -- - | sort -V | tail -n 1)"
+                if [ "$TAG" = "$highest" ]; then latest_flag=--latest; fi
+                ;;
+            esac
+            gh release create "$TAG" "${flags[@]}" "$latest_flag" dist/docker-install.sh dist/docker-install.sh.sha256
+            # Published with both files on it; latest (or not) set again as it's published.
+            gh release edit "$TAG" --draft=false "$latest_flag"
           fi
-          gh release upload "$TAG" dist/docker-install.sh dist/docker-install.sh.sha256 --clobber
-          echo "prerelease=$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" >>"$GITHUB_OUTPUT"
-      - name: The one-line install's address serves this release's script
-        # A prerelease is never releases/latest, so only a release is checked.
-        if: steps.attach.outputs.prerelease == 'false'
+          # Check the address users get: releases/latest/ when this is the latest release, else
+          # this release's own.
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          if [ "$latest" = "$TAG" ]; then
+            base="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download"
+          else
+            base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          fi
+          echo "base=${base}" >>"$GITHUB_OUTPUT"
+      - name: The release's address serves these files
         env:
-          BASE: https://github.com/${{ github.repository }}/releases/latest/download
+          BASE: ${{ steps.attach.outputs.base }}
         run: |
           set -euo pipefail
           cd dist
+          echo "Checking ${BASE}"
           curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o served.sh "$BASE/docker-install.sh"
           curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o served.sha256 "$BASE/docker-install.sh.sha256"
           cmp served.sh docker-install.sh
