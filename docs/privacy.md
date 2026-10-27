@@ -11,10 +11,10 @@ The bridge sends 3D Print Log exactly these calls, and nothing else:
 | `GET /api/Users/me` | `doctor` | nothing; checks the key |
 | `GET /api/Printers/{id}` | `doctor`; at start and every 5 minutes; when a print starts and ends | nothing; checks `printer_id`, and reads which spool is loaded in each slot |
 | `GET /api/Users/me/user-settings` | first print after a start | nothing; reads your default visibility and comment settings |
-| `PUT /api/Connections/{instance}` | at start, then every 5 minutes (the heartbeat) | `kind` (`moonraker` or `bambu`), `displayName` (`printlog-bridge (<printer name from your config>)`), `agentVersion`, `printerId`, and the printer's health: see [The heartbeat](#the-heartbeat). The answer carries `latestAgentVersion`, the newest bridge release, which 3D Print Log reads from this repository's tags; it is how the bridge hears about an update |
+| `PUT /api/Connections/{instance}` | at start, then every 5 minutes (the heartbeat) | `kind` (`moonraker`, `bambu` or `prusalink`), `displayName` (`printlog-bridge (<printer name from your config>)`), `agentVersion`, `printerId`, and the printer's health: see [The heartbeat](#the-heartbeat). The answer carries `latestAgentVersion`, the newest bridge release, which 3D Print Log reads from this repository's tags; it is how the bridge hears about an update |
 | `GET /api/Prints/claimable` | a print starts (and when a print ends that the bridge saw no start for), unless `adopt_prints = false` | `printerId` and `createdAfter` (the start time less `adopt_window`): looks for a print you made yourself, with the Slic3r uploader, the Cura plugin or by hand, to log the job to instead of a new one. The file name is compared on the bridge, not sent |
 | `POST /api/Prints/{id}/claim` | a print starts and one of yours matches it | `externalSource`, `externalId`, `connectionInstanceId` and `startDate`, as for `POST /api/Prints`; your print keeps everything else |
-| `POST /api/Prints` | a print starts and there's no print of yours to adopt (never with `create_prints = false`) | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker` or `bambu`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id, or for a Bambu printer the job's start time and name), the slicer's estimated print time and filament (length and weight, and the weight per tool on a multi-tool file), when the file has them, each tool's row linked to the spool loaded in its slot, and `notes` when the printer's RFID reader disagrees with a spool's material or color |
+| `POST /api/Prints` | a print starts and there's no print of yours to adopt (never with `create_prints = false`) | `printerId`, `title` (made from the file name), `fileName` (the file's name, without its folder), `startDate`, `status`, `viewStatus` and `allowComments` (your account defaults), `externalSource` (`moonraker`, `bambu` or `prusalink`), `externalId` and `connectionInstanceId` (a random id this bridge made for the printer, plus Moonraker's job id, or for a Bambu printer the job's start time and name, or for a PrusaLink printer its job number and file name), the slicer's estimated print time and filament (length and weight, and the weight per tool on a multi-tool file), when the file has them, each tool's row linked to the spool loaded in its slot, and `notes` when the printer's RFID reader disagrees with a spool's material or color |
 | `GET /api/Prints/{id}` | a print ends | nothing; reads what you changed in the app |
 | `POST /api/Prints/{id}/complete` | a print ends | `status` (the outcome), `endedAt`, `printTimeInSeconds`, and per tool (`slot`) the filament length Klipper fed (linked to the spool you chose in the app; from printers that report weight, the grams instead, and from printers that report only the slicer's estimate, `actualIsEstimate: true`), split into a row per spool when a tool's spool changed mid-print |
 | `PATCH /api/Prints/{id}` | a print fails or is cut short, a spool changed mid-print, or a print was paused for a filament change with no spool assigned | `notes`: a line saying why, with Klipper's error message when there is one; which spools a tool changed between, where; how to split a filament change's usage |
@@ -58,8 +58,8 @@ Each heartbeat also tells 3D Print Log how the bridge is doing, so the app can s
 | Field | What it is |
 | --- | --- |
 | `mode` | `local` (Moonraker's socket on this host) or `remote` (Moonraker over the network). Never the address. |
-| `firmwareName`, `firmwareVersion` | the printer's firmware and its version, at most 50 characters each: `Klipper` and the version Moonraker reports (`software_version` in `printer.info`), or `Bambu` and a Bambu printer's firmware version (its `ota` module in `get_version`) |
-| `hostSoftwareName`, `hostSoftwareVersion` | the software the bridge talks to on the printer's host and its version, at most 50 characters each: `Moonraker` and its version (`moonraker_version` in `server.info`); never sent for a Bambu printer, which the bridge talks to directly |
+| `firmwareName`, `firmwareVersion` | the printer's firmware and its version, at most 50 characters each: `Klipper` and the version Moonraker reports (`software_version` in `printer.info`), `Bambu` and a Bambu printer's firmware version (its `ota` module in `get_version`), or `Prusa-Firmware-Buddy` (`Prusa-Firmware` behind PrusaLink on a Raspberry Pi) and the `firmware` in PrusaLink's `/api/version` |
+| `hostSoftwareName`, `hostSoftwareVersion` | the software the bridge talks to on the printer's host and its version, at most 50 characters each: `Moonraker` and its version (`moonraker_version` in `server.info`); `PrusaLink` and its version (`api` in `/api/version` on Buddy firmware, `version` on a Raspberry Pi); never sent for a Bambu printer, which the bridge talks to directly |
 | `printerModel` | the printer model the slicer wrote in the last job's file (`printer_model`, such as `InfiMech EX`), when it wrote one, at most 100 characters |
 | `outboxDepth` | how many events and pictures for this printer are waiting in the outbox to be sent |
 | `outboxOldestAgeSeconds` | how long the oldest of them has waited, in seconds |
@@ -69,7 +69,7 @@ Each heartbeat also tells 3D Print Log how the bridge is doing, so the app can s
 | `snapshots` | whether a webcam frame is added to each print (`snapshots` in the config) |
 | `slicerSettings` | whether each print's slicer settings are sent (`slicer_settings` in the config) |
 
-`kind` is the adapter (`moonraker` or `bambu`). A problem that names no printer (the state directory is full, say) counts for every printer.
+`kind` is the adapter (`moonraker`, `bambu` or `prusalink`). A problem that names no printer (the state directory is full, say) counts for every printer.
 
 **No host names, IP addresses, file names or keys are in a heartbeat.** The bridge asks Moonraker for `printer.info` only for Klipper's version, and drops the host name beside it. Before `lastError` leaves the printer, the bridge removes from it every key and password it knows of, every URL, path, IP address, `host:port`, dotted name (`u1.local`, `benchy.gcode`), quoted text (which is how file names turn up in messages) and the names of your printers, leaving only what went wrong, such as `couldn't send the heartbeat: can't reach 3D Print Log at <url>: Cannot connect to host <ip> ...`. The bridge's own log keeps the full message.
 
@@ -92,13 +92,15 @@ The bridge only makes outbound connections, to:
 
 6. **A Bambu Lab printer** (`adapter = bambu`): its MQTT broker at `host`, port 8883, over TLS, and its FTPS server, port 990, implicit TLS. See [Bambu Lab printers](#bambu-lab-printers).
 
+7. **A Prusa printer's PrusaLink** (`adapter = prusalink`): its web API at `host` (port 80 unless `port` says otherwise), plain HTTP, GET requests only. See [Prusa printers (PrusaLink)](#prusa-printers-prusalink).
+
 It **never listens on a port**: nothing can connect to the bridge. The one exception is `printlog-bridge discover`, which you run yourself: unless `--no-bambu` is given, it listens on UDP port 2021 for 6 seconds to hear Bambu printers announce themselves, and sends nothing to them. Pairing (printlog-bridge#2) will add 3D Print Log's sign-in site while pairing, and nothing else.
 
 Tests: `test_connects_only_to_moonraker_its_webcam_and_3d_print_log` records every connection during a print, and the timelapse test above during one with a video. In `tests/test_discovery.py`, `test_a_different_printer_at_the_old_address_is_never_used` puts another printer at the old address, `test_with_discovery_off_the_printer_isnt_identified_or_looked_for` checks the off switch, `test_the_moonraker_key_goes_only_to_an_address_that_answers_as_moonraker` and `test_no_password_in_the_url_reaches_the_state_file` what they say, and `TestAddresses` that only private networks of a /24 or smaller are searched. `TestOnlyOutboundConnections` fails if any code in the bridge starts a server or listens on a socket, if a module other than the API client, the image fetcher, the Moonraker session and discovery opens a connection, or if `api_url` accepts plain http to another host (beyond a private-network address with `allow_http_on_lan`, which `TestPlainHttpOnTheLanIsWarnedAbout` checks is warned about).
 
 ## Your keys and passwords
 
-The bridge holds up to four kinds of secret: your 3D Print Log API key, Moonraker's API key (`moonraker_api_key`, remote mode only), any password or token in a Moonraker or webcam URL (`http://user:password@host`, `?token=...`), and a Bambu printer's LAN access code (`access_code`).
+The bridge holds up to four kinds of secret: your 3D Print Log API key, Moonraker's API key (`moonraker_api_key`, remote mode only), any password or token in a Moonraker or webcam URL (`http://user:password@host`, `?token=...`), a Bambu printer's LAN access code (`access_code`), and a PrusaLink printer's password or API key (`password`, `api_key`).
 
 **The API key is kept out of the folder Moonraker serves.** In local mode, `printlog-bridge.cfg` sits in Klipper's config folder, and Moonraker lets anyone who can open Mainsail or Fluidd read and download every file in it. So:
 
@@ -109,6 +111,8 @@ The bridge holds up to four kinds of secret: your 3D Print Log API key, Moonrake
 - `doctor` warns when `api_key` is in a config file Moonraker serves (even an unused one), when the key file is in a folder Moonraker serves, and when other users on the computer can read the key file.
 
 A Bambu printer's `access_code` stays in the config too: the bridge sends it only to that printer (as the MQTT and FTPS password, each only after the printer's certificate matched the pinned one), and it is scrubbed like a key everywhere the bridge writes. `doctor` warns when a printer's `access_code` is in a config file a printer's host serves (Klipper's config folder): anyone who can open Mainsail or Fluidd could read it and control the Bambu printer.
+
+A PrusaLink printer's `password` or `api_key` stays in the config too, is sent only to that printer, and is scrubbed like a key everywhere the bridge writes; `doctor` warns about it as about `access_code`.
 
 `moonraker_api_key` stays in the config. It is only for remote mode, where the bridge usually runs on another computer, away from any folder Moonraker serves; `doctor` doesn't check where it is.
 
@@ -153,8 +157,21 @@ With `adapter = bambu`, the bridge connects to the printer itself, as Bambu Stud
 
 Tests: `test_the_bridge_logs_a_bambu_print_with_the_slicers_grams_per_tray` (`tests/test_bambu_adapter.py`) runs a print through the whole bridge from the fake printer and checks the usage rows, and that the access code isn't in the status file; `test_a_bambu_access_code_in_the_config_is_a_known_secret` (`tests/test_secrets.py`) and `test_a_field_named_access_code_is_removed` (`tests/test_trace.py`) the scrubbing; `TestPrinterSecretStorage` in `tests/test_doctor.py` the warning; `TestCertificatePin` and `test_the_certificate_is_checked_before_the_access_code_is_sent` in `tests/test_bambu_mqtt.py`, and `test_the_certificate_is_checked_before_logging_in` in `tests/test_bambu_files.py`, that the access code is never sent to another certificate.
 
+## Prusa printers (PrusaLink)
+
+With `adapter = prusalink`, the bridge connects to the printer itself, over PrusaLink's local web API, and to nothing of Prusa's: no Prusa Connect, no Prusa account.
+
+- **Requests.** Only `GET`: `/api/version` once per connect (the firmware), `/api/v1/status` every 5 seconds during a job and every 30 seconds between jobs, `/api/v1/job` once per job (its file's name and links), and, unless `files = false`, the job's file and its thumbnail. It never starts, pauses, stops, uploads or deletes anything.
+- **The password.** PrusaLink asks for HTTP Digest: the password itself never crosses the network, only a hash of it with a one-time nonce. Firmware that asks for an API key gets `X-Api-Key`, which does cross the network as it is, over plain HTTP, as the printer's own web page sends it.
+- **The file.** For a `.bgcode` file the bridge reads it from the start and stops at its first G-code block, keeping the metadata (the slicer's estimates and the printer model), the largest thumbnail and the slicer settings block. A plain `.gcode` file is read whole (at most 64 MB) and only its first 64 KB and last 512 KB are kept, in memory: its header and the comments after its last G-code command. The toolpaths are never kept or sent. The settings are scrubbed like any G-code file's, and sent only with `slicer_settings` on.
+- **What 3D Print Log gets** is what it gets from a Klipper printer: the file's name (without folders), times, outcome, the slicer's estimates (grams and millimeters per tool, marked as estimates), the thumbnail, the settings, and the printer model the slicer wrote. Never the printer's address, serial, host name or password.
+- **Traces** of a PrusaLink printer hold each request's path, and each answer's status and JSON body: the printer's state, temperatures, fans, job number, progress and times, the job's file names and links, the firmware and host name in `/api/version`, and the challenge of a 401 (realm and nonce). Never a request's headers, so never the password, the key or the Digest answer, and never a file's contents.
+
+Tests: `test_the_bridge_logs_a_prusalink_print_with_the_slicers_grams` (`tests/test_prusalink_adapter.py`) runs a print through the whole bridge from the fake printer, checks the usage rows, that only `GET` reached the printer, and that the password isn't in the status file; `test_a_prusalink_password_and_api_key_in_the_config_are_known_secrets` (`tests/test_secrets.py`) and `test_a_prusalink_session_is_traced_without_its_password` (`tests/test_trace.py`) the scrubbing; `test_a_bgcode_file_is_read_up_to_its_gcode` (`tests/test_prusalink_files.py`) that the download stops at the G-code.
+
 ## Not covered yet
 
 - **Pairing** (printlog-bridge#2) will replace the personal API key with a device token that can only log prints, kept in the state directory. Until then the bridge uses an API key with your account's full API access, so keep it to yourself and revoke it at [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) if it leaks.
 - **A Bambu printer is trusted on first use.** Something on your network posing as the printer the first time the bridge connects would be pinned and get the access code; `tls_fingerprint` closes that.
+- **PrusaLink is plain HTTP.** Its Digest login keeps the password off the network, but the printer's answers (status, file names, the file) are readable by anyone on your network who listens, as they are for the printer's own web page.
 - **Traffic on your network is as secure as Moonraker's.** Remote mode talks to Moonraker over the URL you give it, usually plain HTTP on your LAN, as Mainsail and Fluidd do.

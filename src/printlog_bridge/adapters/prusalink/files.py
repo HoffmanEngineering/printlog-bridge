@@ -1,0 +1,301 @@
+"""What the bridge reads of a PrusaLink job's file: the slicer's estimates per tool, its
+thumbnail, its settings. Never the toolpaths, and never more than once per job.
+
+PrusaLink on a Raspberry Pi puts the file's metadata in `/api/v1/job` (`file.meta`, the keys of
+Prusa-Link-Web's `PrintFileMetadata`), and then nothing is downloaded. Buddy firmware gives only
+the file's name and `refs` (`basic_gets.cpp`), and serves the file without `Range`
+(`send_file.cpp`), so the file is read from its start:
+
+- A `.bgcode` file (PrusaSlicer's default for every Buddy printer) has its metadata, thumbnails
+  and settings in front of its G-code (`bgcode.py`), so the download stops at the first G-code
+  block: usually a few hundred kilobytes, at most `MAX_BGCODE_HEAD_BYTES`.
+- A plain `.gcode` file has PrusaSlicer's estimates and settings after its G-code, so it is read
+  to its end, keeping only its first `HEAD_BYTES` and last `TAIL_BYTES`. A file larger than
+  `max_gcode_bytes` (the job's `file.size`) isn't read: it would take minutes over the printer's
+  network, while it prints.
+
+The thumbnail is the file's largest PNG or JPEG (a `.bgcode`'s), else the printer's
+`refs.thumbnail`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import posixpath
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+import aiohttp
+
+from printlog_bridge.core.events import SlicerFile, SlicerMetadata
+from printlog_bridge.core.images import image_type
+from printlog_bridge.core.slicer_settings import (
+    config_block_from,
+    config_block_from_settings,
+    header_from,
+)
+from printlog_bridge.core.status import PrinterReport
+
+from .bgcode import JPG, PNG, BgcodeInfo, BgcodeReader, NotBgcode, parse_ini
+from .client import PrusaLinkClient, Refused
+
+log = logging.getLogger(__name__)
+
+MAX_BGCODE_HEAD_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_GCODE_BYTES = 64 * 1024 * 1024
+HEAD_BYTES = 64 * 1024
+TAIL_BYTES = 512 * 1024
+MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
+READ_TIMEOUT_S = 180.0
+"""For the whole read: a plain G-code file over a MINI's network can take minutes."""
+WARNING = "files"
+REFUSED = (
+    "the printer refused the bridge's credentials for the job's file, so prints are logged "
+    "without the slicer's estimates"
+)
+_DURATION = re.compile(r"(\d+)\s*([dhms])")
+_UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+
+
+@dataclass
+class JobFile:
+    """What was read of a job's file. Empty when nothing could be."""
+
+    grams: dict[int, float] = field(default_factory=dict)
+    """The slicer's grams per tool (slot), tools that use nothing left out."""
+    mm: dict[int, float] = field(default_factory=dict)
+    duration_s: float | None = None
+    printer_model: str | None = None
+    metadata: SlicerMetadata | None = None
+    settings: SlicerFile | None = None
+    thumbnail: bytes | None = None
+
+
+class PrusaLinkFiles:
+    def __init__(
+        self,
+        printer: str,
+        client: PrusaLinkClient,
+        report: PrinterReport,
+        *,
+        enabled: bool = True,
+        max_gcode_bytes: int = DEFAULT_MAX_GCODE_BYTES,
+        timeout: float = READ_TIMEOUT_S,
+    ) -> None:
+        self.printer = printer
+        self.client = client
+        self.report = report
+        self.enabled = enabled
+        self.max_gcode_bytes = max_gcode_bytes
+        self.timeout = timeout
+        self._key: tuple[Any, ...] | None = None
+        self._file: JobFile | None = None
+
+    async def read(self, job: Mapping[str, Any]) -> JobFile:
+        """The file of `job` (`/api/v1/job`'s answer), read once per job."""
+        file = job.get("file") if isinstance(job.get("file"), Mapping) else {}
+        refs = file.get("refs") if isinstance(file.get("refs"), Mapping) else {}  # type: ignore[union-attr]
+        key = (job.get("id"), refs.get("download"), file.get("display_name"))  # type: ignore[union-attr]
+        if key == self._key and self._file is not None:
+            return self._file
+        found = JobFile()
+        if self.enabled:
+            try:
+                found = await asyncio.wait_for(self._read(file, refs), self.timeout)  # type: ignore[arg-type]
+            except Refused:
+                log.warning("[printer %s] %s", self.printer, REFUSED)
+                self.report.warn(WARNING, REFUSED)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "[printer %s] the job's file didn't arrive within %gs, so it is logged "
+                    "without the slicer's estimates", self.printer, self.timeout,
+                )  # fmt: skip
+            except (aiohttp.ClientError, OSError, NotBgcode) as e:
+                log.warning(
+                    "[printer %s] can't read the job's file (%s), so it is logged without the "
+                    "slicer's estimates", self.printer, e,
+                )  # fmt: skip
+            else:
+                self.report.warn(WARNING, None)
+        self._key, self._file = key, found
+        return found
+
+    async def _read(self, file: Mapping[str, Any], refs: Mapping[str, Any]) -> JobFile:
+        meta = file.get("meta")
+        download = refs.get("download")
+        name = str(file.get("display_name") or file.get("name") or download or "")
+        if isinstance(meta, Mapping) and meta:
+            found = facts_from_meta(meta)
+        elif not isinstance(download, str) or not download.startswith("/"):
+            found = JobFile()
+        elif is_bgcode(name):
+            found = await self._read_bgcode(download)
+        else:
+            size = file.get("size")
+            if isinstance(size, int) and size > self.max_gcode_bytes:
+                log.info(
+                    "[printer %s] %s is %d MB, over the %d MB the bridge reads for its "
+                    "estimates: logged without them",
+                    self.printer, name, size // 2**20, self.max_gcode_bytes // 2**20,
+                )  # fmt: skip
+                found = JobFile()
+            else:
+                found = await self._read_gcode(download)
+        if found.thumbnail is None and isinstance(refs.get("thumbnail"), str):
+            found.thumbnail = await self._thumbnail(refs["thumbnail"])
+        return found
+
+    async def _read_bgcode(self, path: str) -> JobFile:
+        reader = BgcodeReader()
+        read = 0
+        async with self.client.stream(path) as chunks:
+            async for chunk in chunks:
+                read += len(chunk)
+                if reader.feed(chunk) or read >= MAX_BGCODE_HEAD_BYTES:
+                    break
+        for problem in reader.info.problems:
+            log.info("[printer %s] in the job's file, %s", self.printer, problem)
+        return facts_from_bgcode(reader.info)
+
+    async def _read_gcode(self, path: str) -> JobFile:
+        head = bytearray()
+        tail = bytearray()
+        read = 0
+        async with self.client.stream(path) as chunks:
+            async for chunk in chunks:
+                read += len(chunk)
+                if read > self.max_gcode_bytes:
+                    log.info(
+                        "[printer %s] the job's file is over %d MB: logged without estimates",
+                        self.printer, self.max_gcode_bytes // 2**20,
+                    )  # fmt: skip
+                    return JobFile()
+                if len(head) < HEAD_BYTES:
+                    head += chunk[: HEAD_BYTES - len(head)]
+                tail += chunk
+                if len(tail) > 2 * TAIL_BYTES:
+                    del tail[: len(tail) - TAIL_BYTES]
+        cut = len(tail) > TAIL_BYTES
+        tail_bytes = bytes(tail[-TAIL_BYTES:])
+        block = config_block_from(tail_bytes, starts_mid_line=cut, after_gcode=True)
+        found = facts_from_meta(parse_ini(block.encode()) if block else {})
+        header = header_from(bytes(head))
+        if block or header:
+            found.settings = SlicerFile(header=header, config_block=block)
+        return found
+
+    async def _thumbnail(self, path: str) -> bytes | None:
+        data = bytearray()
+        try:
+            async with self.client.stream(path) as chunks:
+                async for chunk in chunks:
+                    data += chunk
+                    if len(data) > MAX_THUMBNAIL_BYTES:
+                        return None
+        except (aiohttp.ClientError, OSError, Refused) as e:
+            log.info("[printer %s] no thumbnail from the printer: %s", self.printer, e)
+            return None
+        return bytes(data) if image_type(bytes(data)) else None
+
+
+def is_bgcode(name: str) -> bool:
+    """`.bgcode`, or `.bgc` as Buddy's short (8.3) names have it."""
+    return posixpath.splitext(name.lower())[1] in (".bgcode", ".bgc")
+
+
+def facts_from_bgcode(info: BgcodeInfo) -> JobFile:
+    printer = info.metadata.get("printer", {})
+    found = facts_from_meta({**printer, **info.metadata.get("print", {})})
+    slicer = info.metadata.get("slicer", {})
+    if slicer:
+        block = config_block_from_settings(slicer)
+        if block:
+            found.settings = SlicerFile(config_block=block)
+    producer = info.metadata.get("file", {}).get("Producer", "")
+    name, _, version = producer.strip().rpartition(" ")
+    if not name:
+        name, version = version, ""
+    settings = {**printer, **slicer}
+    found.metadata = SlicerMetadata(
+        slicer=name or None,
+        slicer_version=version or None,
+        layer_height_mm=_first_number(settings.get("layer_height")),
+        first_layer_height_mm=_first_number(settings.get("first_layer_height")),
+        nozzle_diameter_mm=_first_number(settings.get("nozzle_diameter")),
+        filament_name=_first_text(settings.get("filament_settings_id")),
+        filament_type=_first_text(settings.get("filament_type")),
+        first_layer_nozzle_temperature_c=_first_number(settings.get("first_layer_temperature")),
+        first_layer_bed_temperature_c=_first_number(settings.get("first_layer_bed_temperature")),
+    )
+    pictures = [t for t in info.thumbnails if t.format in (PNG, JPG) and image_type(t.data)]
+    if pictures:
+        found.thumbnail = max(pictures, key=lambda t: t.width * t.height).data
+    return found
+
+
+def facts_from_meta(meta: Mapping[str, Any]) -> JobFile:
+    """The estimates in a file's metadata: PrusaSlicer's `filament used [g]` and `[mm]` (one
+    value per tool, comma separated, in a `.bgcode` or a G-code file's comments; or a number
+    and a `... per tool` list, as PrusaLink's `file.meta` has them), and the print time."""
+    grams = _per_tool(meta, "filament used [g]")
+    mm = _per_tool(meta, "filament used [mm]")
+    duration = None
+    seconds = meta.get("estimated_print_time")
+    if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and seconds > 0:
+        duration = float(seconds)
+    else:
+        text = meta.get("estimated printing time (normal mode)")
+        duration = duration_of(text) if isinstance(text, str) else None
+    model = meta.get("printer_model")
+    return JobFile(
+        grams=grams,
+        mm=mm,
+        duration_s=duration,
+        printer_model=str(model).strip() or None if model else None,
+    )
+
+
+def duration_of(text: str) -> float | None:
+    """PrusaSlicer's `1d 2h 3m 4s` in seconds."""
+    parts = _DURATION.findall(text)
+    if not parts:
+        return None
+    return float(sum(int(n) * _UNITS[unit] for n, unit in parts))
+
+
+def _per_tool(meta: Mapping[str, Any], key: str) -> dict[int, float]:
+    values = _numbers(meta.get(f"{key} per tool"))
+    if not values:
+        values = _numbers(meta.get(key))
+    return {tool: round(v, 3) for tool, v in enumerate(values) if v > 0}
+
+
+def _numbers(value: Any) -> list[float]:
+    if isinstance(value, bool) or value is None:
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    items = value if isinstance(value, (list, tuple)) else re.split(r"[,;]", str(value))
+    out = []
+    for item in items:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            number = 0.0
+        out.append(number if number == number else 0.0)  # NaN is nothing
+    return out
+
+
+def _first_number(value: Any) -> float | None:
+    numbers = _numbers(value)
+    return numbers[0] if numbers else None
+
+
+def _first_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    first = re.split(r"[;,]", value)[0].strip().strip('"')
+    return first or None
