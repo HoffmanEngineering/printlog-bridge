@@ -36,7 +36,7 @@ from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.adapters.moonraker.images import MoonrakerImages
 from printlog_bridge.adapters.moonraker.session import MoonrakerSession
 from printlog_bridge.core.api_client import ApiClient
-from printlog_bridge.core.config import ConfigError, load_config
+from printlog_bridge.core.config import DEFAULT_STATUS_PAGE_HOST, ConfigError, load_config
 from printlog_bridge.core.events import SpoolCommand
 from printlog_bridge.core.spools import Spools
 from printlog_bridge.core.status import format_status
@@ -588,8 +588,15 @@ class TestOnlyOutboundConnections:
             if "sock.bind((" in line
         }
         assert len(bind_udp) == 1
+        # The local page (#100 story 14d) is the one TCP port: read-only, on 127.0.0.1 unless
+        # `status_page` says otherwise, and off with `status_page = off`
+        # (tests/test_local_page.py holds who may open it and what it never shows).
+        local_page = {f for f in found if f.startswith("core/local_page.py:")}
+        assert local_page
+        assert DEFAULT_STATUS_PAGE_HOST == "127.0.0.1"
         assert all(
-            f.startswith("adapters/bambu/discovery.py:") or f in listens_for_bambu | bind_udp
+            f.startswith("adapters/bambu/discovery.py:")
+            or f in listens_for_bambu | bind_udp | local_page
             for f in found
         )
         callers = {

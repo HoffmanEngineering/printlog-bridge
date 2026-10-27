@@ -367,3 +367,50 @@ def test_names_are_cleaned_for_the_api():
     assert pairing.clean_name("bridge\x07 on\tvoron") == "bridge onvoron"
     assert len(pairing.clean_name("x" * 300)) == 100
     assert pairing.clean_name("\x01") == "printlog-bridge"
+
+
+def test_the_code_waiting_for_approval_is_kept_for_the_local_page_until_pairing_ends(tmp_path):
+    seen: list = []
+
+    async def scenario(api, auth0, api_url):
+        auth0.script = ["pending"]
+        auth0.approve()
+        time = FakeTime()
+        result = pairing.pair(
+            api_url, tmp_path, name="n", create=False,
+            show=lambda a: seen.append(pairing.pending.get()), say=lambda m: None,
+            sleep=time.sleep, clock=time.clock,
+        )  # fmt: skip
+        await result
+
+    assert pairing.pending.get() is None
+    run(scenario)
+
+    [shown] = seen
+    assert shown.user_code
+    assert shown.verification_uri.startswith("http")
+    assert "device_code" not in repr(shown)
+    assert not hasattr(shown, "device_code")
+    assert shown.expires_at > 0
+    assert pairing.pending.get() is None  # paired: nothing waits any more
+
+
+def test_a_code_that_expired_is_no_longer_shown():
+    authorization = DeviceAuthorization("dc", "ABCD-EFGH", "https://a/activate", None, 1, 5)
+    now = [100.0]
+    codes = pairing.PendingCodes(clock=lambda: now[0])
+    codes.show(authorization)
+    assert codes.get().user_code == "ABCD-EFGH"
+    now[0] += 2
+    assert codes.get() is None
+
+
+def test_pairing_that_fails_forgets_its_code(tmp_path):
+    async def scenario(api, auth0, api_url):
+        auth0.script = ["pending", "deny"]
+        call, _, _ = pair(api_url, tmp_path)
+        with pytest.raises(PairingDenied):
+            await call
+
+    run(scenario)
+    assert pairing.pending.get() is None

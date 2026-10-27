@@ -8,9 +8,11 @@ import pytest
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.config import (
     DEFAULT_API_URL,
+    DEFAULT_STATUS_PAGE_PORT,
     Adoption,
     ApiKeySource,
     ConfigError,
+    PageAddress,
     find_config,
     load_config,
 )
@@ -497,3 +499,59 @@ class TestSlicerSettings:
 
         with pytest.raises(ConfigError, match="slicer_settings must be true or false"):
             load(path)
+
+
+class TestStatusPage:
+    def config(self, tmp_path, option: str = "", env=None):
+        path = write(tmp_path, f"[bridge]\n{option}\n[printer voron]\nadapter = fake\n")
+        return load(path, env)
+
+    def test_listens_on_this_computer_only_by_default(self, tmp_path):
+        config = self.config(tmp_path)
+        assert config.status_page == PageAddress("127.0.0.1", DEFAULT_STATUS_PAGE_PORT)
+        assert config.status_page_clients == ()
+
+    @pytest.mark.parametrize("value", ["off", "false", "no"])
+    def test_can_be_turned_off(self, tmp_path, value):
+        assert self.config(tmp_path, f"status_page = {value}").status_page is None
+
+    def test_a_port_alone_keeps_it_on_this_computer(self, tmp_path):
+        assert self.config(tmp_path, "status_page = 8000").status_page == PageAddress(
+            "127.0.0.1", 8000
+        )
+
+    def test_an_address_and_port(self, tmp_path):
+        assert self.config(tmp_path, "status_page = 0.0.0.0:7180").status_page == PageAddress(
+            "0.0.0.0", 7180
+        )
+        assert self.config(tmp_path, "status_page = [::]:7180").status_page == PageAddress(
+            "::", 7180
+        )
+        assert self.config(tmp_path, "status_page = localhost:7180").status_page == PageAddress(
+            "localhost", 7180
+        )
+
+    @pytest.mark.parametrize(
+        "value", ["nas.example.com:80", "1.2.3.4:0", "1.2.3.4:70000", "7180x", "1.2.3.4:"]
+    )
+    def test_anything_else_is_a_config_error(self, tmp_path, value):
+        with pytest.raises(ConfigError, match="status_page"):
+            self.config(tmp_path, f"status_page = {value}")
+
+    def test_the_environment_wins_over_the_file(self, tmp_path):
+        env = {"PRINTLOG_BRIDGE_STATUS_PAGE": "0.0.0.0:8099"}
+        config = self.config(tmp_path, "status_page = off", env)
+        assert config.status_page == PageAddress("0.0.0.0", 8099)
+        assert self.config(tmp_path, "", {"PRINTLOG_BRIDGE_STATUS_PAGE": "off"}).status_page is None
+
+    def test_clients_limit_who_may_open_it(self, tmp_path):
+        config = self.config(tmp_path, "status_page_clients = 192.168.1.10, ::1")
+        assert config.status_page_clients == ("192.168.1.10", "::1")
+        env = {"PRINTLOG_BRIDGE_STATUS_PAGE_CLIENTS": "172.30.32.2"}
+        assert self.config(tmp_path, "status_page_clients = 10.0.0.1", env).status_page_clients == (
+            "172.30.32.2",
+        )
+
+    def test_a_client_must_be_an_ip_address(self, tmp_path):
+        with pytest.raises(ConfigError, match="status_page_clients"):
+            self.config(tmp_path, "status_page_clients = laptop.local")

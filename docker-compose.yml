@@ -15,7 +15,8 @@ services:
     # The host's network, so the bridge finds printers for 3D Print Log's "Found on your
     # network" (mDNS and Bambu Lab's announcements don't cross Docker's default network),
     # `printlog-bridge discover` finds Bambu Lab printers, and a printer whose address changed
-    # is found again. The bridge opens no TCP port.
+    # is found again. The bridge opens one TCP port, its read-only local page (status, the
+    # pairing QR code, doctor), on 127.0.0.1:7180: this computer only.
     network_mode: host
     environment:
       # Your time zone, so the times in the log match your clock (UTC without it). status and
@@ -32,6 +33,9 @@ services:
       # PRINTLOG_API_KEY: ...
       # Record every message to and from each printer in state/traces, to report a problem:
       # PRINTLOG_BRIDGE_TRACE: "1"
+      # Open the local page to your network (anyone on it can then see the bridge's status
+      # and, while it pairs, the code to approve it), or turn it off with "off":
+      # PRINTLOG_BRIDGE_STATUS_PAGE: 0.0.0.0:7180
     volumes:
       # This folder: the config (printlog-bridge.cfg) and state/ (the device token, the outbox,
       # the log and the support bundle).

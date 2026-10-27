@@ -66,6 +66,13 @@ STATE_DIR_ENV = "PRINTLOG_BRIDGE_STATE_DIR"
 """The state directory when the config doesn't set `state_dir` (the Docker image sets it)."""
 TRACE_ENV = "PRINTLOG_BRIDGE_TRACE"
 """`trace` without editing the config (for Docker); wins over `trace` in `[bridge]`."""
+STATUS_PAGE_ENV = "PRINTLOG_BRIDGE_STATUS_PAGE"
+"""`status_page` without editing the config; wins over it (the Home Assistant app sets it)."""
+STATUS_PAGE_CLIENTS_ENV = "PRINTLOG_BRIDGE_STATUS_PAGE_CLIENTS"
+"""`status_page_clients` without editing the config; wins over it."""
+DEFAULT_STATUS_PAGE_PORT = 7180
+DEFAULT_STATUS_PAGE_HOST = "127.0.0.1"
+"""The local page listens on this computer only unless told otherwise (core/local_page.py)."""
 BOOLEANS = {
     "true": True, "yes": True, "on": True, "1": True,
     "false": False, "no": False, "off": False, "0": False,
@@ -81,6 +88,18 @@ MAX_ATTACHMENT_MB = 200
 """The API refuses a file attachment over 200 MB."""
 _WINDOW = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$")
 _WINDOW_UNITS = {"s": 1, "m": 60, "h": 60 * 60, "d": 24 * 60 * 60, "": 60 * 60}
+
+
+@dataclass(frozen=True)
+class PageAddress:
+    """Where the local page listens: an IP address (or `localhost`) and a port."""
+
+    host: str
+    port: int
+
+    def url(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host}:{self.port}/"
 
 
 class ConfigError(Exception):
@@ -146,6 +165,12 @@ class BridgeConfig:
     discovery: bool = True
     """`discovery`: look for printers on the network and report them to 3D Print Log, for
     "Found on your network" (#100). Only with a device token that has `bridge:sync`."""
+    status_page: PageAddress | None = PageAddress(
+        DEFAULT_STATUS_PAGE_HOST, DEFAULT_STATUS_PAGE_PORT
+    )
+    """`status_page`: where the local page (status, pairing, doctor) listens, or None (off)."""
+    status_page_clients: tuple[str, ...] = ()
+    """`status_page_clients`: the only addresses that may open the page; empty for any."""
     app_secrets: Mapping[int, Mapping[str, str]] = field(default_factory=dict)
     """`[app_printer <id>]` sections: the secrets of each printer connected in the app, by its
     entry id, until story 14 brings them from the app."""
@@ -277,6 +302,10 @@ def load_config(
         slicer_settings=slicer_settings,
         discovery=_flag(bridge.get("discovery") or "true", "[bridge] discovery"),
         app_secrets=app_secrets,
+        status_page=_status_page(bridge.get("status_page"), env.get(STATUS_PAGE_ENV)),
+        status_page_clients=_status_page_clients(
+            bridge.get("status_page_clients"), env.get(STATUS_PAGE_CLIENTS_ENV)
+        ),
     )
 
 
@@ -341,6 +370,53 @@ def _trace(option: str | None, variable: str | None) -> bool:
     if value is None:
         raise ConfigError(f"[bridge] trace must be true or false, not {option.strip()!r}")
     return value
+
+
+def _status_page(option: str | None, variable: str | None) -> PageAddress | None:
+    """`off`, a port (on this computer only), or `<IP address>:<port>` (`[::]:7180` for IPv6).
+    The environment wins over the file."""
+    from_env = variable is not None and bool(variable.strip())
+    text = (variable if from_env else option) or ""
+    text = text.strip()
+    where = STATUS_PAGE_ENV if from_env else "[bridge] status_page"
+    if not text:
+        return PageAddress(DEFAULT_STATUS_PAGE_HOST, DEFAULT_STATUS_PAGE_PORT)
+    if BOOLEANS.get(text.lower()) is False:
+        return None
+    host, port = DEFAULT_STATUS_PAGE_HOST, text
+    if ":" in text:
+        host, _, port = text.rpartition(":")
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+    problem = (
+        f"{where} must be off, a port, or an IP address and a port (such as 0.0.0.0:"
+        f"{DEFAULT_STATUS_PAGE_PORT}), not {text!r}"
+    )
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ConfigError(problem)
+    if host != "localhost":
+        try:
+            host = str(ipaddress.ip_address(host))
+        except ValueError:
+            raise ConfigError(problem) from None
+    return PageAddress(host, int(port))
+
+
+def _status_page_clients(option: str | None, variable: str | None) -> tuple[str, ...]:
+    from_env = variable is not None and bool(variable.strip())
+    text = (variable if from_env else option) or ""
+    where = STATUS_PAGE_CLIENTS_ENV if from_env else "[bridge] status_page_clients"
+    clients = []
+    for item in re.split(r"[\s,]+", text.strip()):
+        if not item:
+            continue
+        try:
+            clients.append(str(ipaddress.ip_address(item)))
+        except ValueError:
+            raise ConfigError(
+                f"{where} must be IP addresses, separated by commas, not {item!r}"
+            ) from None
+    return tuple(clients)
 
 
 def parse_duration(text: str) -> float | None:

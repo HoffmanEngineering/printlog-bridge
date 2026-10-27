@@ -113,3 +113,32 @@ def test_render_falls_back_to_ascii_when_the_stream_cant_show_blocks() -> None:
     assert all(len(line) == 2 * size for line in lines)
     assert set("".join(lines)) <= {"#", " "}
     text.encode("ascii")
+
+
+def _svg_modules(svg: str) -> set[tuple[int, int]]:
+    """The dark modules an SVG from qr.svg draws, as (row, column), quiet zone included."""
+    import re
+
+    [path] = re.findall(r'<path d="([^"]*)"', svg)
+    return {(int(y), int(x)) for x, y in re.findall(r"M(\d+) (\d+)h1v1h-1z", path)}
+
+
+def test_svg_draws_each_dark_module_inside_a_quiet_zone() -> None:
+    svg = qr.svg(URL)
+    matrix = qr.encode(URL.encode())
+    size = len(matrix) + 2 * qr.SVG_QUIET_ZONE
+    assert svg.startswith("<svg ")
+    assert f'viewBox="0 0 {size} {size}"' in svg
+    expected = {
+        (y + qr.SVG_QUIET_ZONE, x + qr.SVG_QUIET_ZONE)
+        for y, row in enumerate(matrix)
+        for x, dark in enumerate(row)
+        if dark
+    }
+    assert _svg_modules(svg) == expected
+
+
+def test_svg_holds_no_text_from_the_data() -> None:
+    # Only coordinates: nothing in the data can break out of the markup.
+    svg = qr.svg('https://x/"><script>alert(1)</script>')
+    assert "script" not in svg and "x/" not in svg

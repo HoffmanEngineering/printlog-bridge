@@ -124,3 +124,12 @@ def test_the_app_has_its_store_pages():
     for name in ("README.md", "DOCS.md", "CHANGELOG.md"):
         assert (APP / name).is_file(), name
     assert f"## {__version__}" in (APP / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+def test_the_status_page_is_the_apps_ingress_panel():
+    from printlog_bridge.cli.addon import INGRESS_PORT
+
+    assert CONFIG["ingress"] is True
+    assert CONFIG["ingress_port"] == INGRESS_PORT
+    assert CONFIG["panel_icon"].startswith("mdi:")
+    assert CONFIG["panel_title"]
