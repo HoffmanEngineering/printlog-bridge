@@ -20,6 +20,7 @@ import aiohttp
 from printlog_bridge.core.adapter import Adapter, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError, parse_duration
+from printlog_bridge.core.discovery import Discovery, Found
 from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.images import scrub_url
 from printlog_bridge.core.state import PrinterState
@@ -187,6 +188,46 @@ class MoonrakerAdapter(Adapter):
 
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
         return cls(printer, url=None, socket=socket, snapshots=snapshots, timelapse=timelapse)
+
+    app_secrets = ("moonraker_api_key",)
+
+    @classmethod
+    def discovery(cls) -> Discovery:
+        return lan.MoonrakerDiscovery()
+
+    @classmethod
+    def app_options(
+        cls, host: str, port: int | None, serial: str | None, secrets: Mapping[str, str]
+    ) -> dict[str, str]:
+        options = {"url": f"http://{host}:{port or lan.DEFAULT_PORT}"}
+        options.update({k: v for k, v in secrets.items() if v.strip()})
+        return options
+
+    def _address(self) -> tuple[str, int] | None:
+        if self.url is None:
+            return None
+        known = self.state.discovery.get("address") if self.state is not None else None
+        return (known or lan.host_of(self.url)), lan.port_of(self.url)
+
+    def _macs(self) -> frozenset[str]:
+        data = self.state.discovery.get("fingerprint") if self.state is not None else None
+        return lan.Fingerprint.from_json(data).macs if isinstance(data, Mapping) else frozenset()
+
+    def watches(self, found: Found) -> bool:
+        where = self._address()
+        if found.kind != self.name or where is None:
+            return False
+        macs = self._macs()
+        if macs and found.macs and macs & set(found.macs):
+            return found.port == where[1]
+        configured = (lan.host_of(self.url or ""), where[1])
+        return (found.address, found.port) in (where, configured)
+
+    def found_entry(self) -> Found | None:
+        where = self._address()
+        if where is None:
+            return None
+        return Found(self.name, where[0], where[1], macs=tuple(sorted(self._macs())))
 
     def serves(self, path: Path) -> str | None:
         return SERVED_BY_MOONRAKER if moonraker_serves(path) else None

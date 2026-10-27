@@ -17,7 +17,10 @@ import contextlib
 import socket
 from dataclasses import dataclass
 
+from printlog_bridge.core.discovery import Discovery, Found
+
 SSDP_PORT = 2021
+MQTT_PORT = 8883
 LISTEN_S = 6.0
 """Long enough to hear each printer at least once."""
 NOTIFY_TYPE = "urn:bambulab-com:device:3dprinter:1"
@@ -101,3 +104,24 @@ async def listen(seconds: float = LISTEN_S, port: int = SSDP_PORT) -> list[Found
         with contextlib.suppress(Exception):
             transport.close()
     return sorted(listener.found.values(), key=lambda f: f.address)
+
+
+class BambuDiscovery(Discovery):
+    """A Bambu printer's NOTIFY on UDP 2021, heard while the bridge runs. Nothing is sent to the
+    printer. Its MQTT port is reported: where the adapter connects."""
+
+    kind = "bambu"
+    udp_ports = (SSDP_PORT,)
+
+    def from_datagram(self, port: int, data: bytes, sender: str) -> Found | None:
+        printer = parse_notify(data, sender)
+        if printer is None:
+            return None
+        return Found(
+            kind="bambu",
+            address=printer.address,
+            port=MQTT_PORT,
+            model=printer.model_name,
+            name=printer.name,
+            serial=printer.serial,
+        )

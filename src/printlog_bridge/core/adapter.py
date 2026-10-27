@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from printlog_bridge.core.checks import CheckResult
+from printlog_bridge.core.discovery import Discovery, Found
 from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.status import PrinterReport
 
@@ -109,3 +110,40 @@ class Adapter(ABC):
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:
         """Diagnostics for `doctor`, such as whether the printer is reachable."""
+
+    # -- discovery and app-managed printers (#100) ---------------------------------------------
+
+    app_secrets: ClassVar[tuple[str, ...]] = ()
+    """The options a printer connected in the app takes from its `[app_printer <id>]` section
+    (until story 14 brings credentials from the app, encrypted to the bridge)."""
+
+    @classmethod
+    def discovery(cls) -> Discovery | None:
+        """How this kind of printer is found on the network (core/discovery.py). Optional: None
+        when it isn't. Never connects to a printer to log it."""
+        return None
+
+    @classmethod
+    def app_options(
+        cls, host: str, port: int | None, serial: str | None, secrets: Mapping[str, str]
+    ) -> dict[str, str] | None:
+        """The `from_config` options for a printer the user connected in the app, at `host` (an
+        IP address the bridge resolved and checked is private), or None when this adapter can't
+        watch one that way. `secrets` is its `[app_printer <id>]` section. Raise
+        `NeedsCredentials` when one is missing. Optional."""
+        return None
+
+    def watches(self, found: Found) -> bool:
+        """Whether `found` is the printer this adapter watches (by serial, MAC, or address and
+        port), so a config-file printer is reported as such and wins over the app. No I/O."""
+        return False
+
+    def found_entry(self) -> Found | None:
+        """This config-file printer as discovery would report it, when its address is known.
+        Optional. No I/O."""
+        return None
+
+
+class NeedsCredentials(Exception):
+    """A printer connected in the app needs a secret the bridge doesn't have yet. The message
+    names the options to add."""
