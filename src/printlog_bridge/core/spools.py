@@ -50,6 +50,7 @@ from printlog_bridge.core.api_client import (
     ApiRejected,
     ApiUnavailable,
     AuthRejected,
+    RepairNeeded,
 )
 from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolmanSpool, SpoolReading
 from printlog_bridge.core.status import StatusBoard
@@ -344,6 +345,11 @@ class Spools:
                 answer = await self._carry_out(command, printer_id)
                 if self._swapped(command.printer, command.slot, before, command.during):
                     answer += f". This print's {slot} usage is split here"
+        except RepairNeeded:
+            answer = (
+                "3D Print Log no longer accepts this bridge's device token; nothing changed. "
+                "Run `printlog-bridge pair` to pair it again."
+            )
         except AuthRejected:
             answer = (
                 "3D Print Log rejected the bridge's API key; nothing changed. Check it with "

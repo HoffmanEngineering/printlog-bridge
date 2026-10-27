@@ -22,10 +22,11 @@ log = logging.getLogger(__name__)
 
 def check_runnable(config: BridgeConfig) -> None:
     """What `run` needs beyond a valid config. Raises ConfigError saying what to set."""
-    if config.api_key is None:
+    if not config.has_credentials:
         raise ConfigError(
-            f"no API key. Create one at {API_KEYS_PAGE}, then run `printlog-bridge store-key` "
-            f"to store it (or set the {API_KEY_ENV} environment variable)."
+            "not paired with 3D Print Log yet. Run `printlog-bridge pair`, or create an API key "
+            f"at {API_KEYS_PAGE} and store it with `printlog-bridge store-key` (or set the "
+            f"{API_KEY_ENV} environment variable)."
         )
     for printer in config.printers:
         if printer.printer_id is None:
@@ -51,7 +52,6 @@ async def run_bridge(
     `status.json` in the state directory up to date for `printlog-bridge status`.
     """
     check_runnable(config)
-    assert config.api_key is not None  # check_runnable made sure
     # Every warning and error from here on is counted for the heartbeat (#37).
     problems = ProblemLog([p.name for p in config.printers], secrets=_secrets(config))
     bridge_log = logging.getLogger("printlog_bridge")
@@ -70,16 +70,27 @@ async def _run(
     backoff: tuple[float, float],
     spool_interval: float,
 ) -> None:
-    assert config.api_key is not None  # check_runnable made sure
     api_url_warning = config.api_url_warning()
     if api_url_warning is not None:
         log.warning("%s", api_url_warning)
 
     board = StatusBoard(config.state_dir)
-    board.start([p.name for p in config.printers], trace=config.trace)
+    board.start(
+        [p.name for p in config.printers],
+        trace=config.trace,
+        credentials=_credentials(config),
+    )
     traces = _start_tracing(config)
+
+    def credentials_problem(problem: str | None) -> None:
+        if problem is None:
+            log.info("the bridge was paired again: sending to 3D Print Log again")
+        else:
+            log.error("%s. Jobs wait in the outbox until then.", problem)
+        board.credentials_problem(problem)
+
     try:
-        async with ApiClient(config.api_url, config.api_key) as api:
+        async with ApiClient.for_config(config, on_credentials=credentials_problem) as api:
             spools = Spools(
                 api,
                 {p.name: p.printer_id for p in config.printers if p.printer_id is not None},
@@ -172,7 +183,16 @@ def _secrets(config: BridgeConfig) -> list[str]:
     secrets = known_secrets(config.path, config.state_dir, os.environ)
     if config.api_key:
         secrets.append(config.api_key)
+    if config.device is not None:
+        secrets.append(config.device.token)
     return secrets
+
+
+def _credentials(config: BridgeConfig) -> str:
+    if config.device is not None:
+        name = f", paired as {config.device.name}" if config.device.name else ""
+        return f"device token{name}"
+    return "API key"
 
 
 async def _keep_touching(board: StatusBoard, interval: float) -> None:

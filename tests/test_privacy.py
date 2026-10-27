@@ -588,8 +588,8 @@ class TestOnlyOutboundConnections:
     def test_only_these_modules_open_connections(self):
         """3D Print Log's API client, the image fetcher (Moonraker's thumbnails and its webcam),
         the Moonraker session, discovery (finding Moonraker on the local network), a Bambu
-        printer's MQTT and FTPS clients and its discovery (`discover` only), and PrusaLink's
-        HTTP client.
+        printer's MQTT and FTPS clients and its discovery (`discover` only), PrusaLink's
+        HTTP client, and pairing (3D Print Log's sign-in service, Auth0).
         docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
@@ -604,6 +604,7 @@ class TestOnlyOutboundConnections:
         assert found == {
             "core/api_client.py",
             "core/images.py",
+            "core/pairing.py",
             "adapters/moonraker/session.py",
             "adapters/moonraker/discovery.py",
             "adapters/bambu/mqtt.py",

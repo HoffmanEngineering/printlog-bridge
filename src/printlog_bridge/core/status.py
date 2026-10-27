@@ -109,7 +109,10 @@ class StatusBoard:
         self._data: dict[str, Any] = {}
         self._failing = False
 
-    def start(self, printers: Iterable[str], trace: bool = False) -> None:
+    def start(
+        self, printers: Iterable[str], trace: bool = False, credentials: str | None = None
+    ) -> None:
+        """`credentials` is what the bridge signs in with: `device token` or `API key`."""
         now = self._now()
         self._data = {
             "version": __version__,
@@ -119,6 +122,8 @@ class StatusBoard:
             "stopped_at": None,
             "trace": trace,
             "latest_version": None,
+            "credentials": credentials,
+            "credentials_problem": None,
             "printers": {
                 name: {
                     "connection": "starting",
@@ -154,6 +159,13 @@ class StatusBoard:
 
     def get(self, printer: str) -> dict[str, Any]:
         return self._data["printers"][printer]
+
+    def credentials_problem(self, problem: str | None) -> None:
+        """What's wrong with the bridge's credentials (a device token that needs a re-pair), or
+        None once it's fixed."""
+        if self._data.get("credentials_problem") != problem:
+            self._data["credentials_problem"] = problem
+            self._write()
 
     def latest_version(self, version: str | None) -> None:
         """The newest bridge release, as 3D Print Log last reported it, for `status` and
@@ -302,6 +314,7 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
             f"Bridge: not running: it last checked in {_ago(now, status['updated_at'])} ago and "
             "may have crashed. Check its log."
         ]
+    lines.append(_credentials_line(config, status, running))
     update = _update_line(config, status, running)
     if update:
         lines.append(update)
@@ -320,6 +333,19 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
         lines.extend(f"  {line}" for line in _printer_lines(printer, known, running, config, now))
 
     return "\n".join(lines), 0 if running else 1
+
+
+def _credentials_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str:
+    """How the bridge signs in: paired (a device token), or not, with an API key or none."""
+    problem = status.get("credentials_problem") if running else None
+    if problem:
+        return f"Pairing: {problem}"
+    if config.device is not None:
+        name = f" as {config.device.name!r}" if config.device.name else ""
+        return f"Pairing: paired{name} (device token in {config.device_token_file})"
+    if config.api_key is not None:
+        return f"Pairing: not paired; API key from {config.describe_api_key()}"
+    return "Pairing: not paired, and no API key. Run `printlog-bridge pair`."
 
 
 def _update_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str | None:
@@ -368,8 +394,6 @@ def _printer_lines(printer, known, running: bool, config: BridgeConfig, now: dat
         )
     if running and known.get("printer_state"):
         lines.append(f"Printer state: {known['printer_state']}")
-    key = f"API key from {config.describe_api_key()}" if config.api_key else "no API key"
-    lines.append(f"Pairing: not paired; {key}")
 
     if known.get("last_event"):
         lines.append(f"Last event: {known['last_event']} ({_ago(now, known['last_event_at'])} ago)")

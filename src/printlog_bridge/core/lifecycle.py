@@ -59,6 +59,7 @@ from printlog_bridge.core.api_client import (
     ApiUnavailable,
     AuthRejected,
     ClaimConflict,
+    RepairNeeded,
 )
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
@@ -120,6 +121,10 @@ BACKOFF_S = (2.0, 60.0)
 reaching 3D Print Log once the internet is back."""
 AUTH_PAUSE_S = 15 * 60
 """How long sending stops after the API rejects the key. Fixing it means a restart anyway."""
+REPAIR_PAUSE_S = 60
+"""How often sending is tried while the device token needs a re-pair. The API client refuses
+without asking the API until `printlog-bridge pair` stores a new token, so this is how soon the
+outbox starts moving again after a re-pair, without a restart."""
 MAX_RETRY_AFTER_S = 60 * 60
 """A `Retry-After` longer than this is taken as this, in case the API ever asks for days."""
 API_TOPIC = "api"
@@ -688,6 +693,13 @@ class JobLogger:
                 await self._send_image(entry)
             else:
                 await self._send_finish(entry)
+        except RepairNeeded as e:
+            # The API client logged it once; the entry waits, however long the re-pair takes.
+            problem = str(e)
+            log.debug("[printer %s] job %s waits for a re-pair", entry.printer, entry.job_id)
+            self.outbox.failed(entry.seq, problem)
+            self._paused_until = loop.time() + REPAIR_PAUSE_S
+            self._not_logged(entry, problem)
         except AuthRejected:
             problem = "3D Print Log rejected the API key (printlog-bridge doctor checks it)"
             log.error(
