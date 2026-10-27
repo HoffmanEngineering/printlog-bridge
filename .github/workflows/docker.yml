@@ -45,7 +45,7 @@ jobs:
       - if: matrix.qemu
         uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -60,7 +60,7 @@ jobs:
       - run: bash tests/docker/smoke.sh printlog-bridge:smoke "${{ matrix.platform }}"
       # The app's image: the same layers plus the addon stage.
       - if: matrix.platform != 'linux/arm/v7'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: addon
@@ -81,14 +81,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}
           push: false
           tags: printlog-bridge:pr
           cache-from: type=gha,scope=multiarch
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           target: addon
@@ -135,7 +135,7 @@ jobs:
             org.opencontainers.image.description=Logs every Klipper/Moonraker print to 3D Print Log automatically.
           annotations: |
             org.opencontainers.image.description=Logs every Klipper/Moonraker print to 3D Print Log automatically.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ env.PLATFORMS }}
@@ -162,7 +162,7 @@ jobs:
             org.opencontainers.image.description=The printlog-bridge Home Assistant app: logs every print to 3D Print Log.
           annotations: |
             org.opencontainers.image.description=The printlog-bridge Home Assistant app: logs every print to 3D Print Log.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           target: addon
