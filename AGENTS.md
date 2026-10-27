@@ -32,8 +32,13 @@ skipped by default.
   scrubs them, and new output paths go through it.
 - `tests/fixtures/moonraker/` holds real answers from a Snapmaker U1 and an Infimech EX. Don't edit
   them to make a test pass; record a new trace (`trace = true`) instead.
-- Tests never call the real 3D Print Log API: use `tests/fake_printlog_api.py` and
-  `tests/fake_moonraker.py`.
+- Tests never call the real 3D Print Log API or Auth0: use `tests/fake_printlog_api.py`,
+  `tests/fake_auth0.py` and `tests/fake_moonraker.py`. A test of `run` without credentials
+  pairs first, so point its `api_url` at a fake (or at `http://127.0.0.1:9`), never the default.
+- One credential per request (api#286): the device token from `pair` when there is one, else the
+  API key; the API answers 400 `multiple_credentials` to both. Only 401 `invalid_device_token`
+  means re-pair; 429 `device_token_throttled` is waited out. The pairing contract is
+  3d-print-log-api PR #286's "Contract for the bridge".
 
 ## Shipping
 
