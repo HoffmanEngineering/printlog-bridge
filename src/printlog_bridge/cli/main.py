@@ -46,7 +46,7 @@ from printlog_bridge.core.first_run import (
     write_starter_config,
 )
 from printlog_bridge.core.local_page import LocalPage
-from printlog_bridge.core.status import format_status
+from printlog_bridge.core.status import format_status, pairing_state
 from printlog_bridge.core.support import BUNDLE_NAME, write_support_bundle
 
 
@@ -64,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="watch every printer and log its prints")
     status = commands.add_parser(
         "status", help="what the running bridge is doing: each printer's connection and outbox"
+    )
+    status.add_argument(
+        "--pairing",
+        action="store_true",
+        help="print one line for scripts: pending <code> <address> [<link>] while a pairing "
+        "waits for approval, else paired, api-key or waiting",
     )
     store_key = commands.add_parser(
         "store-key",
@@ -142,7 +148,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run":
         return _run(args.config)
     if args.command == "status":
-        return _status(args.config)
+        return _status(args.config, pairing=args.pairing)
     if args.command == "store-key":
         return _store_key(args.config)
     if args.command == "pair":
@@ -187,7 +193,7 @@ def _doctor(explicit_config: Path | None) -> int:
     return 1 if any(r.status is Status.FAIL for r in results) else 0
 
 
-def _status(explicit_config: Path | None) -> int:
+def _status(explicit_config: Path | None, *, pairing: bool = False) -> int:
     env = dict(os.environ)
     home = Path.home()
     config_path = find_config(explicit_config, env=env, home=home)
@@ -198,6 +204,9 @@ def _status(explicit_config: Path | None) -> int:
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
         return 2
 
+    if pairing:
+        print(pairing_state(config))
+        return 0
     text, code = format_status(config)
     print(f"printlog-bridge {__version__} status")
     print(text)

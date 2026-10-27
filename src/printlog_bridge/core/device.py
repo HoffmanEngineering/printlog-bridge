@@ -15,17 +15,23 @@ check loads the config.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import os
+import re
+import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEVICE_ID_FILE = "device_id"
 DEVICE_TOKEN_FILE = "device_token"
 TOKEN_PREFIX = "pld_"
+PENDING_PAIRING_FILE = "pairing_pending.json"
+"""The code a pairing waits on, while it waits (`write_pending_pairing`)."""
 
 
 class DeviceFileError(Exception):
@@ -152,3 +158,90 @@ def write_private_file(path: Path, text: str) -> None:
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
         f.write(text.strip() + "\n")
     os.replace(str(temporary), str(path))
+
+
+@dataclass(frozen=True)
+class PendingPairing:
+    """What the user needs to approve the bridge: never the device code, which polls for the
+    token."""
+
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str | None
+
+
+_USER_CODE = re.compile(r"[A-Za-z0-9-]{1,32}")
+_URL_CHARS = re.compile(r"[!-~]{1,2000}")
+
+
+def _approval_url(url: object) -> bool:
+    """https (or http to this computer, a test tenant), in printable ASCII only: the address
+    reaches a terminal (the one-line Docker install shows it), so nothing that could steer it."""
+    if not isinstance(url, str) or not _URL_CHARS.fullmatch(url):
+        return False
+    parts = urlsplit(url)
+    if not parts.hostname:
+        return False
+    if parts.scheme == "https":
+        return True
+    if parts.scheme != "http":
+        return False
+    if parts.hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(parts.hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def write_pending_pairing(
+    state_dir: Path,
+    user_code: str,
+    verification_uri: str,
+    verification_uri_complete: str | None,
+    expires_in: float,
+    *,
+    now: Callable[[], float] = time.time,
+) -> None:
+    """Keeps the code a pairing waits on in the state directory, until `clear_pending_pairing`,
+    for `printlog-bridge status` (which `docker exec` can run, unlike the local page's memory).
+    Mode 600, like the token it leads to."""
+    write_private_file(
+        state_dir / PENDING_PAIRING_FILE,
+        json.dumps(
+            {
+                "userCode": user_code,
+                "verificationUri": verification_uri,
+                "verificationUriComplete": verification_uri_complete,
+                "expiresAt": now() + expires_in,
+            }
+        ),
+    )
+
+
+def clear_pending_pairing(state_dir: Path) -> None:
+    with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+        (state_dir / PENDING_PAIRING_FILE).unlink()
+
+
+def read_pending_pairing(
+    state_dir: Path, *, now: Callable[[], float] = time.time
+) -> PendingPairing | None:
+    """The code waiting for approval, or None: none, expired, or not a code and an address."""
+    try:
+        data = json.loads((state_dir / PENDING_PAIRING_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    code, uri, complete = (
+        data.get("userCode"),
+        data.get("verificationUri"),
+        data.get("verificationUriComplete"),
+    )
+    expires = data.get("expiresAt")
+    if not isinstance(code, str) or not _USER_CODE.fullmatch(code) or not _approval_url(uri):
+        return None
+    if not isinstance(expires, (int, float)) or now() >= expires:
+        return None
+    return PendingPairing(code, str(uri), complete if _approval_url(complete) else None)

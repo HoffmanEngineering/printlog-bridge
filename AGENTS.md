@@ -65,8 +65,12 @@ skipped by default.
   Docker"), POSIX `sh` (dash, busybox): users download it from
   `releases/latest/download/docker-install.sh`, which `docker.yml`'s `release-script` job attaches
   to each `v*` release with `DEFAULT_TAG=latest` replaced by the version (keep that line as is).
-  It never asks for an API key. `tests/install/docker_install_smoke.sh` runs it against a fake
-  `docker`; a new tool the script uses must be added to that test's `TOOLS` list.
+  It never asks for an API key. It mounts only `<dir>/data` (never the folder with the Compose
+  files, which the user runs again), refuses a folder it didn't make that isn't empty, `$HOME`,
+  top-level folders and running as root (without `--root`), and reads the pairing code from
+  `printlog-bridge status --pairing` (`core/device.py`'s `pairing_pending.json`), never from the
+  log. `tests/install/docker_install_smoke.sh` runs it against a fake `docker`; a new tool the
+  script uses must be added to that test's `TOOLS` list.
 - `unraid/printlog-bridge.xml` is listed in Unraid Community Applications, which indexes this
   repo (`ca_profile.xml`); `tests/test_unraid.py` checks it against the code. Keep its path:
   installs update from its `TemplateURL`. No other `.xml` file in the repo.

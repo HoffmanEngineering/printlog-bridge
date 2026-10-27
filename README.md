@@ -22,6 +22,16 @@ Pick one:
 
 ### One-line install with Docker
 
+> **From release 0.2.0 on.** The command below downloads the script attached to the latest release, and the first release with it is 0.2.0. Until then, download the script from `main`, read it, and run it with the `edge` image (the newest commit on `main`):
+>
+> ```sh
+> curl -fsSLO https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/scripts/docker-install.sh
+> less docker-install.sh
+> sh docker-install.sh --tag edge
+> ```
+>
+> Or set it up by hand with [`docker-compose.yml`](#on-a-raspberry-pi).
+
 On a Linux computer with [Docker](https://docs.docker.com/engine/install/) and Docker Compose, as your own user (not root):
 
 ```sh
@@ -32,7 +42,7 @@ It checks Docker, writes a Compose project to `~/printlog-bridge`, pulls the ima
 
 - runs on the **host's network** (`network_mode: host`): finding printers on your network (mDNS, Bambu Lab's announcements) doesn't work through Docker's own network;
 - starts again with Docker when the computer boots (`restart: unless-stopped`);
-- keeps its config (`printlog-bridge.cfg`) and its state (the pairing, prints not sent yet) in `~/printlog-bridge`;
+- keeps its config (`printlog-bridge.cfg`) and its state (the pairing, prints not sent yet) in `~/printlog-bridge/data`, the only folder the container sees, so nothing in the container can change the Compose files you run;
 - never needs an API key: pairing replaces it;
 - serves its [local page](#the-local-page) at <http://127.0.0.1:7180/>, on that computer only. From another computer, `ssh -L 7180:127.0.0.1:7180 you@that-computer` and open the same address. To open it to your network instead, read [the warning](#the-local-page) first, then put this in `~/printlog-bridge/compose.override.yaml` and run the command again:
 
@@ -45,7 +55,7 @@ It checks Docker, writes a Compose project to `~/printlog-bridge`, pulls the ima
 
 Then connect your printers on 3D Print Log's Bridges page, which lists the ones the bridge found.
 
-**Running it again** updates the bridge to the latest release and keeps your config, your pairing and `compose.override.yaml` (Docker Compose reads it on top of `compose.yaml`, which the script rewrites each time: put your own settings, such as `PRINTLOG_BRIDGE_NAME`, there). It won't touch a folder that has a Compose file it didn't write, or replace a `printlog-bridge` container from elsewhere: it says what to do instead.
+**Running it again** updates the bridge to the latest release and keeps your config, your pairing and `compose.override.yaml` (Docker Compose reads it on top of `compose.yaml`, which the script rewrites each time: put your own settings, such as `PRINTLOG_BRIDGE_NAME`, there). It says what to do instead, and changes nothing, when it's given a folder it didn't make that has anything in it (the bridge takes over the folder it's given), your home folder, `/` or another top-level folder, a folder that isn't yours, or when there's a `printlog-bridge` container from elsewhere. It shows the pairing code from the bridge's own state (`printlog-bridge status --pairing`), never from its log, which a device on your network could put text into; and when the bridge already runs but needs pairing again, it shows that code too.
 
 **Options**, after `sh -s --`: `--dir DIR` for another folder, `--tag TAG` for another image tag (`edge`, to try what's on `main`; running the command again without it goes back to the release), `--no-wait` to not wait for the approval, and `--uninstall`:
 
@@ -55,16 +65,21 @@ curl -fsSL https://github.com/HoffmanEngineering/printlog-bridge/releases/latest
 
 That stops and removes the container and keeps the folder; `rm -rf ~/printlog-bridge` then removes the config and pairing too, and you can remove the bridge on 3D Print Log's Bridges page.
 
+**Not as root.** Run it as your own user: it uses `sudo` for Docker by itself when your user can't use Docker yet, and the folder stays yours. It refuses to run as root, because the folder and everything the script and Docker Compose do would then be root's; where root is the only user (some NAS shells), add `--root`.
+
 **Which version.** The script comes from the latest [release](https://github.com/HoffmanEngineering/printlog-bridge/releases) (not from `main`), and installs exactly that release's image (`printlog-bridge:<version>`, not `latest`), so what it does and what it installs change only with a release, never under you between runs. `docker compose pull` alone doesn't move to a newer release: run the command again.
 
-**Read it first.** `curl … | sh` runs whatever the URL returns, with your user's rights (and Docker's, which amount to root). It comes over HTTPS from this repository's releases, but if you'd rather read it before it runs, download it, read it, then run it, or use a release's own URL, which never changes:
+**Read it first.** `curl … | sh` runs whatever the URL returns, with your user's rights (and Docker's, which amount to root). It comes over HTTPS from this repository's releases, but if you'd rather read it before it runs, download it and its checksum, check and read it, then run it:
 
 ```sh
-curl -fsSLO https://github.com/HoffmanEngineering/printlog-bridge/releases/latest/download/docker-install.sh
+base=https://github.com/HoffmanEngineering/printlog-bridge/releases/latest/download
+curl -fsSLO "$base/docker-install.sh" && curl -fsSLO "$base/docker-install.sh.sha256"
+sha256sum -c docker-install.sh.sha256
 less docker-install.sh
 sh docker-install.sh
-# or a given release: .../releases/download/v0.2.0/docker-install.sh
 ```
+
+A given release's copy is at `.../releases/download/v0.2.0/docker-install.sh` (and `.sha256`). It changes only if that release's file is replaced (the release job re-uploads it when a tag's workflow runs again), so keep the checksum you checked if you want to notice that. The checksum comes from the same place as the script: it catches a damaged download, not a tampered release.
 
 **Where it doesn't install.** It stops and says why, rather than set up a bridge that can't find your printers:
 
@@ -115,6 +130,7 @@ Everything the bridge keeps is in one folder, mounted at `/data`:
 | --- | --- |
 | `/data/printlog-bridge.cfg` | the config: your printers. The bridge writes a starter one when there is none |
 | `/data/state/device_token`, `device_id` | the bridge's device token and its id, once you pair it |
+| `/data/state/pairing_pending.json` | the code to approve, while the bridge pairs (`status --pairing`, for scripts) |
 | `/data/state/api_key` | the API key, if you store one with `store-key` instead |
 | `/data/state/outbox.sqlite3`, `images/` | job events and pictures not sent yet |
 | `/data/state/printers/`, `status.json` | what has been logged, and what `status` shows |
@@ -171,7 +187,7 @@ curl -fsSLO https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge
 docker compose up -d && docker compose logs -f   # scan the QR code, then add printers to printlog-bridge.cfg here
 ```
 
-To switch a folder set up by hand to the one-line install, which keeps its config and pairing: `mv docker-compose.yml docker-compose.yml.old` there, then run the one-line install (with `--dir` if the folder isn't `~/printlog-bridge`).
+To switch a folder set up by hand to the one-line install, keeping its config and pairing: `docker compose down` there, `mkdir -p ~/printlog-bridge/data`, move `printlog-bridge.cfg` and `state/` into that `data/`, then run the one-line install. (The one-line install mounts only `data/`, unlike `docker-compose.yml`, which mounts its whole folder so a NAS project stays one folder.)
 
 ### Anywhere else (any Linux host)
 

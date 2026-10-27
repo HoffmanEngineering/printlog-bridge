@@ -189,12 +189,12 @@ jobs:
           PLATFORMS: ${{ env.ADDON_PLATFORMS }}
 
   release-script:
-    # The one-line install (README "Install with one command") downloads
+    # The one-line install (README "One-line install with Docker") downloads
     # releases/latest/download/docker-install.sh: attach it to the tag's GitHub release (made
     # here when there isn't one), with DEFAULT_TAG set to this release's version, so the copy a
-    # user runs installs the image released with it and only changes with a release. Only after
-    # verify, so the image it names can be pulled. tests/install/docker_install_smoke.sh runs the
-    # same sed.
+    # user runs installs the image released with it and only changes with a release, plus its
+    # SHA-256 for those who check it. Only after verify, so the image it names can be pulled.
+    # tests/install/docker_install_smoke.sh runs the same sed. Any failure fails the job.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [publish, verify]
     runs-on: ubuntu-latest
@@ -202,17 +202,35 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - env:
+      - id: attach
+        name: Attach docker-install.sh and its checksum to the release
+        env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.publish.outputs.tag }}
         run: |
+          set -euo pipefail
           mkdir dist
           sed "s/^DEFAULT_TAG=latest\$/DEFAULT_TAG=${VERSION}/" scripts/docker-install.sh >dist/docker-install.sh
           grep -qx "DEFAULT_TAG=${VERSION}" dist/docker-install.sh
+          (cd dist && sha256sum docker-install.sh >docker-install.sh.sha256)
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             prerelease=""
             case "$TAG" in *-*) prerelease="--prerelease" ;; esac
             gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" $prerelease
           fi
-          gh release upload "$TAG" dist/docker-install.sh --clobber
+          gh release upload "$TAG" dist/docker-install.sh dist/docker-install.sh.sha256 --clobber
+          echo "prerelease=$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" >>"$GITHUB_OUTPUT"
+      - name: The one-line install's address serves this release's script
+        # A prerelease is never releases/latest, so only a release is checked.
+        if: steps.attach.outputs.prerelease == 'false'
+        env:
+          BASE: https://github.com/${{ github.repository }}/releases/latest/download
+        run: |
+          set -euo pipefail
+          cd dist
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o served.sh "$BASE/docker-install.sh"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o served.sha256 "$BASE/docker-install.sh.sha256"
+          cmp served.sh docker-install.sh
+          cmp served.sha256 docker-install.sh.sha256
+          sha256sum -c docker-install.sh.sha256

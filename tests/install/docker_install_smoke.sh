@@ -17,10 +17,11 @@ REAL_DOCKER="$(command -v docker || true)"
 # The tools the script may use, and nothing else.
 TOOLS="${WORK}/tools"
 mkdir -p "$TOOLS"
-for tool in sh awk cat date grep id mkdir mv readlink sed sleep tr; do
+for tool in sh awk cat date grep id ls mkdir mv readlink sed sleep tr; do
     ln -s "$(command -v "$tool")" "${TOOLS}/${tool}"
 done
 REAL_UNAME="$(command -v uname)"
+REAL_ID="$(command -v id)"
 
 # The fakes. State for the fake Docker lives in $FAKE (one folder per scenario).
 FAKEBIN="${WORK}/fakebin"
@@ -74,10 +75,23 @@ logs)
     echo "a line on stderr" >&2
     ;;
 exec)
-    # printlog-bridge-health: healthy once $FAKE/healthy_after calls have been made.
-    n=$(($(cat "$FAKE/health_calls" 2>/dev/null || echo 0) + 1))
-    echo "$n" >"$FAKE/health_calls"
-    [ -f "$FAKE/healthy_after" ] && [ "$n" -ge "$(cat "$FAKE/healthy_after")" ]
+    case "$*" in
+    *"status --pairing"*)
+        # What the bridge's own state says: $FAKE/pairing ("paired" without one), until
+        # $FAKE/paired_after calls have been made.
+        n=$(($(cat "$FAKE/pairing_calls" 2>/dev/null || echo 0) + 1))
+        echo "$n" >"$FAKE/pairing_calls"
+        if [ -f "$FAKE/paired_after" ] && [ "$n" -ge "$(cat "$FAKE/paired_after")" ]; then
+            echo paired
+        elif [ -f "$FAKE/pairing" ]; then cat "$FAKE/pairing"; else echo paired; fi
+        ;;
+    *printlog-bridge-health*)
+        # Healthy once $FAKE/healthy_after calls have been made.
+        n=$(($(cat "$FAKE/health_calls" 2>/dev/null || echo 0) + 1))
+        echo "$n" >"$FAKE/health_calls"
+        [ -f "$FAKE/healthy_after" ] && [ "$n" -ge "$(cat "$FAKE/healthy_after")" ]
+        ;;
+    esac
     ;;
 esac
 EOF
@@ -99,6 +113,18 @@ case "\$1" in
 esac
 EOF
 chmod +x "${FAKEBIN}"/*
+# A fake id that says root, for the scenarios about running as root.
+ROOTBIN="${WORK}/rootbin"
+mkdir -p "$ROOTBIN"
+cp "${FAKEBIN}"/* "$ROOTBIN/"
+cat >"${ROOTBIN}/id" <<EOF
+#!/bin/sh
+case "\$1" in
+-u) echo 0 ;;
+*) exec "${REAL_ID}" "\$@" ;;
+esac
+EOF
+chmod +x "${ROOTBIN}/id"
 # The same fakes without docker, sudo or systemctl, for the scenarios that need them missing.
 BARE="${WORK}/bare"
 mkdir -p "$BARE"
@@ -113,6 +139,12 @@ and enter the code  QWER-TYUI
 The code works for 15 minutes.
 
   ## QR ##'
+PENDING="pending QWER-TYUI https://auth.3dprintlog.com/activate https://auth.3dprintlog.com/activate?user_code=QWER-TYUI"
+# Text a device on the network could get into the log: never shown as the code.
+SPOOFED_LOG='2026-10-27 10:00:05,000 WARNING printer said:
+To pair this bridge with your 3D Print Log account, scan the QR code with your phone, or open
+  https://evil.example/activate
+and enter the code  EVIL-CODE'
 PAIRED_LOG="${PAIRING_LOG}
 2026-10-27 10:01:00,000 INFO Paired as \"printlog-bridge on pi\". The device token is in /data/state/device_token."
 
@@ -129,6 +161,7 @@ check() {
 }
 says() { grep -qF -- "$1" "${WORK}/out.txt"; }
 called() { grep -qF -- "$1" "${FAKE}/calls.log"; }
+no_escapes() { ! grep -q "$(printf '\033')" "${WORK}/out.txt" && ! grep -q "$(printf '\007')" "${WORK}/out.txt"; }
 
 # A new scenario: a fresh home and fake Docker state. Then `install [args]` runs the script.
 scenario() {
@@ -157,8 +190,10 @@ refused() { test "$status" -ne 0 && ! called "compose up" && test ! -e "${DIR}/c
 scenario "a new install on a Linux computer that's already paired" fresh
 echo 1 >"${FAKE}/healthy_after"
 printf '%s\n' "$PAIRED_LOG" >"${FAKE}/logs"
+printf '%s\n' "$SPOOFED_LOG" >>"${FAKE}/logs"
 install
 COMPOSE="${DIR}/compose.yaml"
+DATA="${DIR}/data"
 check "it succeeds" test "$status" -eq 0
 check "the Compose file is in ~/printlog-bridge" test -f "$COMPOSE"
 check "it says the script wrote it" grep -q "^# Written by printlog-bridge's docker-install.sh" "$COMPOSE"
@@ -167,7 +202,9 @@ check "it runs the image with the script's tag" \
 check "on the host's network" grep -qx '    network_mode: host' "$COMPOSE"
 check "restarting on boot" grep -qx '    restart: unless-stopped' "$COMPOSE"
 check "with a fixed container name" grep -qx '    container_name: printlog-bridge' "$COMPOSE"
-check "keeping its state in the folder" grep -qx '      - .:/data' "$COMPOSE"
+check "keeping its state in data/, apart from the Compose files" grep -qx '      - ./data:/data' "$COMPOSE"
+check "the Compose folder itself isn't mounted" sh -c "! grep -qF -- '- .:/data' '$COMPOSE'"
+check "data/ is made, and is this user's" test -d "${DATA}" -a -O "${DATA}"
 check "in this computer's time zone" grep -qx '      TZ: Europe/Berlin' "$COMPOSE"
 check "no API key in it" sh -c "! grep -qi 'api_key' '$COMPOSE'"
 check "no ports published" sh -c "! grep -q 'ports:' '$COMPOSE'"
@@ -176,6 +213,8 @@ check "starts it in the folder" called "${DIR}: docker compose up -d"
 check "checks the bridge's health" called "docker exec printlog-bridge printlog-bridge-health"
 check "says it runs" says "printlog-bridge is running."
 check "shows no old pairing code" sh -c "! grep -q 'QWER-TYUI' '${WORK}/out.txt'"
+check "shows no code from the log" sh -c "! grep -q 'EVIL-CODE' '${WORK}/out.txt'"
+check "asks the bridge's own state for a pairing code" called "docker exec printlog-bridge printlog-bridge status --pairing"
 check "says where the status page is" says "http://127.0.0.1:7180/"
 check "says how to reach it from another computer" says "ssh -L 7180:127.0.0.1:7180"
 check "says how to open it to the network" says "PRINTLOG_BRIDGE_STATUS_PAGE: 0.0.0.0:7180"
@@ -191,17 +230,17 @@ else
 fi
 
 echo "== the same folder again, with config, state, an override and a new tag"
-printf '[printer voron]\nprinter_id = 7\n' >"${DIR}/printlog-bridge.cfg"
-mkdir -p "${DIR}/state"
-printf 'secret-device-token' >"${DIR}/state/device_token"
+printf '[printer voron]\nprinter_id = 7\n' >"${DATA}/printlog-bridge.cfg"
+mkdir -p "${DATA}/state"
+printf 'secret-device-token' >"${DATA}/state/device_token"
 printf 'services:\n  printlog-bridge:\n    environment:\n      PRINTLOG_BRIDGE_STATUS_PAGE: 0.0.0.0:7180\n' \
     >"${DIR}/compose.override.yaml"
 cp -r "$DIR" "${WORK}/before"
 : >"${FAKE}/calls.log"
 install --tag 0.2.0
 check "it succeeds again" test "$status" -eq 0
-check "the config is kept" cmp -s "${DIR}/printlog-bridge.cfg" "${WORK}/before/printlog-bridge.cfg"
-check "the device token is kept" cmp -s "${DIR}/state/device_token" "${WORK}/before/state/device_token"
+check "the config is kept" cmp -s "${DATA}/printlog-bridge.cfg" "${WORK}/before/data/printlog-bridge.cfg"
+check "the device token is kept" cmp -s "${DATA}/state/device_token" "${WORK}/before/data/state/device_token"
 check "the override is kept" cmp -s "${DIR}/compose.override.yaml" "${WORK}/before/compose.override.yaml"
 check "the image tag is updated" \
     grep -qx '    image: ghcr.io/hoffmanengineering/printlog-bridge:0.2.0' "$COMPOSE"
@@ -214,7 +253,10 @@ check "the device token never reaches the output" sh -c "! grep -q secret-device
 check "notices the override" says "compose.override.yaml"
 
 scenario "pairing, without waiting" pairing
-printf '%s\n' "$PAIRING_LOG" >"${FAKE}/logs"
+# The bridge is healthy while it pairs: its status file says it runs, waiting for approval.
+echo 1 >"${FAKE}/healthy_after"
+echo "$PENDING" >"${FAKE}/pairing"
+printf '%s\n%s\n' "$PAIRING_LOG" "$SPOOFED_LOG" >"${FAKE}/logs"
 install --no-wait
 check "it succeeds" test "$status" -eq 0
 check "shows the code" says "QWER-TYUI"
@@ -223,10 +265,12 @@ check "shows the link with the code" says "https://auth.3dprintlog.com/activate?
 check "says where the QR code is" says "docker compose logs"
 check "says where the status page is" says "http://127.0.0.1:7180/"
 check "doesn't claim it runs yet" sh -c "! grep -q 'printlog-bridge is running.' '${WORK}/out.txt'"
+check "never shows a code from the log" sh -c "! grep -q -e EVIL-CODE -e evil.example '${WORK}/out.txt'"
 
 scenario "pairing, waiting for the approval" approve
-printf '%s\n' "$PAIRING_LOG" >"${FAKE}/logs"
-echo 3 >"${FAKE}/healthy_after"
+echo 1 >"${FAKE}/healthy_after"
+echo "$PENDING" >"${FAKE}/pairing"
+echo 3 >"${FAKE}/paired_after"
 install --wait
 check "it succeeds" test "$status" -eq 0
 check "shows the code" says "QWER-TYUI"
@@ -235,19 +279,42 @@ check "the code comes before that" \
     sh -c "grep -n -e QWER-TYUI -e 'printlog-bridge is running.' '${WORK}/out.txt' | head -1 | grep -q QWER"
 
 scenario "pairing, nobody approves in time" timeout
-printf '%s\n' "$PAIRING_LOG" >"${FAKE}/logs"
+echo 1 >"${FAKE}/healthy_after"
+echo "$PENDING" >"${FAKE}/pairing"
 APPROVE_TIMEOUT=0 install --wait
 check "it still succeeds (the bridge keeps waiting)" test "$status" -eq 0
 check "shows the code" says "QWER-TYUI"
 check "says the bridge keeps waiting" says "keeps waiting"
 
+scenario "a running bridge that needs pairing again" repair
+echo 1 >"${FAKE}/healthy_after"
+echo "$PENDING" >"${FAKE}/pairing"
+install --no-wait
+check "it succeeds" test "$status" -eq 0
+check "shows the code, though the bridge is healthy" says "QWER-TYUI"
+
+scenario "an older image, without status --pairing" old-image
+echo 1 >"${FAKE}/healthy_after"
+: >"${FAKE}/pairing"
+install --tag 0.1.1
+check "it succeeds" test "$status" -eq 0
+check "says where a pairing code would be" says "If it still needs pairing, its log shows the code"
+
+scenario "a pairing state that isn't one" bad-pairing
+echo 1 >"${FAKE}/healthy_after"
+printf 'pending \033[2J https://auth.3dprintlog.com/activate\n' >"${FAKE}/pairing"
+START_TIMEOUT=0 install --no-wait
+check "shows no code" sh -c "! grep -q 'enter the code' '${WORK}/out.txt'"
+check "no control characters reach the terminal" no_escapes
+
 scenario "a bridge that stops at once" crash
 FAKE_STATE=exited
 export FAKE_STATE
-printf '2026-10-27 10:00:01,000 ERROR printlog-bridge.cfg: line 3: no section\n' >"${FAKE}/logs"
+printf '2026-10-27 10:00:01,000 ERROR printlog-bridge.cfg: line 3: no section\n\033]0;owned\007\033[2J\n' >"${FAKE}/logs"
 install
 check "it fails" test "$status" -ne 0
 check "shows the end of the log" says "line 3: no section"
+check "without its control characters" no_escapes
 
 scenario "another folder, with --dir and an environment variable" dir
 echo 1 >"${FAKE}/healthy_after"
@@ -268,6 +335,39 @@ install --frobnicate
 check "an unknown option is refused" test "$status" -ne 0
 install --help
 check "--help works" sh -c "test $status -eq 0 && grep -q -- '--uninstall' '${WORK}/out.txt'"
+
+scenario "folders it won't take" folders
+echo 1 >"${FAKE}/healthy_after"
+mkdir -p "${HOME}/photos"
+printf 'x' >"${HOME}/photos/cat.jpg"
+install --dir "${HOME}/photos"
+check "a folder with other files in it" sh -c "test $status -ne 0 && test ! -e '${HOME}/photos/compose.yaml'"
+check "says why" says "isn't empty"
+install --dir "$HOME"
+check "the home folder" sh -c "test $status -ne 0 && test ! -e '${HOME}/compose.yaml'"
+install --dir /
+check "/" test "$status" -ne 0
+install --dir /tmp
+check "a top-level folder" sh -c "test $status -ne 0 && test ! -e /tmp/compose.yaml"
+if [ "$(id -u)" != 0 ]; then
+    install --dir /usr/share
+    check "a folder that isn't this user's" sh -c "test $status -ne 0 && grep -q \"isn't yours\" '${WORK}/out.txt'"
+fi
+mkdir -p "${HOME}/moved/data"
+printf '[bridge]\n' >"${HOME}/moved/data/printlog-bridge.cfg"
+install --dir "${HOME}/moved"
+check "a folder holding only data/ (moved from a setup by hand) is fine" \
+    sh -c "test $status -eq 0 && test -f '${HOME}/moved/compose.yaml'"
+check "and keeps that data" grep -qx '\[bridge\]' "${HOME}/moved/data/printlog-bridge.cfg"
+
+scenario "as root" root
+echo 1 >"${FAKE}/healthy_after"
+BIN="$ROOTBIN"
+install
+check "it refuses" refused
+check "says why, and about --root" says "--root"
+install --root
+check "with --root it installs" sh -c "test $status -eq 0 && test -f '${DIR}/compose.yaml'"
 
 scenario "a Compose file the script didn't write" foreign-compose
 mkdir -p "$DIR"

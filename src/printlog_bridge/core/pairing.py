@@ -32,7 +32,14 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from printlog_bridge import __version__
-from printlog_bridge.core.device import TOKEN_PREFIX, DeviceToken, device_id, write_device_token
+from printlog_bridge.core.device import (
+    TOKEN_PREFIX,
+    DeviceToken,
+    clear_pending_pairing,
+    device_id,
+    write_device_token,
+    write_pending_pairing,
+)
 from printlog_bridge.core.qr import render
 
 log = logging.getLogger(__name__)
@@ -429,11 +436,13 @@ async def pair(
                 try:
                     authorization = await start(session, config, scopes)
                     pending.show(authorization)
+                    _keep_pending(state_dir, authorization)
                     show(authorization)
                     access_token = await wait_for_approval(
                         session, config, authorization, sleep=sleep, clock=clock
                     )
                     pending.clear()
+                    clear_pending_pairing(state_dir)
                     grant, repaired = await exchange(
                         session, api_url, access_token, device, clean_name(name)
                     )
@@ -445,6 +454,7 @@ async def pair(
                 break
         finally:
             pending.clear()
+            clear_pending_pairing(state_dir)
     stored = write_device_token(
         state_dir,
         token=str(grant["token"]),
@@ -454,6 +464,21 @@ async def pair(
         scopes=[str(s) for s in grant.get("scopes") or ()],
     )
     return stored, repaired
+
+
+def _keep_pending(state_dir: Path, authorization: DeviceAuthorization) -> None:
+    """The code, in the state directory too (`printlog-bridge status --pairing`). A state
+    directory that can't be written only loses that: the log and the local page still show it."""
+    try:
+        write_pending_pairing(
+            state_dir,
+            authorization.user_code,
+            authorization.verification_uri,
+            authorization.verification_uri_complete,
+            authorization.expires_in,
+        )
+    except OSError as e:
+        log.warning("Can't keep the pairing code in %s: %s", state_dir, e)
 
 
 async def _post_form(

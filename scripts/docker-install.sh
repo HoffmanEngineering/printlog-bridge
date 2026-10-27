@@ -10,10 +10,11 @@
 #   less docker-install.sh
 #   sh docker-install.sh
 #
-# It writes a Docker Compose project to ~/printlog-bridge (the config and the bridge's state live
-# in that folder too), runs the bridge on the host's network (finding printers needs it), restarts
-# it with Docker when the computer boots, and shows how to pair it with your 3D Print Log account.
-# It never asks for or stores an API key: pairing replaces it.
+# It writes a Docker Compose project to ~/printlog-bridge (the bridge's config and state go in its
+# data/ folder, the only one the container sees), runs the bridge on the host's network (finding
+# printers needs it), restarts it with Docker when the computer boots, and shows how to pair it
+# with your 3D Print Log account. It never asks for or stores an API key: pairing replaces it.
+# Run it as your own user, not root: it uses sudo for Docker by itself when it needs to.
 #
 # Running it again updates the bridge to the version this script names, and keeps your config,
 # your pairing and anything in compose.override.yaml. Options (after `sh -s --` when piped):
@@ -23,6 +24,7 @@
 #   --wait        wait for you to approve the pairing (the default in a terminal)
 #   --no-wait     don't
 #   --uninstall   stop and remove the container, keeping the folder
+#   --root        run as root anyway (see below)
 #
 # To run the bridge on the printer's own Pi instead, use install.sh from the repository.
 set -eu
@@ -51,8 +53,13 @@ usage() {
         "Installs printlog-bridge with Docker Compose in DIR (default ~/printlog-bridge), on the" \
         "host's network, and shows how to pair it. Running it again updates it and keeps the" \
         "config and pairing. --uninstall stops and removes the container and keeps DIR." \
-        "PRINTLOG_BRIDGE_DIR and PRINTLOG_BRIDGE_TAG set --dir and --tag."
+        "PRINTLOG_BRIDGE_DIR and PRINTLOG_BRIDGE_TAG set --dir and --tag. It refuses to run" \
+        "as root unless given --root."
 }
+
+# Text from the container, without control characters (keeps tabs and newlines), so nothing it
+# says can steer the terminal.
+printable() { tr -d '\000-\010\013-\037\177'; }
 
 # Docker, with sudo when this user can't use it directly.
 SUDO=
@@ -212,8 +219,48 @@ write_compose() {
         "    environment:" \
         "      TZ: $(time_zone)" \
         "    volumes:" \
-        "      # This folder: printlog-bridge.cfg and state/ (the pairing, prints not sent yet)." \
-        "      - .:/data"
+        "      # data/: printlog-bridge.cfg and state/ (the pairing, prints not sent yet). Only that" \
+        "      # folder, so nothing in the container can change these Compose files." \
+        "      - ./data:/data"
+}
+
+# Whether DIR is a folder this script may use: its own (its marked compose.yaml), or one with
+# nothing in it but data/ and compose.override.yaml. The container takes over data/ (it hands
+# every file in it to the bridge's user), so never a folder with anything else in it.
+dir_is_ours() {
+    if [ -f "${DIR}/compose.yaml" ] && grep -qxF "$MARKER" "${DIR}/compose.yaml"; then
+        return 0
+    fi
+    for entry in "$DIR"/* "$DIR"/.[!.]* "$DIR"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        case "${entry##*/}" in
+        data | compose.override.yaml) ;;
+        *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+check_dir() {
+    case "$DIR" in
+    /*/*) ;;
+    *) fail "printlog-bridge: ${DIR} is a system folder: choose a folder of its own, such as ~/printlog-bridge." ;;
+    esac
+    home="$(cd "${HOME:-/}" 2>/dev/null && pwd -P || echo "${HOME:-/}")"
+    if [ "$DIR" = "$home" ]; then
+        fail "printlog-bridge: ${DIR} is your home folder: choose a folder of its own, such as ~/printlog-bridge."
+    fi
+    if [ -e "$DIR" ] || [ -L "$DIR" ]; then
+        [ -d "$DIR" ] || fail "printlog-bridge: ${DIR} isn't a folder."
+        # The owner's uid (one folder, by number: nothing in its name is parsed). Root, with
+        # --root, may use any folder.
+        # shellcheck disable=SC2012
+        owner="$(ls -nd "$DIR" | awk '{ print $3 }')"
+        if [ "$(id -u)" != 0 ] && [ "$owner" != "$(id -u)" ]; then
+            fail "printlog-bridge: ${DIR} isn't yours, so this script won't hand it to the bridge." \
+                "Choose a folder of your own with --dir."
+        fi
+    fi
 }
 
 prepare_dir() {
@@ -221,17 +268,19 @@ prepare_dir() {
         if [ -e "${DIR}/${other}" ]; then
             fail "printlog-bridge: ${DIR} already has a ${other}." \
                 "" \
-                "To switch to this script's compose.yaml (it uses the same folder, so your config" \
-                "and pairing are kept), move it aside and run this again:" \
-                "" \
-                "  mv ${DIR}/${other} ${DIR}/${other}.old" \
-                "" \
-                "Or keep it, and update with \`${DK_HINT} compose pull && ${DK_HINT} compose up -d\` there."
+                "Keep it, and update with \`${DK_HINT} compose pull && ${DK_HINT} compose up -d\` there." \
+                "Or, to switch to this script, which keeps the bridge's files in a data/ folder:" \
+                "\`${DK_HINT} compose down\` there, make a new folder with a data/ folder in it, move" \
+                "printlog-bridge.cfg and state/ into that data/, and run this with --dir and the new folder."
         fi
     done
     if [ -e "${DIR}/compose.yaml" ] && ! grep -qxF "$MARKER" "${DIR}/compose.yaml"; then
         fail "printlog-bridge: ${DIR}/compose.yaml isn't one this script wrote, so it's left alone." \
-            "Move it aside to use this script there, or choose another folder with --dir."
+            "Choose another folder with --dir."
+    fi
+    if ! dir_is_ours; then
+        fail "printlog-bridge: ${DIR} isn't empty, and this script didn't make it." \
+            "The bridge takes over the folder it's given, so choose a new one with --dir."
     fi
     if wd="$(dk inspect --type container --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$CONTAINER" 2>/dev/null)" &&
         [ "$wd" != "$DIR" ]; then
@@ -245,19 +294,22 @@ prepare_dir() {
     fi
 }
 
-# The latest pairing code in the bridge's log, as "<code> <address> [<link>]", or nothing once
-# it's paired.
-pairing_code() {
-    dk logs "$CONTAINER" 2>&1 | awk '
-        / Paired[ .]/ || / Paired again/ { code = ""; uri = ""; full = "" }
-        /^To pair this bridge/ { getline; sub(/^ +/, ""); uri = $0 }
-        /^and enter the code / { code = $NF }
-        /^\(or open / { full = $3; sub(/\)$/, "", full) }
-        END {
-            if (code !~ /^[A-Za-z0-9-]+$/ || uri !~ /^https?:\/\/[!-~]+$/) exit
-            if (full !~ /^https?:\/\/[!-~]+$/) full = ""
-            print code " " uri " " full
-        }'
+# What the bridge's own state says about pairing (`printlog-bridge status --pairing`): "pending
+# <code> <address> [<link>]" while it waits for approval, else paired, api-key or waiting; nothing
+# from an image without it. Never its log, which a device on the network can put text into.
+pairing_state() {
+    dk exec "$CONTAINER" printlog-bridge status --pairing 2>/dev/null | printable | sed -n 1p || true
+}
+
+# "<code> <address> [<link>]" from a pending state, when it's a code and https addresses.
+pending_code() { # <state>; runs in a subshell, so set -f stays here
+    set -f
+    # shellcheck disable=SC2086 # split into its words
+    set -- $1
+    [ "${1:-}" = pending ] || return 0
+    case "${2:-}" in "" | *[!A-Za-z0-9-]*) return 0 ;; esac
+    case "${3:-}" in https://?*) ;; *) return 0 ;; esac
+    case "${4:-}" in https://?*) echo "$2 $3 $4" ;; *) echo "$2 $3" ;; esac
 }
 
 show_pairing() { # <code> <address> [<link>]
@@ -275,7 +327,7 @@ show_pairing() { # <code> <address> [<link>]
 
 show_log_tail() {
     say "" "The end of its log:" ""
-    dk logs --tail 20 "$CONTAINER" 2>&1 | sed 's/^/  /' || true
+    dk logs --tail 20 "$CONTAINER" 2>&1 | printable | sed 's/^/  /' || true
 }
 
 # Waits until the bridge runs, or shows its pairing code (and, with --wait, until it's approved).
@@ -293,11 +345,20 @@ wait_for_bridge() {
             fail "printlog-bridge: the bridge stopped (${state}). Its log above says why."
             ;;
         esac
-        if dk exec "$CONTAINER" printlog-bridge-health >/dev/null 2>&1; then
+        # A code waiting for approval comes first: the bridge is healthy while it pairs, and a
+        # paired bridge can need pairing again.
+        pairing="$(pairing_state)"
+        code="$(pending_code "$pairing")"
+        if [ -z "$code" ] && [ "$pairing" != waiting ] &&
+            dk exec "$CONTAINER" printlog-bridge-health >/dev/null 2>&1; then
+            if [ -n "$shown" ]; then say "" "Approved."; fi
             say "" "printlog-bridge is running."
+            if [ -z "$pairing" ]; then
+                # An image from before `status --pairing` (an older --tag).
+                say "If it still needs pairing, its log shows the code: ${DK_HINT} compose logs -f"
+            fi
             return 0
         fi
-        code="$(pairing_code)"
         if [ -n "$code" ] && [ "$code" != "$shown" ]; then
             # shellcheck disable=SC2086 # three words: code, address, link
             show_pairing $code
@@ -306,11 +367,11 @@ wait_for_bridge() {
             say "" "Waiting for you to approve it (Ctrl-C stops waiting; the bridge keeps running)..."
         fi
         now="$(date +%s)"
-        if [ -n "$shown" ] && [ "$now" -ge "$approve_deadline" ]; then
+        if [ -n "$shown" ] && [ -n "$code" ] && [ "$now" -ge "$approve_deadline" ]; then
             say "" "Not approved yet. The bridge keeps waiting, with a new code in its log when this one expires."
             return 0
         fi
-        if [ -z "$shown" ] && [ "$now" -ge "$start_deadline" ]; then
+        if [ -z "$code" ] && [ "$now" -ge "$start_deadline" ]; then
             show_log_tail
             say "" "The bridge is still starting. It keeps going: check its log in a minute."
             return 0
@@ -322,7 +383,8 @@ wait_for_bridge() {
 show_summary() {
     say "" \
         "Folder:      ${DIR}" \
-        "             printlog-bridge.cfg (printers you add by hand) and state/ (the pairing, prints not sent yet)" \
+        "             data/printlog-bridge.cfg (printers you add by hand) and data/state/ (the pairing," \
+        "             prints not sent yet)" \
         "Printers:    3D Print Log's Bridges page lists the printers the bridge finds on your network:" \
         "             connect them there." \
         "Log:         cd ${DIR} && ${DK_HINT} compose logs -f" \
@@ -352,11 +414,22 @@ show_summary() {
 
 install() {
     check_os
+    if [ "$(id -u)" = 0 ] && [ "$ROOT" != yes ]; then
+        fail "printlog-bridge: this is running as root." \
+            "" \
+            "Run it as your own user instead: it uses sudo for Docker by itself when it needs to, and" \
+            "the folder is then yours. As root, the folder is root's, and everything this script" \
+            "and Docker Compose do runs as root. Where root is the only user (some NAS shells), add" \
+            "--root (after \`sh -s --\` when piped)."
+    fi
     find_docker
     check_docker
+    check_dir
     mkdir -p "$DIR" || fail "printlog-bridge: can't make ${DIR}."
     DIR="$(cd "$DIR" && pwd -P)"
+    check_dir
     prepare_dir
+    mkdir -p "${DIR}/data" || fail "printlog-bridge: can't make ${DIR}/data."
     tmp="${DIR}/.compose.yaml.$$"
     write_compose >"$tmp"
     mv -f "$tmp" "${DIR}/compose.yaml"
@@ -375,7 +448,7 @@ uninstall() {
     (cd "$DIR" && dk compose down) || fail "printlog-bridge: Docker Compose failed (above)."
     say "" \
         "Stopped and removed the printlog-bridge container. Its folder is still there, with your" \
-        "config and pairing, for a reinstall. To remove it too:" \
+        "config and pairing in data/, for a reinstall. To remove it too:" \
         "" \
         "  rm -rf ${DIR}" \
         "" \
@@ -388,6 +461,7 @@ main() {
     TAG="${PRINTLOG_BRIDGE_TAG:-$DEFAULT_TAG}"
     WAIT=""
     ACTION=install
+    ROOT=no
     DIR_ARG=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -412,6 +486,7 @@ main() {
         --wait) WAIT=yes && shift ;;
         --no-wait) WAIT=no && shift ;;
         --uninstall) ACTION=uninstall && shift ;;
+        --root) ROOT=yes && shift ;;
         -h | --help)
             usage
             exit 0
