@@ -44,7 +44,16 @@ skipped by default.
 
 Public repo; `main` is protected. Branch, PR against `main`, wait for CI, squash merge (`/ship`).
 Every merge to `main` publishes `ghcr.io/hoffmanengineering/printlog-bridge:edge`; a `v*` tag
-publishes a versioned image. Push tags only when Chris asks. Branches are deleted on merge, so a
+publishes a versioned image, and the same tags of the Home Assistant app's image
+(`printlog-bridge-addon`, the Dockerfile's `addon` stage). Push tags only when Chris asks.
+
+The Home Assistant app (`home-assistant/`, `repository.yaml` at the root) is installed from this
+repo's default branch, and the Supervisor pulls `printlog-bridge-addon:<config.yaml version>`. A
+release PR bumps `__version__`, `home-assistant/config.yaml`'s `version` and its `CHANGELOG.md`
+together (`tests/test_ha_app.py` checks); tag right after merging it, since users see the new
+version as soon as it's on `main` and can't install it until the tag's image is published. No other
+file in the repo may be called `config.yaml`/`.yml`/`.json` (the Supervisor would read it as an
+app). `cli/addon.py` is the app's start-up; its options and config.yaml's schema must agree. Branches are deleted on merge, so a
 stacked PR is retargeted to `main` automatically.
 
 ## Commits and PRs

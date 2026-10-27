@@ -125,8 +125,17 @@ A PrusaLink printer's `password` or `api_key` stays in the config too, is sent o
 - It is kept in `device_token` in the state directory, mode 600, never in the config, with the address of the API that issued it. It is sent only to that API: after a change of `api_url` it isn't used at all (`doctor` says so), so it can't be sent anywhere else. When a device token is there, the bridge sends it and never the API key.
 - It works only on the calls the bridge makes (the table above), and only with the permissions the bridge asked for: it can't delete a print or a spool, or read anything else of your account. It has no expiry; you remove it in 3D Print Log, which takes effect on the bridge's next request. The bridge then stops sending, keeps every job in its outbox, and says "re-pair needed" in its log, `status` and `doctor` until `printlog-bridge pair` gets it a new one (which it picks up without a restart). Pairing again replaces the token; the old one stops working.
 - `device_id` next to it is the bridge's own random id, not a secret: pairing again sends the same one, so 3D Print Log keeps one entry for the bridge instead of adding another.
-- While pairing, the code to approve and a QR code of its address go to the terminal, or to the log on the first run (`docker logs`). Anyone who reads them before you approve could approve the bridge into their own account instead, so the code works for only about 15 minutes, and once.
+- While pairing, the code to approve and a QR code of its address go to the terminal, or to the log on the first run (`docker logs`, a Home Assistant app's Log tab). Anyone who reads them before you approve could approve the bridge into their own account instead, so the code works for only about 15 minutes, and once.
 - The token is scrubbed like a key everywhere the bridge writes, and the support bundle never includes `device_token`.
+
+**In the Home Assistant app** (`home-assistant/`), you enter the secrets in the app's options, as password fields. Home Assistant keeps the options with the app's settings and writes them to `/data/options.json` before each start; `/data` is the app's private folder, which Home Assistant never serves. The app's start-up (`printlog-bridge-addon`) then:
+
+- passes the 3D Print Log API key to the bridge in `PRINTLOG_API_KEY`, never in a file;
+- writes the printers' secrets (`access_code`, `password`, `api_key`) into `/data/printlog-bridge.cfg`, mode 600, owned by the user the bridge runs as (not root);
+- never prints an option's value: the app's Log tab shows only how many printers it watches and their names, and an option it refuses is named, never shown;
+- deletes a device token 3D Print Log refused (removed in the app, or replaced), so restarting the app pairs it again.
+
+A Home Assistant backup of the app includes `/data` (the options, the config, the device token and the outbox), but not `bridge.log`, traces or the support bundle (`backup_exclude`). Home Assistant encrypts backups by default since 2025.1. The app runs on the host's network, as `--network host` does in Docker, only to find printers; it still opens no ports. Tests: `tests/test_addon.py` (the API key in no file, the config's mode, nothing secret in the start-up's output or errors) and `tests/test_ha_app.py` (password fields, backup exclusions).
 
 `moonraker_api_key` stays in the config. It is only for remote mode, where the bridge usually runs on another computer, away from any folder Moonraker serves; `doctor` doesn't check where it is.
 

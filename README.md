@@ -172,7 +172,17 @@ Started with no API key or device token, the container pairs itself: its log sho
 
 To find your printers' addresses for the config, run `docker run --rm <image> discover --subnet 192.168.1.0/24` with your LAN's network: with Docker's default (bridge) networking the container sees its own network, not your LAN's, so it needs telling which one to scan. Finding a printer again after its address changes works with bridge networking too; only the zeroconf shortcut needs host networking (`network_mode: host`), and the scan covers for it.
 
-Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`; `run` and `doctor` then warn that the key travels unencrypted.
+Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`).
+
+## Run it as a Home Assistant app
+
+With Home Assistant OS (or Supervised) on the same network as the printers, the bridge runs as a Home Assistant app (formerly add-on), with no Docker or SSH:
+
+1. In Home Assistant, open **Settings > Apps**, then the app store, and in its menu **Repositories**. Add `https://github.com/HoffmanEngineering/printlog-bridge`.
+2. Install **3D Print Log Bridge**, add your printers on its **Configuration** tab (adapter, printer id, and the address and secrets for that adapter), turn on **Watchdog** and start it.
+3. Scan the QR code in its **Log** tab to pair it.
+
+The app's Documentation tab ([home-assistant/DOCS.md](home-assistant/DOCS.md)) has the details. It runs the image `ghcr.io/hoffmanengineering/printlog-bridge-addon`, the Docker image plus a start-up that writes the config from the app's options, on the host's network, for `amd64` and `aarch64` (Home Assistant no longer supports 32-bit Arm). For settings the options don't have, put a `printlog-bridge.cfg` in the app's config folder. Home Assistant shows its updates; the app's version is the bridge's. `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`; `run` and `doctor` then warn that the key travels unencrypted.
 
 ## Updating
 
@@ -188,6 +198,7 @@ To update:
 
 - **Docker, with Compose:** in the folder with the Compose file, run `docker compose pull && docker compose up -d`. On a Synology NAS, over SSH: `cd /volume1/docker/printlog-bridge && sudo docker compose pull && sudo docker compose up -d` (Container Manager saves the project's file there as `compose.yaml`). The project then runs the new image, with the same config and state.
 - **Docker, without Compose:** `docker pull ghcr.io/hoffmanengineering/printlog-bridge:latest`, then `docker rm -f printlog-bridge` and the same `docker run` as before. Your config and state are in `/data`, so nothing is lost.
+- **Home Assistant app:** Home Assistant shows the update on the app's page (and in Settings); the app doesn't print its own notice.
 - **On the printer (local mode):** update printlog-bridge in Mainsail's or Fluidd's update panel, where `install.sh` added it. Moonraker's update manager follows `main`, so it can be newer than the last release. Over SSH, `git -C ~/printlog-bridge pull && ~/printlog-bridge/install.sh --yes` does the same.
 
 ## Try it
