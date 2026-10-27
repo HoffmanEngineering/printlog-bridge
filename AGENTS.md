@@ -61,6 +61,12 @@ skipped by default.
 - `run` with no config or no printers waits (`core/first_run.py`) instead of exiting: keep it
   that way, or a NAS container restart-loops before the user has added printers. A paired bridge
   runs instead (printers can come from the app) and starts itself again when the file changes.
+- `scripts/docker-install.sh` is the one-line Docker install (README "One-line install with
+  Docker"), POSIX `sh` (dash, busybox): users download it from
+  `releases/latest/download/docker-install.sh`, which `docker.yml`'s `release-script` job attaches
+  to each `v*` release with `DEFAULT_TAG=latest` replaced by the version (keep that line as is).
+  It never asks for an API key. `tests/install/docker_install_smoke.sh` runs it against a fake
+  `docker`; a new tool the script uses must be added to that test's `TOOLS` list.
 - `unraid/printlog-bridge.xml` is listed in Unraid Community Applications, which indexes this
   repo (`ca_profile.xml`); `tests/test_unraid.py` checks it against the code. Keep its path:
   installs update from its `TemplateURL`. No other `.xml` file in the repo.

@@ -34,6 +34,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: shellcheck --version
       - run: shellcheck install.sh uninstall.sh tests/install/smoke.sh tests/docker/smoke.sh tests/docker/check_published.sh tests/docker/addon_smoke.sh
+      - run: shellcheck --shell=sh scripts/docker-install.sh
+      - run: shellcheck tests/install/docker_install_smoke.sh
 
   ha-app-lint:
     # The Home Assistant app's config.yaml against the Supervisor's schema, with the linter
@@ -67,6 +69,15 @@ jobs:
           test "$code" -eq 1 && grep -q "FAIL  Config" out.txt
       - name: install.sh and uninstall.sh, against a fake systemctl
         run: bash tests/install/smoke.sh
+
+  docker-install-smoke:
+    # The one-line Docker install (scripts/docker-install.sh) against a fake docker, with /bin/sh
+    # as dash (Ubuntu's), as on Debian and Raspberry Pi OS. The runner's real docker compose
+    # checks the Compose file it writes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/install/docker_install_smoke.sh
 
   integration:
     # The bridge against a real Moonraker (no Klipper) in Docker. See tests/integration/.

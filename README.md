@@ -10,7 +10,70 @@ It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connectio
 
 ## Requirements
 
-Python 3.9 or newer (Raspberry Pi OS Bullseye and later) and a printer running Moonraker.
+On the printer's own host: Python 3.9 or newer (Raspberry Pi OS Bullseye and later) and Moonraker. Anywhere else: a Linux computer with Docker on the same network as the printers, a NAS, or Home Assistant.
+
+## Install
+
+Pick one:
+
+- **A computer on your network, with Docker** (a Raspberry Pi, a mini PC, a home server, a NAS with a shell): the one-line install below. One bridge watches every printer on the network, and finds them by itself.
+- **A NAS from its app store:** [Synology](#on-a-synology-nas-container-manager) or [Unraid](#on-unraid). **Home Assistant:** [the app](#run-it-as-a-home-assistant-app).
+- **The printer's own Pi** (Klipper with Moonraker): [`install.sh`](#install-on-the-printer-local-mode), with Mainsail's and Fluidd's update panels.
+
+### One-line install with Docker
+
+On a Linux computer with [Docker](https://docs.docker.com/engine/install/) and Docker Compose, as your own user (not root):
+
+```sh
+curl -fsSL https://github.com/HoffmanEngineering/printlog-bridge/releases/latest/download/docker-install.sh | sh
+```
+
+It checks Docker, writes a Compose project to `~/printlog-bridge`, pulls the image and starts the bridge, then shows the code to approve it in 3D Print Log (scan the QR code in the log, or open the address and type the code) and waits until you have. The bridge:
+
+- runs on the **host's network** (`network_mode: host`): finding printers on your network (mDNS, Bambu Lab's announcements) doesn't work through Docker's own network;
+- starts again with Docker when the computer boots (`restart: unless-stopped`);
+- keeps its config (`printlog-bridge.cfg`) and its state (the pairing, prints not sent yet) in `~/printlog-bridge`;
+- never needs an API key: pairing replaces it;
+- serves its [local page](#the-local-page) at <http://127.0.0.1:7180/>, on that computer only. From another computer, `ssh -L 7180:127.0.0.1:7180 you@that-computer` and open the same address. To open it to your network instead, read [the warning](#the-local-page) first, then put this in `~/printlog-bridge/compose.override.yaml` and run the command again:
+
+  ```yaml
+  services:
+    printlog-bridge:
+      environment:
+        PRINTLOG_BRIDGE_STATUS_PAGE: 0.0.0.0:7180
+  ```
+
+Then connect your printers on 3D Print Log's Bridges page, which lists the ones the bridge found.
+
+**Running it again** updates the bridge to the latest release and keeps your config, your pairing and `compose.override.yaml` (Docker Compose reads it on top of `compose.yaml`, which the script rewrites each time: put your own settings, such as `PRINTLOG_BRIDGE_NAME`, there). It won't touch a folder that has a Compose file it didn't write, or replace a `printlog-bridge` container from elsewhere: it says what to do instead.
+
+**Options**, after `sh -s --`: `--dir DIR` for another folder, `--tag TAG` for another image tag (`edge`, to try what's on `main`; running the command again without it goes back to the release), `--no-wait` to not wait for the approval, and `--uninstall`:
+
+```sh
+curl -fsSL https://github.com/HoffmanEngineering/printlog-bridge/releases/latest/download/docker-install.sh | sh -s -- --uninstall
+```
+
+That stops and removes the container and keeps the folder; `rm -rf ~/printlog-bridge` then removes the config and pairing too, and you can remove the bridge on 3D Print Log's Bridges page.
+
+**Which version.** The script comes from the latest [release](https://github.com/HoffmanEngineering/printlog-bridge/releases) (not from `main`), and installs exactly that release's image (`printlog-bridge:<version>`, not `latest`), so what it does and what it installs change only with a release, never under you between runs. `docker compose pull` alone doesn't move to a newer release: run the command again.
+
+**Read it first.** `curl … | sh` runs whatever the URL returns, with your user's rights (and Docker's, which amount to root). It comes over HTTPS from this repository's releases, but if you'd rather read it before it runs, download it, read it, then run it, or use a release's own URL, which never changes:
+
+```sh
+curl -fsSLO https://github.com/HoffmanEngineering/printlog-bridge/releases/latest/download/docker-install.sh
+less docker-install.sh
+sh docker-install.sh
+# or a given release: .../releases/download/v0.2.0/docker-install.sh
+```
+
+**Where it doesn't install.** It stops and says why, rather than set up a bridge that can't find your printers:
+
+- **Docker Desktop** (macOS, Windows, and Docker Desktop on Linux) and **WSL**: Docker runs in a virtual machine there, and its host network isn't your network. Run the bridge on a Linux computer on the printers' network, or [run it by hand](#run-it-in-docker-remote-mode) and connect printers by their address.
+- **Rootless Docker**: its host network is a private one too. Use Docker as root (Docker's default install), or run it by hand.
+- **Podman**: run the image by hand with `--network host` (see [Anywhere else](#anywhere-else-any-linux-host)) and enable `podman-restart.service`.
+- **A Raspberry Pi Zero or 1** (armv6): there's no image for it. Every other Pi (32-bit `linux/arm/v7` or 64-bit `linux/arm64`) and `linux/amd64` work.
+
+If your user can't use Docker yet, it runs Docker with `sudo` (the folder stays yours), and says how to join the `docker` group instead. Without Docker, it shows Docker's own install command (`curl -fsSL https://get.docker.com | sh`) rather than run it for you.
 
 ## Install on the printer (local mode)
 
@@ -97,14 +160,22 @@ To run the bridge on the printer's own Pi, use `install.sh` above instead. Docke
 ```sh
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker "$USER"   # then log out and back in
+curl -fsSL https://github.com/HoffmanEngineering/printlog-bridge/releases/latest/download/docker-install.sh | sh
+```
+
+That's the [one-line install](#one-line-install-with-docker). By hand instead:
+
+```sh
 mkdir ~/printlog-bridge && cd ~/printlog-bridge
 curl -fsSLO https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/docker-compose.yml
 docker compose up -d && docker compose logs -f   # scan the QR code, then add printers to printlog-bridge.cfg here
 ```
 
+To switch a folder set up by hand to the one-line install, which keeps its config and pairing: `mv docker-compose.yml docker-compose.yml.old` there, then run the one-line install (with `--dir` if the folder isn't `~/printlog-bridge`).
+
 ### Anywhere else (any Linux host)
 
-[`docker-compose.yml`](docker-compose.yml) in an empty folder and `docker compose up -d` there, as on a Pi. Without Compose:
+The [one-line install](#one-line-install-with-docker), or [`docker-compose.yml`](docker-compose.yml) in an empty folder and `docker compose up -d` there, as on a Pi. Without Compose:
 
 ```sh
 docker run -d --name printlog-bridge --restart unless-stopped --network host \
@@ -143,6 +214,7 @@ Set `update_check = false` in `[bridge]` to turn the notice off. The heartbeat s
 
 To update:
 
+- **Docker, from the one-line install:** run the [install command](#one-line-install-with-docker) again. It installs the latest release's image, keeping your config and pairing (`docker compose pull` alone stays on the version it installed).
 - **Docker, with Compose:** in the folder with the Compose file, run `docker compose pull && docker compose up -d`. On a Synology NAS, over SSH: `cd /volume1/docker/printlog-bridge && sudo docker compose pull && sudo docker compose up -d` (Container Manager saves the project's file there as `compose.yaml`). The project then runs the new image, with the same config and state.
 - **Docker, without Compose:** `docker pull ghcr.io/hoffmanengineering/printlog-bridge:latest`, then `docker rm -f printlog-bridge` and the same `docker run` as before. Your config and state are in `/data`, so nothing is lost.
 - **Home Assistant app:** Home Assistant shows the update on the app's page (and in Settings); the app doesn't print its own notice.
@@ -358,7 +430,7 @@ access_code = 12345678
 
 Save it and the bridge starts watching within a few seconds. **A value in the config file wins** over one entered in the app for the same field: the config file is the bridge's own, it's the rule for printers too, and setups made before the app took credentials keep working unchanged. `status` shows where each credential came from (`access_code: from [app_printer 7] in the config file, which overrides the app's`); remove the line to use the app's.
 
-**Networking.** Multicast and broadcast don't cross Docker's default (bridge) network, so finding printers needs the host's network: `network_mode: host` (the Compose file and the examples above use it), Unraid's host networking (the template's default), or the Home Assistant app (always on the host's network). On Docker Desktop (Windows, macOS) the container can't see your LAN this way; connect printers in the app by address instead. The bridge opens no TCP port; it listens on UDP 2021 only for Bambu's announcements.
+**Networking.** Multicast and broadcast don't cross Docker's default (bridge) network, so finding printers needs the host's network: `network_mode: host` (the one-line install, the Compose file and the examples above use it), Unraid's host networking (the template's default), or the Home Assistant app (always on the host's network). On Docker Desktop (Windows, macOS) the container can't see your LAN this way; connect printers in the app by address instead. Besides its [local page](#the-local-page) (`127.0.0.1:7180` unless you set otherwise), the bridge opens no TCP port; it listens on UDP 2021 only for Bambu's announcements.
 
 A bridge paired before this release lacks the permission to check in (`bridge:sync`): it pairs again once by itself, with the QR code in its log; if that isn't approved, it says so in `status` and `doctor` and keeps logging the printers in its config. `printlog-bridge pair` gives it the permission at any time.
 
@@ -450,7 +522,7 @@ python -m venv .venv
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`.
+CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`. `tests/install/docker_install_smoke.sh` runs the one-line install, `scripts/docker-install.sh`, against a fake `docker` (with `/bin/sh` as dash, and the runner's `docker compose` checking the file it writes): the Compose project, running it again, pairing, `--uninstall`, and each setup it refuses. A `v*` tag attaches it to the GitHub release with that version's image tag set in it (`docker.yml`'s `release-script` job).
 
 The Docker workflow builds the image for each platform and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run`, `status` and `pair` inside the container run with `--user` (as installs from before the image handed over its folder itself), then a new install with no config and a root-owned folder, and `PUID`/`PGID`, against three fake Moonrakers, a fake 3D Print Log API and a fake Auth0 on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. amd64 and arm64 run natively (arm64 on GitHub's Arm runner), arm/v7 under QEMU. It then pushes all three to GHCR from `main` (`edge`) and from `v*` tags, and `tests/docker/check_published.sh` checks the result without logging in: the tag pulls, has every platform, and each one starts. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev` (add `--platform linux/arm/v7` to the build, and `linux/arm/v7` after the image, to try another platform under QEMU).
 

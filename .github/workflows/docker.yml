@@ -187,3 +187,32 @@ jobs:
       - run: bash tests/docker/check_published.sh "${{ env.ADDON_IMAGE }}:${{ needs.publish.outputs.addon_tag }}"
         env:
           PLATFORMS: ${{ env.ADDON_PLATFORMS }}
+
+  release-script:
+    # The one-line install (README "Install with one command") downloads
+    # releases/latest/download/docker-install.sh: attach it to the tag's GitHub release (made
+    # here when there isn't one), with DEFAULT_TAG set to this release's version, so the copy a
+    # user runs installs the image released with it and only changes with a release. Only after
+    # verify, so the image it names can be pulled. tests/install/docker_install_smoke.sh runs the
+    # same sed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.publish.outputs.tag }}
+        run: |
+          mkdir dist
+          sed "s/^DEFAULT_TAG=latest\$/DEFAULT_TAG=${VERSION}/" scripts/docker-install.sh >dist/docker-install.sh
+          grep -qx "DEFAULT_TAG=${VERSION}" dist/docker-install.sh
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            prerelease=""
+            case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+            gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" $prerelease
+          fi
+          gh release upload "$TAG" dist/docker-install.sh --clobber
