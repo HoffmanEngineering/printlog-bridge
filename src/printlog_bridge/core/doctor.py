@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from printlog_bridge import __version__
+from printlog_bridge.core import credentials
 from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.api_client import ApiClient, ApiUnavailable, AuthRejected, RepairNeeded
 from printlog_bridge.core.checks import CheckResult, Status
@@ -73,6 +74,9 @@ async def diagnose(
     if device is not None:
         results.append(device)
     results.extend(_check_printer_secrets(config))
+    key = _check_credential_key(config, clock())
+    if key is not None:
+        results.append(key)
     results.extend(_check_bridge(config, clock()))
     api, server_time = await _check_api(config)
     results.append(api)
@@ -262,6 +266,51 @@ def _check_device_token(config: BridgeConfig) -> CheckResult | None:
     return CheckResult.ok(name, f"in {path}{paired}")
 
 
+def _check_credential_key(config: BridgeConfig, now: datetime) -> CheckResult | None:
+    """The key printer credentials from the app are sealed to (story 14b): the package, the
+    file, who can read it, and whether 3D Print Log uses it. Only for a paired bridge."""
+    if config.device is None:
+        return None
+    name = "Credential key"
+    if not credentials.available():
+        return CheckResult.warn(name, credentials.MISSING_PACKAGE)
+    path = credentials.key_path(config.state_dir)
+    try:
+        key = credentials.read_key(config.state_dir)
+    except credentials.KeyUnavailable as e:
+        return CheckResult.fail(
+            name,
+            f"{e}. Printers connected in the app can't use credentials entered there until the "
+            "bridge can read its key (or, if the file is damaged, run "
+            "`printlog-bridge rotate-key` and confirm the new key in 3D Print Log)",
+        )
+    if key is None:
+        return CheckResult.ok(name, "none yet: the bridge makes one when it runs")
+    served = _served(config, path)
+    if served is not None:
+        return CheckResult.warn(
+            name,
+            f"{path} is in a folder {served}. Set state_dir in [bridge] to a folder outside it, "
+            "then run `printlog-bridge rotate-key`.",
+        )
+    if os.name == "posix":
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            return CheckResult.warn(
+                name,
+                f"other users on this computer can read {path} (mode {mode:o}). Run: chmod 600 "
+                f"{path}",
+            )
+    detail = f"fingerprint {credentials.short_fingerprint(key.fingerprint)}, in {path}"
+    status = read_status(config.state_dir) or {}
+    reported = (status.get("bridge") or {}).get("key") or {}
+    if not (status and is_running(status, now)) or reported.get("fingerprint") != key.fingerprint:
+        return CheckResult.ok(name, detail)
+    if reported.get("state") in ("pending", "other", "rejected"):
+        return CheckResult.warn(name, f"{detail}: {reported.get('detail')}")
+    return CheckResult.ok(name, f"{detail}: {reported.get('detail')}")
+
+
 def _check_bridge(config: BridgeConfig, now: datetime) -> list[CheckResult]:
     """Discovery, the check-in and the printers connected in the app (#100), as the running
     bridge last wrote them."""
@@ -291,7 +340,14 @@ def _check_bridge(config: BridgeConfig, now: datetime) -> list[CheckResult]:
         detail = f"{app.get('kind')} at {app.get('host')}: {app.get('state')}" + (
             f": {app['detail']}" if app.get("detail") else ""
         )
-        if app.get("state") in ("watching", "in the config file"):
+        problems = [
+            f"{field}: {words}"
+            for field, words in sorted((app.get("credentials") or {}).items())
+            if not words.startswith("from ")
+        ]
+        if problems:
+            detail += "; " + "; ".join(problems)
+        if app.get("state") in ("watching", "in the config file") and not problems:
             results.append(CheckResult.ok(name, detail))
         else:
             results.append(CheckResult.warn(name, detail))
