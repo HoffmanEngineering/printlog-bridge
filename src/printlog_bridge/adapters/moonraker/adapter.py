@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from printlog_bridge.core.adapter import Adapter
+from printlog_bridge.core.adapter import Adapter, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError, parse_duration
 from printlog_bridge.core.events import EventSink, SpoolSink
@@ -45,6 +45,7 @@ from .session import (
 from .spoolman import SpoolmanSync
 from .spools import SpoolWatcher
 from .timelapse import TimelapseWatcher
+from .tools import EXTRUDER
 from .u1_rfid import U1RfidReader
 
 log = logging.getLogger(__name__)
@@ -335,6 +336,51 @@ class MoonrakerAdapter(Adapter):
         else:
             result = CheckResult.ok(name, detail)
         return [result, *await self._notifier_check(self.url)]
+
+    async def printer_details(self) -> PrinterDetails:
+        """The host name, the kinematics and how many extruders Klipper has (one slot each)."""
+        url = lan.with_host(self.url, self._last_found()) if self._last_found() else self.url
+
+        async def call(method: str, params: Mapping[str, Any] | None = None) -> Any:
+            return await asyncio.wait_for(
+                fetch_once(
+                    self.printer,
+                    method,
+                    url=url,
+                    socket=self.socket,
+                    api_key=self.api_key,
+                    params=params,
+                ),
+                CHECK_TIMEOUT_S,
+            )
+
+        try:
+            info = await call("printer.info")
+            objects = (await call("printer.objects.list")).get("objects") or []
+            query = {"objects": {"configfile": ["settings"]}}
+            status = (await call("printer.objects.query", query)).get("status") or {}
+        except (MoonrakerAuthError, *CHECK_ERRORS, AttributeError):
+            return PrinterDetails(name=self.printer, make="Klipper")
+        hostname = info.get("hostname") if isinstance(info, Mapping) else None
+        extruders = sum(1 for o in objects if isinstance(o, str) and EXTRUDER.fullmatch(o))
+        settings = (status.get("configfile") or {}).get("settings") or {}
+        kinematics = (settings.get("printer") or {}).get("kinematics")
+        kinematics = kinematics if isinstance(kinematics, str) and kinematics else None
+        return PrinterDetails(
+            name=hostname if isinstance(hostname, str) and hostname else self.printer,
+            make="Klipper",
+            model=kinematics,
+            slot_count=extruders or None,
+            description=", ".join(
+                part
+                for part in (
+                    f"{kinematics} kinematics" if kinematics else "",
+                    f"{extruders} extruder{'' if extruders == 1 else 's'}" if extruders else "",
+                )
+                if part
+            )
+            or None,
+        )
 
     async def _notifier_check(self, url: str | None) -> list[CheckResult]:
         """A warning when Moonraker still has a notifier logging prints to 3D Print Log, or

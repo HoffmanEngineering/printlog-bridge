@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -14,6 +15,20 @@ from printlog_bridge.core.status import PrinterReport
 if TYPE_CHECKING:
     from printlog_bridge.core.state import PrinterState
     from printlog_bridge.core.trace import Trace
+
+
+@dataclass(frozen=True)
+class PrinterDetails:
+    """What an adapter can tell about its printer, to fill in a new printer in 3D Print Log when
+    the bridge pairs (`printlog-bridge pair`). Every field is a suggestion the user can change."""
+
+    name: str | None = None
+    """Such as the host name the printer goes by on the network."""
+    make: str | None = None
+    model: str | None = None
+    slot_count: int | None = None
+    """How many filament positions (tools, MMU or AMS slots) it has, when the adapter knows."""
+    description: str | None = None
 
 
 class Adapter(ABC):
@@ -84,6 +99,12 @@ class Adapter(ABC):
         "a folder", naming who can download it, such as "Moonraker serves to anyone who can open
         Mainsail or Fluidd". No I/O beyond looking at the local file system."""
         return None
+
+    async def printer_details(self) -> PrinterDetails:
+        """What the adapter knows of the printer's name, make, model and slots, asking the
+        printer if it must, for `pair` to suggest when it creates the printer in 3D Print Log.
+        Optional. Never raises for a printer that can't be reached: return what is known."""
+        return PrinterDetails()
 
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:

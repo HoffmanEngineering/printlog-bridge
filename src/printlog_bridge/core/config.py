@@ -20,6 +20,9 @@ The API key is looked up in this order: the `PRINTLOG_API_KEY` environment varia
 file `<state_dir>/api_key` (which `printlog-bridge store-key` and install.sh write, mode 600),
 then `api_key` in `[bridge]`. In local mode the config sits in Klipper's config folder, which
 Moonraker serves to anyone who can open Mainsail or Fluidd, so the key file is the default.
+
+A device token from `printlog-bridge pair` (`<state_dir>/device_token`, core/device.py) wins
+over every API key: the bridge sends one credential, never both.
 """
 
 from __future__ import annotations
@@ -41,6 +44,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from printlog_bridge.core.adapter import Adapter
+from printlog_bridge.core.device import (
+    DEVICE_TOKEN_FILE,
+    DeviceFileError,
+    DeviceToken,
+    read_device_token,
+    write_private_file,
+)
 from printlog_bridge.core.urls import mask_url
 
 DEFAULT_API_URL = "https://api.3dprintlog.com"
@@ -127,6 +137,31 @@ class BridgeConfig:
     """A file to attach to a print (a timelapse video) larger than this is skipped."""
     update_check: bool = True
     """Say in the log, `status` and `doctor` when 3D Print Log reports a newer bridge (#39)."""
+    stored_device: DeviceToken | None = None
+    """The device token `printlog-bridge pair` stored, whichever API issued it."""
+
+    @property
+    def device(self) -> DeviceToken | None:
+        """The device token to use: the stored one, when this config's API issued it."""
+        if self.stored_device is None or self.stored_device.api_url != self.api_url:
+            return None
+        return self.stored_device
+
+    @property
+    def has_credentials(self) -> bool:
+        return self.device is not None or self.api_key is not None
+
+    @property
+    def device_token_file(self) -> Path:
+        return self.state_dir / DEVICE_TOKEN_FILE
+
+    def describe_credentials(self) -> str:
+        """The credential the bridge sends, for `doctor` and `status`."""
+        if self.device is not None:
+            return f"the device token in {self.device_token_file} (from printlog-bridge pair)"
+        if self.api_key is not None:
+            return f"the API key in {self.describe_api_key()}"
+        return "none"
 
     def api_url_warning(self) -> str | None:
         """What to say, every time, when `api_url` is plain http to another computer, which
@@ -193,6 +228,10 @@ def load_config(
 
     config_api_key = (bridge.get("api_key") or "").strip() or None
     api_key, source = _api_key(env, state_dir / API_KEY_FILE, config_api_key)
+    try:
+        stored_device = read_device_token(state_dir)
+    except DeviceFileError as e:
+        raise ConfigError(str(e)) from None
 
     adoption = _adoption("[bridge]", bridge, Adoption())
     slicer_settings = _slicer_settings("[bridge]", bridge, True)
@@ -215,6 +254,7 @@ def load_config(
         trace=_trace(bridge.get("trace"), env.get(TRACE_ENV)),
         max_attachment_mb=_max_attachment_mb(bridge.get("max_attachment_mb")),
         update_check=_flag(bridge.get("update_check") or "true", "update_check"),
+        stored_device=stored_device,
     )
 
 
@@ -354,22 +394,7 @@ def clean_key(text: str) -> str:
 def write_key_file(path: Path, key: str) -> None:
     """Writes the key file so only this user can read it (mode 600), replacing any earlier key in
     one step. A state directory it has to make is made mode 700."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.tmp")
-    with contextlib.suppress(FileNotFoundError):
-        temporary.unlink()
-    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    # A folder that hands down an ACL ignores that mode: on a Synology share the file came out
-    # readable by everyone the share lets read. An explicit chmod replaces the ACL with mode 600.
-    if hasattr(os, "fchmod"):
-        try:
-            os.fchmod(fd, 0o600)
-        except OSError:
-            os.close(fd)
-            raise
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        f.write(clean_key(key) + "\n")
-    os.replace(str(temporary), str(path))
+    write_private_file(path, clean_key(key))
 
 
 def _load_printer(
@@ -552,6 +577,61 @@ def _clear_by_path(path: Path) -> bool:
         with contextlib.suppress(OSError):
             os.unlink(temporary)
         raise
+    return True
+
+
+_PRINTER_ID_LINE = re.compile(r"^(\s*)printer_id\s*[=:]", re.IGNORECASE)
+
+
+def set_printer_ids(path: Path, ids: Mapping[str, int]) -> list[str]:
+    """Sets `printer_id` in each named `[printer <name>]` section of the config, replacing the
+    line that has one or adding it under the section's header, and leaving every other line (and
+    its line ending) as it was. Returns the names it found no section for. A symlink stays one:
+    the file it points to is rewritten, keeping its mode."""
+    real = Path(os.path.realpath(path))
+    with real.open(encoding="utf-8-sig", newline="") as f:
+        lines = f.readlines()
+    missing = []
+    for name, printer_id in ids.items():
+        if not _set_printer_id(lines, name, printer_id):
+            missing.append(name)
+    fd, temporary = tempfile.mkstemp(dir=str(real.parent), prefix=f".{real.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.writelines(lines)
+        shutil.copymode(str(real), temporary)
+        os.replace(temporary, str(real))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+    return missing
+
+
+def _set_printer_id(lines: list[str], name: str, printer_id: int) -> bool:
+    header = None
+    section = None
+    for i, line in enumerate(lines):
+        match = _SECTION.match(line)
+        if match:
+            if header is not None:
+                break  # the section ended without a printer_id line
+            kind, _, title = match.group(1).strip().partition(" ")
+            if kind == PRINTER_PREFIX and title.strip() == name:
+                header, section = i, True
+            continue
+        if section and _PRINTER_ID_LINE.match(line):
+            ending = line[len(line.rstrip("\r\n")) :] or "\n"
+            indent = _PRINTER_ID_LINE.match(line).group(1)
+            lines[i] = f"{indent}printer_id = {printer_id}{ending}"
+            return True
+    if header is None:
+        return False
+    ending = lines[header][len(lines[header].rstrip("\r\n")) :]
+    if not ending:
+        lines[header] += "\n"
+        ending = "\n"
+    lines.insert(header + 1, f"printer_id = {printer_id}{ending}")
     return True
 
 

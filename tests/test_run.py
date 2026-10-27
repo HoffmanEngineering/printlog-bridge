@@ -120,13 +120,31 @@ def write_config(tmp_path: Path, text: str) -> Path:
     return path
 
 
-def test_run_without_an_api_key_says_where_to_get_one(tmp_path, capsys):
-    config = write_config(tmp_path, "[printer voron]\nprinter_id = 42\nurl = http://voron:7125\n")
+@pytest.fixture
+def root_logging():
+    """Takes away the handlers `run` adds to the root logger (it pairs in the log)."""
+    before = list(logging.getLogger().handlers)
+    yield
+    for handler in logging.getLogger().handlers[:]:
+        if handler not in before:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
+
+
+def test_run_without_credentials_says_where_to_get_them_when_it_cant_pair(
+    tmp_path, capsys, root_logging
+):
+    # Nothing answers at the API's address, so pairing can't even ask whether it's on.
+    config = write_config(
+        tmp_path,
+        "api_url = http://127.0.0.1:9\n[printer voron]\nprinter_id = 42\nurl = http://voron:7125\n",
+    )
 
     assert main(["run", "--config", str(config)]) == 2
 
     err = capsys.readouterr().err
-    assert "no API key" in err
+    assert "not paired with 3D Print Log yet" in err
+    assert "printlog-bridge pair" in err
     assert "https://www.3dprintlog.com/api-keys" in err
 
 

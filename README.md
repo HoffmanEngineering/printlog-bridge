@@ -31,7 +31,7 @@ It asks for an API key and the printer's number in 3D Print Log (press Enter to 
 - adds an `[update_manager printlog-bridge]` section to `moonraker.conf`, so updates show up in Mainsail's and Fluidd's update panels, and restarts Moonraker to load it;
 - copies the `PRINTLOG_SET_SPOOL` macros to `~/printer_data/config/printlog.cfg` and adds `[include printlog.cfg]` to `printer.cfg` (above its SAVE_CONFIG block), unless you pass `--no-macros`. Restart Klipper when it isn't printing to load them; the installer doesn't, since that would end a print.
 
-Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key for later, store it with `~/printlog-bridge-env/bin/printlog-bridge store-key`, as yourself rather than with `sudo` (it refuses to run as root); set the printer in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it). Then restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
+Running it again is safe. Options: `--printer-data DIR` when Moonraker's data folder isn't `~/printer_data`, `--printer-id N`, and `--yes` to ask nothing; `install.sh --help` lists them all. If you leave the key for later, pair the bridge instead with `~/printlog-bridge-env/bin/printlog-bridge pair` (see [Signing in](#signing-in-pairing)), or store a key with `~/printlog-bridge-env/bin/printlog-bridge store-key`, as yourself rather than with `sudo` (both refuse to run as root); set the printer in `printlog-bridge.cfg` (Mainsail and Fluidd can edit it, and `pair` can set it for you). Then restart printlog-bridge from their services menu. The service doesn't restart itself while its config needs fixing.
 
 `./printlog-bridge/uninstall.sh` removes the service and the virtualenv, puts `moonraker.conf`, `moonraker.asvc` and `printer.cfg` back exactly as they were, and removes `printlog.cfg` unless you changed it. It keeps your config and the state directory (including prints not yet logged) for a reinstall; `--purge` removes those too.
 
@@ -51,7 +51,8 @@ Everything the bridge keeps is in one folder, mounted at `/data`:
 | Path | What it is |
 | --- | --- |
 | `/data/printlog-bridge.cfg` | the config, which you write |
-| `/data/state/api_key` | the API key, if you store it with `store-key` |
+| `/data/state/device_token`, `device_id` | the bridge's device token and its id, once you pair it |
+| `/data/state/api_key` | the API key, if you store one with `store-key` instead |
 | `/data/state/outbox.sqlite3`, `images/` | job events and pictures not sent yet |
 | `/data/state/printers/`, `status.json` | what has been logged, and what `status` shows |
 | `/data/state/bridge.log` | the log (`docker logs` shows it too) |
@@ -95,7 +96,12 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
          - /volume1/docker/printlog-bridge:/data
    ```
    `restart: unless-stopped` brings it back after a crash and after the NAS restarts. `TZ` is optional: set it to your own time zone (a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), such as `America/Chicago` or `Europe/London`) so the times in the log match your clock. Without it they're in UTC. It changes nothing else: `status` and 3D Print Log use UTC either way.
-6. **Give it the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys), one of two ways:
+6. **Pair it with your account.** Over SSH:
+   ```sh
+   sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
+     ghcr.io/hoffmanengineering/printlog-bridge:latest pair
+   ```
+   It shows a QR code and a short code: scan the QR code with your phone (or open the address it shows and type the code), sign in to 3D Print Log and approve the bridge. It stores the bridge's device token in the folder, where only that user can read it, and lists your printers for any `[printer]` without a `printer_id`. You can skip this step: started without an API key or device token, the bridge pairs by itself and shows the QR code in its log (Container Manager > Container > printlog-bridge > Log), then carries on once you approve it. Pairing is off on 3D Print Log until its app can list and remove paired bridges; until then `pair` says so, and you use an API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) instead, one of two ways:
    - Store it in the folder, where only that user can read it. Over SSH:
      ```sh
      sudo docker run --rm -it --user 1026:100 -v /volume1/docker/printlog-bridge:/data \
@@ -104,12 +110,12 @@ The container runs as a normal user, never root: `1000:1000` unless you give it 
    - Or add `PRINTLOG_API_KEY: <key>` under `environment:`. That's simpler, but anyone who can manage containers on the NAS can read it in the container's settings.
 7. **Check it.** In Container Manager the container shows as healthy once the bridge runs (the health check is `printlog-bridge-health`, a lighter `printlog-bridge status` that Docker runs every minute). Over SSH:
    ```sh
-   sudo docker exec printlog-bridge printlog-bridge doctor   # checks the config, the key and every printer
+   sudo docker exec printlog-bridge printlog-bridge doctor   # checks the config, the sign-in and every printer
    sudo docker exec printlog-bridge printlog-bridge status   # what each printer is doing
    ```
    `doctor` leaves the support bundle at `/volume1/docker/printlog-bridge/state/printlog-bridge-support.zip`, which you can download from File Station.
 
-If the config needs fixing (no key, a printer without `printer_id`), the bridge says what to fix in the container's log and exits, and the restart policy tries again every few seconds until you fix it. After editing `printlog-bridge.cfg`, restart the container.
+If the config needs fixing (no key and pairing off, a printer without `printer_id`), the bridge says what to fix in the container's log and exits, and the restart policy tries again every few seconds until you fix it. After editing `printlog-bridge.cfg`, restart the container.
 
 ### On Unraid
 
@@ -121,12 +127,12 @@ Unraid has no Compose out of the box, so use the template in [`unraid/printlog-b
    nano /mnt/user/appdata/printlog-bridge/printlog-bridge.cfg
    chown -R nobody:users /mnt/user/appdata/printlog-bridge
    ```
-2. **Store the API key** from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys):
+2. **Pair it** (scan the QR code it shows, as in step 6 of the Synology steps), or skip this and let the container pair itself on its first start, with the QR code in its log:
    ```sh
    docker run --rm -it --user 99:100 -v /mnt/user/appdata/printlog-bridge:/data \
-     ghcr.io/hoffmanengineering/printlog-bridge:latest store-key
+     ghcr.io/hoffmanengineering/printlog-bridge:latest pair
    ```
-   (Or leave this out and put the key in the template's API key field. That's simpler, but anyone who can edit the container can read it.)
+   While pairing is off on 3D Print Log, store an API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) instead: the same command with `store-key` in place of `pair`. (Or put the key in the template's API key field. That's simpler, but anyone who can edit the container can read it.)
 3. **Add the template:**
    ```sh
    wget -O /boot/config/plugins/dockerMan/templates-user/my-printlog-bridge.xml \
@@ -143,8 +149,10 @@ To run the bridge on the printer's own Pi, use `install.sh` above instead. Docke
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker "$USER"   # then log out and back in
 mkdir ~/printlog-bridge            # write printlog-bridge.cfg in it (Synology step 3)
-docker run --rm -it -v ~/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge:latest store-key
+docker run --rm -it -v ~/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge:latest pair
 ```
+
+(`store-key` in place of `pair` stores an API key instead, while pairing is off on 3D Print Log.)
 
 Then start it with the `docker run -d` command below, or with `docker compose up -d` and [`docker-compose.yml`](docker-compose.yml) after changing its folder to `~/printlog-bridge` and removing the `user:` line. The first user on Raspberry Pi OS is uid 1000, the same as the image's own user, so it needs no `user:`.
 
@@ -156,12 +164,15 @@ The same `docker-compose.yml` works after changing the folder and `user:`. Witho
 docker run -d --name printlog-bridge --restart unless-stopped \
   -e TZ=America/New_York -v "$PWD/printlog-bridge:/data" \
   ghcr.io/hoffmanengineering/printlog-bridge:latest
+docker logs -f printlog-bridge   # the first time: scan the QR code to pair it
 docker exec printlog-bridge printlog-bridge doctor
 ```
 
+Started with no API key or device token, the container pairs itself: its log shows a QR code, the address and the code, and a new one each time one expires, until you approve it. Then it carries on (a `[printer]` without `printer_id` still needs one: the log lists your printers). To pair (or pair again) in a terminal instead, run `docker run --rm -it -v "$PWD/printlog-bridge:/data" ghcr.io/hoffmanengineering/printlog-bridge:latest pair`, or `docker compose run --rm printlog-bridge pair` next to the Compose file; then `docker restart printlog-bridge`. Set `PRINTLOG_BRIDGE_NAME` on the container to choose the name 3D Print Log shows for it (otherwise `printlog-bridge on <container id>`).
+
 To find your printers' addresses for the config, run `docker run --rm <image> discover --subnet 192.168.1.0/24` with your LAN's network: with Docker's default (bridge) networking the container sees its own network, not your LAN's, so it needs telling which one to scan. Finding a printer again after its address changes works with bridge networking too; only the zeroconf shortcut needs host networking (`network_mode: host`), and the scan covers for it.
 
-Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`; `run` and `doctor` then warn that the key travels unencrypted. Pairing (`docker run ... pair`, #2) isn't here yet: until it is, use an API key as above.
+Any command runs the same way (`docker run --rm -v ...:/data <image> doctor`). `api_url` must stay `https` (plain `http` is only allowed to `localhost`, which inside a container is the container itself). To test against a development API on another computer on your network, set `PRINTLOG_ALLOW_HTTP_ON_LAN=1` (or `allow_http_on_lan = true` in `[bridge]`) and use its private IP address, such as `http://192.168.1.20:5000`; `run` and `doctor` then warn that the key travels unencrypted.
 
 ## Updating
 
@@ -188,18 +199,18 @@ cp printlog-bridge.example.cfg ~/printer_data/config/printlog-bridge.cfg   # the
 ~/printlog-bridge-env/bin/printlog-bridge doctor
 ```
 
-`doctor` checks the config, the state directory, the API key, this computer's clock and each printer, and says what to fix. `printlog-bridge run` then watches every printer until stopped (Ctrl-C, or SIGTERM from systemd), and shows up in Moonraker's extensions list (Mainsail and Fluidd show it too).
+`doctor` checks the config, the state directory, the device token or API key (and whether 3D Print Log takes it), this computer's clock and each printer, and says what to fix. `printlog-bridge run` then watches every printer until stopped (Ctrl-C, or SIGTERM from systemd), and shows up in Moonraker's extensions list (Mainsail and Fluidd show it too).
 
 `printlog-bridge status` shows what the running bridge is doing. For each printer it lists the connection, the printer's state, the last job event, the last heartbeat, how many jobs are waiting to reach 3D Print Log, and anything you need to fix (the `Trace` line shows only with `trace = true`):
 
 ```
 printlog-bridge 0.1.0 status
 Bridge: running since 2026-10-10 09:30 UTC (version 0.1.0, pid 812)
+Pairing: paired as 'printlog-bridge on voron' (device token in /home/pi/.local/share/printlog-bridge/device_token)
 Trace: on, recording every Moonraker message in /home/pi/.local/share/printlog-bridge/traces
 Printer voron (printer 42 in 3D Print Log)
   Connection: connected for 3h 12m (moonraker, local socket /home/pi/printer_data/comms/moonraker.sock)
   Printer state: ready
-  Pairing: not paired; API key from /home/pi/.local/share/printlog-bridge/api_key
   Last event: job 00002A completed: print 1834 (14m ago)
   Heartbeat: 2m 10s ago
   Outbox: empty
@@ -278,11 +289,34 @@ When 3D Print Log can't be reached (the internet is down, or the API is busy), n
 
 The bridge reads Moonraker's job history, so `[history]` must be in moonraker.conf (most installs have it; `run` logs how to add it when it's missing). It remembers what it has logged in its state directory, and on every start or reconnect it catches up on jobs that started or ended while it was away. On its very first run it picks up a print already running, but not older history.
 
-Until pairing lands, the bridge signs in with a personal API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys). Store it with `printlog-bridge store-key`, which keeps it in `api_key` in the state directory, readable only by you. The bridge looks for the key in the `PRINTLOG_API_KEY` environment variable, then that file, then `api_key` in `[bridge]`. A key in `[bridge]` still works, but in local mode the config sits in Klipper's config folder, which Moonraker serves to anyone who can open Mainsail or Fluidd: `doctor` warns about it, and `store-key` moves it out of the config for you.
+### Signing in (pairing)
+
+`printlog-bridge pair` signs the bridge in to your account with nothing to copy:
+
+```
+$ printlog-bridge pair
+To pair this bridge with your 3D Print Log account, scan the QR code with your phone, or open
+  https://auth.3dprintlog.com/activate
+and enter the code  QWER-TYUI
+(or open https://auth.3dprintlog.com/activate?user_code=QWER-TYUI)
+The code works for 15 minutes.
+
+<QR code>
+```
+
+Approve it on the page that opens, signed in to 3D Print Log. The bridge then stores its own device token in `device_token` in the state directory, readable only by you, and, for each `[printer]` without a `printer_id`, asks which of your printers it logs to, or creates a new one filled in from the printer (its host name, Klipper's kinematics and extruder count, a Bambu printer's model), and writes the number into the config. Restart the bridge to use the token.
+
+- `--yes` (or no terminal, as in Docker) asks nothing: it pairs, then lists your printers and says which `printer_id` to set. `--name` sets the name 3D Print Log shows for the bridge (default `printlog-bridge on <host name>`, or `PRINTLOG_BRIDGE_NAME`), and `--switch-printers` also asks again for printers that already have a `printer_id`.
+- Running it again pairs the same bridge again: 3D Print Log keeps one entry for it, with a new token, and the old token stops working.
+- The device token works only for what the bridge does (logging prints, its spools and its heartbeat), not for the rest of your account, and you can remove it in 3D Print Log at any time. A bridge whose token was removed says "re-pair needed" in its log, `status` and `doctor`, keeps every job in its outbox, and carries on by itself within a minute of `printlog-bridge pair`.
+- `run` with no API key and no device token pairs by itself, with the QR code in its log, so a Docker container or an add-on needs no setup beyond its printers.
+- Pairing is off on 3D Print Log until its app can list and remove paired bridges. Until then `pair` says so, and you use a personal API key instead.
+
+`store-key` stays for scripted installs and for servers without pairing: it stores a personal API key from [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) in `api_key` in the state directory, readable only by you. The bridge looks for a key in the `PRINTLOG_API_KEY` environment variable, then that file, then `api_key` in `[bridge]`; a device token wins over all of them, since the bridge never sends both. A key in `[bridge]` still works, but in local mode the config sits in Klipper's config folder, which Moonraker serves to anyone who can open Mainsail or Fluidd: `doctor` warns about it, and `store-key` moves it out of the config for you.
 
 ## Privacy and security
 
-The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail, its slicer settings with hosts and credentials blanked (unless you turn them off), and, unless you turn snapshots off, one webcam frame when it ends; with Pro and moonraker-timelapse, also the print's timelapse video. Of the G-code file it reads only the header and the settings block after the G-code, never the toolpaths, and it never uploads the file. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (with a timelapse, also the file storage 3D Print Log names for it; and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
+The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail, its slicer settings with hosts and credentials blanked (unless you turn them off), and, unless you turn snapshots off, one webcam frame when it ends; with Pro and moonraker-timelapse, also the print's timelapse video. Of the G-code file it reads only the header and the settings block after the G-code, never the toolpaths, and it never uploads the file. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (with a timelapse, also the file storage 3D Print Log names for it; while pairing, 3D Print Log's sign-in service; and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
 
 ## Config
 
@@ -417,7 +451,7 @@ python -m venv .venv
 
 CI runs both on Python 3.9 and 3.12. It also runs `shellcheck` on the shell scripts, and `tests/install/smoke.sh`, which runs `install.sh` and `uninstall.sh` in a throwaway home inside a `python:3.9-slim` container, against a fake `systemctl`, and checks that Moonraker's files end up byte for byte as they started. The file edits themselves are in `scripts/install_helper.py`, tested by `tests/test_install_helper.py`.
 
-The Docker workflow builds the image for each platform and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run` and `status` inside the container, as a non-root user, against three fake Moonrakers and a fake 3D Print Log API on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. amd64 and arm64 run natively (arm64 on GitHub's Arm runner), arm/v7 under QEMU. It then pushes all three to GHCR from `main` (`edge`) and from `v*` tags, and `tests/docker/check_published.sh` checks the result without logging in: the tag pulls, has every platform, and each one starts. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev` (add `--platform linux/arm/v7` to the build, and `linux/arm/v7` after the image, to try another platform under QEMU).
+The Docker workflow builds the image for each platform and runs `tests/docker/smoke.sh` against it: `--version`, `store-key`, `doctor`, `run`, `status` and `pair` inside the container, as a non-root user, against three fake Moonrakers, a fake 3D Print Log API and a fake Auth0 on the runner (`tests/docker/serve_fakes.py`), so it never calls the real API. amd64 and arm64 run natively (arm64 on GitHub's Arm runner), arm/v7 under QEMU. It then pushes all three to GHCR from `main` (`edge`) and from `v*` tags, and `tests/docker/check_published.sh` checks the result without logging in: the tag pulls, has every platform, and each one starts. Run the smoke test yourself with `docker build -t printlog-bridge:dev . && tests/docker/smoke.sh printlog-bridge:dev` (add `--platform linux/arm/v7` to the build, and `linux/arm/v7` after the image, to try another platform under QEMU).
 
 `tests/fixtures/moonraker/` holds REAL answers from a Snapmaker U1 and an Infimech EX, which `tests/test_real_captures.py` runs the adapter against. `tests/trace_replay.py` replays a trace as Moonraker, so a recorded print becomes a regression test: see `tests/test_trace_replay.py`, which replays a SYNTHETIC U1 print from `tests/fixtures/traces/`.
 

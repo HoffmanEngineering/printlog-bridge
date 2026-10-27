@@ -21,7 +21,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.5", "jinja2>=3"]  # jinja2 renders klipper/printlog.cfg in tests
+dev = ["pytest>=7", "ruff>=0.5", "jinja2>=3", "segno>=1.5"]
+# jinja2 renders klipper/printlog.cfg in tests; segno checks core/qr.py in tests (never at runtime)
 
 [project.scripts]
 printlog-bridge = "printlog_bridge.cli.main:run"

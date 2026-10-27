@@ -1,6 +1,8 @@
 # printlog-bridge in remote mode, watching every printer in /data/printlog-bridge.cfg.
 # On a Synology NAS: Container Manager > Project > Create, with this file. See the README's
-# "Run it in Docker" section for the folder, the config and the API key.
+# "Run it in Docker" section for the folder, the config and pairing. Started without an API key
+# or device token, the bridge pairs itself: its log shows a QR code to scan. Or pair it from a
+# terminal: docker compose run --rm printlog-bridge pair
 services:
   printlog-bridge:
     image: ghcr.io/hoffmanengineering/printlog-bridge:latest
@@ -13,12 +15,14 @@ services:
       # Optional: your time zone, so the times in the log match your clock (UTC without it).
       # status and 3D Print Log use UTC either way.
       TZ: America/New_York
-      # The API key, if you'd rather not store it in /data/state/api_key with `store-key`:
+      # The name 3D Print Log shows for the bridge once paired (default: the container's id):
+      # PRINTLOG_BRIDGE_NAME: printlog-bridge on the NAS
+      # An API key instead of pairing, if you'd rather not store it with `store-key`:
       # PRINTLOG_API_KEY: ...
       # Record every Moonraker message in /data/state/traces, to report a problem (README):
       # PRINTLOG_BRIDGE_TRACE: "1"
     volumes:
       # Holds the config (printlog-bridge.cfg) and the state directory (state/: the outbox, the
-      # key file, the log and the support bundle).
+      # device token or key file, the log and the support bundle).
       - /volume1/docker/printlog-bridge:/data
     # The bridge only connects out (to your printers and 3D Print Log), so it needs no ports.

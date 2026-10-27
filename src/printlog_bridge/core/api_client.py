@@ -1,25 +1,37 @@
 """The 3D Print Log API, as the bridge uses it.
 
-Authenticates with a personal API key (`X-Api-Key`) until pairing (printlog-bridge#2) replaces
-it with a device token.
+Authenticates with one credential, never both (the API answers 400 `multiple_credentials`): the
+device token `printlog-bridge pair` stored (`Authorization: Bearer pld_...`, #2) when there is
+one, else a personal API key (`X-Api-Key`).
+
+A device token the API no longer knows (401 `invalid_device_token`: revoked in the app, or
+replaced by pairing again) raises RepairNeeded, and from then on every call raises it without
+asking the API, until `printlog-bridge pair` stores a new token, which the next call picks up.
+429 `device_token_throttled` is the API limiting guesses from this address: ApiUnavailable, to
+wait out, never a reason to pair again.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+import json as jsonlib
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.core.device import DeviceFileError, DeviceToken, read_device_token
 from printlog_bridge.core.images import mask_url, scrub_url
+
+if TYPE_CHECKING:
+    from printlog_bridge.core.config import BridgeConfig
 
 REQUEST_TIMEOUT_S = 15
 UPLOAD_TIMEOUT_S = 30
@@ -36,6 +48,28 @@ class ApiError(Exception):
 
 class AuthRejected(ApiError):
     """The API refused the credentials. Retrying will not help; the user has to act."""
+
+
+REPAIR_COMMAND = "printlog-bridge pair"
+REPAIR_NEEDED = (
+    "3D Print Log no longer accepts this bridge's device token: it was removed in the app, or "
+    f"replaced by pairing this bridge again somewhere else. Re-pair needed: run `{REPAIR_COMMAND}`"
+)
+
+
+class RepairNeeded(AuthRejected):
+    """The device token was revoked or replaced (401 `invalid_device_token`): only pairing the
+    bridge again fixes it."""
+
+    def __init__(self) -> None:
+        super().__init__(REPAIR_NEEDED)
+
+
+INVALID_DEVICE_TOKEN = "invalid_device_token"
+DEVICE_TOKEN_THROTTLED = "device_token_throttled"
+INSUFFICIENT_SCOPE = "insufficient_scope"
+THROTTLED_RETRY_S = 60.0
+"""How long to wait on a `device_token_throttled` without a `Retry-After` (the API sends 60)."""
 
 
 class ApiUnavailable(ApiError):
@@ -80,12 +114,48 @@ class CurrentUser:
 
 
 class ApiClient:
-    def __init__(self, base_url: str, api_key: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str | None = None,
+        *,
+        device: DeviceToken | None = None,
+        state_dir: Path | None = None,
+        on_credentials: Callable[[str | None], None] | None = None,
+    ) -> None:
+        """`device`, when given, is the credential and `api_key` is never sent. `state_dir` is
+        where a re-paired token is looked for after a RepairNeeded. `on_credentials` hears the
+        credential problem when one starts (its message) and when it's over (None)."""
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._device = device
+        self._state_dir = state_dir
+        self._refused: str | None = None
+        """The device token the API refused, while no other has replaced it."""
+        self.on_credentials = on_credentials
         self._session: aiohttp.ClientSession | None = None
         self.server_time: datetime | None = None
         """The API's clock, from the `Date` of its last answer, to tell when ours is off."""
+
+    @classmethod
+    def for_config(
+        cls, config: BridgeConfig, on_credentials: Callable[[str | None], None] | None = None
+    ) -> ApiClient:
+        return cls(
+            config.api_url,
+            config.api_key,
+            device=config.device,
+            state_dir=config.state_dir,
+            on_credentials=on_credentials,
+        )
+
+    @property
+    def uses_device_token(self) -> bool:
+        return self._device is not None
+
+    @property
+    def repair_needed(self) -> bool:
+        return self._refused is not None
 
     def __repr__(self) -> str:
         return f"ApiClient({self.base_url!r})"
@@ -93,7 +163,6 @@ class ApiClient:
     async def __aenter__(self) -> ApiClient:
         self._session = aiohttp.ClientSession(
             headers={
-                "X-Api-Key": self._api_key,
                 "User-Agent": f"printlog-bridge/{__version__}",
                 "Accept": "application/json",
             },
@@ -159,10 +228,16 @@ class ApiClient:
 
     async def filament_by_spoolman_id(self, spoolman_id: int) -> dict[str, Any] | None:
         """The key owner's spool linked to this spool in their own Spoolman server
-        (`spoolmanId`), or None when none of theirs is, or the API doesn't store the link."""
-        return await self._request(
-            "GET", f"/api/Filaments/by-spoolman-id/{spoolman_id}", missing_ok=True
-        )
+        (`spoolmanId`), or None when none of theirs is, or the API doesn't store the link (or
+        doesn't take a device token there)."""
+        try:
+            return await self._request(
+                "GET", f"/api/Filaments/by-spoolman-id/{spoolman_id}", missing_ok=True
+            )
+        except ApiRejected as e:
+            if self._device is not None and e.status == 403:
+                return None
+            raise
 
     async def create_print(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         """The print, and whether it is new. An `externalId` already used returns the original."""
@@ -329,6 +404,64 @@ class ApiClient:
         """Registers the connection, or sends its heartbeat. Each call replaces every field."""
         return await self._request("PUT", f"/api/Connections/{instance_id}", json=body)
 
+    async def printers(self) -> list[dict[str, Any]]:
+        """Every active printer of the account (`id`, `name`, `make`, `model`, `slotCount`), all
+        pages of `GET /api/Printers/summary`."""
+        found: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            body = await self._request(
+                "GET",
+                "/api/Printers/summary",
+                params={"pageNumber": str(page), "pageSize": str(PRINTERS_PAGE_SIZE)},
+            )
+            items = body.get("items") if isinstance(body, Mapping) else None
+            items = [p for p in items or [] if isinstance(p, Mapping)]
+            found.extend(items)
+            total = (body.get("paging") or {}).get("totalCount") if isinstance(body, Mapping) else 0
+            if not items or len(found) >= (total if isinstance(total, int) else 0):
+                return found
+            page += 1
+
+    async def create_printer(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Adds a printer to the account (`AddPrinterDTO`: `name`, `make` and `model` are
+        required). Needs the `printers:create` scope with a device token."""
+        _, created = await self._send("POST", "/api/Printers", body)
+        return created
+
+    def _credentials(self) -> dict[str, str]:
+        """The one credential header to send. Raises RepairNeeded, without asking the API, while
+        the refused device token is still the one stored."""
+        if self._device is None:
+            return {"X-Api-Key": self._api_key} if self._api_key else {}
+        if self._refused is not None:
+            stored = self._stored_device()
+            if stored is None or stored.token == self._refused:
+                raise RepairNeeded()
+            self._device = stored
+            self._refused = None
+            if self.on_credentials is not None:
+                self.on_credentials(None)
+        return {"Authorization": f"Bearer {self._device.token}"}
+
+    def _stored_device(self) -> DeviceToken | None:
+        if self._state_dir is None:
+            return None
+        try:
+            stored = read_device_token(self._state_dir)
+        except DeviceFileError:
+            return None
+        if stored is None or stored.api_url != self.base_url:
+            return None
+        return stored
+
+    def _refuse(self, token: str) -> None:
+        if self._refused == token:
+            return
+        self._refused = token
+        if self.on_credentials is not None:
+            self.on_credentials(REPAIR_NEEDED)
+
     async def _get_json(self, path: str) -> Any:
         try:
             return await self._request("GET", path)
@@ -361,6 +494,8 @@ class ApiClient:
     ) -> tuple[int, Any]:
         if self._session is None:
             raise RuntimeError("use ApiClient as `async with ApiClient(...) as client`")
+        headers = self._credentials()
+        sent = self._device.token if self._device is not None else None
 
         try:
             async with self._session.request(
@@ -369,11 +504,17 @@ class ApiClient:
                 json=json,
                 params=params,
                 data=data,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as response:
                 self.server_time = _date(response.headers.get("Date")) or self.server_time
                 if response.status == 401:
-                    raise AuthRejected(f"the API rejected the key ({response.status})")
+                    code = await _code(response)
+                    if sent is not None and code == INVALID_DEVICE_TOKEN:
+                        self._refuse(sent)
+                        raise RepairNeeded()
+                    what = "device token" if sent is not None else "key"
+                    raise AuthRejected(f"the API rejected the {what} ({response.status})")
                 if response.status == 404 and missing_ok:
                     return 404, None
                 if response.status == 409 and conflict_ok:
@@ -383,9 +524,26 @@ class ApiClient:
                         return 409, None
                 if response.status in (400, 403, 413, 415):
                     reason = (await response.text()).strip()[:300]
+                    if sent is not None and _code_in(reason) == INSUFFICIENT_SCOPE:
+                        reason += (
+                            ". The bridge was paired without this permission: run "
+                            f"`{REPAIR_COMMAND}` to pair it again"
+                        )
                     raise ApiRejected(
                         f"the API refused {method} {path} ({response.status})"
                         + (f": {reason}" if reason else ""),
+                        status=response.status,
+                    )
+                if (
+                    response.status == 429
+                    and sent is not None
+                    and await _code(response) == DEVICE_TOKEN_THROTTLED
+                ):
+                    raise ApiUnavailable(
+                        "3D Print Log is limiting device-token requests from this address "
+                        "(device_token_throttled); the bridge waits and tries again",
+                        _retry_after(response.headers.get("Retry-After"), self.server_time)
+                        or THROTTLED_RETRY_S,
                         status=response.status,
                     )
                 if response.status >= 400:
@@ -401,6 +559,28 @@ class ApiClient:
             raise ApiUnavailable(f"can't reach {self.base_url}: {e}") from e
         except asyncio.TimeoutError as e:
             raise ApiUnavailable(f"{self.base_url} did not answer within {timeout:g}s") from e
+
+
+PRINTERS_PAGE_SIZE = 100
+
+
+async def _code(response: aiohttp.ClientResponse) -> str | None:
+    """The `code` of a problem details answer, or None."""
+    try:
+        body = await response.json(content_type=None)
+    except (ValueError, aiohttp.ClientError):
+        return None
+    code = body.get("code") if isinstance(body, Mapping) else None
+    return code if isinstance(code, str) else None
+
+
+def _code_in(text: str) -> str | None:
+    try:
+        body = jsonlib.loads(text)
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, Mapping) else None
+    return code if isinstance(code, str) else None
 
 
 def _retry_after(header: str | None, server_time: datetime | None) -> float | None:

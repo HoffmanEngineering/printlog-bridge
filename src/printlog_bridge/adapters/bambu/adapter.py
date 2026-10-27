@@ -24,7 +24,7 @@ import ssl
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from printlog_bridge.core.adapter import Adapter
+from printlog_bridge.core.adapter import Adapter, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.current_job import CurrentJob
@@ -75,6 +75,19 @@ def refused_message(code: int) -> str:
         f"the printer refused the access code (MQTT {code}). Check access_code. "
         f"{WHERE_IS_THE_CODE} {DEVELOPER_MODE}"
     )
+
+
+SERIAL_MODELS = {
+    "00M": "X1 Carbon",
+    "00W": "X1",
+    "03W": "X1E",
+    "01S": "P1P",
+    "01P": "P1S",
+    "030": "A1 mini",
+    "039": "A1",
+    "094": "H2D",
+}
+"""Models by the first three characters of the serial number."""
 
 
 class BambuAdapter(Adapter):
@@ -164,6 +177,13 @@ class BambuAdapter(Adapter):
 
     def use_state(self, state: PrinterState) -> None:
         self.state = state
+
+    async def printer_details(self) -> PrinterDetails:
+        """The model, from the serial number's first three characters (as ha-bambulab reads
+        them). No I/O."""
+        return PrinterDetails(
+            name=self.printer, make="Bambu Lab", model=SERIAL_MODELS.get(self.serial[:3].upper())
+        )
 
     @property
     def report_topic(self) -> str:

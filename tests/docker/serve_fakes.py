@@ -1,4 +1,5 @@
-"""Three fake Moonrakers and a fake 3D Print Log API on this computer, for tests/docker/smoke.sh.
+"""Three fake Moonrakers, a fake 3D Print Log API and a fake Auth0 (approving every pairing) on
+this computer, for tests/docker/smoke.sh.
 
 Writes `<data>/printlog-bridge.cfg` pointing at them (remote mode, one section per printer), then
 serves until killed. Once the bridge has subscribed to all three printers, a print starts and
@@ -18,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from fake_auth0 import FakeAuth0  # noqa: E402
 from fake_moonraker import FakeMoonraker  # noqa: E402
 from fake_printlog_api import FakePrintLogApi  # noqa: E402
 
@@ -27,6 +29,12 @@ PRINTERS = {"voron": 41, "u1": 42, "k2": 43}
 async def main(data: Path, report: Path) -> None:
     api = FakePrintLogApi(printers=tuple(PRINTERS.values()))
     api_url = await api.start()
+    # Pairing on, approved as soon as the bridge asks: `pair --yes` in the container works.
+    auth0 = FakeAuth0(interval=0.2)
+    await auth0.start()
+    auth0.approve()
+    api.auth0 = auth0
+    api.pairing = auth0.discovery()
     moonrakers = {name: FakeMoonraker() for name in PRINTERS}
     urls = {name: await m.start() for name, m in moonrakers.items()}
 

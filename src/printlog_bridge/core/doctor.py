@@ -12,7 +12,7 @@ from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.core.adapter import Adapter
-from printlog_bridge.core.api_client import ApiClient, ApiUnavailable, AuthRejected
+from printlog_bridge.core.api_client import ApiClient, ApiUnavailable, AuthRejected, RepairNeeded
 from printlog_bridge.core.checks import CheckResult, Status
 from printlog_bridge.core.config import (
     API_KEY_ENV,
@@ -64,6 +64,9 @@ async def diagnose(
     key_storage = _check_key_storage(config)
     if key_storage is not None:
         results.append(key_storage)
+    device = _check_device_token(config)
+    if device is not None:
+        results.append(device)
     results.extend(_check_printer_secrets(config))
     api, server_time = await _check_api(config)
     results.append(api)
@@ -144,9 +147,8 @@ async def _check_printer_link(config: BridgeConfig, printer: PrinterConfig) -> C
             f"[printer {printer.name}] to the number at the end of the printer's page "
             f"({PRINTERS_PAGE}<number>).",
         )
-    assert config.api_key is not None  # the API check passed
     try:
-        async with ApiClient(config.api_url, config.api_key) as client:
+        async with ApiClient.for_config(config) as client:
             found = await client.get_printer(printer.printer_id)
     except (ApiUnavailable, AuthRejected) as e:
         return CheckResult.fail(name, str(e))
@@ -175,6 +177,14 @@ def _served(config: BridgeConfig, path: Path) -> str | None:
 def _check_key_storage(config: BridgeConfig) -> CheckResult | None:
     """Where the API key is kept, and a warning when someone else could read it."""
     name = "API key"
+    if config.device is not None:
+        if config.api_key_source is None:
+            return None
+        return CheckResult.ok(
+            name,
+            f"not used: the device token from `printlog-bridge pair` is. The key in "
+            f"{config.describe_api_key()} can go (delete it at {API_KEYS_PAGE}).",
+        )
     move = (
         f"Move it to {config.api_key_file}, which only you can read: run "
         "`printlog-bridge store-key`, then restart printlog-bridge."
@@ -213,6 +223,39 @@ def _check_key_storage(config: BridgeConfig) -> CheckResult | None:
     return CheckResult.ok(name, f"in {config.describe_api_key()}")
 
 
+def _check_device_token(config: BridgeConfig) -> CheckResult | None:
+    """Where the device token is kept, and a warning when someone else could read it, or when
+    it was issued by another API than the configured one (so it isn't used)."""
+    name = "Device token"
+    stored = config.stored_device
+    if stored is None:
+        return None
+    path = config.device_token_file
+    if config.device is None:
+        return CheckResult.warn(
+            name,
+            f"{path} is from pairing with {stored.api_url}, not {config.api_url}, so it isn't "
+            "used. Run `printlog-bridge pair` to pair with this one.",
+        )
+    served = _served(config, path)
+    if served is not None:
+        return CheckResult.warn(
+            name,
+            f"{path} is in a folder {served}. Set state_dir in [bridge] to a folder outside it, "
+            "then run `printlog-bridge pair` again.",
+        )
+    if os.name == "posix":
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            return CheckResult.warn(
+                name,
+                f"other users on this computer can read {path} (mode {mode:o}). Run: chmod 600 "
+                f"{path}",
+            )
+    paired = f", paired as {stored.name!r}" if stored.name else ""
+    return CheckResult.ok(name, f"in {path}{paired}")
+
+
 def _check_printer_secrets(config: BridgeConfig) -> list[CheckResult]:
     """A warning for each printer whose own secret (a Bambu access code) is in a config file a
     printer's host serves to its users. Nothing otherwise."""
@@ -249,17 +292,26 @@ def _check_printer_secrets(config: BridgeConfig) -> list[CheckResult]:
 async def _check_api(config: BridgeConfig) -> tuple[CheckResult, datetime | None]:
     """The API check, and the API's clock when it answered."""
     name = "3D Print Log API"
-    if config.api_key is None:
+    if not config.has_credentials:
         return CheckResult.fail(
             name,
-            f"no API key. Create one at {API_KEYS_PAGE}, then run `printlog-bridge store-key` "
-            f"to store it (or set the {API_KEY_ENV} environment variable).",
+            "not paired yet. Run `printlog-bridge pair`, or create an API key at "
+            f"{API_KEYS_PAGE} and store it with `printlog-bridge store-key` (or set the "
+            f"{API_KEY_ENV} environment variable).",
         ), None
 
     try:
-        async with ApiClient(config.api_url, config.api_key) as client:
+        async with ApiClient.for_config(config) as client:
             user = await client.current_user()
+    except RepairNeeded as e:
+        return CheckResult.fail(name, f"{config.api_url}: {e}."), None
     except AuthRejected:
+        if config.device is not None:
+            return CheckResult.fail(
+                name,
+                f"{config.api_url} rejected the device token. Run `printlog-bridge pair` to pair "
+                "the bridge again.",
+            ), None
         return CheckResult.fail(
             name,
             f"{config.api_url} rejected the API key. Check it, or create a new one at "
@@ -269,7 +321,10 @@ async def _check_api(config: BridgeConfig) -> tuple[CheckResult, datetime | None
         return CheckResult.fail(name, str(e)), None
 
     who = user.display_name or f"user {user.id}"
-    return CheckResult.ok(name, f"{config.api_url}, signed in as {who}"), client.server_time
+    how = "the device token" if config.device is not None else "the API key"
+    return CheckResult.ok(
+        name, f"{config.api_url}, signed in as {who} with {how}"
+    ), client.server_time
 
 
 def _check_clock(server_time: datetime, now: datetime) -> CheckResult:

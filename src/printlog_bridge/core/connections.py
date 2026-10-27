@@ -26,7 +26,13 @@ from datetime import datetime
 from typing import Any
 
 from printlog_bridge import __version__
-from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
+from printlog_bridge.core.api_client import (
+    ApiClient,
+    ApiRejected,
+    ApiUnavailable,
+    AuthRejected,
+    RepairNeeded,
+)
 from printlog_bridge.core.health import ProblemLog, Problems, utc_now
 from printlog_bridge.core.outbox import read_waiting
 from printlog_bridge.core.status import FIRMWARE, HOST_SOFTWARE, StatusBoard
@@ -108,6 +114,8 @@ class Heartbeat:
         body = self._body(connection, problems)
         try:
             answer = await self.api.put_connection(connection.instance_id, body)
+        except RepairNeeded as e:
+            problem = f"{e}. Until then the printer shows as offline and its jobs wait."
         except AuthRejected:
             problem = (
                 "3D Print Log rejected the API key, so the printer shows as offline and its jobs "
