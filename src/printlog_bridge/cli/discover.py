@@ -1,5 +1,5 @@
-"""`printlog-bridge discover`: lists the Moonraker printers on the local network, with a
-`[printer]` section for each, ready to paste into the config."""
+"""`printlog-bridge discover`: lists the Moonraker and Bambu Lab printers on the local network,
+with a `[printer]` section for each, ready to paste into the config."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import ipaddress
 import re
 from collections.abc import Sequence
 
+from printlog_bridge.adapters.bambu.discovery import SSDP_PORT, FoundBambu
 from printlog_bridge.adapters.moonraker import discovery
 from printlog_bridge.adapters.moonraker.discovery import Found
 from printlog_bridge.core.config import BridgeConfig
@@ -144,3 +145,52 @@ def _configured_names(config: BridgeConfig | None) -> list[tuple[str, int, str]]
 def _section_name(text: str) -> str:
     name = re.sub(r"[^A-Za-z0-9_-]+", "-", text.strip()).strip("-").lower()
     return name or "printer"
+
+
+def format_bambu(
+    found: Sequence[FoundBambu] | None,
+    config: BridgeConfig | None,
+    seconds: float,
+    error: str | None = None,
+) -> str:
+    """The Bambu Lab printers that announced themselves, with a section for each. `found` is
+    None when the bridge couldn't listen (`error` says why)."""
+    if found is None:
+        return f"Couldn't listen for Bambu Lab printers on UDP port {SSDP_PORT}: {error}."
+    lines = [f"Listened {seconds:g}s for Bambu Lab printers (UDP port {SSDP_PORT})."]
+    if not found:
+        lines.append("No Bambu Lab printer announced itself.")
+        if discovery.in_container():
+            lines.append(
+                "This looks like a container: a printer's announcement only reaches one on the "
+                "host's network (network_mode: host)."
+            )
+        return "\n".join(lines)
+    configured = {
+        getattr(p.adapter, "serial", None): p.name for p in (config.printers if config else [])
+    }
+    lines.append(f"Found {len(found)} Bambu Lab printer{'' if len(found) == 1 else 's'}:")
+    for f in found:
+        details = [f.model_name or "", f'"{f.name}"' if f.name else "", f"serial {f.serial}"]
+        lines.append("")
+        lines.append(f"{f.address}: {', '.join(d for d in details if d)}")
+        name = configured.get(f.serial)
+        if name is not None:
+            lines.append(f"  already in the config as [printer {name}]")
+            continue
+        lines.extend(
+            [
+                f"  [printer {_section_name(f.name or f.model_name or f.serial)}]",
+                "  adapter = bambu",
+                "  printer_id =      ; the number at the end of its page in 3D Print Log",
+                f"  host = {f.address}",
+                f"  serial = {f.serial}",
+                "  access_code =     ; on the printer's screen (LAN Only settings)",
+            ]
+        )
+    lines.append("")
+    lines.append(
+        "Fill in printer_id and access_code. Bambu firmware with Authorization Control also "
+        "needs LAN Only Mode and Developer Mode on the printer."
+    )
+    return "\n".join(lines)

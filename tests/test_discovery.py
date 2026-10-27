@@ -430,7 +430,8 @@ def test_discover_command(tmp_path, capsys, monkeypatch):
         await printer.start(OLD, port)
         try:
             loop = asyncio.get_running_loop()
-            args = ["discover", "--subnet", "127.0.0.0/24", "--port", str(port), "--no-zeroconf"]
+            args = ["discover", "--subnet", "127.0.0.0/24", "--port", str(port), "--no-zeroconf",
+                    "--no-bambu"]  # fmt: skip
             return await loop.run_in_executor(None, main, args)
         finally:
             await printer.close()
@@ -445,7 +446,8 @@ def test_discover_command(tmp_path, capsys, monkeypatch):
 
 def test_discover_says_when_nothing_answers(capsys, tmp_path, monkeypatch):
     monkeypatch.setenv("PRINTLOG_BRIDGE_CONFIG", str(tmp_path / "missing.cfg"))
-    args = ["discover", "--subnet", "127.0.5.0/28", "--port", str(free_port()), "--no-zeroconf"]
+    args = ["discover", "--subnet", "127.0.5.0/28", "--port", str(free_port()), "--no-zeroconf",
+            "--no-bambu"]  # fmt: skip
 
     assert main(args) == 1
     assert "No Moonraker answered." in capsys.readouterr().out

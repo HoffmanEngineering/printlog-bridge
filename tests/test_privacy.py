@@ -561,22 +561,39 @@ class TestOnlyOutboundConnections:
             r"\.bind\(|web\.Application|AppRunner|TCPSite|UnixSite|run_app|socketserver|"
             r"http\.server"
         )
+        main = (SRC / "cli" / "main.py").read_text(encoding="utf-8").splitlines()
+        listens_for_bambu = {
+            f"cli/main.py:{number}"
+            for number, line in enumerate(main, 1)
+            if "bambu_discovery.listen(" in line
+        }
         found = [
-            f"{path.relative_to(SRC)}:{number}"
+            f"{path.relative_to(SRC).as_posix()}:{number}"
             for path in SRC.rglob("*.py")
             for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
             if server_apis.search(line)
         ]
-        assert found == []
+        # `printlog-bridge discover`, which you run yourself, listens for Bambu printers'
+        # announcements (UDP) while it runs; nothing `run` uses imports it.
+        assert all(
+            f.startswith("adapters/bambu/discovery.py:") or f in listens_for_bambu for f in found
+        )
+        importers = {
+            path.relative_to(SRC).as_posix()
+            for path in SRC.rglob("*.py")
+            if re.search(r"bambu(\.| import )discovery", path.read_text(encoding="utf-8"))
+        }
+        assert importers == {"cli/main.py", "cli/discover.py"}
 
-    def test_only_four_modules_open_connections(self):
+    def test_only_these_modules_open_connections(self):
         """3D Print Log's API client, the image fetcher (Moonraker's thumbnails and its webcam),
-        the Moonraker session, and discovery (finding Moonraker on the local network).
+        the Moonraker session, discovery (finding Moonraker on the local network), and a Bambu
+        printer's MQTT and FTPS clients and its discovery (`discover` only).
         docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
             r"create_datagram_endpoint|urllib\.request|http\.client|import requests|"
-            r"import httpx"
+            r"import httpx|ftplib\.FTP"
         )
         found = {
             path.relative_to(SRC).as_posix()
@@ -588,6 +605,9 @@ class TestOnlyOutboundConnections:
             "core/images.py",
             "adapters/moonraker/session.py",
             "adapters/moonraker/discovery.py",
+            "adapters/bambu/mqtt.py",
+            "adapters/bambu/ftps.py",
+            "adapters/bambu/discovery.py",
         }
 
     @pytest.mark.parametrize(
