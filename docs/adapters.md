@@ -1,6 +1,6 @@
 # Writing an adapter
 
-An adapter watches one kind of printer and reports its jobs to the bridge. Moonraker (Klipper) was the first, and Bambu Lab the second; PrusaLink, OctoPrint or anything else with an API can follow without a change to `core/`.
+An adapter watches one kind of printer and reports its jobs to the bridge. Moonraker (Klipper) was the first, then Bambu Lab and PrusaLink; OctoPrint or anything else with an API can follow without a change to `core/`.
 
 ## Where things live
 
@@ -11,6 +11,7 @@ src/printlog_bridge/
     __init__.py    ADAPTERS: the registry, by config name
     moonraker/     the Klipper adapter
     bambu/         Bambu Lab printers, over their LAN MQTT broker and FTPS
+    prusalink/     Prusa printers, over PrusaLink's local HTTP API
   cli/             the printlog-bridge command
 ```
 
@@ -25,7 +26,8 @@ src/printlog_bridge/
    ```ini
    [printer mk4]
    adapter = prusalink
-   url = http://mk4.local
+   host = mk4.local
+   password = ...
    ```
 
 ## The interface
@@ -71,7 +73,7 @@ Use timezone-aware `datetime`s.
 
 `run` replays jobs from `resume_after` after each connect, which needs the printer to keep a job history, as Moonraker does (`server.history`). PrusaLink, Bambu's local API and OctoPrint's core say only what is printing now. For those, `core/current_job.py` keeps the running job in the printer's state (`state.discovery["current_job"]`, so take the `PrinterState` in `use_state`):
 
-- `CurrentJob(state)`, then `started(event)` when you emit a `JobStarted`, `seen()` now and then while it runs (written at most once a minute), and `ended()` once you have emitted its `JobFinished` yourself.
+- `CurrentJob(state)` (with `MemoryState()` from `core/state.py` for a printer the bridge gives no state, one without a `printer_id`), then `started(event)` when you emit a `JobStarted`, `seen()` now and then while it runs (written at most once a minute), and `ended()` once you have emitted its `JobFinished` yourself.
 - After each connect, emit every event `reconcile(running, outcome=None, finished_at=None)` returns, where `running` is the `job_id` the printer is running now (or `None`), and `outcome` and `finished_at` are what the printer says of how and when its last job ended, when it says. The same job still running gives its start again, which the sink recognizes. Another job, or none, gives the remembered job's start and its `JobFinished`: the printer's outcome, or `COMPLETED` when it doesn't say; the printer's end time, or when the bridge last saw the job running, with a note on the print saying so. A job taken as complete carries the slicer's estimate as its usage, marked estimated. Then it is forgotten, so it is never finished twice.
 
 **A job that starts and ends entirely while the bridge is down (or the printer is unreachable) is missed**: nothing on the printer says it ran. Neither is a job that ended while the bridge was away told from one cancelled at once, unless the printer reports how its last job ended. Say so in the adapter's setup docs.
@@ -118,3 +120,15 @@ With any other `[spoolman] server`, the user's own Spoolman (#38), `spoolman.py`
 - **`discovery.py`**: `printlog-bridge discover` listens 6 s on UDP 2021 for the printers' `NOTIFY` announcements (`Location`, `USN`, `DevModel.bambu.com`, `DevName.bambu.com`). `run` never listens.
 
 To check on a real printer: the field names and states above on each model and firmware; whether `pushall` and `get_version` are answered without Developer Mode; the cancel codes; whether `print_error` arrives before or with `FAILED`; `ams_mapping` for an AMS HT and the H2D; whether FTPS works without Developer Mode; and whether the FTPS certificate is the MQTT one. Tests: `tests/test_bambu_mqtt.py` (the client and the pin), `test_bambu_files.py` (FTPS and the 3MF), `test_bambu_slots.py`, `test_bambu_jobs.py` (the lifecycle and reconnects), `test_bambu_adapter.py` (config, `check()`, `run`, and the whole bridge against the fake API), `test_bambu_discovery.py`.
+
+## The PrusaLink adapter
+
+`adapters/prusalink/` watches a Prusa printer with PrusaLink built in (Prusa-Firmware-Buddy: MK4/MK4S, MK3.5/3.9, Core One, MINI, XL), and should also work with PrusaLink on a Raspberry Pi (an MK3S). **It is built from Prusa's published sources, not a recorded printer**: Prusa-Link-Web's `spec/openapi.yaml`, Prusa-Firmware-Buddy's `lib/WUI/link_content/` (`prusa_link_api_v1.cpp`, `basic_gets.cpp`, `usb_files.cpp`, `previews.cpp`), `lib/WUI/nhttp/` (`req_parser.cpp`, `status_page.cpp`, `status_renderer.cpp`, `file_info.cpp`, `send_file.cpp`) and `src/state/printer_state.cpp`, and libbgcode's `doc/specifications.md` (Oct 2026). `tests/fake_prusalink.py` follows the same sources. Replace it with a real trace (`trace = true`, #17) when one exists, and check each point below against it.
+
+- **`client.py`**: GET only, on aiohttp. Buddy asks for HTTP Digest, user `maker`, realm `Printer API`, without `qop` (so RFC 2069's MD5(HA1:nonce:HA2)), with a nonce good for 300 s and `stale=true` after; it also takes the password as `X-Api-Key`, and older firmware asks only for that (`WWW-Authenticate: ApiKey`). aiohttp has Digest only from 3.12, so the client answers the challenge itself, `qop=auth` included when offered, and reuses the nonce, so a poll is one request. A second refusal for a fresh nonce is `Refused`.
+- **`jobs.py`**: `/api/v1/status` is polled (`poll_interval`, 5 s, while a job is under way; `idle_poll_interval`, 30 s, otherwise). Buddy reports `job` only while it is `PRINTING`, `PAUSED` or `ATTENTION` in a print, and ends at `FINISHED` or `STOPPED` (without `job`), which stays until dismissed on the screen, or `ERROR`. A job starts when first seen `PRINTING` or `PAUSED`, with `started_at` now less `time_printing`, and ends `COMPLETED`, `CANCELLED` or `FAILED` (with `status_printer.message` when the printer gives one); gone with the printer back at `IDLE` or `READY` it is taken as completed at 99% or more, else cancelled, with a note. `BUSY` or `ATTENTION` without a job (crash recovery, a power panic) doesn't end it. `job_id` is `<job id>-<file name>`, the printer's counter alone repeating after a reset. `CurrentJob` keeps the running job; after each connect, `FINISHED`, `STOPPED` or `ERROR` is taken as the remembered job's outcome (it can't be checked: the job is gone from the status by then).
+- **`files.py`, `bgcode.py`**: `/api/v1/job` once per job. PrusaLink on a Pi puts the file's metadata in `file.meta`; Buddy gives only `refs` (`download` is the file's short path under `/usb/`, `thumbnail` under `/thumb/l/`) and serves files without `Range`. So a `.bgcode` file (or `.bgc`, its short name) is streamed until `BgcodeReader` reaches the first G-code block (at most 8 MB), and a plain `.gcode` file is streamed whole (at most `DEFAULT_MAX_GCODE_BYTES`, 64 MB, by the job's `file.size`; 180 s) keeping its first 64 KB and last 512 KB. Estimates are PrusaSlicer's `filament used [g]` and `[mm]` (comma-separated per tool) and `estimated printing time (normal mode)` from the printer and print metadata blocks, or the comments after the G-code; tool N is slot N, tools at 0 left out. A bgcode metadata block may be stored, deflated (zlib, or raw Deflate) or Heatshrink-compressed (window 11 or 12, lookahead 4); one in another compression or encoding is skipped and logged. The slicer metadata block becomes `config_block_from_settings`; the slicer and its version come from the file metadata's `Producer`. The thumbnail is the largest PNG or JPEG block, else the printer's `refs.thumbnail`.
+- **`adapter.py`**: config (`host`, `port`, `username`, `password` or `api_key`, `poll_interval` at least 1 s, `idle_poll_interval` at least `poll_interval`, `files`), `/api/version` once per connect (Buddy: firmware `Prusa-Firmware-Buddy` and its `firmware`, host software `PrusaLink` and `api`; a Pi: `Prusa-Firmware` and PrusaLink's `version`), a 404 from `/api/v1/status` taken as firmware too old for the v1 API, and `check()` for `doctor`. Backoff 5 s doubling to 60 s while unreachable, 5 minutes after refused credentials.
+- **Discovery**: not yet. Buddy firmware can answer mDNS, and `/api/version` answers 401 with `realm="Printer API"`, so a probe could be added to `discover` (#100).
+
+To check on a real printer: the field names and states above on each model and firmware; whether `FINISHED`/`STOPPED` stay until dismissed when the printer is also on Prusa Connect; what `status` and `job` say on an XL and with an MMU3; the menu path to the password on each model; the minimum firmware with `/api/v1/`; whether the file download stops cleanly mid-print; files sliced in PrusaSlicer's window, which have thumbnails. Tests: `tests/test_prusalink_client.py` (Digest, stale nonces, the key), `test_prusalink_bgcode.py` (two real PrusaSlicer 2.9.2 files in `tests/fixtures/gcode/`, blocks, every compression, Heatshrink), `test_prusalink_files.py` (estimates, the reads and their caps), `test_prusalink_jobs.py` (the lifecycle and reconnects), `test_prusalink_adapter.py` (config, `check()`, `run`, poll timing, and the whole bridge against the fake API).

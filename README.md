@@ -4,7 +4,7 @@ An open-source bridge agent that watches Klipper/Moonraker printers and logs eve
 
 It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1.
 
-It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers).
+It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, and **Prusa printers with PrusaLink** (MK4/MK4S, MK3.5/3.9, Core One, MINI, XL) over its local API, from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers) and [Prusa printers (PrusaLink)](#prusa-printers-prusalink).
 
 > Status: early development. `run` logs each print when it starts and completes it when it ends, with its outcome, duration and filament used, adds the slicer's thumbnail and a webcam snapshot (and, with Pro, the moonraker-timelapse video), and keeps what it can't send yet until 3D Print Log is reachable again. On a multi-tool printer the filament is split per tool. See the [issues](https://github.com/HoffmanEngineering/printlog-bridge/issues) and milestones for the roadmap.
 
@@ -37,7 +37,7 @@ Running it again is safe. Options: `--printer-data DIR` when Moonraker's data fo
 
 ## Run it in Docker (remote mode)
 
-One container watches every printer in its config over the network, through each printer's Moonraker WebSocket. That suits a NAS, a home server or a Pi that isn't a printer. The image is `ghcr.io/hoffmanengineering/printlog-bridge`, for `linux/amd64`, `linux/arm64` and `linux/arm/v7` (32-bit Raspberry Pi OS):
+One container watches every printer in its config over the network: through Moonraker's WebSocket for a Klipper printer, and directly for a Bambu Lab or PrusaLink printer, which have no host of their own to run the bridge on. That suits a NAS, a home server or a Pi that isn't a printer. The image is `ghcr.io/hoffmanengineering/printlog-bridge`, for `linux/amd64`, `linux/arm64` and `linux/arm/v7` (32-bit Raspberry Pi OS):
 
 | Tag | What it is |
 | --- | --- |
@@ -314,6 +314,27 @@ access_code = 12345678
 Each job is logged when it starts printing (after the printer has heated and leveled; its start time is the printer's), with the slicer's estimates from the 3MF, and completed when it ends: finished, cancelled (from the screen or the slicer) or failed (with the printer's error code in the print's notes). Usage is the slicer's grams per filament, scaled by how far a cancelled or failed job got, and marked as an estimate in 3D Print Log, since the printer doesn't measure what it feeds. With an AMS, each filament is logged on its tray's slot: slot 0 is the external spool, slots 1-4 the first AMS's trays A1-A4, 5-8 the second's, and so on (17-24 for AMS HT units, 25 for the H2D's second external spool). The AMS's RFID readings (a Bambu spool's tag, material and color) are passed on like any slot reader's, so a spool with that tag in 3D Print Log is assigned to its tray.
 
 Without the 3MF (`ftps = false`, Developer Mode off, or a file the printer no longer has), prints are logged with their outcome and times but no filament usage. Bambu's local connection keeps no job history, so **a job that starts and ends while the bridge is down isn't logged**; one that ends while it's down is logged when it's back, from what the printer still shows. The printer's TLS certificate is self-signed by Bambu: the bridge pins the one it sees first and refuses a different one (set `tls_fingerprint` to accept a new printer). This adapter is built from Bambu's and the community's documentation of the protocol and hasn't been checked against a recorded session yet; if something looks wrong, run with `trace = true` and attach the support bundle to an issue.
+
+### Prusa printers (PrusaLink)
+
+`adapter = prusalink` watches a Prusa printer through PrusaLink, the local web API built into its firmware (MK4/MK4S, MK3.5/3.9, Core One, MINI/MINI+, XL). A Prusa printer has no computer of its own to run the bridge on, so run it in Docker, on a NAS or on a Raspberry Pi on the same network (see [Run it in Docker](#run-it-in-docker-remote-mode)); you don't need Klipper or Moonraker for it. It only ever reads from the printer: it never starts, pauses or stops anything, and never uploads or deletes a file.
+
+```ini
+[printer mk4s]
+adapter = prusalink
+printer_id = 45
+host = 192.168.1.60
+password = <the password the printer shows>
+```
+
+1. On the printer, open **Settings > Network > PrusaLink**, turn PrusaLink on if it's off, and note the **user** (`maker`) and the **password** shown there. Firmware that asks for an API key instead (older MINI firmware) takes `api_key = ...` in place of `password`. Prusa Connect can stay on: they don't get in each other's way.
+2. Find the printer's address on the same screen or under Settings > Network, and give it a fixed one (a DHCP reservation in your router), so `host` stays right.
+3. Keep the config where nothing serves it, as for any password. `password` and `api_key` are treated like keys (never logged, traced or bundled), and `doctor` warns when they're in a folder Moonraker serves.
+4. Run `printlog-bridge doctor`: it says whether the printer answered, and which firmware it runs, or why it refused.
+
+The bridge asks the printer for its status every 5 seconds while a job is under way and every 30 seconds between jobs (`poll_interval`, `idle_poll_interval`), and backs off up to a minute while it can't reach it. Each job is logged when it starts printing (its start time is the printer's), with the slicer's estimates, and completed when it ends: finished, stopped (cancelled) or failed (an error on the printer). Usage is the slicer's estimate per tool, scaled by how far a stopped or failed job got, and marked as an estimate in 3D Print Log, since the printer doesn't measure what it feeds. On an XL each tool is its own slot (T1 is slot 0, T5 slot 4); with an MMU3, each filament is.
+
+The estimates, thumbnail and slicer settings come from the job's file. For a `.bgcode` file (PrusaSlicer's default for these printers) the bridge reads only its start, up to the G-code: usually a few hundred kilobytes. A plain `.gcode` file keeps its estimates at its end, so it is read whole, as it prints, up to 64 MB; a larger one is logged without estimates. `files = false` turns these reads off; prints are then logged with outcome and times but no usage. PrusaLink keeps no job history, so **a job that starts and ends while the bridge is down isn't logged**; one that ends while it's down is logged when it's back, from what the printer still shows (a finished or stopped job stays on its screen until someone dismisses it). This adapter is built from Prusa's published PrusaLink API and firmware sources and hasn't been checked against a recorded session yet; if something looks wrong, run with `trace = true` and attach the support bundle to an issue.
 
 ### Timelapse videos (Pro)
 
