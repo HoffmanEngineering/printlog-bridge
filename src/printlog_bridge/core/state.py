@@ -161,6 +161,17 @@ class PrinterState:
         os.replace(temporary, self.path)
 
 
+class MemoryState(PrinterState):
+    """For a printer with no printer_id, which the bridge gives no state file: nothing is
+    kept between runs. For an adapter that keeps its running job with `CurrentJob`."""
+
+    def __init__(self) -> None:
+        super().__init__(Path(), "", {})
+
+    def save(self) -> None:
+        pass
+
+
 def safe_file_name(name: str) -> str:
     """`name` with anything a file name shouldn't hold replaced by `_`."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)

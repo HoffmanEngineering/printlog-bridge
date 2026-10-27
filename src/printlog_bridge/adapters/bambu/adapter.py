@@ -29,7 +29,7 @@ from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.current_job import CurrentJob
 from printlog_bridge.core.events import EventSink, SpoolSink
-from printlog_bridge.core.state import PrinterState
+from printlog_bridge.core.state import MemoryState, PrinterState
 from printlog_bridge.core.status import PrinterReport
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
@@ -174,7 +174,7 @@ class BambuAdapter(Adapter):
         return f"device/{self.serial}/request"
 
     async def run(self, sink: EventSink, report: PrinterReport) -> None:
-        state = self.state or _MemoryState()
+        state = self.state or MemoryState()
         pin = CertificatePin(self.printer, self.tls_fingerprint, state)
         files = BambuFiles(self.printer, self._ftps(pin), report) if self.ftps else None
         tracker = JobTracker(
@@ -402,16 +402,6 @@ def firmware_version(message: Mapping[str, Any]) -> str | None:
             version = str(module.get("sw_ver") or "").strip()
             return version or None
     return None
-
-
-class _MemoryState(PrinterState):
-    """For a printer with no printer_id, which the bridge gives no state: nothing is kept."""
-
-    def __init__(self) -> None:
-        super().__init__(None, "", {})  # type: ignore[arg-type]
-
-    def save(self) -> None:
-        pass
 
 
 def _port(printer: str, values: Mapping[str, str], option: str, default: int) -> int:
