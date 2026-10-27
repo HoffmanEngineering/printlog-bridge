@@ -28,8 +28,6 @@ from printlog_bridge.core.updates import is_newer, update_notice
 API_KEYS_PAGE = "https://www.3dprintlog.com/api-keys"
 PRINTERS_PAGE = "https://www.3dprintlog.com/printers/"
 MAX_CLOCK_SKEW = timedelta(minutes=2)
-MOONRAKER_SERVED = ("config", "gcodes", "logs")
-"""The folders of Moonraker's data folder (printer_data) that it serves to its clients."""
 
 
 def _utc_now() -> datetime:
@@ -158,20 +156,17 @@ async def _check_printer_link(config: BridgeConfig, printer: PrinterConfig) -> C
     return CheckResult.ok(name, f"printer {printer.printer_id}, {found.get('name')}")
 
 
-def moonraker_serves(path: Path) -> bool:
-    """Whether `path` is in a folder Moonraker serves to its clients: Klipper's config folder,
-    or its gcodes or logs, next to Moonraker's `comms` folder. Anyone who can open Mainsail or
-    Fluidd can download what is in them."""
-    folder = path.parent
-    if any((folder / name).is_file() for name in ("moonraker.conf", "printer.cfg")):
-        return True
-    for ancestor in (folder, *folder.parents):
-        if ancestor.name not in MOONRAKER_SERVED:
+def _served(config: BridgeConfig, path: Path) -> str | None:
+    """Who can download `path` because a printer's host serves the folder it's in, as the first
+    configured adapter that serves it says (`Adapter.serves`), or None."""
+    for printer in config.printers:
+        try:
+            served = printer.adapter.serves(path)
+        except Exception:  # an adapter bug must not hide the key check
             continue
-        data = ancestor.parent
-        if data.name == "printer_data" or (data / "comms").is_dir():
-            return True
-    return False
+        if served:
+            return served
+    return None
 
 
 def _check_key_storage(config: BridgeConfig) -> CheckResult | None:
@@ -181,7 +176,8 @@ def _check_key_storage(config: BridgeConfig) -> CheckResult | None:
         f"Move it to {config.api_key_file}, which only you can read: run "
         "`printlog-bridge store-key`, then restart printlog-bridge."
     )
-    if config.config_api_key is not None and moonraker_serves(config.path):
+    served = _served(config, config.path) if config.config_api_key is not None else None
+    if served is not None:
         unused = (
             f" It isn't used (the key in {config.describe_api_key()} is), so delete it from "
             "the file."
@@ -190,18 +186,18 @@ def _check_key_storage(config: BridgeConfig) -> CheckResult | None:
         )
         return CheckResult.warn(
             name,
-            f"api_key is in {config.path}, which Moonraker serves to anyone who can open "
-            f"Mainsail or Fluidd.{unused}",
+            f"api_key is in {config.path}, which {served}.{unused}",
         )
     if config.api_key_source is None:
         return None  # the API check says what to do
     if config.api_key_source is ApiKeySource.KEY_FILE:
         key_file = config.api_key_file
-        if moonraker_serves(key_file):
+        served = _served(config, key_file)
+        if served is not None:
             return CheckResult.warn(
                 name,
-                f"{key_file} is in a folder Moonraker serves to anyone who can open Mainsail "
-                "or Fluidd. Set state_dir in [bridge] to a folder outside printer_data.",
+                f"{key_file} is in a folder {served}. Set state_dir in [bridge] to a folder "
+                "outside it.",
             )
         if os.name == "posix":
             mode = key_file.stat().st_mode & 0o777

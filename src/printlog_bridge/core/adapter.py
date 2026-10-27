@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from printlog_bridge.core.checks import CheckResult
@@ -75,6 +76,14 @@ class Adapter(ABC):
         something of its own between runs in `state.discovery` (and calls `state.save()`), such
         as where it last found the printer. `doctor` also calls it before `check`, with the
         state read-only (`PrinterState.peek`): its `save()` raises. Optional."""
+
+    def serves(self, path: Path) -> str | None:
+        """Whether the software on the printer's host serves `path` to its users, so anyone who
+        can open its web page can download it, for `doctor`'s check of where the API key is kept.
+        Optional: None (the default) when it doesn't. Otherwise, words that follow "which" and
+        "a folder", naming who can download it, such as "Moonraker serves to anyone who can open
+        Mainsail or Fluidd". No I/O beyond looking at the local file system."""
+        return None
 
     @abstractmethod
     async def check(self) -> Sequence[CheckResult]:

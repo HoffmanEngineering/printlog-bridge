@@ -79,6 +79,27 @@ CHECK_ERRORS = (
 URL_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
 
+MOONRAKER_SERVED = ("config", "gcodes", "logs")
+"""The folders of Moonraker's data folder (printer_data) that it serves to its clients."""
+SERVED_BY_MOONRAKER = "Moonraker serves to anyone who can open Mainsail or Fluidd"
+
+
+def moonraker_serves(path: Path) -> bool:
+    """Whether `path` is in a folder Moonraker serves to its clients: Klipper's config folder,
+    or its gcodes or logs, next to Moonraker's `comms` folder. Anyone who can open Mainsail or
+    Fluidd can download what is in them."""
+    folder = path.parent
+    if any((folder / name).is_file() for name in ("moonraker.conf", "printer.cfg")):
+        return True
+    for ancestor in (folder, *folder.parents):
+        if ancestor.name not in MOONRAKER_SERVED:
+            continue
+        data = ancestor.parent
+        if data.name == "printer_data" or (data / "comms").is_dir():
+            return True
+    return False
+
+
 class MoonrakerAdapter(Adapter):
     name = "moonraker"
 
@@ -165,6 +186,9 @@ class MoonrakerAdapter(Adapter):
 
         socket = Path(options.get("socket", DEFAULT_SOCKET).strip()).expanduser()
         return cls(printer, url=None, socket=socket, snapshots=snapshots, timelapse=timelapse)
+
+    def serves(self, path: Path) -> str | None:
+        return SERVED_BY_MOONRAKER if moonraker_serves(path) else None
 
     def mode(self) -> str:
         return "local" if self.url is None else "remote"
