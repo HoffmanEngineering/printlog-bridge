@@ -4,7 +4,9 @@
 #   docker run -d --name printlog-bridge --restart unless-stopped \
 #     -v /volume1/docker/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge
 #
-# Built for linux/amd64, linux/arm64 and linux/arm/v7 by .github/workflows/docker.yml.
+# Built for linux/amd64, linux/arm64 and linux/arm/v7 by .github/workflows/docker.yml. The `addon`
+# stage is the Home Assistant app's image (home-assistant/), ghcr.io/hoffmanengineering/
+# printlog-bridge-addon; the default target is the normal image.
 
 ARG PYTHON_VERSION=3.12
 
@@ -23,7 +25,7 @@ COPY src /src/src
 RUN /opt/printlog-bridge/bin/pip install --no-deps /src \
     && { /opt/printlog-bridge/bin/pip uninstall -y pip setuptools wheel || true; }
 
-FROM python:${PYTHON_VERSION}-slim-bookworm
+FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 LABEL org.opencontainers.image.title="printlog-bridge" \
       org.opencontainers.image.description="Logs every Klipper/Moonraker print to 3D Print Log automatically." \
       org.opencontainers.image.source="https://github.com/HoffmanEngineering/printlog-bridge" \
@@ -59,3 +61,15 @@ HEALTHCHECK --interval=60s --timeout=20s --start-period=30s --retries=3 \
 
 ENTRYPOINT ["printlog-bridge"]
 CMD ["run"]
+
+# The Home Assistant app. The Supervisor gives the app a root-owned /data with its options in
+# /data/options.json, so this starts as root: printlog-bridge-addon (cli/addon.py) writes the
+# config from the options, gives /data to the printlog user and runs `printlog-bridge run` as
+# that user. The health check above is the app's watchdog.
+FROM runtime AS addon
+USER root
+ENTRYPOINT ["printlog-bridge-addon"]
+CMD []
+
+# The default target: the normal image, exactly as the runtime stage built it.
+FROM runtime

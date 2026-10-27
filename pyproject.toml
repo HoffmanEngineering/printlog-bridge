@@ -27,6 +27,7 @@ dev = ["pytest>=7", "ruff>=0.5", "jinja2>=3", "segno>=1.5"]
 [project.scripts]
 printlog-bridge = "printlog_bridge.cli.main:run"
 printlog-bridge-health = "printlog_bridge.cli.health:run"
+printlog-bridge-addon = "printlog_bridge.cli.addon:run"
 
 [project.urls]
 Homepage = "https://www.3dprintlog.com"
