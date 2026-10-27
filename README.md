@@ -272,7 +272,7 @@ Approve it on the page that opens, signed in to 3D Print Log. The bridge then st
 
 ## Privacy and security
 
-The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail, its slicer settings with hosts and credentials blanked (unless you turn them off), and, unless you turn snapshots off, one webcam frame when it ends; with Pro and moonraker-timelapse, also the print's timelapse video. Of the G-code file it reads only the header and the settings block after the G-code, never the toolpaths, and it never uploads the file. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (with a timelapse, also the file storage 3D Print Log names for it; while pairing, 3D Print Log's sign-in service; and, to find a printer whose address changed, to Moonraker's port on your local network), and never listens on a port. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
+The bridge sends 3D Print Log the print's file name (without its folders), times, duration, outcome, filament used, the slicer's estimates, its thumbnail, its slicer settings with hosts and credentials blanked (unless you turn them off), and, unless you turn snapshots off, one webcam frame when it ends; with Pro and moonraker-timelapse, also the print's timelapse video. Of the G-code file it reads only the header and the settings block after the G-code, never the toolpaths, and it never uploads the file. It connects only to Moonraker, the webcam Moonraker names, and 3D Print Log over HTTPS (with a timelapse, also the file storage 3D Print Log names for it; while pairing, 3D Print Log's sign-in service; and, to find a printer whose address changed, to Moonraker's port on your local network), and opens no port: paired, it only listens on UDP port 2021 for Bambu Lab printers' announcements. What it finds on your network is reported to 3D Print Log only for printers an adapter recognizes. Keys, passwords and tokens never reach its log, status or support bundle. [docs/privacy.md](docs/privacy.md) lists every call and field, and the test that holds each guarantee.
 
 ## Config
 
@@ -331,6 +331,30 @@ The estimates, thumbnail and slicer settings come from the job's file. For a `.b
 If the printer runs [moonraker-timelapse](https://github.com/mainsail-crew/moonraker-timelapse) and your 3D Print Log account has Pro, the video it renders after a print is attached to that print. The bridge waits up to 10 minutes after the print ends for the render (a render that `TIMELAPSE_RENDER` in your end macro finished just before the end counts too), downloads the video from Moonraker and uploads it straight to 3D Print Log's file storage. The print itself is completed right away; the video follows. Without Pro the bridge only asks whether you have it, and never downloads or uploads the video.
 
 Set `timelapse = false` in the printer's section to never attach videos. A video over `max_attachment_mb` in `[bridge]` (100 by default, at most 200, 3D Print Log's limit) is skipped, as is one that would leave the state directory's disk with less than 50 MB free. Videos wait in `attachments/` in the state directory until they're uploaded, and while one uploads, other prints' starts and ends go first. A print holds 5 files; a video 3D Print Log refuses is skipped with a line in the log. A render that finishes while the bridge isn't running isn't attached.
+
+### Printers found on your network, and connected in the app
+
+A paired bridge checks in with 3D Print Log every few minutes (`PUT /api/bridges/me`, [privacy](docs/privacy.md#discovery-and-check-in)). It says which printers it recognizes on your network, and 3D Print Log lists them under "Found on your network" on the bridge's page. **It never watches a printer just because it found it**: you connect one in the app (to an existing printer of yours or a new one), and the bridge starts watching it within a minute, with no restart and no config. Disconnect it there and the bridge lets it go. On a shared network (a dorm, a makerspace) a neighbor's printer is never logged to your account.
+
+How it looks, while it runs:
+
+- **Always, and cheaply:** an mDNS query every 5 minutes for Moonraker (`[zeroconf]`) and PrusaLink, and listening for Bambu Lab printers' announcements on UDP port 2021.
+- **Only when you tap "Scan now" in the app:** the per-address scan `printlog-bridge discover` does, on this computer's /24 and those of the printers it knows. A scan looks like a port scan to network security tools, so it never runs on its own.
+
+It reports only printers an adapter recognizes (Moonraker, Bambu Lab, PrusaLink), never any other host. Printers in the config file are reported too, as "managed by config": they stay read-only in the app, and the config file wins when both name the same printer. `discovery = false` in `[bridge]` turns the looking off; printers you connect in the app by address are still watched.
+
+**A password or access code** isn't in the app yet (a later release sends it encrypted to the bridge). For a Bambu Lab printer's access code, a PrusaLink password, or the API key of a Moonraker with `[authorization]`, add a section to the config with the number the bridge's log and `printlog-bridge status` give the printer (`App printer 7 ... needs credentials`):
+
+```ini
+[app_printer 7]
+access_code = 12345678
+```
+
+Save it and the bridge starts watching within a few seconds. Until then `status` and `doctor` say what's missing.
+
+**Networking.** Multicast and broadcast don't cross Docker's default (bridge) network, so finding printers needs the host's network: `network_mode: host` (the Compose file and the examples above use it), Unraid's host networking (the template's default), or the Home Assistant app (always on the host's network). On Docker Desktop (Windows, macOS) the container can't see your LAN this way; connect printers in the app by address instead. The bridge opens no TCP port; it listens on UDP 2021 only for Bambu's announcements.
+
+A bridge paired before this release lacks the permission to check in (`bridge:sync`): it pairs again once by itself, with the QR code in its log; if that isn't approved, it says so in `status` and `doctor` and keeps logging the printers in its config. `printlog-bridge pair` gives it the permission at any time.
 
 ### When a printer's address changes
 

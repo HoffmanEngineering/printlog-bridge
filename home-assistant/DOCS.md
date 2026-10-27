@@ -18,6 +18,10 @@ Home Assistant must be on the same network as the printers. The app needs a 64-b
 4. Turn on **Watchdog**, then **Start** the app.
 5. Open the **Log** tab and pair the bridge (below).
 
+## Printers found on your network
+
+Once paired, the bridge looks for printers on your network (Moonraker and PrusaLink over mDNS, Bambu Lab printers' announcements) and 3D Print Log lists them under "Found on your network" on the bridge's page. It never watches one until you connect it there; then it starts within a minute, with no restart. The app runs on Home Assistant's own network, so this works as is. A printer connected in the app that needs an access code or password gets it, for now, in a `printlog-bridge.cfg` in the app's config folder, under `[app_printer <number>]` (the number is in the **Log** tab); see the bridge's README.
+
 ## Signing in (pairing)
 
 On its first start the bridge pairs with your 3D Print Log account. The **Log** tab shows a QR code, an address and a code:

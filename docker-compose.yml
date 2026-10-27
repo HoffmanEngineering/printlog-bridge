@@ -12,8 +12,10 @@ services:
     image: ghcr.io/hoffmanengineering/printlog-bridge:latest
     container_name: printlog-bridge
     restart: unless-stopped
-    # The host's network, so `printlog-bridge discover` finds Bambu Lab printers and the bridge
-    # finds a printer whose address changed. The bridge opens no ports.
+    # The host's network, so the bridge finds printers for 3D Print Log's "Found on your
+    # network" (mDNS and Bambu Lab's announcements don't cross Docker's default network),
+    # `printlog-bridge discover` finds Bambu Lab printers, and a printer whose address changed
+    # is found again. The bridge opens no TCP port.
     network_mode: host
     environment:
       # Your time zone, so the times in the log match your clock (UTC without it). status and
