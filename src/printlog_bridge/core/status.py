@@ -527,7 +527,8 @@ def _printer_lines(printer, known, running: bool, config: BridgeConfig, now: dat
 
 
 def _time(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    # Python 3.9's fromisoformat doesn't take "Z", which the check-in times use.
+    return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
 
 
 def _clock(value: str) -> str:
