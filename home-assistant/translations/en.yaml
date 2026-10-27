@@ -1,0 +1,62 @@
+configuration:
+  printers:
+    name: Printers
+    description: >-
+      The printers to watch, one entry each. Every printer needs a name and an adapter; the
+      other fields depend on the adapter (see the Documentation tab).
+    fields:
+      name:
+        name: Name
+        description: Your name for the printer, shown in the log (letters, digits, spaces).
+      adapter:
+        name: Adapter
+        description: >-
+          moonraker for Klipper printers (Voron, Snapmaker U1, Creality K1/K2...), bambu for
+          Bambu Lab printers, prusalink for Prusa printers.
+      printer_id:
+        name: Printer ID
+        description: >-
+          The printer's number in 3D Print Log, the end of its page's address
+          (www.3dprintlog.com/printers/42). After pairing, the log lists your printers with
+          their numbers.
+      url:
+        name: Moonraker URL
+        description: "moonraker: the printer's Moonraker address, such as http://192.168.1.20:7125."
+      host:
+        name: Host
+        description: "bambu, prusalink: the printer's IP address or host name."
+      serial:
+        name: Serial number
+        description: "bambu: the printer's serial number."
+      access_code:
+        name: Access code
+        description: "bambu: the LAN access code on the printer's screen."
+      password:
+        name: PrusaLink password
+        description: "prusalink: the password in the printer's Settings > Network > PrusaLink."
+      api_key:
+        name: Printer API key
+        description: >-
+          moonraker: Moonraker's API key, only when its [authorization] doesn't trust this
+          host. prusalink: the API key of older firmware, instead of a password.
+      username:
+        name: PrusaLink user
+        description: "prusalink: the user, when it isn't maker."
+  device_name:
+    name: Device name
+    description: >-
+      The name 3D Print Log shows for this bridge once paired (default: printlog-bridge on
+      <your Home Assistant's host name>).
+  api_key:
+    name: 3D Print Log API key
+    description: >-
+      Leave empty to pair instead: the bridge shows a QR code in the Log tab on its first start.
+      Or a personal API key from www.3dprintlog.com/api-keys.
+  api_url:
+    name: 3D Print Log API
+    description: Leave empty. Only for testing against another 3D Print Log server (https).
+  trace:
+    name: Trace
+    description: >-
+      Record every message to and from each Moonraker printer in the app's data, secrets
+      removed, to report a problem. Leave off otherwise.

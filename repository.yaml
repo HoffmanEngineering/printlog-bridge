@@ -1,0 +1,5 @@
+# A Home Assistant app repository: add https://github.com/HoffmanEngineering/printlog-bridge in the
+# app store's Repositories. The app itself is in home-assistant/.
+name: 3D Print Log
+url: "https://github.com/HoffmanEngineering/printlog-bridge"
+maintainer: "Hoffman Engineering"

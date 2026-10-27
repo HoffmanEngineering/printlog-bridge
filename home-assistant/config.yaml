@@ -1,0 +1,47 @@
+# The printlog-bridge Home Assistant app (formerly add-on).
+# https://contributors.home-assistant.io/apps/reference/configuration/
+#
+# version is the bridge's (src/printlog_bridge/__init__.py; tests/test_ha_app.py checks), and
+# the Supervisor pulls image:version. A v* tag publishes that tag of the app image
+# (.github/workflows/docker.yml), so bump both in the release PR and tag right after merging it.
+name: 3D Print Log Bridge
+version: "0.1.1"
+slug: printlog_bridge
+description: Logs every print from your Klipper, Bambu Lab and Prusa printers to 3D Print Log.
+url: "https://github.com/HoffmanEngineering/printlog-bridge/tree/main/home-assistant"
+# The image is also built for linux/arm/v7, but Home Assistant dropped 32-bit Arm in 2025.12.
+arch:
+  - aarch64
+  - amd64
+image: "ghcr.io/hoffmanengineering/printlog-bridge-addon"
+# The bridge only connects out. The host's network lets it find printers that moved (mDNS,
+# scanning, Bambu's UDP broadcasts) as the Docker image does with --network host (#100).
+host_network: true
+# Optional: a full printlog-bridge.cfg in the app's config folder, for settings the options
+# don't have. Used instead of the printers below when it exists.
+map:
+  - app_config:rw
+# The image's health check (printlog-bridge-health) is the watchdog.
+backup_exclude:
+  - "state/traces/*"
+  - "state/*.log*"
+  - "state/printlog-bridge-support.zip"
+options:
+  printers: []
+  trace: false
+schema:
+  device_name: "str(1,100)?"
+  api_key: "password?"
+  api_url: "url?"
+  trace: bool
+  printers:
+    - name: "str(1,64)"
+      adapter: "list(moonraker|bambu|prusalink)"
+      printer_id: "int(1,)?"
+      url: "url?"
+      host: "str?"
+      serial: "str?"
+      access_code: "password?"
+      password: "password?"
+      api_key: "password?"
+      username: "str?"
