@@ -291,3 +291,33 @@ def test_a_field_named_access_code_is_removed(tmp_path):
     recorded(tmp_path, ("recv", '{"system": {"command": "get_access_code", "access_code": "x1"}}'))
 
     assert lines(trace_files(tmp_path, "u1")[0])[0]["msg"]["system"]["access_code"] == "<redacted>"
+
+
+def test_a_prusalink_session_is_traced_without_its_password(tmp_path):
+    from fake_prusalink import PASSWORD, FakePrusaLink
+
+    from printlog_bridge.adapters.prusalink.client import PrusaLinkClient
+
+    trace = Trace(tmp_path, "mk4s", secrets=[PASSWORD], clock=lambda: T0)
+
+    async def scenario():
+        fake = FakePrusaLink()
+        address = await fake.start()
+        client = PrusaLinkClient(f"http://{address}", password=PASSWORD, trace=trace)
+        try:
+            await client.get_json("/api/v1/status")
+        finally:
+            await client.close()
+            await fake.close()
+
+    asyncio.run(scenario())
+    trace.close()
+
+    path = trace_files(tmp_path, "mk4s")[0]
+    found = lines(path)
+    assert [line["dir"] for line in found] == ["send", "recv", "send", "recv"]
+    assert found[1]["msg"]["challenge"].startswith("Digest realm=")
+    assert found[-1]["msg"]["body"]["printer"]["state"] == "IDLE"
+    text = path.read_text(encoding="utf-8")
+    assert PASSWORD not in text
+    assert "response=" not in text  # the Authorization header is never traced

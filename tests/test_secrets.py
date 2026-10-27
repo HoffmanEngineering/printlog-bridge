@@ -78,3 +78,19 @@ def test_a_bambu_access_code_in_the_config_is_a_known_secret(tmp_path):
 
     assert "12345678" in known_secrets(config, tmp_path / "state", {})
     assert "12345678" not in redact_config(text)
+
+
+def test_a_prusalink_password_and_api_key_in_the_config_are_known_secrets(tmp_path):
+    from printlog_bridge.core.support import known_secrets, redact_config
+
+    config = tmp_path / "printlog-bridge.cfg"
+    text = (
+        "[printer mk4s]\nadapter = prusalink\nhost = 192.168.1.60\npassword = Xk3pT9vQ2mWz\n"
+        "[printer mini]\nadapter = prusalink\nhost = 192.168.1.61\napi_key = 9aZ3kQ7p\n"
+    )
+    config.write_text(text, encoding="utf-8")
+
+    secrets = known_secrets(config, tmp_path / "state", {})
+    assert "Xk3pT9vQ2mWz" in secrets and "9aZ3kQ7p" in secrets
+    redacted = redact_config(text)
+    assert "Xk3pT9vQ2mWz" not in redacted and "9aZ3kQ7p" not in redacted

@@ -587,8 +587,9 @@ class TestOnlyOutboundConnections:
 
     def test_only_these_modules_open_connections(self):
         """3D Print Log's API client, the image fetcher (Moonraker's thumbnails and its webcam),
-        the Moonraker session, discovery (finding Moonraker on the local network), and a Bambu
-        printer's MQTT and FTPS clients and its discovery (`discover` only).
+        the Moonraker session, discovery (finding Moonraker on the local network), a Bambu
+        printer's MQTT and FTPS clients and its discovery (`discover` only), and PrusaLink's
+        HTTP client.
         docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
@@ -608,6 +609,7 @@ class TestOnlyOutboundConnections:
             "adapters/bambu/mqtt.py",
             "adapters/bambu/ftps.py",
             "adapters/bambu/discovery.py",
+            "adapters/prusalink/client.py",
         }
 
     @pytest.mark.parametrize(

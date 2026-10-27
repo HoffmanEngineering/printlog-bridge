@@ -320,6 +320,13 @@ class TestPrinterSecretStorage:
         assert "Moonraker serves" in check.detail
         assert "12345678" not in check.detail
 
+    def test_a_prusalink_password_in_a_served_config_is_a_warning(self, tmp_path):
+        check = self.check(tmp_path / "printer_data" / "config", "password = Xk3pT9vQ2mWz\n")
+
+        assert check.status is Status.WARN
+        assert "password" in check.detail
+        assert "Xk3pT9vQ2mWz" not in check.detail
+
     def test_an_access_code_elsewhere_says_nothing(self, tmp_path):
         assert self.check(tmp_path / "nas", "access_code = 12345678\n") is None
 
