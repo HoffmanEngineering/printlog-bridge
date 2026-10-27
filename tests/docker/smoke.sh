@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Smoke-tests a built image: --version, store-key, doctor, run and status inside the container,
-# against three fake Moonrakers and a fake 3D Print Log API on this computer (tests/docker/
-# serve_fakes.py), so nothing calls the real API. CI runs it (docker.yml, smoke) after building
-# the image for each platform: arm64 on an Arm runner, arm/v7 under QEMU. Needs docker, and python3
-# with aiohttp for the fakes.
+# Smoke-tests a built image: --version, store-key, doctor, run, status and pair inside the
+# container, against three fake Moonrakers, a fake 3D Print Log API and a fake Auth0 on this
+# computer (tests/docker/serve_fakes.py), so nothing calls the real API. CI runs it (docker.yml,
+# smoke) after building the image for each platform: arm64 on an Arm runner, arm/v7 under QEMU.
+# Needs docker, and python3 with aiohttp for the fakes.
 #
 # Usage: tests/docker/smoke.sh <image> [platform]   (the platform defaults to the image's own)
 set -euo pipefail
@@ -135,6 +135,21 @@ set -e
 cat "${WORK}/status.txt"
 check "status then says it stopped" grep -q 'not running: stopped at' "${WORK}/status.txt"
 check "and exits 1, which marks the container unhealthy" test "$code" -eq 1
+
+echo "== pair"
+set +e
+bridge pair --yes --name "smoke test" >"${WORK}/pair.txt" 2>&1
+code=$?
+set -e
+cat "${WORK}/pair.txt"
+check "pair works without a terminal" test "$code" -eq 0
+check "pair shows the code to approve" grep -q 'enter the code' "${WORK}/pair.txt"
+check "the device token is in the volume" test -f "${DATA}/state/device_token"
+check "only its owner can read it" test "$(stat -c %a "${DATA}/state/device_token")" = 600
+set +e
+bridge doctor >"${WORK}/doctor.txt"
+set -e
+check "doctor signs in with the device token" grep -q 'with the device token' "${WORK}/doctor.txt"
 
 if [ "$failures" -ne 0 ]; then
     echo "== bridge log"
