@@ -343,14 +343,18 @@ How it looks, while it runs:
 
 It reports only printers an adapter recognizes (Moonraker, Bambu Lab, PrusaLink), never any other host. Printers in the config file are reported too, as "managed by config": they stay read-only in the app, and the config file wins when both name the same printer. `discovery = false` in `[bridge]` turns the looking off; printers you connect in the app by address are still watched.
 
-**A password or access code** isn't in the app yet (a later release sends it encrypted to the bridge). For a Bambu Lab printer's access code, a PrusaLink password, or the API key of a Moonraker with `[authorization]`, add a section to the config with the number the bridge's log and `printlog-bridge status` give the printer (`App printer 7 ... needs credentials`):
+**A password or access code** (a Bambu Lab printer's access code, a PrusaLink password, the API key of a Moonraker with `[authorization]`) is entered in the app, next to the printer on the bridge's page. The app encrypts it in your browser to this bridge's own key, so 3D Print Log stores and forwards only something it can't read, and only this bridge can open it ([privacy](docs/privacy.md#printer-credentials-entered-in-the-app)). The bridge starts watching within a minute. If the printer refuses it, or the bridge can't open it, the app says so next to the printer, and so do `status` and `doctor`.
+
+**The bridge's key.** The bridge makes its key the first time it runs paired (or when you `pair` it), in `credential-key.pem` in its state directory, readable only by the bridge's user. It never leaves the bridge. `printlog-bridge status`, `doctor` and `pair` show its fingerprint, such as `Encryption key: aed0 3e9a 8282 33b2`. A key the bridge reports after it was first paired (an update from a bridge without one, a lost state directory, `printlog-bridge rotate-key`) is held by 3D Print Log until you confirm it on the Bridges page: check that the app shows the same characters as `status`, then confirm. Until then `status` says `waiting for confirmation in the app`. Pairing again keeps the key. `printlog-bridge rotate-key` makes a new one (confirm it in the app, then enter the printers' credentials there again, since nothing sealed to the old key opens with the new one). The key needs the `cryptography` package, which installs with the bridge on 64-bit PCs, 64-bit Arm and 32-bit Arm (armv7: a Raspberry Pi 2 or later); elsewhere (a Pi Zero or Pi 1) the bridge runs without it, `doctor` says so, and credentials go in the config file as below.
+
+**In the config file instead** (the way before the app took credentials, and still supported): add a section with the number the bridge's log and `printlog-bridge status` give the printer (`App printer 7 ... needs credentials`):
 
 ```ini
 [app_printer 7]
 access_code = 12345678
 ```
 
-Save it and the bridge starts watching within a few seconds. Until then `status` and `doctor` say what's missing.
+Save it and the bridge starts watching within a few seconds. **A value in the config file wins** over one entered in the app for the same field: the config file is the bridge's own, it's the rule for printers too, and setups made before the app took credentials keep working unchanged. `status` shows where each credential came from (`access_code: from [app_printer 7] in the config file, which overrides the app's`); remove the line to use the app's.
 
 **Networking.** Multicast and broadcast don't cross Docker's default (bridge) network, so finding printers needs the host's network: `network_mode: host` (the Compose file and the examples above use it), Unraid's host networking (the template's default), or the Home Assistant app (always on the host's network). On Docker Desktop (Windows, macOS) the container can't see your LAN this way; connect printers in the app by address instead. The bridge opens no TCP port; it listens on UDP 2021 only for Bambu's announcements.
 
