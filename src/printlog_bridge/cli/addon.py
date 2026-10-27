@@ -7,7 +7,8 @@ writes the options the user set in the app's Configuration tab to `/data/options
 1. writes the bridge's config, `/data/printlog-bridge.cfg` (mode 600), from the options. A
    `printlog-bridge.cfg` the user put in the app's config folder (`/config` in the container)
    is used instead, for settings the options don't have;
-2. passes the device name, the API key and `trace` in the environment. The API key is never
+2. passes the device name, the API key and `trace` in the environment, and the local page's
+   address: the app's ingress port, answering the Supervisor only. The API key is never
    written to a file;
 3. gives `/data` and the state directory to the image's own user, and runs `printlog-bridge run`
    as that user, as the normal image does.
@@ -32,6 +33,8 @@ from printlog_bridge.core.config import (
     CONFIG_FILE_NAME,
     CONFIG_PATH_ENV,
     STATE_DIR_ENV,
+    STATUS_PAGE_CLIENTS_ENV,
+    STATUS_PAGE_ENV,
     TRACE_ENV,
 )
 from printlog_bridge.core.device import DEVICE_TOKEN_FILE, write_private_file
@@ -43,6 +46,12 @@ USER_CONFIG = Path("/config") / CONFIG_FILE_NAME
 """The app's public config folder (`map: app_config`), which the user can reach over Samba or
 an editor app."""
 OPTIONS_FILE = "options.json"
+INGRESS_PORT = 7180
+"""config.yaml's `ingress_port`: the local page (core/local_page.py) is the app's ingress page."""
+INGRESS_PROXY = "172.30.32.2"
+"""The Supervisor's address, the only one the app answers on that port. The app is on the host's
+network (for discovery), so the port is open on every address of the host: everyone else gets
+403, as Home Assistant's ingress documentation asks."""
 STATE_DIR_NAME = "state"
 BRIDGE_UID = BRIDGE_GID = 1000
 """The image's `printlog` user (Dockerfile)."""
@@ -152,6 +161,9 @@ def bridge_env(options: Mapping[str, Any], base: Mapping[str, str]) -> dict[str,
         env[API_KEY_ENV] = key
     if options.get("trace"):
         env[TRACE_ENV] = "1"
+    # Set here, so a printlog-bridge.cfg in the app's config folder can't open it to the LAN.
+    env[STATUS_PAGE_ENV] = f"0.0.0.0:{INGRESS_PORT}"
+    env[STATUS_PAGE_CLIENTS_ENV] = INGRESS_PROXY
     return env
 
 

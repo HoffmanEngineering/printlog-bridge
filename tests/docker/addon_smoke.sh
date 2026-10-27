@@ -109,6 +109,11 @@ cat "${WORK}/status.txt"
 check "status says it runs" test "$code" -eq 0
 check "status says it is paired" grep -q 'Pairing: paired' "${WORK}/status.txt"
 
+echo "== ingress page"
+# On the host's network, so the port is open on the host: only the Supervisor (172.30.32.2) may
+# open it; this computer is disconnected as it connects, before anything is read (curl: 000).
+check "the ingress page refuses anyone but the Supervisor" test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7180/)" = 000
+
 echo "== stop"
 docker stop -t 20 "$NAME" >/dev/null
 check "the bridge exits 0 on SIGTERM" test "$(docker inspect -f '{{.State.ExitCode}}' "$NAME")" -eq 0

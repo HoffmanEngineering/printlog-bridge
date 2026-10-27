@@ -45,6 +45,7 @@ from printlog_bridge.core.first_run import (
     wait_for_printers,
     write_starter_config,
 )
+from printlog_bridge.core.local_page import LocalPage
 from printlog_bridge.core.status import format_status
 from printlog_bridge.core.support import BUNDLE_NAME, write_support_bundle
 
@@ -573,14 +574,47 @@ def _run(explicit_config: Path | None) -> int:
     def load() -> BridgeConfig:
         return _load_for_setup(config_path, explicit_config, env, home)
 
-    logging_on = False
     try:
         config = load()
         check_writable(config.state_dir)
+    except ConfigError as e:
+        print(f"printlog-bridge: {e}", file=sys.stderr)
+        print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
+        return 2
+    configure_logging(config.state_dir)
+    # From the start, so it shows the code to approve while the bridge pairs.
+    page = start_local_page(config, load, env, home)
+    try:
+        return _run_loaded(config, load, env)
+    finally:
+        if page is not None:
+            page.stop()
+
+
+def start_local_page(
+    config: BridgeConfig, load: Callable[[], BridgeConfig], env: Mapping[str, str], home: Path
+) -> LocalPage | None:
+    """The local page (status, pairing, doctor) in a thread of its own, or None when it's off
+    or can't listen. It keeps the address it started with until the bridge restarts."""
+    if config.status_page is None:
+        return None
+    page = LocalPage(
+        config.status_page,
+        config.status_page_clients,
+        load,
+        env=env,
+        adapters=ADAPTERS,
+        home=home,
+    )
+    return page if page.start() else None
+
+
+def _run_loaded(
+    config: BridgeConfig, load: Callable[[], BridgeConfig], env: Mapping[str, str]
+) -> int:
+    try:
         if not config.has_credentials:
             # First run in Docker or an add-on: pair in the log, then carry on.
-            configure_logging(config.state_dir)
-            logging_on = True
             problem = _first_run_pairing(config, env)
             if problem is not None:
                 print(f"printlog-bridge: {problem}", file=sys.stderr)
@@ -589,9 +623,6 @@ def _run(explicit_config: Path | None) -> int:
         if config.has_credentials and setup_problem(config) is not None:
             # Nothing to watch yet (no printers, or one without printer_id): wait for the
             # config instead of exiting into the container's restart loop.
-            if not logging_on:
-                configure_logging(config.state_dir)
-                logging_on = True
             waited = _wait_for_printers(config, load)
             if waited is None:
                 return 0
@@ -602,8 +633,6 @@ def _run(explicit_config: Path | None) -> int:
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
         return 2
 
-    if not logging_on:
-        configure_logging(config.state_dir)
     logger = logging.getLogger(__name__)
     logger.info("printlog-bridge %s, config %s", __version__, config.path)
     if not config.printers:

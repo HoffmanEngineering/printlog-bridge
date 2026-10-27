@@ -24,7 +24,7 @@ Once paired, the bridge looks for printers on your network (Moonraker and PrusaL
 
 ## Signing in (pairing)
 
-On its first start the bridge pairs with your 3D Print Log account. The **Log** tab shows a QR code, an address and a code:
+On its first start the bridge pairs with your 3D Print Log account. The app's panel (**3D Print Log Bridge** in the sidebar, or **Open web UI** on the app's page) and the **Log** tab show a QR code, an address and a code:
 
 1. Scan the QR code with your phone (or open the address and enter the code).
 2. Sign in to 3D Print Log if asked, and approve the bridge.
@@ -85,6 +85,10 @@ For the bridge's other settings (where to look for a printer that moved, finish-
 
 When that file exists, the app uses it instead of the **Printers** option. Device name, API key and Trace still apply. Leave out `state_dir`: the app keeps its state in its own data.
 
+## The status panel
+
+The app's panel (**3D Print Log Bridge** in Home Assistant's sidebar; turn on **Show in sidebar** on the app's page) shows whether the bridge runs, its version, whether it's paired and its encryption key's fingerprint, the last check-in with 3D Print Log, each printer and its connection, and the code to approve while it pairs. **Run the checks** runs the bridge's `doctor`. The panel only shows: printers are managed in 3D Print Log and on the Configuration tab. Home Assistant's ingress serves it, signed in as you; the app answers only Home Assistant's own proxy on its port (7180), even though it's on the host's network: any other address is closed as it connects. It never shows a key, token, password or access code.
+
 ## Logs, health and updates
 
 - The **Log** tab shows the bridge's log: pairing, each print it logs, and problems with a printer.
@@ -97,7 +101,6 @@ The app keeps the bridge's config (written from your options at every start), th
 
 ## Not yet
 
-- A status page inside Home Assistant (Ingress) and finding printers for you are planned (printlog-bridge#100). Until then, the Log tab shows the status.
 - 32-bit systems (armv7): Home Assistant no longer supports them. Run the Docker image instead.
 
 ## Support

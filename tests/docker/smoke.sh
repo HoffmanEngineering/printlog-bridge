@@ -135,6 +135,10 @@ check "status shows three connected printers" \
     test "$(grep -c 'Connection: connected' "${WORK}/status.txt")" -eq 3
 check "status reads the key from the volume" grep -q 'API key from /data/state/api_key' "${WORK}/status.txt"
 
+echo "== local page"
+check "the local page answers on this computer" grep -q 'Printer voron (printer 41 in 3D Print Log)' <<<"$(curl -fsS http://127.0.0.1:7180/)"
+check "the local page changes nothing" test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:7180/)" = 405
+
 echo "== stop"
 docker stop -t 20 "$NAME" >/dev/null
 check "the bridge exits 0 on SIGTERM" test "$(docker inspect -f '{{.State.ExitCode}}' "$NAME")" -eq 0

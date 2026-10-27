@@ -439,3 +439,77 @@ def test_a_paired_bridge_with_no_printers_runs_and_starts_again_when_one_is_adde
     text = asyncio.run(scenario())
     assert "starting again with it" in text
     assert "Traceback" not in text
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _fetch(url: str) -> str:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return response.read().decode("utf-8")
+    except OSError:
+        return ""
+
+
+def test_run_serves_the_local_page_with_the_code_to_approve_while_it_pairs(tmp_path):
+    """A new container: the local page shows the pairing code (and its QR code) at once, and
+    that the bridge is paired once it's approved."""
+    from fake_auth0 import FakeAuth0
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}/"
+
+    async def scenario():
+        auth0, api = FakeAuth0(interval=0.2), FakePrintLogApi()
+        await auth0.start()
+        api_url = await api.start()
+        api.auth0, api.pairing = auth0, auth0.discovery()
+        config = tmp_path / "printlog-bridge.cfg"
+        config.write_text(f"[bridge]\napi_url = {api_url}\n", encoding="utf-8")
+        env = {
+            "PRINTLOG_BRIDGE_CONFIG": str(config),
+            "PRINTLOG_BRIDGE_STATE_DIR": str(tmp_path / "state"),
+            "PRINTLOG_BRIDGE_STATUS_PAGE": f"127.0.0.1:{port}",
+            "PRINTLOG_API_KEY": "",
+        }
+        process = await _start_run(env)
+        out = Lines(process)
+        loop = asyncio.get_running_loop()
+
+        async def until_page_has(text: str, timeout: float = 20) -> str:
+            """The page once it says `text`, or as it was when `timeout` ran out."""
+            deadline = loop.time() + timeout
+            while True:
+                body = await loop.run_in_executor(None, _fetch, url)
+                if text in body or loop.time() > deadline:
+                    return body
+                await asyncio.sleep(0.2)
+
+        try:
+            await eventually(lambda: auth0.user_codes, timeout=20)
+            code = auth0.user_codes[-1]
+            pairing_page = await until_page_has(code)
+            auth0.approve()
+            paired_page = await until_page_has("Paired")
+            return code, pairing_page, paired_page, out.text
+        finally:
+            await _stop(process)
+            await api.close()
+            await auth0.close()
+
+    code, pairing_page, paired_page, text = asyncio.run(scenario())
+
+    assert code in pairing_page, text
+    assert "<svg " in pairing_page
+    assert "Paired" in paired_page, text
+    assert code not in paired_page
+    assert f"local page (status, pairing, doctor): {url}" in text
+    assert "Traceback" not in text

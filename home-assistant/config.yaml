@@ -14,9 +14,18 @@ arch:
   - aarch64
   - amd64
 image: "ghcr.io/hoffmanengineering/printlog-bridge-addon"
-# The bridge only connects out. The host's network lets it find printers that moved (mDNS,
-# scanning, Bambu's UDP broadcasts) as the Docker image does with --network host (#100).
+# The bridge connects out, and serves its status panel to the Supervisor (ingress, below). The
+# host's network lets it find printers that moved (mDNS, scanning, Bambu's UDP broadcasts) as
+# the Docker image does with --network host (#100).
 host_network: true
+# The bridge's local page (status, the pairing code and QR code, doctor's checks) is the app's
+# panel. It answers only the Supervisor's ingress proxy (172.30.32.2) on this port, which the
+# host's network otherwise opens on the LAN too: any other address is closed as it connects
+# (cli/addon.py INGRESS_PORT).
+ingress: true
+ingress_port: 7180
+panel_icon: mdi:printer-3d
+panel_title: 3D Print Log Bridge
 # Optional: a full printlog-bridge.cfg in the app's config folder, for settings the options
 # don't have. Used instead of the printers below when it exists.
 map:

@@ -21,6 +21,8 @@ from printlog_bridge.core.config import (
     API_KEY_ENV,
     CONFIG_PATH_ENV,
     STATE_DIR_ENV,
+    STATUS_PAGE_CLIENTS_ENV,
+    STATUS_PAGE_ENV,
     TRACE_ENV,
     load_config,
 )
@@ -179,6 +181,13 @@ def test_unset_options_leave_the_environment_alone():
     assert API_KEY_ENV not in env  # an empty variable would read as no key anyway
     assert env[NAME_ENV] == "x"
     assert TRACE_ENV not in env
+
+
+def test_the_local_page_is_the_ingress_page_for_the_supervisor_only():
+    # Even a printlog-bridge.cfg in the app's config folder can't move it: the environment wins.
+    env = bridge_env({"printers": []}, {STATUS_PAGE_ENV: "off", STATUS_PAGE_CLIENTS_ENV: ""})
+    assert env[STATUS_PAGE_ENV] == f"0.0.0.0:{addon.INGRESS_PORT}"
+    assert env[STATUS_PAGE_CLIENTS_ENV] == addon.INGRESS_PROXY == "172.30.32.2"
 
 
 # -- preparing /data -----------------------------------------------------------------------------

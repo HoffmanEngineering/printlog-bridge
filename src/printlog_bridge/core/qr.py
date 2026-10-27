@@ -80,6 +80,29 @@ def render(text: str, stream: TextIO | None = None) -> str:
     return "\n".join(lines)
 
 
+SVG_QUIET_ZONE = 4
+"""The standard's quiet zone, for the local page's QR code (core/local_page.py)."""
+
+
+def svg(text: str) -> str:
+    """The QR code for `text` as an SVG element: a white square with a black path of one unit
+    square per dark module. It holds only numbers, so nothing in `text` reaches the markup."""
+    matrix = encode(text.encode("utf-8"))
+    size = len(matrix) + 2 * SVG_QUIET_ZONE
+    path = "".join(
+        f"M{x + SVG_QUIET_ZONE} {y + SVG_QUIET_ZONE}h1v1h-1z"
+        for y, row in enumerate(matrix)
+        for x, dark in enumerate(row)
+        if dark
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" '
+        f'shape-rendering="crispEdges" role="img" aria-label="QR code">'
+        f'<rect width="{size}" height="{size}" fill="#fff"/>'
+        f'<path d="{path}" fill="#000"/></svg>'
+    )
+
+
 def _can_show(stream: TextIO | None, characters: str) -> bool:
     encoding = getattr(stream, "encoding", None) or "utf-8"
     try:

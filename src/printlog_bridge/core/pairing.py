@@ -21,6 +21,7 @@ import ipaddress
 import logging
 import re
 import socket
+import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -115,6 +116,53 @@ class DeviceAuthorization:
 
     def __repr__(self) -> str:  # never the device code, which is what polls for the token
         return f"DeviceAuthorization({self.user_code!r}, {self.verification_uri!r})"
+
+
+@dataclass(frozen=True)
+class PendingCode:
+    """What the user needs to approve the bridge, for the local page (core/local_page.py). Never
+    the device code, which is what polls for the token."""
+
+    user_code: str
+    verification_uri: str
+    verification_uri_complete: str | None
+    expires_at: float
+    """When the code stops working, on the PendingCodes clock (time.monotonic)."""
+
+
+class PendingCodes:
+    """The code this process's pairing is waiting on, if any. `pair` keeps it here while it
+    waits; the local page reads it from its own thread."""
+
+    def __init__(self, clock: Clock = time.monotonic) -> None:
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._code: PendingCode | None = None
+
+    def show(self, authorization: DeviceAuthorization) -> None:
+        code = PendingCode(
+            authorization.user_code,
+            authorization.verification_uri,
+            authorization.verification_uri_complete,
+            self.clock() + authorization.expires_in,
+        )
+        with self._lock:
+            self._code = code
+
+    def clear(self) -> None:
+        with self._lock:
+            self._code = None
+
+    def get(self) -> PendingCode | None:
+        """The code waiting for approval, or None (none, or it expired)."""
+        with self._lock:
+            code = self._code
+        if code is None or self.clock() >= code.expires_at:
+            return None
+        return code
+
+
+pending = PendingCodes()
 
 
 def default_name(env: Mapping[str, str]) -> str:
@@ -376,22 +424,27 @@ async def pair(
         if not scopes:
             raise PairingError(f"{api_url} offers none of the permissions the bridge needs")
         device = device_id(state_dir)
-        while True:
-            try:
-                authorization = await start(session, config, scopes)
-                show(authorization)
-                access_token = await wait_for_approval(
-                    session, config, authorization, sleep=sleep, clock=clock
-                )
-                grant, repaired = await exchange(
-                    session, api_url, access_token, device, clean_name(name)
-                )
-            except PairingError as e:
-                if not (keep_trying and e.again):
-                    raise
-                say(f"Pairing didn't finish: {e}. Here is a new code.")
-                continue
-            break
+        try:
+            while True:
+                try:
+                    authorization = await start(session, config, scopes)
+                    pending.show(authorization)
+                    show(authorization)
+                    access_token = await wait_for_approval(
+                        session, config, authorization, sleep=sleep, clock=clock
+                    )
+                    pending.clear()
+                    grant, repaired = await exchange(
+                        session, api_url, access_token, device, clean_name(name)
+                    )
+                except PairingError as e:
+                    if not (keep_trying and e.again):
+                        raise
+                    say(f"Pairing didn't finish: {e}. Here is a new code.")
+                    continue
+                break
+        finally:
+            pending.clear()
     stored = write_device_token(
         state_dir,
         token=str(grant["token"]),
