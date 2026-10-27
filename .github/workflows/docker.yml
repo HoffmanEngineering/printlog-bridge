@@ -3,6 +3,11 @@ name: Docker
 # The remote-mode image, ghcr.io/hoffmanengineering/printlog-bridge, for linux/amd64, linux/arm64
 # and linux/arm/v7. Every push to main publishes `edge`; a v1.2.3 tag publishes 1.2.3, 1.2 and
 # latest. Pull requests build every platform without pushing, after the same smoke test.
+#
+# The Home Assistant app's image, ghcr.io/hoffmanengineering/printlog-bridge-addon (the
+# Dockerfile's addon stage, home-assistant/), is built, smoke-tested and published alongside it
+# with the same tags, for linux/amd64 and linux/arm64 only: Home Assistant dropped 32-bit Arm.
+# The Supervisor pulls the tag equal to home-assistant/config.yaml's version.
 
 on:
   push:
@@ -16,6 +21,8 @@ permissions:
 env:
   IMAGE: ghcr.io/hoffmanengineering/printlog-bridge
   PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
+  ADDON_IMAGE: ghcr.io/hoffmanengineering/printlog-bridge-addon
+  ADDON_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   smoke:
@@ -51,6 +58,18 @@ jobs:
           python-version: "3.12"
       - run: pip install "aiohttp>=3.8" # for the fakes
       - run: bash tests/docker/smoke.sh printlog-bridge:smoke "${{ matrix.platform }}"
+      # The app's image: the same layers plus the addon stage.
+      - if: matrix.platform != 'linux/arm/v7'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: addon
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: printlog-bridge-addon:smoke
+          cache-from: type=gha,scope=${{ matrix.cache }}
+      - if: matrix.platform != 'linux/arm/v7'
+        run: bash tests/docker/addon_smoke.sh printlog-bridge-addon:smoke "${{ matrix.platform }}"
 
   build:
     # Pull requests (forks included) build every platform and push nothing, with no registry
@@ -69,6 +88,14 @@ jobs:
           push: false
           tags: printlog-bridge:pr
           cache-from: type=gha,scope=multiarch
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: addon
+          platforms: ${{ env.ADDON_PLATFORMS }}
+          push: false
+          tags: printlog-bridge-addon:pr
+          cache-from: type=gha,scope=multiarch
 
   publish:
     # The only job that can write to GHCR, and it never runs for a pull request.
@@ -80,6 +107,7 @@ jobs:
       packages: write
     outputs:
       tag: ${{ steps.meta.outputs.version }} # edge, or 1.2.3 for a v1.2.3 tag
+      addon_tag: ${{ steps.addon-meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -117,14 +145,45 @@ jobs:
           annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha,scope=multiarch
           cache-to: type=gha,scope=multiarch,mode=max
+      - id: addon-meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ env.ADDON_IMAGE }}
+          flavor: latest=auto
+          # The same tags: a v1.2.3 tag publishes 1.2.3, the version Home Assistant pulls.
+          tags: |
+            type=edge,branch=main
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.title=printlog-bridge-addon
+            org.opencontainers.image.description=The printlog-bridge Home Assistant app: logs every print to 3D Print Log.
+          annotations: |
+            org.opencontainers.image.description=The printlog-bridge Home Assistant app: logs every print to 3D Print Log.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: addon
+          platforms: ${{ env.ADDON_PLATFORMS }}
+          push: true
+          tags: ${{ steps.addon-meta.outputs.tags }}
+          labels: ${{ steps.addon-meta.outputs.labels }}
+          annotations: ${{ steps.addon-meta.outputs.annotations }}
+          cache-from: type=gha,scope=multiarch
 
   verify:
     # Checks what was just published the way someone without a GitHub account sees it: it pulls
     # without logging in, has every platform, and each one starts. GHCR makes a new package
-    # private, so this fails until the package is made public.
+    # private, so this fails until the package is made public (printlog-bridge and
+    # printlog-bridge-addon alike).
     needs: publish
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - run: bash tests/docker/check_published.sh "${{ env.IMAGE }}:${{ needs.publish.outputs.tag }}"
+      - run: bash tests/docker/check_published.sh "${{ env.ADDON_IMAGE }}:${{ needs.publish.outputs.addon_tag }}"
+        env:
+          PLATFORMS: ${{ env.ADDON_PLATFORMS }}

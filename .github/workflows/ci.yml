@@ -33,7 +33,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck --version
-      - run: shellcheck install.sh uninstall.sh tests/install/smoke.sh tests/docker/smoke.sh tests/docker/check_published.sh
+      - run: shellcheck install.sh uninstall.sh tests/install/smoke.sh tests/docker/smoke.sh tests/docker/check_published.sh tests/docker/addon_smoke.sh
+
+  ha-app-lint:
+    # The Home Assistant app's config.yaml against the Supervisor's schema, with the linter
+    # Home Assistant's example app repository uses. tests/test_ha_app.py checks that it agrees
+    # with the code.
+    name: Home Assistant app lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: frenck/action-addon-linter@v2.21
+        with:
+          path: ./home-assistant
 
   install-smoke:
     # A clean install from the source tree in the image people will run, without dev tools.

@@ -31,10 +31,36 @@ def test_config_and_state_live_in_the_data_volume():
     assert ":/data" in COMPOSE
 
 
+def stages() -> dict[str, str]:
+    """Each stage of the Dockerfile by name (the unnamed last one as ""), from its FROM line."""
+    found = {}
+    for chunk in re.split(r"^(?=FROM )", DOCKERFILE, flags=re.MULTILINE)[1:]:
+        header = chunk.splitlines()[0]
+        match = re.search(r"\sAS\s+(\S+)", header, re.IGNORECASE)
+        found[match.group(1) if match else ""] = chunk
+    return found
+
+
+def test_the_default_target_is_the_runtime_stage_unchanged():
+    # `docker build .` and the published image get the normal image; the app's stage is built
+    # only with --target addon. The last stage adds nothing to the runtime stage.
+    assert stages()[""].strip() == "FROM runtime"
+    assert list(stages()) == ["build", "runtime", "addon", ""]
+
+
 def test_runs_as_a_non_root_user():
-    users = re.findall(r"^USER\s+(\S+)", DOCKERFILE, re.MULTILINE)
-    assert users, "the final stage has no USER"
+    users = re.findall(r"^USER\s+(\S+)", stages()["runtime"], re.MULTILINE)
+    assert users, "the runtime stage has no USER"
     assert users[-1].split(":")[0] not in ("root", "0"), users[-1]
+
+
+def test_the_app_stage_starts_as_root_and_runs_the_app_glue():
+    # The Supervisor's /data is root's; printlog-bridge-addon drops to the printlog user.
+    addon = stages()["addon"]
+    assert addon.splitlines()[0] == "FROM runtime AS addon"
+    assert re.search(r"^USER root$", addon, re.MULTILINE)
+    assert 'ENTRYPOINT ["printlog-bridge-addon"]' in addon
+    assert "HEALTHCHECK" not in addon  # the runtime stage's own health check is the watchdog
 
 
 def test_runs_the_bridge_and_checks_its_health_with_the_light_health_command():
