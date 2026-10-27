@@ -64,7 +64,7 @@ printers:
 
 A field an adapter doesn't use must stay empty: the app says which one when it refuses to start. Give each printer a fixed address (a DHCP reservation in your router). A Moonraker printer that moves to a new address is found again on your network.
 
-Secrets (access codes, passwords, API keys) are entered as password fields. A value can't contain line breaks, start with `#` or `;`, or have `#` or `;` after a space; for such a value, use a config file (below).
+Secrets (access codes, passwords, API keys) are entered as password fields. A value can't contain line breaks, start with `#` or `;`, or have `#` or `;` after a space (the bridge's config would read the rest as a comment), so change such a password on the printer.
 
 ## Options
 

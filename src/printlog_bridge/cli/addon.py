@@ -114,7 +114,7 @@ def _printer(printer: Mapping[str, Any], names: set[str]) -> list[str]:
     for option in printer:
         if option in PRINTER_FIELDS or option in fields:
             continue
-        if _text(printer, option, where):
+        if _text(printer, option, f"{where} {option}"):
             raise OptionsError(f"{where} doesn't use {option}; clear it")
     for option, config_option in fields.items():
         value = _text(printer, option, f"{where} {option}")
@@ -135,9 +135,8 @@ def _text(options: Mapping[str, Any], key: str, what: str) -> str:
         raise OptionsError(f"{what} can't contain line breaks or control characters")
     if _INLINE_COMMENT.search(text):
         raise OptionsError(
-            f"{what} can't start with # or ;, or have them after a space (the config would cut it "
-            "there). "
-            "Put it in a printlog-bridge.cfg in the app's config folder instead, or change it."
+            f"{what} can't start with # or ;, or have one after a space: the bridge's config "
+            "reads the rest as a comment. Change it (on the printer, for a password)."
         )
     return text
 
