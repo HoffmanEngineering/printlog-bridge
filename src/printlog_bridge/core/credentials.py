@@ -29,6 +29,7 @@ import hashlib
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +52,8 @@ _CONTROL = re.compile("[\u0000-\u001f\u007f-\u009f]")
 MISSING_PACKAGE = (
     "the cryptography package isn't installed, so this bridge can't use access codes and "
     "passwords entered in 3D Print Log (printers in the config file, and [app_printer <id>] "
-    "sections, still work). Install it into the bridge's Python: pip install cryptography"
+    "sections, still work). Install it into the bridge's Python, then restart the bridge: "
+    f"{sys.executable} -m pip install cryptography"
 )
 
 
