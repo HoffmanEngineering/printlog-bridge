@@ -314,6 +314,7 @@ class MoonrakerSession:
                 reason = str(e)
                 if isinstance(e, MoonrakerAuthError):
                     log.error("[printer %s] %s", self.printer, e)
+                    self.report.credentials_refused(("moonraker_api_key",))
                 else:
                     log.warning("[printer %s] %s", self.printer, e)
                 self.report.warn(WARNING_TOPIC, reason)

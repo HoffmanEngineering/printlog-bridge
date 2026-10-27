@@ -43,6 +43,14 @@ skipped by default.
   "Contract for story 12" (`core/bridge_sync.py`). Discovery only reports; nothing is watched
   unless a `[printer]` or the desired list names it, and the config file wins. Printers
   connected in the app run as `app-<entry id>` (`core/app_printers.py`, `core/watchers.py`).
+- Sealed credentials (#100, story 14b): the scheme is 3d-print-log-api
+  `docs/bridge-credential-sealing.md` (api#289). `core/credentials.py` is the only place that
+  imports `cryptography`, lazily: without it the bridge must still run (`available()`). The
+  private key (`<state_dir>/credential-key.pem`) and opened values never reach a file, log, trace,
+  `status` or bundle; `tests/test_privacy.py` `TestSealedCredentials` checks. An `[app_printer]`
+  value wins over a sealed one. `tests/fixtures/credentials/` is a copy of the API's vectors
+  (SOURCE.txt names the commit): copy a new one, never edit it. `tests/sealing.py` seals as the
+  web app does, for tests only.
 
 ## Docker and NAS installs
 

@@ -25,6 +25,7 @@ from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_sub
 from printlog_bridge.cli.data_owner import drop_root
 from printlog_bridge.cli.discover import discover, format_bambu, format_found, subnets_to_scan
 from printlog_bridge.cli.pair import pair_command, pair_on_first_run
+from printlog_bridge.core import credentials
 from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import (
@@ -89,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also choose again for printers that already have a printer_id",
     )
+    rotate_key = commands.add_parser(
+        "rotate-key",
+        help="replace the bridge's encryption key: confirm the new one in 3D Print Log, then "
+        "enter the printers' access codes and passwords again",
+    )
+    rotate_key.add_argument("--yes", "-y", action="store_true", help="don't ask for confirmation")
     discover = commands.add_parser(
         "discover",
         help="list the Moonraker and Bambu Lab printers on the local network, with a [printer] "
@@ -113,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="don't listen for Bambu Lab printers' announcements (UDP port 2021)",
     )
-    for command in (doctor, run, status, store_key, pair, discover):
+    for command in (doctor, run, status, store_key, pair, rotate_key, discover):
         command.add_argument(
             "--config",
             type=Path,
@@ -139,6 +146,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _store_key(args.config)
     if args.command == "pair":
         return _pair(args)
+    if args.command == "rotate-key":
+        return _rotate_key(args)
     if args.command == "discover":
         return _discover(args)
 
@@ -206,6 +215,51 @@ def _pair(args: argparse.Namespace) -> int:
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
         return 2
     return pair_command(config, env, name=args.name, yes=args.yes, switch=args.switch_printers)
+
+
+def _rotate_key(args: argparse.Namespace) -> int:
+    """Replaces the encryption key. A running bridge reports the new one at its next check-in."""
+    env = dict(os.environ)
+    home = Path.home()
+    config_path = find_config(args.config, env=env, home=home)
+    try:
+        config = _load_for_setup(config_path, args.config, env, home)
+        check_writable(config.state_dir)
+    except ConfigError as e:
+        print(f"printlog-bridge: {e}", file=sys.stderr)
+        return 2
+    if not credentials.available():
+        print(f"printlog-bridge: {credentials.MISSING_PACKAGE}", file=sys.stderr)
+        return 1
+    try:
+        old = credentials.read_key(config.state_dir)
+    except credentials.KeyUnavailable:
+        old = None
+    if old is not None:
+        print(f"The bridge's encryption key is {credentials.short_fingerprint(old.fingerprint)}.")
+    print(
+        "A new key can't open anything sealed to the old one: you confirm it in 3D Print Log "
+        "(Bridges), then enter each printer's access code or password there again."
+    )
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("printlog-bridge: run it with --yes to replace the key.", file=sys.stderr)
+            return 1
+        if input("Replace it? Type yes: ").strip().lower() != "yes":
+            print("The key is unchanged.")
+            return 1
+    try:
+        key = credentials.write_new_key(config.state_dir)
+    except OSError as e:
+        print(f"printlog-bridge: couldn't write the new key: {e}", file=sys.stderr)
+        return 1
+    print(
+        f"New encryption key: {credentials.short_fingerprint(key.fingerprint)}, in "
+        f"{credentials.key_path(config.state_dir)}. The running bridge reports it at its next "
+        "check-in (within 5 minutes); then confirm it in 3D Print Log, checking it shows these "
+        "characters."
+    )
+    return 0
 
 
 def _discover(args: argparse.Namespace) -> int:

@@ -4,9 +4,12 @@ Secrets are removed twice. The config file is redacted option by option (any opt
 key, token, secret, password or access code, and passwords in URLs), and then every known secret
 value, from the config, the key file, the device token file and the environment, is replaced
 wherever it appears in any file of the bundle, in case one was ever written to the log or the
-status file. The key file and the device token file (`<state_dir>/api_key`,
-`<state_dir>/device_token`) are never bundled. With `trace = true`, the newest traces are bundled
-too, up to `TRACE_BYTES`; they were scrubbed when written, and are scrubbed again here.
+status file. The key file, the device token file and the encryption key
+(`<state_dir>/api_key`, `<state_dir>/device_token`, `<state_dir>/credential-key.pem`) are never
+bundled, nor is `bridge.json`; the encryption key's lines, and every credential the app sealed to
+it (opened here only to be found and removed) are scrubbed too. With `trace = true`, the newest
+traces are bundled too, up to `TRACE_BYTES`; they were scrubbed when written, and are scrubbed
+again here.
 
 The outbox goes in as `outbox.json`, less the text of any slicer settings waiting to be sent
 (the file's header and settings block): only their size is kept.
@@ -25,6 +28,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from printlog_bridge import __version__
+from printlog_bridge.core import credentials
 from printlog_bridge.core.config import API_KEY_ENV, API_KEY_FILE
 from printlog_bridge.core.device import DeviceFileError, read_device_token
 from printlog_bridge.core.outbox import Entry, read_entries
@@ -117,7 +121,29 @@ def known_secrets(config_path: Path, state_dir: Path, env: Mapping[str, str]) ->
         device = None
     if device is not None:
         found.add(device.token)
-    return sorted(found, key=len, reverse=True)
+    found.update(_sealed_secrets(state_dir))
+    return sorted((s for s in found if len(s) >= MIN_SECRET_LENGTH), key=len, reverse=True)
+
+
+def _sealed_secrets(state_dir: Path) -> set[str]:
+    """The encryption key's lines, and the credentials sealed to it in the stored desired list
+    (as sent, and opened), in case any reached a log."""
+    found = set()
+    pem = _read(credentials.key_path(state_dir)) or ""
+    found.update(line.strip() for line in pem.splitlines() if "-----" not in line)
+    try:
+        stored = json.loads(_read(state_dir / "bridge.json") or "{}")
+    except ValueError:
+        return found
+    if not isinstance(stored, dict):
+        return found
+    desired = stored.get("desired")
+    for printer in (desired.get("printers") or []) if isinstance(desired, dict) else []:
+        for secret in (printer.get("secrets") or []) if isinstance(printer, dict) else []:
+            if isinstance(secret, dict) and isinstance(secret.get("sealed"), str):
+                found.add(secret["sealed"])
+    found.update(credentials.stored_plaintexts(state_dir, desired, stored.get("bridge_id")))
+    return found
 
 
 def _secrets(config_text: str, env: Mapping[str, str]) -> set[str]:

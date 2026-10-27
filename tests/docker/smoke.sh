@@ -87,6 +87,9 @@ echo "== --version"
 version="$(bridge --version)"
 echo "$version"
 check "--version names the bridge" grep -q '^printlog-bridge ' <<<"$version"
+check "cryptography is installed (sealed credentials)" \
+    inside --entrypoint python "$IMAGE" -c \
+    'from printlog_bridge.core import credentials; assert credentials.available()'
 
 echo "== fakes"
 python3 "${REPO}/tests/docker/serve_fakes.py" "$DATA" "$REPORT" &
@@ -157,6 +160,9 @@ set +e
 bridge doctor >"${WORK}/doctor.txt"
 set -e
 check "doctor signs in with the device token" grep -q 'with the device token' "${WORK}/doctor.txt"
+check "pair shows the encryption key" grep -q '^Encryption key: [0-9a-f]\{4\} ' "${WORK}/pair.txt"
+check "only its owner can read the key" test "$(stat -c %a "${DATA}/state/credential-key.pem")" = 600
+check "doctor shows the key" grep -q 'ok    Credential key: fingerprint' "${WORK}/doctor.txt"
 
 # A new install as the NAS docs now have it: no `user:`, no config file, and a data folder that
 # belongs to root (Docker makes a missing bind-mount folder as root). The container starts as

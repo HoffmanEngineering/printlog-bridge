@@ -209,6 +209,10 @@ class Report:
         self.states: list[str] = []
         self.connects = 0
         self.disconnects: list[str] = []
+        self.refused: list[tuple[str, ...]] = []
+
+    def credentials_refused(self, fields) -> None:
+        self.refused.append(tuple(fields))
 
     def connected(self) -> None:
         self.connects += 1

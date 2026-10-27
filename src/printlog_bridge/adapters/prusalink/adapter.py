@@ -139,8 +139,11 @@ class PrusaLinkAdapter(Adapter):
                 f"[printer {printer}] host must be the printer's address, such as 192.168.1.60 "
                 f"or mk4.local, not {host!r} (a port goes in port)"
             )
-        password = values.get("password") or None
-        api_key = values.get("api_key") or None
+        # Credentials are used as given: configparser has already trimmed a config file's
+        # values, and one opened from the app is used exactly as it opened (a password may start
+        # or end with a space). Blank is the same as missing.
+        password = _secret(options, "password")
+        api_key = _secret(options, "api_key")
         if password is None and api_key is None:
             raise ConfigError(
                 f"[printer {printer}] needs password (or api_key) for adapter = prusalink. "
@@ -158,7 +161,7 @@ class PrusaLinkAdapter(Adapter):
             printer,
             host,
             port=int(port_text),
-            username=values.get("username") or DEFAULT_USER,
+            username=_secret(options, "username") or DEFAULT_USER,
             password=password,
             api_key=api_key,
             poll_interval=poll,
@@ -168,6 +171,13 @@ class PrusaLinkAdapter(Adapter):
 
     def describe(self) -> str:
         return f"prusalink, {self.base_url}"
+
+    def credential_fields(self) -> tuple[str, ...]:
+        """The options the printer refuses when it refuses the bridge: the API key when there
+        is one (it's all that's sent), else the password, and the user name when one was set."""
+        if self.api_key:
+            return ("api_key",)
+        return ("password",) if self.username == DEFAULT_USER else ("password", "username")
 
     app_secrets = ("password", "username", "api_key")
 
@@ -182,7 +192,8 @@ class PrusaLinkAdapter(Adapter):
         values = {k: v for k, v in secrets.items() if v.strip()}
         if not values.get("password") and not values.get("api_key"):
             raise NeedsCredentials(
-                "password (on the printer: Settings > Network > PrusaLink), or api_key"
+                "password (on the printer: Settings > Network > PrusaLink), or api_key",
+                fields=("password",),
             )
         return {"host": host, "port": str(port or 80), **values}
 
@@ -233,6 +244,7 @@ class PrusaLinkAdapter(Adapter):
                     log.warning("[printer %s] %s", self.printer, message)
                     report.disconnected("the printer refused the bridge's credentials")
                     report.warn(ACCESS_WARNING, message)
+                    report.credentials_refused(self.credential_fields())
                     retry = REFUSED_RETRY_S
                 except FirmwareTooOld:
                     log.warning("[printer %s] %s", self.printer, TOO_OLD)
@@ -385,3 +397,9 @@ def _unreachable(error: BaseException, url: str) -> str:
     if isinstance(error, (aiohttp.ClientConnectorError, ConnectionRefusedError)):
         return f"can't reach {url}. Is it the printer's address, and is the printer on?"
     return f"can't reach {url} ({error})"
+
+
+def _secret(options: Mapping[str, str], name: str) -> str | None:
+    """A credential option as given, or None when it's missing or blank."""
+    value = options.get(name)
+    return value if value is not None and value.strip() else None

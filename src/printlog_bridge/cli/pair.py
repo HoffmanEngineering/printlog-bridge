@@ -20,6 +20,7 @@ from typing import Any
 from printlog_bridge.core.adapter import PrinterDetails
 from printlog_bridge.core.api_client import ApiClient, ApiError
 from printlog_bridge.core.config import API_KEY_ENV, BridgeConfig, PrinterConfig, set_printer_ids
+from printlog_bridge.core.credentials import KeyStore, short_fingerprint
 from printlog_bridge.core.device import DeviceToken
 from printlog_bridge.core.doctor import API_KEYS_PAGE, PRINTERS_PAGE
 from printlog_bridge.core.pairing import (
@@ -95,6 +96,7 @@ def pair_command(
         )
     if env.get(API_KEY_ENV):
         print(f"{API_KEY_ENV} is set, but the device token wins over it.")
+    print(key_line(config))
 
     code = asyncio.run(link_printers(config, stored, needs, interactive=interactive, ask=ask))
     print(
@@ -328,6 +330,20 @@ def _describe(printer: Mapping[str, Any]) -> str:
     kind = " ".join(str(printer.get(k) or "").strip() for k in ("make", "model")).strip()
     text = str(printer.get("name") or f"printer {printer.get('id')}")
     return f"{text} ({kind})" if kind and kind != text else text
+
+
+def key_line(config: BridgeConfig) -> str:
+    """The bridge's encryption key (made now if it has none; kept when pairing again), for the
+    owner to compare with the one 3D Print Log shows."""
+    keys = KeyStore(config.state_dir)
+    keys.load()
+    if keys.key is None:
+        return f"Encryption key: none: {keys.problem}"
+    return (
+        f"Encryption key: {short_fingerprint(keys.key.fingerprint)}. 3D Print Log seals printer "
+        "access codes and passwords to it; when the app asks you to confirm this bridge's key, "
+        "check it shows these characters."
+    )
 
 
 def _as(device: DeviceToken) -> str:

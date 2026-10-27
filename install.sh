@@ -117,6 +117,13 @@ make_venv() {
     "${VENV}/bin/python" -m pip install --quiet --upgrade pip
     "${VENV}/bin/python" -m pip install --quiet -r "${REPO_DIR}/requirements.txt"
     "${VENV}/bin/python" -m pip install --quiet -e "$REPO_DIR"
+    # Credentials entered in the app need cryptography. requirements.txt has it only where PyPI
+    # has wheels for it and cffi; on 32-bit Arm try it here (Raspberry Pi OS gets cffi from
+    # piwheels), and carry on without it if it won't install.
+    if ! "${VENV}/bin/python" -c 'import cryptography' 2>/dev/null; then
+        "${VENV}/bin/python" -m pip install --quiet --only-binary cryptography 'cryptography>=3.1' ||
+            say "cryptography didn't install, so printers connected in the app take their passwords from the config file ([app_printer <number>]); printlog-bridge doctor says more."
+    fi
 }
 
 # Pairing (#2) will replace this: it will start `printlog-bridge pair`, which shows a code to

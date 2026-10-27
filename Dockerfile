@@ -15,14 +15,18 @@ ARG PYTHON_VERSION=3.12
 
 # The virtualenv is built here, with a compiler in case a platform has no wheel for aiohttp or
 # its C extensions (linux/arm/v7 may not), and copied into a clean image without it.
+# cryptography (sealed credentials) on every platform: requirements.txt leaves it out on 32-bit
+# Arm, where PyPI has a wheel for it but not for cffi, which is built here against libffi-dev (the
+# runtime image has libffi already: Python's ctypes uses it). No Rust is compiled.
 FROM python:${PYTHON_VERSION}-slim-bookworm AS build
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && apt-get install -y --no-install-recommends gcc libc6-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN python -m venv /opt/printlog-bridge
 COPY requirements.txt /src/
-RUN /opt/printlog-bridge/bin/pip install -r /src/requirements.txt
+RUN /opt/printlog-bridge/bin/pip install -r /src/requirements.txt \
+    && /opt/printlog-bridge/bin/pip install --only-binary cryptography "cryptography>=3.1"
 COPY pyproject.toml README.md LICENSE /src/
 COPY src /src/src
 RUN /opt/printlog-bridge/bin/pip install --no-deps /src \

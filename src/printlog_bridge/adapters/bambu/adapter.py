@@ -146,7 +146,9 @@ class BambuAdapter(Adapter):
                 "digits such as 01S00C123456789 (on the printer's device information page or "
                 "its sticker, or from printlog-bridge discover)"
             )
-        if any(c.isspace() for c in values["access_code"]):
+        # Used as given (an access code opened from the app is used exactly as it opened).
+        access_code = options["access_code"]
+        if any(c.isspace() for c in access_code):
             raise ConfigError(f"[printer {printer}] access_code can't hold spaces")
         fingerprint = values.get("tls_fingerprint") or None
         if fingerprint is not None and parse_fingerprint(fingerprint) is None:
@@ -161,7 +163,7 @@ class BambuAdapter(Adapter):
             printer,
             host,
             serial,
-            values["access_code"],
+            access_code,
             tls_fingerprint=fingerprint,
             ftps=ftps,
             mqtt_port=_port(printer, values, "mqtt_port", MQTT_PORT),
@@ -185,7 +187,8 @@ class BambuAdapter(Adapter):
             raise NeedsCredentials("a serial number, which 3D Print Log should have sent")
         if not (secrets.get("access_code") or "").strip():
             raise NeedsCredentials(
-                "access_code (on the printer's screen, with LAN Only Mode and Developer Mode on)"
+                "access_code (on the printer's screen, with LAN Only Mode and Developer Mode on)",
+                fields=("access_code",),
             )
         options = {"host": host, "serial": serial, "access_code": secrets["access_code"]}
         if port and port != MQTT_PORT:
@@ -244,6 +247,7 @@ class BambuAdapter(Adapter):
                     log.warning("[printer %s] %s", self.printer, message)
                     report.disconnected("the printer refused the access code")
                     report.warn(ACCESS_WARNING, message)
+                    report.credentials_refused(("access_code",))
                     backoff = REFUSED_BACKOFF_S
                 except CertificateChanged as e:
                     log.warning("[printer %s] %s", self.printer, e)

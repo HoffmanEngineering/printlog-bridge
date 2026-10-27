@@ -149,7 +149,11 @@ class MoonrakerAdapter(Adapter):
                 "url is for remote mode, socket for local mode."
             )
 
-        api_key = options.get("moonraker_api_key", "").strip() or None
+        # Used as given: configparser trimmed a config file's; one from the app is used as it
+        # opened.
+        api_key = options.get("moonraker_api_key") or None
+        if api_key is not None and not api_key.strip():
+            api_key = None
         snapshots = _boolean(printer, options, "snapshots")
         timelapse = _boolean(printer, options, "timelapse")
         discovery = _boolean(printer, options, "discovery")

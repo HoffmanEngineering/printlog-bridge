@@ -23,6 +23,7 @@ from printlog_bridge.core.config import (
     ConfigError,
 )
 from printlog_bridge.core.connections import HEARTBEAT_INTERVAL_S, Heartbeat
+from printlog_bridge.core.credentials import KeyStore, Opener
 from printlog_bridge.core.device import DeviceToken
 from printlog_bridge.core.discovery import (
     DiscoveryService,
@@ -170,6 +171,8 @@ async def _run(
             sink.before_create = heartbeat.ensure_registered
             spools.on_swap = sink.spool_swapped
             secrets = _secrets(config)
+            opened: list[str] = []
+            """The credentials opened from the app, which the scrubbers learn as they're opened."""
             watchers = Watchers(
                 sink,
                 heartbeat,
@@ -178,7 +181,7 @@ async def _run(
                 problems,
                 api_url=config.api_url,
                 trace=(
-                    (lambda name: Trace(config.state_dir, name, secrets=secrets))
+                    (lambda name: Trace(config.state_dir, name, secrets=[*secrets, *opened]))
                     if config.trace
                     else None
                 ),
@@ -196,8 +199,23 @@ async def _run(
             sync: BridgeSync | None = None
             if config.device is not None and adapters is not None:
                 resolve = sync_options.pop("resolve", resolve_private)
-                app = AppPrinters(watchers, config, adapters, board, resolve=resolve)
-                sync = _bridge_sync(config, api, board, app, adapters, sync_options)
+                keys = KeyStore(config.state_dir)
+                opener = Opener(keys)
+
+                def learn(values: list[str]) -> None:
+                    opened[:] = values
+                    problems.secrets = [*_secrets(app.config if app else config), *values]
+
+                app = AppPrinters(
+                    watchers,
+                    config,
+                    adapters,
+                    board,
+                    resolve=resolve,
+                    opener=opener,
+                    on_secrets=learn,
+                )
+                sync = _bridge_sync(config, api, board, app, adapters, sync_options, keys, opener)
                 work.append(_sync_quietly(sync))
             if not config.printers:
                 board.setup_problem(NO_PRINTERS_YET if app is not None else None)
@@ -245,6 +263,8 @@ def _bridge_sync(
     app: AppPrinters,
     adapters: Mapping[str, type[Adapter]],
     options: dict[str, Any],
+    keys: KeyStore | None = None,
+    opener: Opener | None = None,
 ) -> BridgeSync:
     discovery = None
     if config.discovery:
@@ -282,6 +302,10 @@ def _bridge_sync(
         is_configured=is_configured,
         mode="local" if local else "remote",
         repair=options.pop("repair", repair),
+        keys=keys,
+        opener=opener,
+        issues=app.credential_issues,
+        refresh=app.refresh,
         **options,
     )
 

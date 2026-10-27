@@ -17,9 +17,17 @@
   if the scope is still missing, it says so and stops syncing. It never loops re-pairing, also
   across restarts: `bridge.json` records the token that was refused.
 
-What it remembers is in `<state_dir>/bridge.json`: the last desired object and its `ETag` (so a
-restart watches the app's printers before 3D Print Log answers), the last `scanRequestedAt` acted
-on, `lastSweepAt`, and the scope re-pair record.
+- **Sealed credentials** (story 14b; 3d-print-log-api `docs/bridge-credential-sealing.md`):
+  every check-in sends the bridge's public key and its fingerprint (core/credentials.py), and,
+  once a desired version has been applied, the complete list of credential issues for that
+  version (`[]` when all is well). The answer says whether 3D Print Log uses the key, or holds it
+  until the owner confirms it in the app: `status`, `doctor` and the log say so, with the
+  fingerprint to compare. A changed set of issues brings the next check-in forward.
+
+What it remembers is in `<state_dir>/bridge.json`: the last desired object (sealed values as
+sent: only the key opens them) and its `ETag` (so a restart watches the app's printers before 3D
+Print Log answers), the bridge's id in 3D Print Log (the associated data of every sealed value),
+the last `scanRequestedAt` acted on, `lastSweepAt`, and the scope re-pair record.
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ from printlog_bridge.core.api_client import (
     AuthRejected,
 )
 from printlog_bridge.core.app_printers import DesiredPrinter
+from printlog_bridge.core.credentials import KeyStore, Opener, short_fingerprint
 from printlog_bridge.core.device import DeviceToken, write_private_file
 from printlog_bridge.core.discovery import MAX_FOUND, DiscoveryService, Found
 from printlog_bridge.core.status import StatusBoard
@@ -61,6 +70,16 @@ FAILED_RETRY_S = 60
 MAX_BACKOFF_S = 30 * 60
 MAX_NETWORKS = 16
 INSUFFICIENT_SCOPE = "insufficient_scope"
+INVALID_PUBLIC_KEY = "invalid_public_key"
+ISSUES_CHECK_IN_S = 30
+"""The soonest a changed set of credential issues brings the next check-in forward."""
+
+KEY_CONFIRMED = "confirmed"
+KEY_PENDING = "pending"
+KEY_OTHER = "other"
+KEY_REJECTED = "rejected"
+KEY_UNSUPPORTED = "unsupported"
+KEY_UNAVAILABLE = "unavailable"
 NOT_SUPPORTED = ("device_endpoint_not_allowed", "device_token_required")
 
 NO_SCOPE = (
@@ -76,6 +95,8 @@ UNSUPPORTED = (
 
 Repair = Callable[[], Awaitable[Optional[DeviceToken]]]
 Apply = Callable[[Sequence[DesiredPrinter]], Awaitable[None]]
+Issues = Callable[[], Sequence[dict]]
+Refresh = Callable[[], Awaitable[None]]
 
 
 def _sha(token: str) -> str:
@@ -106,6 +127,10 @@ class BridgeSync:
         is_configured: Callable[[Found], bool] = lambda found: False,
         mode: str = "remote",
         repair: Repair | None = None,
+        keys: KeyStore | None = None,
+        opener: Opener | None = None,
+        issues: Issues = lambda: [],
+        refresh: Refresh | None = None,
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
@@ -137,6 +162,17 @@ class BridgeSync:
         self._wake: asyncio.Event | None = None
         self._registered = False
         """Whether a check-in got through in this run."""
+        self.keys = keys
+        self.opener = opener
+        self.issues = issues
+        self.refresh = refresh
+        """Opens the desired list's sealed values again (a new key or bridge id)."""
+        self._sent_issues: Any = None
+        """The issues the last check-in carried, with their version."""
+        self._last_check_in = float("-inf")
+        self._key_said: tuple[str, str] | None = None
+        if self.opener is not None and isinstance(self.state.get("bridge_id"), int):
+            self.opener.bridge_id = self.state["bridge_id"]
 
     # -- the state file ------------------------------------------------------------------------
 
@@ -163,12 +199,16 @@ class BridgeSync:
     async def run(self) -> None:
         """Checks in and polls until cancelled, or until it can't for good (a missing scope)."""
         self._wake = asyncio.Event()
+        if self.keys is not None:
+            self.keys.load()
+            self._key_report(None)
         stored = self.state.get("desired")
         if isinstance(stored, dict):
             await self._apply(stored)
         self._report()
         try:
             while self.stopped is None:
+                self._issues_changed()
                 now = self.clock()
                 if now >= self._next_check_in:
                     await self.check_in()
@@ -217,7 +257,31 @@ class BridgeSync:
             body["lastSweepAt"] = self.state["last_sweep_at"]
         if self.discovery is not None:
             body["discovered"] = self.discovered()
+        key = self.keys.key if self.keys is not None else None
+        if key is not None:
+            body["publicKey"] = key.public_key
+            body["publicKeyFingerprint"] = key.fingerprint
+        issues = self._current_issues()
+        if issues is not None:
+            body["credentialIssuesVersion"], body["credentialIssues"] = issues
         return body
+
+    def _current_issues(self) -> tuple[str, list[dict]] | None:
+        """The desired version applied and the complete list of its credential issues, or None
+        before there is one to describe (no version applied, or the bridge's id not known yet,
+        so nothing could be opened: a missing list keeps what 3D Print Log has)."""
+        version = self.desired_version
+        if version is None or (self.opener is not None and self.opener.bridge_id is None):
+            return None
+        return version, list(self.issues())
+
+    def _issues_changed(self) -> None:
+        """Brings the next check-in forward when the issues changed since the last one."""
+        if not self._registered:
+            return
+        if self._current_issues() != self._sent_issues:
+            soonest = self._last_check_in + ISSUES_CHECK_IN_S
+            self._next_check_in = min(self._next_check_in, max(self.clock(), soonest))
 
     def discovered(self) -> list[dict[str, Any]]:
         """What discovery found, plus the config file's printers, each once, configured ones
@@ -250,8 +314,12 @@ class BridgeSync:
     async def check_in(self) -> None:
         now = self.clock()
         self._next_check_in = now + self.check_in_s
+        if self.keys is not None and self.keys.load():  # rotate-key while running
+            await self._refresh()
+        body = self.body()
+        self._last_check_in = now
         try:
-            answer = await self.api.check_in(self.body())
+            answer = await self.api.check_in(body)
         except ApiRejected as e:
             await self._refused(e)
             return
@@ -270,17 +338,83 @@ class BridgeSync:
             return
         self._backoff = 0.0
         self._registered = True
+        if "credentialIssues" in body:
+            self._sent_issues = (body["credentialIssuesVersion"], body["credentialIssues"])
         self._timings(answer)
         self.state["last_check_in_at"] = _iso(self.now())
         self.board.bridge(check_in={"at": self.state["last_check_in_at"], "problem": None})
-        for item in answer.get("rejected") or []:
+        rejected = [item for item in answer.get("rejected") or [] if isinstance(item, dict)]
+        for item in rejected:
             self._log_rejected(item)
+        self._key_report(answer, rejected)
+        bridge_id = answer.get("bridgeId")
+        if isinstance(bridge_id, int) and bridge_id != self.state.get("bridge_id"):
+            self.state["bridge_id"] = bridge_id
+            if self.opener is not None:
+                self.opener.bridge_id = bridge_id
+            await self._refresh()
         desired = answer.get("desired")
         if isinstance(desired, dict):
             await self._desired(desired, None)
         self._save()
         self._start_discovery()
         self._report()
+
+    async def _refresh(self) -> None:
+        if self.refresh is not None and isinstance(self.state.get("desired"), dict):
+            try:
+                await self.refresh()
+            except Exception:  # never stops the sync
+                log.exception("couldn't apply the desired printers again")
+
+    def _key_report(
+        self, answer: dict[str, Any] | None, rejected: Sequence[dict[str, Any]] = ()
+    ) -> None:
+        """Where the key stands with 3D Print Log, for `status` and `doctor`, and the log
+        when it changes. `answer` is None before the first check-in."""
+        if self.keys is None:
+            return
+        key = self.keys.key
+        if key is None:
+            state, detail = KEY_UNAVAILABLE, self.keys.problem or "no key"
+        elif answer is None:
+            state, detail = None, None
+        elif any(i.get("code") == INVALID_PUBLIC_KEY for i in rejected):
+            state = KEY_REJECTED
+            detail = "3D Print Log refused this bridge's key as malformed (invalid_public_key)"
+        elif "publicKeyFingerprint" not in answer and "pendingPublicKeyFingerprint" not in answer:
+            state = KEY_UNSUPPORTED
+            detail = "this 3D Print Log doesn't take encryption keys yet"
+        elif answer.get("publicKeyFingerprint") == key.fingerprint:
+            state, detail = KEY_CONFIRMED, "in use: 3D Print Log seals credentials to it"
+        elif answer.get("pendingPublicKeyFingerprint") == key.fingerprint:
+            state = KEY_PENDING
+            short = short_fingerprint(key.fingerprint)
+            detail = (
+                "waiting for confirmation in the app: open Bridges in 3D Print Log, check that "
+                f"the fingerprint it shows for this bridge's new key is {short}, and confirm it"
+            )
+        else:
+            state = KEY_OTHER
+            detail = (
+                "3D Print Log uses another key for this bridge and isn't holding this one for "
+                "confirmation (it may have changed keys too often today): it's reported again "
+                "at every check-in"
+            )
+        fingerprint = key.fingerprint if key is not None else None
+        self.board.bridge(key={"fingerprint": fingerprint, "state": state, "detail": detail})
+        said = (str(state), str(fingerprint))
+        if state is None or said == self._key_said:
+            return
+        self._key_said = said
+        if state in (KEY_PENDING, KEY_OTHER, KEY_REJECTED, KEY_UNAVAILABLE):
+            short = f" ({short_fingerprint(fingerprint)})" if fingerprint else ""
+            log.warning("this bridge's encryption key%s: %s", short, detail)
+        elif state == KEY_CONFIRMED:
+            log.info(
+                "3D Print Log uses this bridge's encryption key (%s)",
+                short_fingerprint(fingerprint),
+            )
 
     def _timings(self, answer: dict[str, Any]) -> None:
         check_in = answer.get("checkInSeconds")
@@ -292,9 +426,7 @@ class BridgeSync:
             self.poll_s = max(MIN_POLL_S, float(poll))
         self._next_poll = self.clock() + self.poll_s
 
-    def _log_rejected(self, item: Any) -> None:
-        if not isinstance(item, dict):
-            return
+    def _log_rejected(self, item: dict[str, Any]) -> None:
         key = (str(item.get("field")), str(item.get("code")))
         if key in self._rejected_logged:
             return
