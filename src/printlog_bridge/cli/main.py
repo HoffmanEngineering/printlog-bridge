@@ -20,8 +20,9 @@ from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
+from printlog_bridge.adapters.bambu import discovery as bambu_discovery
 from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
-from printlog_bridge.cli.discover import discover, format_found, subnets_to_scan
+from printlog_bridge.cli.discover import discover, format_bambu, format_found, subnets_to_scan
 from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import (
@@ -61,7 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover = commands.add_parser(
         "discover",
-        help="list the Moonraker printers on the local network, with a [printer] section for each",
+        help="list the Moonraker and Bambu Lab printers on the local network, with a [printer] "
+        "section for each",
     )
     discover.add_argument(
         "--subnet",
@@ -76,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover.add_argument(
         "--no-zeroconf", action="store_true", help="only scan; don't ask over mDNS"
+    )
+    discover.add_argument(
+        "--no-bambu",
+        action="store_true",
+        help="don't listen for Bambu Lab printers' announcements (UDP port 2021)",
     )
     for command in (doctor, run, status, store_key, discover):
         command.add_argument(
@@ -173,9 +180,24 @@ def _discover(args: argparse.Namespace) -> int:
     networks = subnets_to_scan(subnets, config)
     zeroconf = not args.no_zeroconf
     print(f"printlog-bridge {__version__} discover")
-    found = asyncio.run(discover(networks, port=args.port, zeroconf=zeroconf))
+    bambu = not args.no_bambu
+
+    async def both() -> tuple[list, list | None, str | None]:
+        listening = asyncio.ensure_future(bambu_discovery.listen()) if bambu else None
+        found = await discover(networks, port=args.port, zeroconf=zeroconf)
+        if listening is None:
+            return found, None, None
+        try:
+            return found, await listening, None
+        except OSError as e:
+            return found, None, e.strerror or str(e)
+
+    found, bambus, error = asyncio.run(both())
     print(format_found(found, networks, config, zeroconf=zeroconf))
-    return 0 if found else 1
+    if bambu:
+        print()
+        print(format_bambu(bambus, config, bambu_discovery.LISTEN_S, error))
+    return 0 if found or bambus else 1
 
 
 def _store_key(explicit_config: Path | None) -> int:

@@ -1,9 +1,9 @@
 """The support bundle `printlog-bridge doctor` writes: everything support needs, minus every secret.
 
 Secrets are removed twice. The config file is redacted option by option (any option named like a
-key, token, secret or password, and passwords in URLs), and then every known secret value, from
-the config, the key file and the environment, is replaced wherever it appears in any file of
-the bundle, in case one was ever written to the log or the status file. The key file itself
+key, token, secret, password or access code, and passwords in URLs), and then every known secret
+value, from the config, the key file and the environment, is replaced wherever it appears in any
+file of the bundle, in case one was ever written to the log or the status file. The key file itself
 (`<state_dir>/api_key`) is never bundled. With `trace = true`, the newest traces are bundled
 too, up to `TRACE_BYTES`; they were scrubbed when written, and are scrubbed again here.
 
@@ -36,7 +36,9 @@ LOG_FILES = ("bridge.log", "bridge.log.1")
 TRACE_BYTES = 20 * 1024 * 1024
 """How much of the newest traces (`trace = true`) goes into the bundle, before compression."""
 
-_SECRET_OPTION = re.compile(r"(key|token|secret|password)", re.IGNORECASE)
+SECRET_OPTION = re.compile(r"(key|token|secret|password|access_code)", re.IGNORECASE)
+"""A config option whose value is a secret: an API key, a password, a Bambu printer's LAN
+access code."""
 _OPTION_LINE = re.compile(r"^(\s*)([^=:\s\[;#][^=:]*?)(\s*[=:]\s*)(.*)$")
 _SECRET_ENV = (API_KEY_ENV,)
 MIN_SECRET_LENGTH = 4
@@ -93,7 +95,7 @@ def redact_config(text: str) -> str:
     lines = []
     for line in text.splitlines():
         match = _OPTION_LINE.match(line)
-        if match and _SECRET_OPTION.search(match.group(2)) and match.group(4).strip():
+        if match and SECRET_OPTION.search(match.group(2)) and match.group(4).strip():
             line = f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}"
         lines.append(URL_USERINFO.sub(rf"\1{REDACTED}@", line))
     return "\n".join(lines) + "\n"
@@ -117,7 +119,7 @@ def _secrets(config_text: str, env: Mapping[str, str]) -> set[str]:
         parser.read_string(config_text)
     for section in parser.sections():
         for option, value in parser[section].items():
-            if _SECRET_OPTION.search(option):
+            if SECRET_OPTION.search(option):
                 found.add(value.strip())
             found.update(m.group(1) for m in re.finditer(r"\w+://([^/@\s]+)@", value))
     return {s for s in found if len(s) >= MIN_SECRET_LENGTH}

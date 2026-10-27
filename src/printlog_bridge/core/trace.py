@@ -11,8 +11,9 @@ this computer; `doctor`'s support bundle includes the latest.
 
 Secrets are removed as in the support bundle: every key, token and password the bridge knows of,
 passwords in URLs and query values named like a secret (a webcam's `?token=`), any field named
-like a key, token or password, the answer to a request for a token or key (`access.*`), and
-Moonraker's config (`server.config`), whose notifier URLs hold tokens no scrubber can find.
+like a key, token, password or access code, the answer to a request for a token or key
+(`access.*`), and Moonraker's config (`server.config`), whose notifier URLs hold tokens no
+scrubber can find.
 
 Recording never holds up the bridge: `record` only queues the message, and a thread of the
 trace's own scrubs and writes it. When the disk can't keep up, messages are dropped rather than
@@ -64,7 +65,8 @@ SECRET_ANSWERS = frozenset(
 apart from the rest (moonraker.conf's Apprise notifier URLs, `tgram://<bot>:<token>/...`)."""
 
 _SECRET_FIELD = re.compile(
-    r'("[^"\\]*(?:key|token|secret|passw)[^"\\]*"\s*:\s*)"(?:[^"\\]|\\.)*"', re.IGNORECASE
+    r'("[^"\\]*(?:key|token|secret|passw|access_code)[^"\\]*"\s*:\s*)"(?:[^"\\]|\\.)*"',
+    re.IGNORECASE,
 )
 _SECRET_METHOD = re.compile(r'"method"\s*:\s*"(access\.[^"]+|server\.config)"')
 

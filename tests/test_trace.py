@@ -285,3 +285,9 @@ def test_the_session_records_over_the_unix_socket_too(tmp_path):
     found = lines(trace_files(tmp_path, "voron")[0])
     assert any(line["dir"] == "recv" for line in found)
     assert any(line["dir"] == "send" for line in found)
+
+
+def test_a_field_named_access_code_is_removed(tmp_path):
+    recorded(tmp_path, ("recv", '{"system": {"command": "get_access_code", "access_code": "x1"}}'))
+
+    assert lines(trace_files(tmp_path, "u1")[0])[0]["msg"]["system"]["access_code"] == "<redacted>"

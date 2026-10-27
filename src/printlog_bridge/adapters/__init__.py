@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from printlog_bridge.adapters.bambu import BambuAdapter
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.core.adapter import Adapter
 
 ADAPTERS: Mapping[str, type[Adapter]] = {
     MoonrakerAdapter.name: MoonrakerAdapter,
+    BambuAdapter.name: BambuAdapter,
 }
