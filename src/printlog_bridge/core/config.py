@@ -580,6 +580,61 @@ def _clear_by_path(path: Path) -> bool:
     return True
 
 
+_PRINTER_ID_LINE = re.compile(r"^(\s*)printer_id\s*[=:]", re.IGNORECASE)
+
+
+def set_printer_ids(path: Path, ids: Mapping[str, int]) -> list[str]:
+    """Sets `printer_id` in each named `[printer <name>]` section of the config, replacing the
+    line that has one or adding it under the section's header, and leaving every other line (and
+    its line ending) as it was. Returns the names it found no section for. A symlink stays one:
+    the file it points to is rewritten, keeping its mode."""
+    real = Path(os.path.realpath(path))
+    with real.open(encoding="utf-8-sig", newline="") as f:
+        lines = f.readlines()
+    missing = []
+    for name, printer_id in ids.items():
+        if not _set_printer_id(lines, name, printer_id):
+            missing.append(name)
+    fd, temporary = tempfile.mkstemp(dir=str(real.parent), prefix=f".{real.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.writelines(lines)
+        shutil.copymode(str(real), temporary)
+        os.replace(temporary, str(real))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+    return missing
+
+
+def _set_printer_id(lines: list[str], name: str, printer_id: int) -> bool:
+    header = None
+    section = None
+    for i, line in enumerate(lines):
+        match = _SECTION.match(line)
+        if match:
+            if header is not None:
+                break  # the section ended without a printer_id line
+            kind, _, title = match.group(1).strip().partition(" ")
+            if kind == PRINTER_PREFIX and title.strip() == name:
+                header, section = i, True
+            continue
+        if section and _PRINTER_ID_LINE.match(line):
+            ending = line[len(line.rstrip("\r\n")) :] or "\n"
+            indent = _PRINTER_ID_LINE.match(line).group(1)
+            lines[i] = f"{indent}printer_id = {printer_id}{ending}"
+            return True
+    if header is None:
+        return False
+    ending = lines[header][len(lines[header].rstrip("\r\n")) :]
+    if not ending:
+        lines[header] += "\n"
+        ending = "\n"
+    lines.insert(header + 1, f"printer_id = {printer_id}{ending}")
+    return True
+
+
 def _empty_api_key(lines: list[str]) -> bool:
     """Empties, in place, each `api_key` line of `[bridge]`. True when there was one."""
     section = None

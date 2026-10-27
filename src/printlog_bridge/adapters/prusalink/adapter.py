@@ -21,7 +21,7 @@ from typing import Any
 
 import aiohttp
 
-from printlog_bridge.core.adapter import Adapter
+from printlog_bridge.core.adapter import Adapter, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.current_job import CurrentJob
@@ -79,6 +79,10 @@ class FirmwareTooOld(Exception):
 
 class UnexpectedAnswer(Exception):
     pass
+
+
+MMU_SLOTS = 5
+"""Filaments an MMU3 feeds."""
 
 
 class PrusaLinkAdapter(Adapter):
@@ -268,6 +272,25 @@ class PrusaLinkAdapter(Adapter):
             report.firmware(*firmware)
         if host is not None:
             report.host_software(*host)
+
+    async def printer_details(self) -> PrinterDetails:
+        """The host name, and five slots with an MMU (`/api/v1/info`). PrusaLink doesn't name the
+        model in words; the slicer's name for it comes from the last job, when there was one."""
+        client = self._client()
+        try:
+            status_code, info = await client.get_json("/api/v1/info")
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError, Refused, UnexpectedAnswer):
+            status_code, info = 0, None
+        finally:
+            await client.close()
+        if status_code != 200 or not isinstance(info, Mapping):
+            return PrinterDetails(name=self.printer, make="Prusa")
+        hostname = info.get("hostname")
+        return PrinterDetails(
+            name=hostname if isinstance(hostname, str) and hostname else self.printer,
+            make="Prusa",
+            slot_count=MMU_SLOTS if info.get("mmu") is True else None,
+        )
 
     async def check(self) -> Sequence[CheckResult]:
         name = f"Printer {self.printer}"

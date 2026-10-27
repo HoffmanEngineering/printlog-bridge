@@ -94,6 +94,7 @@ class FakeMoonraker:
             "toolhead": {"extruder": "extruder", "homed_axes": ""},
             "virtual_sdcard": {"progress": 0.0, "is_active": False},
             "filament_detect": {"info": []},
+            "configfile": {"settings": {"printer": {"kinematics": "corexy"}}},
         }
         self.files: dict[str, bytes] = {}
         """Files under the gcodes root, by path relative to it (`.thumbs/x-300x300.png`)."""
@@ -340,6 +341,21 @@ class FakeMoonraker:
         if method == "printer.info":
             return {"state": self.klippy_state, "hostname": self.hostname,
                     "software_version": "v0.12.0-fake"}  # fmt: skip
+        if method == "printer.objects.query":
+            self._require_klippy()
+            return {
+                "eventtime": 1.0,
+                "status": {
+                    name: dict(self.status.get(name, {}))
+                    if fields is None
+                    else {
+                        f: self.status.get(name, {})[f]
+                        for f in fields
+                        if f in self.status.get(name, {})
+                    }
+                    for name, fields in params["objects"].items()
+                },
+            }
         if method == "printer.objects.list":
             self._require_klippy()
             return {"objects": list(self.objects)}

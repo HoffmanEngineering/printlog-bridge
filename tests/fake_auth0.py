@@ -29,7 +29,7 @@ AUDIENCE = "https://api.3dprintlog.com/device"
 
 
 class FakeAuth0:
-    def __init__(self, *, interval: int = 5, expires_in: int = 900) -> None:
+    def __init__(self, *, interval: float = 5, expires_in: int = 900) -> None:
         self.interval = interval
         self.expires_in = expires_in
         self.client_id = CLIENT_ID

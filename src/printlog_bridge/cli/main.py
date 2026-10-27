@@ -23,10 +23,12 @@ from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.bambu import discovery as bambu_discovery
 from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
 from printlog_bridge.cli.discover import discover, format_bambu, format_found, subnets_to_scan
+from printlog_bridge.cli.pair import pair_command, pair_on_first_run
 from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import (
     API_KEY_ENV,
+    BridgeConfig,
     ConfigError,
     clean_key,
     clear_config_api_key,
@@ -60,6 +62,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep the API key in the state directory, where Moonraker can't serve it: moves "
         "api_key out of the config, or asks for a key",
     )
+    pair = commands.add_parser(
+        "pair",
+        help="pair the bridge with your 3D Print Log account: approve it on your phone (QR code) "
+        "or in a browser, no API key to copy. Running it again pairs the bridge again.",
+    )
+    pair.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="ask nothing: pair, then say which printer_id to set (also without a terminal)",
+    )
+    pair.add_argument(
+        "--name",
+        help="the name the bridge goes by in 3D Print Log (default: $PRINTLOG_BRIDGE_NAME, then "
+        "'printlog-bridge on <host name>')",
+    )
+    pair.add_argument(
+        "--switch-printers",
+        action="store_true",
+        help="also choose again for printers that already have a printer_id",
+    )
     discover = commands.add_parser(
         "discover",
         help="list the Moonraker and Bambu Lab printers on the local network, with a [printer] "
@@ -84,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="don't listen for Bambu Lab printers' announcements (UDP port 2021)",
     )
-    for command in (doctor, run, status, store_key, discover):
+    for command in (doctor, run, status, store_key, pair, discover):
         command.add_argument(
             "--config",
             type=Path,
@@ -107,6 +130,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _status(args.config)
     if args.command == "store-key":
         return _store_key(args.config)
+    if args.command == "pair":
+        return _pair(args)
     if args.command == "discover":
         return _discover(args)
 
@@ -160,6 +185,20 @@ def _status(explicit_config: Path | None) -> int:
     print(f"printlog-bridge {__version__} status")
     print(text)
     return code
+
+
+def _pair(args: argparse.Namespace) -> int:
+    env = dict(os.environ)
+    home = Path.home()
+    config_path = find_config(args.config, env=env, home=home)
+    try:
+        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        check_writable(config.state_dir)
+    except ConfigError as e:
+        print(f"printlog-bridge: {e}", file=sys.stderr)
+        print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
+        return 2
+    return pair_command(config, env, name=args.name, yes=args.yes, switch=args.switch_printers)
 
 
 def _discover(args: argparse.Namespace) -> int:
@@ -453,20 +492,54 @@ def _run(explicit_config: Path | None) -> int:
     env = dict(os.environ)
     home = Path.home()
     config_path = find_config(explicit_config, env=env, home=home)
+    logging_on = False
     try:
         config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
-        check_runnable(config)
         check_writable(config.state_dir)
+        if not config.has_credentials:
+            # First run in Docker or an add-on: pair in the log, then carry on.
+            configure_logging(config.state_dir)
+            logging_on = True
+            problem = _first_run_pairing(config, env)
+            if problem is not None:
+                print(f"printlog-bridge: {problem}", file=sys.stderr)
+                return 2
+            config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        check_runnable(config)
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
         return 2
 
-    configure_logging(config.state_dir)
+    if not logging_on:
+        configure_logging(config.state_dir)
     logging.getLogger(__name__).info("printlog-bridge %s, config %s", __version__, config.path)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(until_stopped(run_bridge(config)))
     return 0
+
+
+def _first_run_pairing(config: BridgeConfig, env: Mapping[str, str]) -> str | None:
+    """Pairs, or says why it can't (pairing off on the server: then what to do instead)."""
+    outcome: list[str | None] = []
+
+    async def pairing() -> None:
+        outcome.append(await pair_on_first_run(config, env))
+
+    try:
+        asyncio.run(until_stopped(pairing()))
+    except KeyboardInterrupt:
+        return "pairing canceled"
+    if not outcome:
+        return "pairing canceled"
+    problem = outcome[0]
+    if problem is None:
+        return None
+    try:
+        check_runnable(config)
+    except ConfigError as e:
+        return f"{e} (Pairing: {problem})"
+    return problem
 
 
 def check_writable(state_dir: Path) -> None:
