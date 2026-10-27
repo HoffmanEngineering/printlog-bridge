@@ -64,6 +64,9 @@ class ReportRecorder:
     def printer_model(self, model: str) -> None:
         self.calls.append(("printer_model", model))
 
+    def credentials_refused(self, fields) -> None:
+        self.calls.append(("credentials_refused", *fields))
+
     def warn(self, topic: str, message: str | None) -> None:
         if message is None:
             self.warnings.pop(topic, None)

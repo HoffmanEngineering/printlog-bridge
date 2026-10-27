@@ -168,10 +168,22 @@ def test_check_reaches_moonraker_over_its_unix_socket():
 
 def test_moonraker_api_key_is_read_for_remote_mode():
     adapter = MoonrakerAdapter.from_config(
-        "u1", {"url": "http://u1.local", "moonraker_api_key": " abc123 "}
+        "u1", {"url": "http://u1.local", "moonraker_api_key": "abc123"}
     )
 
     assert adapter.api_key == "abc123"
+
+
+def test_moonraker_api_key_is_used_as_given():
+    """A key opened from the app is used exactly as it opened (configparser has already trimmed
+    a config file's); a blank one is no key."""
+    given = MoonrakerAdapter.from_config(
+        "u1", {"url": "http://u1.local", "moonraker_api_key": " k "}
+    )
+    blank = MoonrakerAdapter.from_config("u1", {"url": "http://u1.local", "moonraker_api_key": " "})
+
+    assert given.api_key == " k "
+    assert blank.api_key is None
 
 
 def test_moonraker_api_key_is_refused_for_the_trusted_local_socket():

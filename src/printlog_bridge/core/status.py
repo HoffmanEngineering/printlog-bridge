@@ -9,12 +9,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from printlog_bridge import __version__
+from printlog_bridge.core import credentials
 from printlog_bridge.core.outbox import read_waiting
 from printlog_bridge.core.trace import trace_dir
 from printlog_bridge.core.updates import is_newer, update_notice
@@ -72,6 +73,11 @@ class PrinterReport(Protocol):
         """The printer's model, as the slicer named it in a job's file, sent with the heartbeat.
         Never a host name or anything the user typed for the printer."""
 
+    def credentials_refused(self, fields: Sequence[str]) -> None:
+        """The printer refused the bridge's credentials: `fields` names the options it sent
+        (`access_code`, `password`), so a printer connected in the app can report the ones that
+        came from the app as `rejected_by_printer`. `connected()` clears it."""
+
 
 class NullReport:
     """A PrinterReport that keeps nothing, for code run outside `printlog-bridge run`."""
@@ -98,6 +104,9 @@ class NullReport:
         pass
 
     def printer_model(self, model: str) -> None:
+        pass
+
+    def credentials_refused(self, fields: Sequence[str]) -> None:
         pass
 
 
@@ -229,6 +238,7 @@ def _new_printer(now: str) -> dict[str, Any]:
         "moved": None,
         "software": {},
         "printer_model": None,
+        "credentials_refused": [],
     }
 
 
@@ -240,6 +250,8 @@ class BoardReport:
         self.printer = printer
 
     def connected(self) -> None:
+        if self.board.get(self.printer).get("credentials_refused"):
+            self.board.update(self.printer, credentials_refused=[])
         if self.board.get(self.printer)["connection"] == "connected":
             return
         self.board.update(
@@ -298,6 +310,11 @@ class BoardReport:
     def printer_model(self, model: str) -> None:
         if self.board.get(self.printer).get("printer_model") != model:
             self.board.update(self.printer, printer_model=model)
+
+    def credentials_refused(self, fields: Sequence[str]) -> None:
+        refused = sorted(set(fields))
+        if self.board.get(self.printer).get("credentials_refused") != refused:
+            self.board.update(self.printer, credentials_refused=refused)
 
     def event(self, text: str) -> None:
         self.board.update(self.printer, last_event=text, last_event_at=self.board._now())
@@ -378,7 +395,7 @@ def bridge_lines(
     bridge = status.get("bridge") or {}
     if config.device is None:
         return ["Discovery: off; it needs the bridge paired (`printlog-bridge pair`)"]
-    lines = []
+    lines = [key_line(config, bridge.get("key") if running else None)]
     discovery = bridge.get("discovery")
     if not config.discovery:
         lines.append("Discovery: off ([bridge] discovery = false)")
@@ -426,7 +443,24 @@ def bridge_lines(
                 )
             for warning in (known.get("warnings") or {}).values():
                 lines.append(f"  Warning: {warning}")
+        for name, words in sorted((app.get("credentials") or {}).items()):
+            lines.append(f"  {name}: {words}")
     return lines
+
+
+def key_line(config: BridgeConfig, reported: Mapping[str, Any] | None) -> str:
+    """The bridge's encryption key and where it stands with 3D Print Log (as the running bridge
+    last heard), for `status`. Reads the key file; never makes one."""
+    try:
+        key = credentials.read_key(config.state_dir)
+    except credentials.KeyUnavailable as e:
+        return f"Encryption key: none: {e}"
+    if key is None:
+        return "Encryption key: none yet; the bridge makes one when it runs"
+    line = f"Encryption key: {credentials.short_fingerprint(key.fingerprint)}"
+    if reported and reported.get("fingerprint") == key.fingerprint and reported.get("detail"):
+        line += f", {reported['detail']}"
+    return line
 
 
 def _credentials_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str:

@@ -114,8 +114,10 @@ class Adapter(ABC):
     # -- discovery and app-managed printers (#100) ---------------------------------------------
 
     app_secrets: ClassVar[tuple[str, ...]] = ()
-    """The options a printer connected in the app takes from its `[app_printer <id>]` section
-    (until story 14 brings credentials from the app, encrypted to the bridge)."""
+    """The credentials a printer connected in the app takes: sealed to the bridge in the app
+    (core/credentials.py), or from an `[app_printer <id>]` section of the config file. The same
+    names as 3D Print Log's `secretFields`. `from_config` must use them as given (no trimming):
+    a value opened from the app is used exactly as it opened."""
 
     @classmethod
     def discovery(cls) -> Discovery | None:
@@ -129,8 +131,9 @@ class Adapter(ABC):
     ) -> dict[str, str] | None:
         """The `from_config` options for a printer the user connected in the app, at `host` (an
         IP address the bridge resolved and checked is private), or None when this adapter can't
-        watch one that way. `secrets` is its `[app_printer <id>]` section. Raise
-        `NeedsCredentials` when one is missing. Optional."""
+        watch one that way. `secrets` holds its credentials (from the app, or its
+        `[app_printer <id>]` section). Raise `NeedsCredentials` when one is missing, naming it in
+        `fields`. Optional."""
         return None
 
     def watches(self, found: Found) -> bool:
@@ -146,4 +149,9 @@ class Adapter(ABC):
 
 class NeedsCredentials(Exception):
     """A printer connected in the app needs a secret the bridge doesn't have yet. The message
-    names the options to add."""
+    names the options to add; `fields` names the `app_secrets` that are missing, which the bridge
+    reports to 3D Print Log as `missing` (none for something that isn't a credential)."""
+
+    def __init__(self, message: str, fields: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.fields = fields
