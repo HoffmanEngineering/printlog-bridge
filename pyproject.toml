@@ -11,7 +11,12 @@ license = { text = "MIT" }
 authors = [{ name = "Hoffman Engineering" }]
 # Raspberry Pi OS Bullseye ships Python 3.9, and it is still on a lot of printers.
 requires-python = ">=3.9"
-dependencies = ["aiohttp>=3.8"]
+dependencies = [
+    "aiohttp>=3.8",
+    # Opens the LAN credentials sealed to the bridge in the app (core/credentials.py). Only
+    # where PyPI has a wheel, so no install compiles Rust; elsewhere the bridge runs without it.
+    "cryptography>=3.1; platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'armv7l' or platform_machine == 'AMD64' or platform_machine == 'arm64'",
+]
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",

@@ -1,3 +1,4 @@
 # What Moonraker's update manager installs into the bridge's virtualenv on each update.
 # Keep it the same as `dependencies` in pyproject.toml (tests/test_install_helper.py checks).
 aiohttp>=3.8
+cryptography>=3.1; platform_machine == 'x86_64' or platform_machine == 'aarch64' or platform_machine == 'armv7l' or platform_machine == 'AMD64' or platform_machine == 'arm64'
