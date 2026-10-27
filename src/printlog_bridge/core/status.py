@@ -28,6 +28,8 @@ RUNNING_WITHIN = timedelta(seconds=3 * TOUCH_INTERVAL_S)
 """A status file older than this was left by a bridge that stopped without saying so."""
 STALE_HEARTBEAT = timedelta(minutes=15)
 """When 3D Print Log starts showing a connection as offline."""
+FIRMWARE, HOST_SOFTWARE = "firmware", "host"
+"""The keys of a printer's `software` in the status file, each `{"name", "version"}`."""
 
 Clock = Callable[[], datetime]
 
@@ -57,9 +59,14 @@ class PrinterReport(Protocol):
         """The printer was found at a new address (`old` and `new` are hosts, `at` when, ISO
         8601, defaulting to now)."""
 
-    def software(self, name: str, version: str) -> None:
-        """The version of the printer's `name` software (`klipper`, `moonraker`), sent with the
-        connection's heartbeat."""
+    def firmware(self, name: str, version: str) -> None:
+        """The printer's firmware and its version (`Klipper`, `Prusa-Firmware-Buddy`), sent with
+        the connection's heartbeat once known."""
+
+    def host_software(self, name: str, version: str) -> None:
+        """The software the adapter talks to on the printer's host and its version (`Moonraker`,
+        `PrusaLink`), sent with the connection's heartbeat once known. Never for a printer the
+        adapter talks to directly."""
 
     def printer_model(self, model: str) -> None:
         """The printer's model, as the slicer named it in a job's file, sent with the heartbeat.
@@ -84,7 +91,10 @@ class NullReport:
     def moved(self, old: str, new: str, at: str | None = None) -> None:
         pass
 
-    def software(self, name: str, version: str) -> None:
+    def firmware(self, name: str, version: str) -> None:
+        pass
+
+    def host_software(self, name: str, version: str) -> None:
         pass
 
     def printer_model(self, model: str) -> None:
@@ -227,11 +237,18 @@ class BoardReport:
             self.printer, moved={"from": old, "to": new, "at": at or self.board._now()}
         )
 
-    def software(self, name: str, version: str) -> None:
+    def firmware(self, name: str, version: str) -> None:
+        self._software(FIRMWARE, name, version)
+
+    def host_software(self, name: str, version: str) -> None:
+        self._software(HOST_SOFTWARE, name, version)
+
+    def _software(self, role: str, name: str, version: str) -> None:
         software = dict(self.board.get(self.printer).get("software") or {})
-        if software.get(name) == version:
+        known = {"name": name, "version": version}
+        if software.get(role) == known:
             return
-        software[name] = version
+        software[role] = known
         self.board.update(self.printer, software=software)
 
     def printer_model(self, model: str) -> None:

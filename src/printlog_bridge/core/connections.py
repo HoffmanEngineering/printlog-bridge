@@ -8,8 +8,9 @@ Print Log either, the print waits and is tried again like any other request: cre
 would get through as soon as the API was back (the end of an outage) and never link. The app
 shows a connection as stale after 15 minutes without a heartbeat.
 
-Each heartbeat also carries the printer's health (#37): its software's versions, the outbox's
-backlog, and the problems logged since the last heartbeat. docs/privacy.md lists every field.
+Each heartbeat also carries the printer's health (#37): its firmware and host software, each with
+its version, once the adapter has said, the outbox's backlog, and the problems logged since the
+last heartbeat. docs/privacy.md lists every field.
 
 3D Print Log answers each heartbeat with the newest bridge release (`latestAgentVersion`), which
 goes in the status file for `status` and `doctor`, and in the log once per version (#39).
@@ -28,7 +29,7 @@ from printlog_bridge import __version__
 from printlog_bridge.core.api_client import ApiClient, ApiRejected, ApiUnavailable, AuthRejected
 from printlog_bridge.core.health import ProblemLog, Problems, utc_now
 from printlog_bridge.core.outbox import read_waiting
-from printlog_bridge.core.status import StatusBoard
+from printlog_bridge.core.status import FIRMWARE, HOST_SOFTWARE, StatusBoard
 from printlog_bridge.core.updates import is_newer, update_notice
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ HEARTBEAT_INTERVAL_S = 5 * 60
 MAX_DISPLAY_NAME = 100
 """The API's limit."""
 MAX_VERSION = 50
+"""For a software name and its version alike."""
 MAX_PRINTER_MODEL = 100
 """The API's limits."""
 
@@ -167,8 +169,8 @@ class Heartbeat:
             "agentVersion": __version__,
             "printerId": connection.printer_id,
             "mode": connection.mode,
-            "klipperVersion": _cut(software.get("klipper"), MAX_VERSION),
-            "moonrakerVersion": _cut(software.get("moonraker"), MAX_VERSION),
+            **_software(software.get(FIRMWARE), "firmware"),
+            **_software(software.get(HOST_SOFTWARE), "hostSoftware"),
             "printerModel": _cut(known.get("printer_model"), MAX_PRINTER_MODEL),
             "outboxDepth": waiting.entries if waiting else 0,
             "outboxOldestAgeSeconds": (
@@ -180,6 +182,18 @@ class Heartbeat:
             "snapshots": connection.snapshots,
             "slicerSettings": connection.slicer_settings,
         }
+
+
+def _software(known: Any, prefix: str) -> dict[str, str]:
+    """`<prefix>Name` and `<prefix>Version`, together, or neither until both are known: a
+    null would read as cleared to an older API, so the first check-in after a start, sent
+    before the adapter has asked the printer, leaves them out (#80)."""
+    if not isinstance(known, dict):
+        return {}
+    name, version = _cut(known.get("name"), MAX_VERSION), _cut(known.get("version"), MAX_VERSION)
+    if name is None or version is None:
+        return {}
+    return {f"{prefix}Name": name, f"{prefix}Version": version}
 
 
 def _cut(value: Any, limit: int) -> str | None:

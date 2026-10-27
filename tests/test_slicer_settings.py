@@ -18,6 +18,7 @@ from printlog_bridge.core.slicer_settings import (
     CONFIG_BLOCK_MAX_BYTES,
     HEADER_MAX_BYTES,
     config_block_from,
+    config_block_from_settings,
     header_from,
     is_sensitive,
     request_body,
@@ -229,3 +230,42 @@ class TestRequestBody:
         assert body["configBlock"].endswith("; a = \ufffd\n")
         assert body["configBlock"].startswith("; a = ")
         assert len(body["header"].encode()) <= HEADER_MAX_BYTES
+
+
+class TestConfigBlockFromSettings:
+    """Settings that aren't text in the file (bgcode's slicer block, a 3MF's
+    `project_settings.config`) in the shape of a G-code file's settings block (#82)."""
+
+    def test_one_line_per_setting_in_the_slicers_shape(self):
+        block = config_block_from_settings({"layer_height": "0.2", "fill_density": "15%"})
+
+        assert block == "; layer_height = 0.2\n; fill_density = 15%\n"
+
+    def test_lists_are_joined_as_the_slicers_write_them(self):
+        block = config_block_from_settings({"filament_type": ["PLA", "PETG"], "nozzle": [0.4, 0.6]})
+
+        assert block == "; filament_type = PLA;PETG\n; nozzle = 0.4;0.6\n"
+
+    def test_a_value_over_several_lines_stays_on_one(self):
+        block = config_block_from_settings({"start_gcode": "G28\r\nG1 Z5\nM104"})
+
+        assert block == "; start_gcode = G28\\nG1 Z5\\nM104\n"
+        assert len(block.splitlines()) == 1
+
+    def test_keys_that_cant_be_a_setting_and_nested_values_are_left_out(self):
+        block = config_block_from_settings(
+            {"bad key": "1", "x\n; print_host": "h", "nested": {"a": 1}, "ok": True, "none": None}
+        )
+
+        assert block == "; ok = 1\n"
+
+    def test_nothing_is_none(self):
+        assert config_block_from_settings({}) is None
+
+    def test_it_is_scrubbed_like_any_settings_block(self):
+        block = config_block_from_settings({"print_host": "192.168.1.5", "layer_height": 0.2})
+
+        body = request_body(None, SlicerFile(config_block=block))
+
+        assert "192.168.1.5" not in body["configBlock"]
+        assert "; layer_height = 0.2" in body["configBlock"]

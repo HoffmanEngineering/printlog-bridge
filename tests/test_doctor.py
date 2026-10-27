@@ -282,10 +282,37 @@ class TestDoctorCommand:
         return exit_code["value"]
 
 
-class TestApiKeyStorage:
-    """Moonraker serves its config folder to anyone who can open Mainsail or Fluidd."""
+class ServedLikeMoonraker(FakeAdapter):
+    def serves(self, path: Path) -> str | None:
+        return MoonrakerAdapter.serves(self, path)  # type: ignore[arg-type]
 
-    def key_check(self, config_dir: Path, bridge: str, env=None, key_file: str | None = None):
+
+class ServedLikeOctoPrint(FakeAdapter):
+    """An adapter whose host serves its uploads folder, as OctoPrint does."""
+
+    def serves(self, path: Path) -> str | None:
+        if "uploads" in path.parts:
+            return "OctoPrint serves to anyone who can open it"
+        return None
+
+
+class BrokenServes(FakeAdapter):
+    def serves(self, path: Path) -> str | None:
+        raise RuntimeError("bug")
+
+
+class TestApiKeyStorage:
+    """Moonraker serves its config folder to anyone who can open Mainsail or Fluidd, and other
+    adapters' hosts serve folders of their own (`Adapter.serves`)."""
+
+    def key_check(
+        self,
+        config_dir: Path,
+        bridge: str,
+        env=None,
+        key_file: str | None = None,
+        adapter: type[Adapter] = ServedLikeMoonraker,
+    ):
         config_dir.mkdir(parents=True, exist_ok=True)
         state = config_dir.parent / "state"
         if key_file is not None:
@@ -299,9 +326,39 @@ class TestApiKeyStorage:
             encoding="utf-8",
         )
         results = asyncio.run(
-            diagnose(path, adapters=ADAPTERS, env=env or {}, home=config_dir.parent)
+            diagnose(path, adapters={"fake": adapter}, env=env or {}, home=config_dir.parent)
         )
         return by_name(results).get("API key")
+
+    def test_a_key_in_a_folder_another_adapters_host_serves_names_it(self, tmp_path):
+        check = self.key_check(
+            tmp_path / "uploads" / "config", "api_key = k\n", adapter=ServedLikeOctoPrint
+        )
+
+        assert check.status is Status.WARN
+        assert "OctoPrint serves to anyone who can open it" in check.detail
+        assert "Moonraker" not in check.detail
+
+    def test_a_key_file_in_a_served_folder_says_to_move_the_state_dir(self, tmp_path):
+        check = self.key_check(
+            tmp_path / "uploads" / "config", "", key_file="k\n", adapter=ServedLikeOctoPrint
+        )
+
+        assert check.status is Status.WARN
+        assert "OctoPrint" in check.detail
+        assert "state_dir" in check.detail
+
+    def test_a_folder_named_like_klippers_is_fine_for_an_adapter_without_moonraker(self, tmp_path):
+        check = self.key_check(
+            tmp_path / "printer_data" / "config", "api_key = k\n", adapter=FakeAdapter
+        )
+
+        assert check.status is Status.OK
+
+    def test_an_adapter_that_raises_doesnt_hide_the_key_check(self, tmp_path):
+        check = self.key_check(tmp_path / "config", "api_key = k\n", adapter=BrokenServes)
+
+        assert check.status is Status.OK
 
     def test_a_key_in_a_config_moonraker_serves_is_a_warning_saying_how_to_move_it(self, tmp_path):
         config_dir = tmp_path / "printer_data" / "config"

@@ -393,7 +393,7 @@ class MoonrakerSession:
 
             info = await rpc.call("server.info")
             if info.get("moonraker_version"):
-                self.report.software("moonraker", str(info["moonraker_version"]))
+                self.report.host_software("Moonraker", str(info["moonraker_version"]))
             klippy = info.get("klippy_state", "unknown")
             if klippy == "ready":
                 await self._subscribe(rpc)
@@ -464,7 +464,7 @@ class MoonrakerSession:
             return
         version = (info or {}).get("software_version")
         if version:
-            self.report.software("klipper", str(version))
+            self.report.firmware("Klipper", str(version))
 
     async def _klippy_state(self, state: str) -> None:
         self.report.printer_state(state)

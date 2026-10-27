@@ -48,7 +48,9 @@ It follows the API's contract for connectors (checked against 3d-print-log-api m
   store, as the API does, so confirming twice is two attachments. `GET /api/Prints/{id}/files`
   lists them.
 - `PUT /api/Connections/{instanceId}` registers a connection or refreshes it, replacing every
-  field; `kind` and `displayName` are required and `printerId` must be the user's. A print
+  field but the software ones (`firmwareName`, `firmwareVersion`, `hostSoftwareName`,
+  `hostSoftwareVersion`), which a null or missing value leaves as they were (api#282); `kind`
+  and `displayName` are required and `printerId` must be the user's. A print
   links to a connection only when it is created after the connection was registered.
 
 Spools and slots (api#146, PR 158; api#147, PR 159):
@@ -628,6 +630,10 @@ class FakePrintLogApi:
             "status": 1,
             "latestAgentVersion": self.latest_agent_version,
         }
+        for field in SOFTWARE_FIELDS:
+            # Like the API (api#282, #80): missing or null keeps what was stored.
+            kept = (existing or {}).get(field)
+            connection[field] = body[field] if body.get(field) is not None else kept
         self.connections[instance_id] = connection
         return web.json_response(connection, status=200 if existing else 201)
 
@@ -976,6 +982,7 @@ def _merge_actual_usage(
             match["source"] = _source(incoming)
             for field in ("amountMg", "lengthInM", "volumeMl"):
                 match[field] = incoming.get(field)
+            match["actualIsEstimate"] = bool(incoming.get("actualIsEstimate"))
 
 
 def _file_problem(body: dict[str, Any]) -> str | None:
@@ -1047,6 +1054,8 @@ def normalize_tag(uid: str) -> str | None:
 
 
 MEASUREMENTS = {1: "amountMg", 2: "lengthInM", 3: "volumeMl"}  # Weight, Length, Volume
+SOFTWARE_FIELDS = ("firmwareName", "firmwareVersion", "hostSoftwareName", "hostSoftwareVersion")
+"""A check-in's software fields (api#282), which a null or missing value leaves as they were."""
 
 
 def _source(row: dict[str, Any]) -> int | None:
@@ -1089,5 +1098,6 @@ def _row(sent: dict[str, Any], filament_id: str | None) -> dict[str, Any]:
         "lengthInM": sent.get("lengthInM"),
         "volumeMl": sent.get("volumeMl"),
         "source": sent.get("source"),
+        "actualIsEstimate": bool(sent.get("actualIsEstimate")),
         "notes": sent.get("notes"),
     }

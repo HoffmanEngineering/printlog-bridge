@@ -54,6 +54,10 @@ TAIL_FALLBACK_BYTES = 128 * 1024
 """The tail read when Moonraker doesn't say where the G-code ends: real settings blocks are
 tens of kilobytes."""
 
+UNKNOWN = "unknown"
+"""What Moonraker's metadata says for a slicer, or its version, it couldn't identify (QIDI
+Studio's files, for one). Left out, so the API reads the slicer from the file or reports none."""
+
 _TEXT = {"slicer": "slicer", "slicer_version": "slicer_version",
          "filament_name": "filament_name", "filament_type": "filament_type"}  # fmt: skip
 _NUMBERS = {
@@ -74,6 +78,10 @@ def slicer_metadata(metadata: Mapping[str, Any]) -> SlicerMetadata | None:
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             values[name] = value.strip()
+    for name in ("slicer", "slicer_version"):
+        # Moonraker's word for a slicer it couldn't identify, not a name (#81).
+        if values.get(name, "").lower() == UNKNOWN:
+            del values[name]
     for key, name in _NUMBERS.items():
         value = metadata.get(key)
         number = isinstance(value, (int, float)) and not isinstance(value, bool)

@@ -55,8 +55,11 @@ class ReportRecorder:
     def printer_state(self, state: str) -> None:
         self.calls.append(("printer_state", state))
 
-    def software(self, name: str, version: str) -> None:
-        self.calls.append(("software", name, version))
+    def firmware(self, name: str, version: str) -> None:
+        self.calls.append(("firmware", name, version))
+
+    def host_software(self, name: str, version: str) -> None:
+        self.calls.append(("host_software", name, version))
 
     def printer_model(self, model: str) -> None:
         self.calls.append(("printer_model", model))

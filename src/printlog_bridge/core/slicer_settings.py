@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from printlog_bridge.core.events import SlicerFile, SlicerMetadata
@@ -42,6 +43,8 @@ SENSITIVE = (
 _LINE_BREAK = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 """Every line break `str.splitlines()` knows, a superset of the API's: so a line the API reads
 starts where one of these does, and a CR-only block can't slip a key past."""
+_SETTING_KEY = re.compile(r"[A-Za-z0-9_]+")
+"""A setting's name, as the API reads one from a `; key = value` line."""
 _API_LINE_BREAK = re.compile(r"[\n\r\f\x85\u2028\u2029]")
 """Where the API (`MemoryExtensions.EnumerateLines`) ends a line, and so where a value ends."""
 _TRAILING_LINE_BREAK = re.compile(r"(?:\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029])\Z")
@@ -123,6 +126,41 @@ def config_block_from(
             keep -= 1
         text = "".join(lines[keep:])
     return text if text.strip() else None
+
+
+def config_block_from_settings(settings: Mapping[str, Any]) -> str | None:
+    """Settings that the file doesn't hold as text, such as a `.bgcode` file's slicer metadata
+    block or a 3MF's `Metadata/project_settings.config`, as the `; key = value` block a G-code
+    file ends with, so they go to 3D Print Log the same way (`SlicerFile.config_block`).
+
+    A list is joined with `;`, as PrusaSlicer and OrcaSlicer write one value per extruder, and a
+    value over several lines is kept on one with `\\n`, as they write `start_gcode`. A key that
+    isn't a setting's name (letters, digits, `_`), a nested value and None are left out. None
+    when nothing is left."""
+    lines = []
+    for key, value in settings.items():
+        if not isinstance(key, str) or not _SETTING_KEY.fullmatch(key):
+            continue
+        if isinstance(value, (list, tuple)):
+            if not all(_is_scalar(v) for v in value):
+                continue
+            text = ";".join(_setting_text(v) for v in value)
+        elif _is_scalar(value):
+            text = _setting_text(value)
+        else:
+            continue
+        lines.append(f"; {key} = {text}\n")
+    return "".join(lines) or None
+
+
+def _is_scalar(value: Any) -> bool:
+    return isinstance(value, (str, int, float, bool))
+
+
+def _setting_text(value: Any) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return _LINE_BREAK.sub("\\\\n", str(value))
 
 
 def _lines(text: str):

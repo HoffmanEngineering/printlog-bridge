@@ -1576,6 +1576,99 @@ class TestPerToolUsage:
         assert [rows[s]["estimatedAmountMg"] for s in range(4)] == [30200, 9800, 3600, 1500]
 
 
+class TestGramsAndEstimates:
+    """Usage from a printer that reports grams, or only the slicer's estimate (#82)."""
+
+    def test_grams_per_slot_are_sent_as_weight(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(
+            api,
+            tmp_path,
+            four_tool_start(),
+            finished(filament_mm={}, filament_g={0: 12.34, 1: 3.21}),
+        )
+
+        [completion] = api.completions
+        assert completion["filamentUsage"] == [
+            {"slot": 0, "amountMg": 12340, "source": 1},
+            {"slot": 1, "amountMg": 3210, "source": 1},
+        ]
+        rows = by_slot(api.prints[1])
+        assert (rows[0]["amountMg"], rows[0]["source"]) == (12340, 1)
+        assert rows[0]["actualIsEstimate"] is False
+
+    def test_an_estimate_is_marked_as_one_on_every_row(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(
+            api,
+            tmp_path,
+            four_tool_start(),
+            finished(filament_mm={}, filament_g={0: 12.34, 1: 3.21}, usage_estimated=True),
+        )
+
+        [completion] = api.completions
+        assert [r["actualIsEstimate"] for r in completion["filamentUsage"]] == [True, True]
+        assert all(r["actualIsEstimate"] for r in by_slot(api.prints[1]).values() if r["amountMg"])
+
+    def test_measured_length_is_sent_as_it_always_was(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), finished())
+
+        [completion] = api.completions
+        assert completion["filamentUsage"] == [{"slot": 0, "lengthInM": 4.3215, "source": 2}]
+
+    def test_a_slot_with_both_is_weighed_and_keeps_its_length(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), finished(filament_mm={0: 4321.5}, filament_g={0: 12.9}))
+
+        [completion] = api.completions
+        assert completion["filamentUsage"] == [
+            {"slot": 0, "amountMg": 12900, "lengthInM": 4.3215, "source": 1}
+        ]
+
+    def test_slots_with_length_and_slots_with_grams_each_get_their_own(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), finished(filament_mm={0: 1000.0}, filament_g={1: 2.5}))
+
+        [completion] = api.completions
+        assert completion["filamentUsage"] == [
+            {"slot": 0, "lengthInM": 1.0, "source": 2},
+            {"slot": 1, "amountMg": 2500, "source": 1},
+        ]
+
+    def test_a_slot_that_weighed_nothing_sends_no_row(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, started(), finished(filament_mm={}, filament_g={0: 5.0, 1: 0.0}))
+
+        [completion] = api.completions
+        assert [r["slot"] for r in completion["filamentUsage"]] == [0]
+
+    def test_grams_and_the_estimate_flag_survive_a_restart(self, tmp_path):
+        api = FakePrintLogApi()
+        run(api, tmp_path, started())
+        api.offline = True
+        run(
+            api,
+            tmp_path,
+            finished(filament_mm={}, filament_g={0: 7.5}, usage_estimated=True),
+            timeout=0.1,
+        )
+        api.offline = False
+
+        run(api, tmp_path)
+
+        [completion] = api.completions
+        assert completion["filamentUsage"] == [
+            {"slot": 0, "amountMg": 7500, "source": 1, "actualIsEstimate": True}
+        ]
+
+
 class TestLoadedSpools:
     """The spools loaded on the printer in 3D Print Log go on its prints' usage rows (#6)."""
 

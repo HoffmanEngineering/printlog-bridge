@@ -46,6 +46,13 @@ class JobFinished:
     duration_s: float | None = None
     filament_mm: Mapping[int, float] = field(default_factory=dict)
     """Filament fed per slot (tool index), in millimetres."""
+    filament_g: Mapping[int, float] = field(default_factory=dict)
+    """Filament used per slot, in grams, for a printer that reports weight (a Bambu 3MF's per
+    filament). A slot with grams is sent by weight, and keeps its millimetres beside them."""
+    usage_estimated: bool = False
+    """`filament_mm` and `filament_g` are the slicer's estimate, not what the printer measured:
+    most firmwares other than Klipper report only that. 3D Print Log still charges the spools,
+    but leaves the rows out of its accuracy analytics."""
     note: str | None = None
     """For the print's notes: why it failed, such as "Klipper shutdown", and what else the
     user would want to know, such as objects they cancelled mid-print."""
