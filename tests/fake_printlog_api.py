@@ -116,10 +116,24 @@ Bridges (api#288, "Contract for story 12"), only with a device token holding `br
   `desired` object with `ETag: W/"<version>"`, or 304 for a matching `If-None-Match`.
 - A test changes the desired list with `connect`, `disconnect` and `request_scan`, each giving it
   a new version, as the app's Bridges screen does.
+
+Sealed credentials (api#289, `docs/bridge-credential-sealing.md`):
+
+- The check-in's `publicKey` (strict: padded base64 DER SPKI of a P-256 point, 124 characters)
+  and `publicKeyFingerprint` (must match) are taken on the check-in that registers the bridge;
+  any other new key is held pending until `confirm_key`. A malformed one is named in `rejected`
+  as `invalid_public_key`. The answer adds `publicKeyFingerprint` and
+  `pendingPublicKeyFingerprint` (both left out with `keys_supported = False`, as an API before
+  14a).
+- `credentialIssues` with `credentialIssuesVersion` replaces the stored issues
+  (`bridge["issues"]`) only when the version is current; every check-in's are in `check_ins`.
+- `set_secret` seals a value to the bridge's current key as the web app would; `confirm_key`
+  makes values sealed to the old key stale (not sent). Each changes the desired version.
 """
 
 from __future__ import annotations
 
+import base64
 import contextvars
 import hashlib
 import ipaddress
@@ -254,6 +268,8 @@ class FakePrintLogApi:
         self.heartbeats: list[tuple[str, dict[str, Any]]] = []
         """Every PUT /api/Connections body received, by instance id."""
         self.latest_agent_version: str | None = None
+        self.keys_supported = True
+        """False: an API from before sealed credentials (no key fields in the answer)."""
         """The `latestAgentVersion` connections answer with: the newest bridge release, which
         the API reads from GitHub, or None when it doesn't know one."""
         self.images: dict[int, bytes] = {}
@@ -461,6 +477,73 @@ class FakePrintLogApi:
     def _new_version(self, bridge: dict[str, Any]) -> None:
         bridge["desired"]["version"] = uuid.uuid4().hex
 
+    def set_secret(
+        self,
+        entry_id: int,
+        field: str,
+        plaintext: str | None = None,
+        *,
+        sealed: str | None = None,
+        grant_id: int | None = None,
+    ) -> str:
+        """The user enters a credential in the app: sealed to the bridge's current key (or
+        `sealed` as given). Returns the sealed value."""
+        from sealing import seal
+
+        from printlog_bridge.core.credentials import CredentialKey
+
+        bridge = self.bridge(grant_id)
+        current = bridge.get("publicKey")
+        assert current is not None, "the bridge has no confirmed key to seal to"
+        if sealed is None:
+            from cryptography.hazmat.primitives import serialization
+
+            key = CredentialKey.__new__(CredentialKey)
+            key.spki = base64.b64decode(current)
+            assert serialization.load_der_public_key(key.spki)
+            sealed = seal(key, bridge["id"], entry_id, field, plaintext or "")
+        entry = next(p for p in bridge["desired"]["printers"] if p["id"] == entry_id)
+        entry["secrets"] = [s for s in entry["secrets"] if s["field"] != field]
+        entry["secrets"].append(
+            {
+                "field": field,
+                "sealed": sealed,
+                "keyFingerprint": bridge["publicKeyFingerprint"],
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+                "stale": False,
+            }
+        )
+        bridge["issues"] = [i for i in bridge.get("issues", []) if i["entryId"] != entry_id]
+        self._new_version(bridge)
+        return sealed
+
+    def confirm_key(self, grant_id: int | None = None) -> None:
+        """The owner confirms the pending key: values sealed to the old one go stale."""
+        bridge = self.bridge(grant_id)
+        assert bridge.get("pendingPublicKey"), "no pending key"
+        bridge["publicKey"] = bridge.pop("pendingPublicKey")
+        bridge["publicKeyFingerprint"] = bridge.pop("pendingPublicKeyFingerprint")
+        for entry in bridge["desired"]["printers"]:
+            entry["secrets"] = []
+        self._new_version(bridge)
+
+    def _take_key(self, bridge: dict[str, Any], body: dict[str, Any], first: bool) -> list:
+        key, given = body.get("publicKey"), body.get("publicKeyFingerprint")
+        if key is None:
+            return []
+        fingerprint = _key_fingerprint(key)
+        if fingerprint is None:
+            return [{"field": "publicKey", "code": "invalid_public_key"}]
+        if given is not None and given != fingerprint:
+            return [{"field": "publicKeyFingerprint", "code": "invalid_public_key"}]
+        if first:
+            bridge["publicKey"], bridge["publicKeyFingerprint"] = key, fingerprint
+        elif fingerprint == bridge.get("publicKeyFingerprint"):
+            pass  # the current key again leaves a pending one alone
+        else:
+            bridge["pendingPublicKey"], bridge["pendingPublicKeyFingerprint"] = key, fingerprint
+        return []
+
     def connect(
         self,
         kind: str,
@@ -486,6 +569,9 @@ class FakePrintLogApi:
                 "identityKey": f"{kind}:sn:{serial}" if serial else f"{kind}:ip:{host}:{port}",
                 "macs": [],
                 "createdAt": datetime.now(timezone.utc).isoformat(),
+                "secretFields": list(SECRET_FIELDS.get(kind, ())),
+                "secrets": [],
+                "credentialIssues": [],
             }
         )
         self._new_version(bridge)
@@ -525,6 +611,14 @@ class FakePrintLogApi:
             or not _text_ok(body.get("hostName"))
         ):
             return _coded(400, "invalid_check_in")
+        issues = body.get("credentialIssues")
+        if issues is not None and (
+            not isinstance(issues, list)
+            or len(issues) > 200
+            or not body.get("credentialIssuesVersion")
+        ):
+            return _coded(400, "invalid_check_in")
+        first = grant["id"] not in self.bridges
         bridge = self.bridges.setdefault(
             grant["id"],
             {
@@ -535,6 +629,13 @@ class FakePrintLogApi:
             },
         )
         rejected: list[dict[str, str]] = []
+        if self.keys_supported:
+            rejected.extend(self._take_key(bridge, body, first))
+            if (
+                issues is not None
+                and body["credentialIssuesVersion"] == bridge["desired"]["version"]
+            ):
+                bridge["issues"] = issues
         for field in ("agentVersion", "mode", "hostName", "lastSweepAt"):
             if body.get(field) is not None:
                 bridge[field] = body[field]
@@ -560,15 +661,17 @@ class FakePrintLogApi:
                 seen.add(identity)
                 kept.append(printer)
             bridge["discovered"] = kept
-        return web.json_response(
-            {
-                "bridgeId": grant["id"],
-                "checkInSeconds": self.check_in_seconds,
-                "desiredPollSeconds": self.desired_poll_seconds,
-                "desired": bridge["desired"],
-                "rejected": rejected,
-            }
-        )
+        answer = {
+            "bridgeId": grant["id"],
+            "checkInSeconds": self.check_in_seconds,
+            "desiredPollSeconds": self.desired_poll_seconds,
+            "desired": bridge["desired"],
+            "rejected": rejected,
+        }
+        if self.keys_supported:
+            answer["publicKeyFingerprint"] = bridge.get("publicKeyFingerprint")
+            answer["pendingPublicKeyFingerprint"] = bridge.get("pendingPublicKeyFingerprint")
+        return web.json_response(answer)
 
     async def _get_desired(self, request: web.Request) -> web.Response:
         grant = _GRANT.get()
@@ -1620,3 +1723,29 @@ def _row(sent: dict[str, Any], filament_id: str | None) -> dict[str, Any]:
         "actualIsEstimate": bool(sent.get("actualIsEstimate")),
         "notes": sent.get("notes"),
     }
+
+
+SECRET_FIELDS = {
+    "bambu": ("access_code",),
+    "prusalink": ("password", "username", "api_key"),
+    "moonraker": ("moonraker_api_key",),
+    "octoprint": ("api_key",),
+}
+_SPKI_PREFIX = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE"
+
+
+def _key_fingerprint(key: Any) -> str | None:
+    """The fingerprint of a public key in the check-in's strict shape, or None."""
+    if not isinstance(key, str) or len(key) != 124 or not key.startswith(_SPKI_PREFIX):
+        return None
+    try:
+        spki = base64.b64decode(key, validate=True)
+    except ValueError:
+        return None
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    try:
+        ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), spki[-65:])
+    except ValueError:
+        return None
+    return hashlib.sha256(spki).hexdigest()

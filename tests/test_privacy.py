@@ -927,7 +927,12 @@ class TestAdoptionCalls:
         assert "benchy" not in json.dumps(lookup).lower()  # the file name stays on the bridge
 
 
-CHECK_IN_FIELDS = {"agentVersion", "mode", "hostName", "networks", "lastSweepAt", "discovered"}
+CHECK_IN_FIELDS = {
+    "agentVersion", "mode", "hostName", "networks", "lastSweepAt", "discovered",
+    # Sealed credentials (story 14b): the public half of the key, and field names with codes.
+    "publicKey", "publicKeyFingerprint", "credentialIssues", "credentialIssuesVersion",
+}  # fmt: skip
+ISSUE_FIELDS = {"entryId", "field", "code"}
 DISCOVERED_FIELDS = {
     "kind", "address", "port", "model", "name", "serial", "mainboardId", "macs", "configured",
 }  # fmt: skip
@@ -979,3 +984,98 @@ class TestBridgeCheckIn:
         assert all(set(d) == DISCOVERED_FIELDS for d in body["discovered"])
         assert {d["address"] for d in body["discovered"]} == {"192.168.1.60", "192.168.1.50"}
         assert token not in json.dumps(body) and token not in state
+
+
+class TestSealedCredentials:
+    """Story 14b: the private key never leaves the state directory, and what the app sealed never
+    reaches a log, the status file or a support bundle."""
+
+    def test_the_check_in_carries_the_public_key_and_issue_codes_only(self, tmp_path):
+        from sealing import seal
+
+        from printlog_bridge.core.bridge_sync import BridgeSync
+        from printlog_bridge.core.credentials import KeyStore, Opener
+        from printlog_bridge.core.device import DeviceToken
+        from printlog_bridge.core.status import StatusBoard
+
+        keys = KeyStore(tmp_path)
+        keys.load()
+        sealed = seal(keys.key, 1, 5, "access_code", "PLAINTEXT-CANARY")
+
+        async def scenario():
+            api = FakePrintLogApi()
+            url = await api.start()
+            token = api.issue_device_token()
+            device = DeviceToken(token, url, grant_id=1)
+            board = StatusBoard(tmp_path)
+            board.start([])
+            try:
+                async with ApiClient(url, device=device, state_dir=tmp_path) as client:
+                    sync = BridgeSync(
+                        client, tmp_path, board, lambda entries: asyncio.sleep(0), device=device,
+                        keys=keys, opener=Opener(keys),
+                        issues=lambda: [{"entryId": 5, "field": "access_code", "code": "missing"}],
+                    )  # fmt: skip
+                    sync.state["desired"] = {"version": "v1", "printers": [{
+                        "id": 5, "printerId": 42, "kind": "bambu", "host": "192.168.1.50",
+                        "secrets": [{"field": "access_code", "sealed": sealed}],
+                    }]}  # fmt: skip
+                    sync.state["bridge_id"] = sync.opener.bridge_id = 1
+                    await sync.check_in()
+                return api.check_ins
+            finally:
+                await api.close()
+
+        [body] = asyncio.run(scenario())
+        assert set(body) <= CHECK_IN_FIELDS
+        assert body["publicKey"] == keys.key.public_key
+        assert all(set(i) == ISSUE_FIELDS for i in body["credentialIssues"])
+        text = json.dumps(body)
+        assert "PLAINTEXT-CANARY" not in text and sealed not in text
+        for line in keys.key.to_pem().splitlines()[1:-1]:
+            assert line not in text
+
+    def test_the_bundle_leaves_out_the_key_and_removes_what_was_sealed(self, tmp_path):
+        from sealing import seal
+
+        from printlog_bridge.core.credentials import KEY_FILE, KeyStore
+
+        state = tmp_path / "state"
+        keys = KeyStore(state)
+        keys.load()
+        sealed = seal(keys.key, 3, 5, "password", "PLAINTEXT-CANARY")
+        (state / "bridge.json").write_text(json.dumps({
+            "bridge_id": 3,
+            "desired": {"version": "v", "printers": [
+                {"id": 5, "secrets": [{"field": "password", "sealed": sealed}]},
+            ]},
+        }), encoding="utf-8")  # fmt: skip
+        pem_line = keys.key.to_pem().splitlines()[1]
+        (state / "bridge.log").write_text(
+            f"ERROR oops PLAINTEXT-CANARY {sealed} {pem_line}\n", encoding="utf-8"
+        )
+        config = tmp_path / "printlog-bridge.cfg"
+        config.write_text(f"[bridge]\nstate_dir = {state}\n", encoding="utf-8")
+
+        bundle = write_support_bundle(
+            state / "bundle.zip", report="", config_path=config, state_dir=state, env={}
+        )
+
+        with zipfile.ZipFile(bundle) as z:
+            assert KEY_FILE not in z.namelist()
+            assert "bridge.json" not in z.namelist()
+            log_text = z.read("bridge.log").decode("utf-8")
+        assert "PLAINTEXT-CANARY" not in log_text
+        assert sealed not in log_text
+        assert pem_line not in log_text
+
+    def test_a_trace_scrubs_what_was_opened_from_the_app(self, tmp_path):
+        """The running bridge hands its trace every value it opened."""
+        from printlog_bridge.core.trace import RECEIVE, Trace, trace_files
+
+        trace = Trace(tmp_path, "app-5", secrets=["PLAINTEXT-CANARY"])
+        trace.record(RECEIVE, '{"password": "x", "echo": "PLAINTEXT-CANARY"}')
+        trace.close()
+
+        text = "".join(p.read_text(encoding="utf-8") for p in trace_files(tmp_path))
+        assert "PLAINTEXT-CANARY" not in text
