@@ -174,9 +174,11 @@ class JobTracker:
                     await self.sink.emit(event)
                 self.job = None
             if self.job is None:
+                # Not its print_error yet: the last job's cancel lingers a few seconds.
                 self.job = Job(job_id, self._file_name(), self._started_at())
                 log.info("[printer %s] job %s is under way", self.printer, job_id)
-            self._note_error()
+            else:
+                self._note_error()
             if self.job.start is None and state in PRINTING:
                 await self._start(self.job)
             elif self.job.start is not None:

@@ -137,6 +137,8 @@ class FakeBambu:
         self.version: dict[str, Any] | None = VERSION
         self.refuse: int | None = None
         """A CONNACK return code to answer every CONNECT with (5: not authorized)."""
+        self.hang_up = False
+        """Close the connection on CONNECT without answering."""
         self.answer_pushall = True
         self.requests: list[dict[str, Any]] = []
         self.connects: list[dict[str, Any]] = []
@@ -195,6 +197,8 @@ class FakeBambu:
                 return
             connect = _parse_connect(body)
             self.connects.append(connect)
+            if self.hang_up:
+                return
             if self.refuse is not None:
                 writer.write(bytes([0x20, 2, 0, self.refuse]))
                 await writer.drain()

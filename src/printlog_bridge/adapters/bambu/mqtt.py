@@ -81,7 +81,10 @@ class MqttClient:
                 verify((tls.getpeercert(binary_form=True) if tls else None) or b"")
             writer.write(_connect_packet(client_id, username, password, keepalive))
             await writer.drain()
-            first, body = await asyncio.wait_for(_read_packet(reader), timeout)
+            try:
+                first, body = await asyncio.wait_for(_read_packet(reader), timeout)
+            except asyncio.IncompleteReadError:
+                raise MqttClosed("the printer closed the connection before answering") from None
             kind = first >> 4
             if kind != _CONNACK or len(body) < 2:
                 raise MqttClosed(f"expected CONNACK, got packet type {kind}")

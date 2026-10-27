@@ -368,3 +368,20 @@ class TestReconnect:
 
         assert len(sink.of(JobStarted)) == 2  # the replay, which the sink recognizes
         assert sink.of(JobFinished)[0].filament_g == {0: 12.34}
+
+
+def test_the_last_jobs_cancel_code_doesnt_make_a_failure_a_cancel(tmp_path):
+    sink = Sink()
+    t = tracker(tmp_path, sink)
+
+    run(
+        feed(
+            t,
+            idle_status(gcode_state="FAILED", print_error=CANCELLED_ERROR),
+            job(print_error=CANCELLED_ERROR),
+            {"print_error": 0},
+            {"gcode_state": "FAILED"},
+        )
+    )
+
+    assert sink.of(JobFinished)[0].outcome is JobOutcome.FAILED

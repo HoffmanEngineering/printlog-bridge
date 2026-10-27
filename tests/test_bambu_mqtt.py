@@ -179,3 +179,17 @@ class TestCertificatePin:
         CertificatePin("x1c", None, state).check(b"cert-one", "mqtt")
 
         assert "bambu_certificates" not in PrinterState.load(tmp_path, "x1c").discovery
+
+
+def test_a_broker_that_hangs_up_on_connect_is_closed_not_refused(cert):
+    async def scenario():
+        broker = FakeBambu(*cert)
+        broker.hang_up = True
+        await broker.start()
+        try:
+            await connect(broker)
+        finally:
+            await broker.close()
+
+    with pytest.raises(mqtt.MqttClosed):
+        run(scenario())
