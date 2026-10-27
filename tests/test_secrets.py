@@ -67,3 +67,14 @@ def test_url_userinfo(text, expected):
 )
 def test_hides_a_secret_query_value_after_a_nested_url(text):
     assert "SECRET123" not in scrub(text, [])
+
+
+def test_a_bambu_access_code_in_the_config_is_a_known_secret(tmp_path):
+    from printlog_bridge.core.support import known_secrets, redact_config
+
+    config = tmp_path / "printlog-bridge.cfg"
+    text = "[printer x1c]\nadapter = bambu\naccess_code = 12345678\n"
+    config.write_text(text, encoding="utf-8")
+
+    assert "12345678" in known_secrets(config, tmp_path / "state", {})
+    assert "12345678" not in redact_config(text)

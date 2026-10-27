@@ -296,6 +296,37 @@ class ServedLikeOctoPrint(FakeAdapter):
         return None
 
 
+class TestPrinterSecretStorage:
+    """A printer's own secret (a Bambu access code) in a config an adapter's host serves."""
+
+    def check(self, config_dir: Path, printer: str, adapter: type[Adapter] = ServedLikeMoonraker):
+        config_dir.mkdir(parents=True, exist_ok=True)
+        path = config_dir / "printlog-bridge.cfg"
+        path.write_text(
+            f"[bridge]\napi_url = http://127.0.0.1:9\nstate_dir = {config_dir.parent / 'state'}\n"
+            f"[printer x1c]\nadapter = fake\nprinter_id = 7\n{printer}",
+            encoding="utf-8",
+        )
+        results = asyncio.run(
+            diagnose(path, adapters={"fake": adapter}, env={}, home=config_dir.parent)
+        )
+        return by_name(results).get("Printer x1c secrets")
+
+    def test_an_access_code_in_a_served_config_is_a_warning(self, tmp_path):
+        check = self.check(tmp_path / "printer_data" / "config", "access_code = 12345678\n")
+
+        assert check.status is Status.WARN
+        assert "access_code" in check.detail
+        assert "Moonraker serves" in check.detail
+        assert "12345678" not in check.detail
+
+    def test_an_access_code_elsewhere_says_nothing(self, tmp_path):
+        assert self.check(tmp_path / "nas", "access_code = 12345678\n") is None
+
+    def test_no_secret_says_nothing(self, tmp_path):
+        assert self.check(tmp_path / "printer_data" / "config", "") is None
+
+
 class BrokenServes(FakeAdapter):
     def serves(self, path: Path) -> str | None:
         raise RuntimeError("bug")

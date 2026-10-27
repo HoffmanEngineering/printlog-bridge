@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import os
 import platform
 import sqlite3
@@ -23,6 +24,7 @@ from printlog_bridge.core.config import (
 )
 from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import read_status
+from printlog_bridge.core.support import SECRET_OPTION
 from printlog_bridge.core.updates import is_newer, update_notice
 
 API_KEYS_PAGE = "https://www.3dprintlog.com/api-keys"
@@ -62,6 +64,7 @@ async def diagnose(
     key_storage = _check_key_storage(config)
     if key_storage is not None:
         results.append(key_storage)
+    results.extend(_check_printer_secrets(config))
     api, server_time = await _check_api(config)
     results.append(api)
     if server_time is not None:
@@ -208,6 +211,39 @@ def _check_key_storage(config: BridgeConfig) -> CheckResult | None:
                     f"Run: chmod 600 {key_file}",
                 )
     return CheckResult.ok(name, f"in {config.describe_api_key()}")
+
+
+def _check_printer_secrets(config: BridgeConfig) -> list[CheckResult]:
+    """A warning for each printer whose own secret (a Bambu access code) is in a config file a
+    printer's host serves to its users. Nothing otherwise."""
+    served = _served(config, config.path)
+    if served is None:
+        return []
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+    try:
+        parser.read(config.path, encoding="utf-8-sig")
+    except (configparser.Error, OSError):
+        return []
+    results = []
+    for printer in config.printers:
+        section = f"printer {printer.name}"
+        if not parser.has_section(section):
+            continue
+        options = sorted(
+            option
+            for option, value in parser[section].items()
+            if SECRET_OPTION.search(option) and value.strip()
+        )
+        if options:
+            results.append(
+                CheckResult.warn(
+                    f"Printer {printer.name} secrets",
+                    f"{', '.join(options)} is in {config.path}, which {served}. Keep the config "
+                    "in a folder nothing serves, and point printlog-bridge at it with --config "
+                    "or PRINTLOG_BRIDGE_CONFIG.",
+                )
+            )
+    return results
 
 
 async def _check_api(config: BridgeConfig) -> tuple[CheckResult, datetime | None]:
