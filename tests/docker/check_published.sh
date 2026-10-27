@@ -4,6 +4,8 @@
 # after each publish; the arm platforms need QEMU (or an Arm host).
 #
 # Usage: tests/docker/check_published.sh <image:tag>
+# PLATFORMS (comma-separated) overrides the platforms it must have, for the Home Assistant app's
+# image (amd64 and arm64 only).
 set -euo pipefail
 
 REF="${1:?usage: $0 <image:tag>}"
@@ -26,7 +28,8 @@ if ! published="$(docker buildx imagetools inspect "$REF" --format "$format" 2>&
     echo "$published"
     echo "FAIL  $REF can't be read without logging in."
     echo "      GHCR makes a new package private. Make it public: GitHub > HoffmanEngineering >"
-    echo "      Packages > printlog-bridge > Package settings > Change visibility."
+    package="${REF%:*}"
+    echo "      Packages > ${package##*/} > Package settings > Change visibility."
     exit 1
 fi
 echo "ok    it can be read without logging in"

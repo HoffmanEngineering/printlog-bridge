@@ -1,10 +1,11 @@
 """Three fake Moonrakers, a fake 3D Print Log API and a fake Auth0 (approving every pairing) on
-this computer, for tests/docker/smoke.sh.
+this computer, for tests/docker/smoke.sh and tests/docker/addon_smoke.sh.
 
-Writes `<data>/printlog-bridge.cfg` pointing at them (remote mode, one section per printer), then
-serves until killed. Once the bridge has subscribed to all three printers, a print starts and
-ends on each. `<report>` is rewritten every half second with what the fakes saw, so the smoke
-test can check the container logged all three prints without ever calling the real API.
+Writes `<data>/printlog-bridge.cfg` pointing at them (remote mode, one section per printer), and
+`<data>/options.json`, the same as a Home Assistant app's options, then serves until killed.
+Once the bridge has subscribed to all three printers, a print starts and ends on each.
+`<report>` is rewritten every half second with what the fakes saw, so the smoke test can
+check the container logged all three prints without ever calling the real API.
 
 Usage: python tests/docker/serve_fakes.py <data dir> <report.json>
 """
@@ -49,6 +50,17 @@ async def main(data: Path, report: Path) -> None:
         ),
         encoding="utf-8",
     )
+    # The same setup as a Home Assistant app's options (tests/docker/addon_smoke.sh); the
+    # normal image never reads this file.
+    options = {
+        "api_url": api_url,
+        "trace": False,
+        "printers": [
+            {"name": name, "adapter": "moonraker", "printer_id": PRINTERS[name], "url": urls[name]}
+            for name in PRINTERS
+        ],
+    }
+    (data / "options.json").write_text(json.dumps(options, indent=1), encoding="utf-8")
     print(f"fakes up: api {api_url}, moonrakers {urls}", flush=True)
 
     printed = False
