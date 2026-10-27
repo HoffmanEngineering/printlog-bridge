@@ -81,12 +81,35 @@ Spools and slots (api#146, PR 158; api#147, PR 159):
   is a 404 always, as an API without the field is.
 - `AddPrint` on a printer with one slot makes the print's spools the printer's loaded list (so a
   print with no spool unloads it); on a printer with more slots it leaves the slots alone.
+
+Device pairing and device tokens (api#148, PR 286, the "Contract for the bridge"):
+
+- `GET /api/device-grants/pairing` (no credentials) answers `pairing` (the Auth0 tenant's
+  parameters, `FakeAuth0.discovery()`), or 503 `device_pairing_unavailable` while it is None.
+- `POST /api/device-grants` with `Authorization: Bearer <an access token FakeAuth0 issued>` and
+  `{deviceId, name}`: 201 with a new grant, or 200 rotating the token of the grant with that
+  `deviceId`. 400 `invalid_request` for a `deviceId` that isn't a UUID or a name outside 1 to 100
+  characters or with control characters; 401 for a token FakeAuth0 didn't issue; 403 with no
+  code for one older than 10 minutes, `insufficient_scope` for one with no device scope,
+  `offline_access_not_allowed`, and `pairing_token_used` the second time (by `jti`); 409
+  `device_grant_limit` past `max_grants`, and `device_grant_revoked` (once) for a `deviceId` in
+  `revoke_during_repair`. The grant's scopes are the token's device scopes.
+- `Authorization: Bearer pld_...` works on the endpoints of `DEVICE_SCOPES` whose scope the grant
+  holds: 401 `invalid_device_token` for a token no grant has (revoked or rotated), 403
+  `insufficient_scope` or `device_endpoint_not_allowed`, 400 `multiple_credentials` with an
+  `X-Api-Key` too, and 429 `device_token_throttled` (`Retry-After: 60`) while `throttled`.
+- `GET /api/Printers/summary` pages the user's printers (`pageNumber`, `pageSize`), and
+  `POST /api/Printers` (`AddPrinterDTO`: `make`, `model`, `name` required) adds one: 201.
 """
 
 from __future__ import annotations
 
+import hashlib
 import itertools
+import json
 import re
+import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -133,9 +156,60 @@ CONNECTOR_OWNED = (
 )
 
 
+DEVICE_SCOPES = {
+    ("GET", "/api/Users/me"): None,
+    ("GET", "/api/Users/me/user-settings"): None,
+    ("GET", "/api/Subscription/me"): None,
+    ("GET", "/api/Printers/summary"): "printers:read",
+    ("GET", "/api/Printers/{id}"): "printers:read",
+    ("GET", "/api/Printers/{id}/filament"): "printers:read",
+    ("POST", "/api/Printers"): "printers:create",
+    ("PUT", "/api/Printers/{id}"): "printers:slots",
+    ("PUT", "/api/Printers/{id}/slots/{slot}"): "printers:slots",
+    ("DELETE", "/api/Printers/{id}/slots/{slot}"): "printers:slots",
+    ("GET", "/api/Filaments/by-tag/{uid}"): "filaments:read",
+    ("GET", "/api/Filaments/by-number/{number}"): "filaments:read",
+    ("GET", "/api/Prints/{id}"): "prints:read",
+    ("GET", "/api/Prints/claimable"): "prints:read",
+    ("GET", "/api/Prints/{id}/files"): "prints:read",
+    ("POST", "/api/Prints"): "prints:write",
+    ("PATCH", "/api/Prints/{id}"): "prints:write",
+    ("POST", "/api/Prints/{id}/claim"): "prints:write",
+    ("POST", "/api/Prints/{id}/complete"): "prints:write",
+    ("POST", "/api/Prints/{id}/image"): "prints:write",
+    ("POST", "/api/Prints/{id}/slicer-settings"): "prints:write",
+    ("POST", "/api/Prints/{id}/files/upload-url"): "files:write",
+    ("POST", "/api/Prints/{id}/files/confirm"): "files:write",
+    ("PUT", "/api/Connections/{instance}"): "connections:write",
+}
+"""Where a device token works, and the scope it needs there (None: any grant)."""
+ALL_DEVICE_SCOPES = frozenset(s for s in DEVICE_SCOPES.values() if s)
+MAX_PAIRING_TOKEN_AGE_S = 10 * 60
+UUID = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+
+
 class FakePrintLogApi:
     def __init__(self, *, api_key: str = "key-123", printers: tuple[int, ...] = (42,)) -> None:
         self.api_key = api_key
+        self.pairing: dict[str, Any] | None = None
+        """What pairing discovery answers; None is a server with pairing off (503)."""
+        self.auth0: Any = None
+        """The FakeAuth0 whose access tokens pairing accepts."""
+        self.grants: dict[int, dict[str, Any]] = {}
+        """Device grants by id: `deviceId`, `name`, `scopes`, `tokenHash`."""
+        self.pairings: list[tuple[int, dict[str, Any]]] = []
+        """Every pairing answer: its status and body (the token left out)."""
+        self.max_grants = 25
+        self.revoke_during_repair: set[str] = set()
+        """Device ids whose next re-pair loses the race with a revoke (409 once)."""
+        self.throttled = False
+        """While True, every device-token request is answered 429 `device_token_throttled`."""
+        self.credentials: list[tuple[str, str]] = []
+        """The credential each request came with, and its path: "key", "device" or "both"."""
+        self.created_printers: list[dict[str, Any]] = []
+        """Every POST /api/Printers body received."""
+        self._spent_pairing_tokens: set[str] = set()
+        self._grant_ids = itertools.count(1)
         self.printers = set(printers)
         self.settings: list[dict[str, Any]] = []
         self.prints: dict[int, dict[str, Any]] = {}
@@ -219,8 +293,12 @@ class FakePrintLogApi:
 
     async def start(self) -> str:
         app = web.Application(middlewares=[self._middleware])
+        app.router.add_get("/api/device-grants/pairing", self._pairing_config)
+        app.router.add_post("/api/device-grants", self._pair)
         app.router.add_get("/api/Users/me", self._me)
         app.router.add_get("/api/Users/me/user-settings", self._settings)
+        app.router.add_get("/api/Printers/summary", self._printer_summary)
+        app.router.add_post("/api/Printers", self._create_printer)
         app.router.add_get("/api/Printers/{id}", self._printer)
         app.router.add_put("/api/Printers/{id}", self._put_printer)
         app.router.add_get("/api/Printers/{id}/filament", self._loaded_filament)
@@ -267,9 +345,72 @@ class FakePrintLogApi:
         if self._failures:
             status, headers = self._failures.pop(0)
             return web.Response(status=status, headers=headers)
+        if request.path.startswith("/api/device-grants"):
+            return await handler(request)  # anonymous, or the pairing token's own checks
+        bearer = request.headers.get("Authorization", "")
+        device = bearer[len("Bearer ") :] if bearer.startswith("Bearer pld_") else None
+        has_key = "X-Api-Key" in request.headers
+        if device is not None and has_key:
+            self.credentials.append(("both", request.path))
+            return _coded(400, "multiple_credentials")
+        if device is not None:
+            self.credentials.append(("device", request.path))
+            return await self._device_request(request, handler, device)
+        self.credentials.append(("key", request.path))
         if request.headers.get("X-Api-Key") != self.api_key:
             return web.Response(status=401)
         return await handler(request)
+
+    async def _device_request(self, request: web.Request, handler, token: str):
+        if self.throttled:
+            return _coded(429, "device_token_throttled", headers={"Retry-After": "60"})
+        grant = self.grant_for(token)
+        if grant is None:
+            return _coded(
+                401,
+                "invalid_device_token",
+                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+            )
+        route = request.match_info.route.resource
+        key = (request.method, route.canonical if route is not None else request.path)
+        if key not in DEVICE_SCOPES:
+            return _coded(403, "device_endpoint_not_allowed")
+        scope = DEVICE_SCOPES[key]
+        if scope is not None and scope not in grant["scopes"]:
+            return _coded(
+                403,
+                "insufficient_scope",
+                headers={"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{scope}"'},
+            )
+        grant["lastUsedAt"] = time.time()
+        return await handler(request)
+
+    def grant_for(self, token: str) -> dict[str, Any] | None:
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        return next((g for g in self.grants.values() if g["tokenHash"] == hashed), None)
+
+    def revoke(self, grant_id: int) -> None:
+        """The user removes the bridge in the app: its token stops working at once."""
+        del self.grants[grant_id]
+
+    def issue_device_token(
+        self, scopes: Any = None, device_id: str | None = None, name: str = "bridge"
+    ) -> str:
+        """A device token for a grant made as pairing would (all device scopes by default),
+        without the device flow."""
+        token = "pld_" + secrets.token_urlsafe(32)
+        grant_id = next(self._grant_ids)
+        self.grants[grant_id] = {
+            "id": grant_id,
+            "deviceId": device_id or str(uuid.uuid4()),
+            "name": name,
+            "scopes": sorted(ALL_DEVICE_SCOPES if scopes is None else scopes),
+            "tokenHash": hashlib.sha256(token.encode()).hexdigest(),
+        }
+        return token
+
+    def grant_by_device(self, device_id: str) -> dict[str, Any] | None:
+        return next((g for g in self.grants.values() if g["deviceId"] == device_id), None)
 
     # -- driving it from a test ----------------------------------------------------------------
 
@@ -363,6 +504,114 @@ class FakePrintLogApi:
         return found
 
     # -- the API -------------------------------------------------------------------------------
+
+    async def _pairing_config(self, _request: web.Request) -> web.Response:
+        if self.pairing is None:
+            return _coded(503, "device_pairing_unavailable")
+        return web.json_response(self.pairing)
+
+    async def _pair(self, request: web.Request) -> web.Response:
+        answer = await self._pairing(request)
+        body = json.loads(answer.text) if answer.text else None
+        shown = {k: v for k, v in (body or {}).items() if k != "token"}
+        self.pairings.append((answer.status, shown))
+        return answer
+
+    async def _pairing(self, request: web.Request) -> web.Response:
+        if "X-Api-Key" in request.headers:
+            return web.Response(status=401)
+        bearer = request.headers.get("Authorization", "")
+        token = bearer[len("Bearer ") :] if bearer.startswith("Bearer ") else ""
+        claims = self.auth0.issued.get(token) if self.auth0 is not None and token else None
+        if claims is None:
+            return web.Response(status=401)
+        if (
+            claims["azp"] != self.auth0.client_id
+            or time.time() - claims["iat"] > MAX_PAIRING_TOKEN_AGE_S
+        ):
+            return web.Response(status=403)
+        scopes = claims["scope"].split()
+        if "offline_access" in scopes:
+            return _coded(403, "offline_access_not_allowed")
+        device_scopes = sorted(s for s in scopes if s in ALL_DEVICE_SCOPES)
+        if not device_scopes:
+            return _coded(403, "insufficient_scope")
+        if claims["jti"] in self._spent_pairing_tokens:
+            return _coded(403, "pairing_token_used")
+        body = await request.json()
+        device_id, name = body.get("deviceId"), body.get("name")
+        if (
+            not isinstance(device_id, str)
+            or not UUID.match(device_id)
+            or not isinstance(name, str)
+            or not 1 <= len(name) <= 100
+            or any(ord(c) < 32 or ord(c) == 127 for c in name)
+        ):
+            return _coded(400, "invalid_request")
+        new_token = "pld_" + secrets.token_urlsafe(32)
+        hashed = hashlib.sha256(new_token.encode()).hexdigest()
+        grant = self.grant_by_device(device_id)
+        if device_id in self.revoke_during_repair:
+            self.revoke_during_repair.discard(device_id)
+            if grant is not None:
+                del self.grants[grant["id"]]
+            self._spent_pairing_tokens.add(claims["jti"])
+            return _coded(409, "device_grant_revoked")
+        if grant is None:
+            if len(self.grants) >= self.max_grants:
+                return _coded(409, "device_grant_limit")
+            grant = {"id": next(self._grant_ids), "deviceId": device_id, "createdAt": time.time()}
+            self.grants[grant["id"]] = grant
+            status = 201
+        else:
+            status = 200
+        grant.update(name=name, scopes=device_scopes, tokenHash=hashed)
+        self._spent_pairing_tokens.add(claims["jti"])
+        return web.json_response(
+            {
+                "id": grant["id"],
+                "deviceId": device_id,
+                "name": name,
+                "scopes": device_scopes,
+                "createdAt": "2026-10-27T18:04:11+00:00",
+                "token": new_token,
+                "tokenType": "Bearer",
+            },
+            status=status,
+        )
+
+    async def _printer_summary(self, request: web.Request) -> web.Response:
+        page = int(request.query.get("pageNumber", "1"))
+        size = int(request.query.get("pageSize", "10"))
+        printers = sorted(self.printers, reverse=True)
+        items = [
+            {
+                "id": p,
+                **{k: self._fields(p)[k] for k in ("name", "make", "model", "isActive")},
+                "slotCount": self.slot_counts.get(p, 1),
+            }
+            for p in printers[(page - 1) * size : page * size]
+        ]
+        return web.json_response(
+            {
+                "paging": {"totalCount": len(printers), "currentPage": page, "pageSize": size},
+                "items": items,
+            }
+        )
+
+    async def _create_printer(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        if any(not (body.get(f) or "").strip() for f in ("make", "model", "name")):
+            return _problem(400, "One or more validation errors occurred.")
+        printer_id = max(self.printers, default=0) + 100
+        self.printers.add(printer_id)
+        self.loaded[printer_id] = []
+        if body.get("slotCount"):
+            self.slot_counts[printer_id] = int(body["slotCount"])
+        fields = {k: v for k, v in body.items() if k in PRINTER_FIELDS}
+        self.user_edits_printer(printer_id, **fields)
+        self.created_printers.append(body)
+        return web.json_response(self._printer_detail(printer_id), status=201)
 
     async def _me(self, _request: web.Request) -> web.Response:
         return web.json_response({"id": 7, "displayName": "Maker"})
@@ -1033,6 +1282,16 @@ def _metadata_problem(metadata: dict[str, Any]) -> str | None:
         if not low <= value <= high:
             return f"The field {field} must be between {low} and {high}."
     return None
+
+
+def _coded(status: int, code: str, headers: dict[str, str] | None = None) -> web.Response:
+    """A problem details answer with the API's `code` extension, as `DeviceTokenErrors` sends."""
+    return web.json_response(
+        {"status": status, "title": code.replace("_", " "), "code": code},
+        status=status,
+        headers=headers,
+        content_type="application/problem+json",
+    )
 
 
 def _problem(status: int, title: str) -> web.Response:

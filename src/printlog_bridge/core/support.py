@@ -2,9 +2,10 @@
 
 Secrets are removed twice. The config file is redacted option by option (any option named like a
 key, token, secret, password or access code, and passwords in URLs), and then every known secret
-value, from the config, the key file and the environment, is replaced wherever it appears in any
-file of the bundle, in case one was ever written to the log or the status file. The key file itself
-(`<state_dir>/api_key`) is never bundled. With `trace = true`, the newest traces are bundled
+value, from the config, the key file, the device token file and the environment, is replaced
+wherever it appears in any file of the bundle, in case one was ever written to the log or the
+status file. The key file and the device token file (`<state_dir>/api_key`,
+`<state_dir>/device_token`) are never bundled. With `trace = true`, the newest traces are bundled
 too, up to `TRACE_BYTES`; they were scrubbed when written, and are scrubbed again here.
 
 The outbox goes in as `outbox.json`, less the text of any slicer settings waiting to be sent
@@ -25,6 +26,7 @@ from pathlib import Path
 
 from printlog_bridge import __version__
 from printlog_bridge.core.config import API_KEY_ENV, API_KEY_FILE
+from printlog_bridge.core.device import DeviceFileError, read_device_token
 from printlog_bridge.core.outbox import Entry, read_entries
 from printlog_bridge.core.secrets import REDACTED, URL_USERINFO, scrub
 from printlog_bridge.core.slicer_settings import OUTBOX_KIND, TEXT_FIELDS
@@ -103,12 +105,18 @@ def redact_config(text: str) -> str:
 
 def known_secrets(config_path: Path, state_dir: Path, env: Mapping[str, str]) -> list[str]:
     """Every secret the bridge knows of: the config's keys, tokens and passwords (URL passwords
-    among them), the API key from the environment and from the key file. Longest first, so a
-    secret containing another is replaced whole."""
+    among them), the API key from the environment and from the key file, and the device token.
+    Longest first, so a secret containing another is replaced whole."""
     found = _secrets(_read(config_path) or "", env)
     key_file = (_read(state_dir / API_KEY_FILE) or "").strip()
     if len(key_file) >= MIN_SECRET_LENGTH:
         found.add(key_file)
+    try:
+        device = read_device_token(state_dir)
+    except DeviceFileError:
+        device = None
+    if device is not None:
+        found.add(device.token)
     return sorted(found, key=len, reverse=True)
 
 
