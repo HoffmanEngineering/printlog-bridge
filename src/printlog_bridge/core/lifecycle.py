@@ -1270,12 +1270,13 @@ class JobLogger:
             # every time: a retry reads the print back with a row per spool already on it (#44).
             loaded = await self.spools.current(event.printer) if self.spools is not None else {}
             slot_count = self.spools.slot_count(event.printer) if self.spools is not None else None
-            single_tool = (slot_count or 1) <= 1 and all(slot == 0 for slot in event.filament_mm)
+            fed = _fed(event)
+            single_tool = (slot_count or 1) <= 1 and all(slot == 0 for slot in fed)
             swaps = list(job.swaps)
             rows_now = print_.get("filamentUsage") or []
             conflicts: list[str] = []
             usage = _usage_rows(event, rows_now, loaded, single_tool, swaps, conflicts)
-            noted = "\n".join([*swap_notes(swaps, event.filament_mm), *conflicts])
+            noted = "\n".join([*swap_notes(swaps, fed), *conflicts])
             hints = change_hints(job.filament_changes, swaps)
             completion = {"usage": usage, "notes": [n for n in (event.note, noted, *hints) if n]}
             if swaps:
@@ -1381,6 +1382,8 @@ def _finish_payload(event: JobFinished) -> dict[str, Any]:
         "finished_at": event.finished_at.isoformat(),
         "duration_s": event.duration_s,
         "filament_mm": {str(slot): mm for slot, mm in event.filament_mm.items()},
+        "filament_g": {str(slot): grams for slot, grams in event.filament_g.items()},
+        "usage_estimated": event.usage_estimated,
         "note": event.note,
     }
 
@@ -1394,6 +1397,8 @@ def _finish_event(entry: Entry) -> JobFinished:
         finished_at=datetime.fromisoformat(payload["finished_at"]),
         duration_s=payload.get("duration_s"),
         filament_mm={int(slot): mm for slot, mm in (payload.get("filament_mm") or {}).items()},
+        filament_g={int(slot): g for slot, g in (payload.get("filament_g") or {}).items()},
+        usage_estimated=bool(payload.get("usage_estimated")),
         note=payload.get("note"),
     )
 
@@ -1508,27 +1513,84 @@ def _usage_rows(
         if first is not None:
             spools[slot] = first
     usage: list[dict[str, Any]] = []
-    for slot, mm in sorted(event.filament_mm.items()):
+    for slot in sorted(_fed(event)):
+        mm, grams = event.filament_mm.get(slot, 0.0), event.filament_g.get(slot, 0.0)
         slot_swaps = [swap for swap in on_slot(swaps, slot) if is_split(swap)]
-        pieces = [p for p in segments(mm, spools.get(slot), slot_swaps) if p[1] > 0]
-        # In metres to 0.1 mm, the last piece taking what rounding left, so the slot's rows
-        # add up to its rounded total exactly.
-        metres = [round(length / 1000, 4) for _, length in pieces[:-1]]
-        if pieces:
-            metres.append(round(round(mm / 1000, 4) - sum(metres), 4))
-        for (spool, _), m in zip(pieces, metres):
+        metres: list[float] = []
+        if mm > 0:
+            pieces = [p for p in segments(mm, spools.get(slot), slot_swaps) if p[1] > 0]
+            # In metres to 0.1 mm, the last piece taking what rounding left, so the slot's rows
+            # add up to its rounded total exactly.
+            metres = _shares(mm / 1000, [length / 1000 for _, length in pieces], 4)
+            fractions = [length / mm for _, length in pieces]
+        else:
+            # Weighed only: split where the job had got to (its progress) at each swap.
+            by_progress = [{**swap, "fed_mm": _progress(swap)} for swap in slot_swaps]
+            pieces = [p for p in segments(1.0, spools.get(slot), by_progress) if p[1] > 0]
+            fractions = [share for _, share in pieces]
+        milligrams: list[float] = []
+        if grams > 0:
+            milligrams = _shares(grams * 1000, [grams * 1000 * f for f in fractions], 0)
+        for n, (spool, _) in enumerate(pieces):
+            piece: dict[str, Any] = {"slot": slot}
+            if milligrams:
+                piece["amountMg"] = int(milligrams[n])
+            if metres:
+                piece["lengthInM"] = metres[n]
+            piece["source"] = WEIGHT if milligrams else LENGTH
+            if event.usage_estimated:
+                piece["actualIsEstimate"] = True
             # One row per spool, and one row per slot with no spool (the API matches those by
             # slot, so it takes only one each).
             key = _row_key({"slot": slot, "filamentId": spool})
             row = next((r for r in usage if _row_key(r) == key), None)
             if row is not None:
-                row["lengthInM"] = round(row["lengthInM"] + m, 4)
+                _add(row, piece)
                 continue
-            row = {"slot": slot, "lengthInM": m, "source": LENGTH}
             if spool is not None:
-                row["filamentId"] = spool
-            usage.append(row)
+                piece["filamentId"] = spool
+            usage.append(piece)
     return usage
+
+
+def _fed(event: JobFinished) -> dict[int, float]:
+    """Each slot that fed anything, by length or by weight."""
+    fed = {slot: g for slot, g in event.filament_g.items() if g > 0}
+    fed.update({slot: mm for slot, mm in event.filament_mm.items() if mm > 0})
+    return fed
+
+
+def _progress(swap: Mapping[str, Any]) -> float:
+    """How far through the job a swap was, 0 to 1; at the end when that isn't known."""
+    progress = swap.get("progress")
+    return float(progress) if isinstance(progress, (int, float)) else 1.0
+
+
+def _shares(total: float, parts: Sequence[float], digits: int) -> list[float]:
+    """`parts` rounded to `digits`, the last taking what rounding left of `total`, so they add
+    up to `total` rounded exactly."""
+    rounded = [round(part, digits) for part in parts[:-1]]
+    if parts:
+        rounded.append(round(round(total, digits) - sum(rounded), digits))
+    return rounded
+
+
+def _add(row: dict[str, Any], piece: Mapping[str, Any]) -> None:
+    """Adds another slot's piece to the row of the spool it was fed from. A measure only one of
+    them has is dropped, since it would be part of the spool's usage counted as all of it; an
+    adapter reports every slot the same way, so that is only ever a spool on two slots that
+    one weighed and the other measured."""
+    common = [m for m in ("amountMg", "lengthInM") if m in row and m in piece]
+    if not common:
+        return
+    for measure in ("amountMg", "lengthInM"):
+        if measure not in common:
+            row.pop(measure, None)
+    if "amountMg" in common:
+        row["amountMg"] += piece["amountMg"]
+    if "lengthInM" in common:
+        row["lengthInM"] = round(row["lengthInM"] + piece["lengthInM"], 4)
+    row["source"] = WEIGHT if "amountMg" in row else LENGTH
 
 
 def _row_key(row: Mapping[str, Any]) -> tuple[int, str | None] | str:

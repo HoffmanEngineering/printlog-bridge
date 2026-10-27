@@ -800,10 +800,10 @@ def test_a_swap_after_the_jobs_end_was_worked_out_isnt_a_split(tmp_path):
 # -- the pieces on their own ---------------------------------------------------------------------
 
 
-def finished(filament_mm: dict[int, float]) -> JobFinished:
+def finished(filament_mm: dict[int, float], **more) -> JobFinished:
     return JobFinished(
         "voron", "000001", JobOutcome.COMPLETED, datetime(2026, 10, 14, tzinfo=timezone.utc),
-        filament_mm=filament_mm,
+        filament_mm=filament_mm, **more,
     )  # fmt: skip
 
 
@@ -926,6 +926,46 @@ class TestUsageRows:
         assert [(r["slot"], r["filamentId"], r["lengthInM"]) for r in usage] == [
             (0, "a", 3.0), (1, "b", 0.5), (1, "c", 1.5),
         ]  # fmt: skip
+
+
+class TestUsageRowsByWeight:
+    """A printer that reports grams (#82): split the same way, by weight."""
+
+    def test_grams_with_a_length_split_as_the_length_does(self):
+        usage = _usage_rows(
+            finished({0: 5000.0}, filament_g={0: 15.0}), [], {}, True, [swap(0, 3000, "a", "b")]
+        )
+
+        assert usage == [
+            {"slot": 0, "amountMg": 9000, "lengthInM": 3.0, "source": 1, "filamentId": "a"},
+            {"slot": 0, "amountMg": 6000, "lengthInM": 2.0, "source": 1, "filamentId": "b"},
+        ]
+
+    def test_grams_alone_split_where_the_job_had_got_to(self):
+        swaps = [swap(0, 40.0, "a", "b", progress=0.25)]
+
+        usage = _usage_rows(finished({}, filament_g={0: 10.001}), [], {}, True, swaps)
+
+        assert usage == [
+            {"slot": 0, "amountMg": 2500, "source": 1, "filamentId": "a"},
+            {"slot": 0, "amountMg": 7501, "source": 1, "filamentId": "b"},
+        ]
+
+    def test_an_estimate_is_marked_on_every_piece(self):
+        swaps = [swap(0, 40.0, "a", "b", progress=0.5)]
+
+        usage = _usage_rows(
+            finished({}, filament_g={0: 10.0}, usage_estimated=True), [], {}, True, swaps
+        )
+
+        assert [r["actualIsEstimate"] for r in usage] == [True, True]
+
+    def test_a_spool_on_two_weighed_slots_adds_up_its_grams(self):
+        rows = [{"slot": 0, "filament": {"id": "a"}}, {"slot": 1, "filament": {"id": "a"}}]
+
+        usage = _usage_rows(finished({}, filament_g={0: 2.0, 1: 3.0}), rows, {}, False)
+
+        assert usage == [{"slot": 0, "amountMg": 5000, "source": 1, "filamentId": "a"}]
 
 
 class TestNotes:
