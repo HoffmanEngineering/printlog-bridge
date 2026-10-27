@@ -40,6 +40,7 @@ PAIRING_PATH = "/api/device-grants/pairing"
 GRANTS_PATH = "/api/device-grants"
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 BRIDGE_SCOPES = (
+    "bridge:sync",
     "connections:write",
     "files:write",
     "filaments:read",
@@ -50,7 +51,9 @@ BRIDGE_SCOPES = (
 )
 """What the bridge calls the API for (api#286's scope table). `files:write` is asked for even
 without Pro, which the bridge can't know before it pairs: the API still checks Pro, and a user
-who upgrades later doesn't have to pair again."""
+who upgrades later doesn't have to pair again. `bridge:sync` (check-in, the printers connected in
+the app, api#288) is asked for only when the server lists it, like every scope."""
+SYNC_SCOPE = "bridge:sync"
 CREATE_SCOPE = "printers:create"
 """Asked for only when `pair` may offer to create a printer."""
 SLOW_DOWN_S = 5
@@ -184,6 +187,15 @@ async def discover(session: aiohttp.ClientSession, api_url: str) -> PairingConfi
         if not _secure(endpoint):
             raise PairingError(f"{api_url} named a sign-in address that isn't https: {endpoint}")
     return config
+
+
+async def offered_scopes(api_url: str) -> tuple[str, ...]:
+    """The scopes the server's pairing discovery lists. Raises PairingError."""
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": f"printlog-bridge/{__version__}", "Accept": "application/json"},
+        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S),
+    ) as session:
+        return (await discover(session, api_url)).scopes
 
 
 async def start(

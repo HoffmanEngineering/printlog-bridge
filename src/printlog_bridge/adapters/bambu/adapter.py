@@ -24,15 +24,17 @@ import ssl
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from printlog_bridge.core.adapter import Adapter, PrinterDetails
+from printlog_bridge.core.adapter import Adapter, NeedsCredentials, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.current_job import CurrentJob
+from printlog_bridge.core.discovery import Discovery, Found
 from printlog_bridge.core.events import EventSink, SpoolSink
 from printlog_bridge.core.state import MemoryState, PrinterState
 from printlog_bridge.core.status import PrinterReport
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
+from .discovery import BambuDiscovery
 from .files import BambuFiles
 from .ftps import FTPS_PORT, BambuFtps, FilesRefused
 from .jobs import JobTracker
@@ -168,6 +170,37 @@ class BambuAdapter(Adapter):
 
     def describe(self) -> str:
         return f"bambu, {self.host} (serial {self.serial})"
+
+    app_secrets = ("access_code",)
+
+    @classmethod
+    def discovery(cls) -> Discovery:
+        return BambuDiscovery()
+
+    @classmethod
+    def app_options(
+        cls, host: str, port: int | None, serial: str | None, secrets: Mapping[str, str]
+    ) -> dict[str, str]:
+        if not serial:
+            raise NeedsCredentials("a serial number, which 3D Print Log should have sent")
+        if not (secrets.get("access_code") or "").strip():
+            raise NeedsCredentials(
+                "access_code (on the printer's screen, with LAN Only Mode and Developer Mode on)"
+            )
+        options = {"host": host, "serial": serial, "access_code": secrets["access_code"]}
+        if port and port != MQTT_PORT:
+            options["mqtt_port"] = str(port)
+        return options
+
+    def watches(self, found: Found) -> bool:
+        if found.kind != self.name:
+            return False
+        if found.serial:
+            return found.serial.upper() == self.serial.upper()
+        return found.address == self.host
+
+    def found_entry(self) -> Found | None:
+        return Found(self.name, self.host, self.mqtt_port, serial=self.serial)
 
     def use_spools(self, spools: SpoolSink, api_url: str | None = None) -> None:
         self.spools = spools

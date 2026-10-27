@@ -101,6 +101,9 @@ API_CALLS = [
     ("GET", r"/api/Subscription/me"),
     ("GET", r"/api/Prints/\d+/files"),
     ("POST", r"/api/Prints/\d+/files/upload-url"),
+    # A paired bridge's check-in and the printers connected in the app (#100).
+    ("PUT", r"/api/bridges/me"),
+    ("GET", r"/api/bridges/me/desired"),
     ("POST", r"/api/Prints/\d+/files/confirm"),
 ]
 CREATE_FIELDS = {
@@ -574,16 +577,30 @@ class TestOnlyOutboundConnections:
             if server_apis.search(line)
         ]
         # `printlog-bridge discover`, which you run yourself, listens for Bambu printers'
-        # announcements (UDP) while it runs; nothing `run` uses imports it.
+        # announcements (UDP) while it runs (`listen`, which nothing `run` calls). `run` listens
+        # only through discovery's `bind_udp` (#100): a UDP port an adapter's hook names, only
+        # with discovery on and the bridge checked in with `bridge:sync`.
+        bind_udp = {
+            f"core/discovery.py:{number}"
+            for number, line in enumerate(
+                (SRC / "core" / "discovery.py").read_text(encoding="utf-8").splitlines(), 1
+            )
+            if "sock.bind((" in line
+        }
+        assert len(bind_udp) == 1
         assert all(
-            f.startswith("adapters/bambu/discovery.py:") or f in listens_for_bambu for f in found
+            f.startswith("adapters/bambu/discovery.py:") or f in listens_for_bambu | bind_udp
+            for f in found
         )
-        importers = {
+        callers = {
             path.relative_to(SRC).as_posix()
             for path in SRC.rglob("*.py")
-            if re.search(r"bambu(\.| import )discovery", path.read_text(encoding="utf-8"))
+            if re.search(r"(bambu_discovery|discovery)\.listen\(", path.read_text(encoding="utf-8"))
         }
-        assert importers == {"cli/main.py", "cli/discover.py"}
+        assert callers == {"cli/main.py"}
+        hooks = (SRC / "adapters" / "bambu" / "discovery.py").read_text(encoding="utf-8")
+        hook = hooks[hooks.index("class BambuDiscovery") :]
+        assert "listen(" not in hook and "bind" not in hook and "socket" not in hook
 
     def test_only_these_modules_open_connections(self):
         """3D Print Log's API client, the image fetcher (Moonraker's thumbnails and its webcam),
@@ -605,6 +622,8 @@ class TestOnlyOutboundConnections:
             "core/api_client.py",
             "core/images.py",
             "core/pairing.py",
+            "core/mdns.py",
+            "core/discovery.py",
             "adapters/moonraker/session.py",
             "adapters/moonraker/discovery.py",
             "adapters/bambu/mqtt.py",
@@ -906,3 +925,57 @@ class TestAdoptionCalls:
         assert claimed == print_id
         assert set(body) <= CLAIM_FIELDS
         assert "benchy" not in json.dumps(lookup).lower()  # the file name stays on the bridge
+
+
+CHECK_IN_FIELDS = {"agentVersion", "mode", "hostName", "networks", "lastSweepAt", "discovered"}
+DISCOVERED_FIELDS = {
+    "kind", "address", "port", "model", "name", "serial", "mainboardId", "macs", "configured",
+}  # fmt: skip
+
+
+class TestBridgeCheckIn:
+    """The check-in (#100) carries only what docs/privacy.md lists, and no key."""
+
+    def test_only_the_listed_fields_and_no_secret(self, tmp_path):
+        from printlog_bridge.core.api_client import ApiClient
+        from printlog_bridge.core.bridge_sync import BridgeSync
+        from printlog_bridge.core.device import DeviceToken
+        from printlog_bridge.core.discovery import DiscoveryService, Found
+        from printlog_bridge.core.status import StatusBoard
+
+        async def ask(services, wait):
+            return []
+
+        async def bind(port, on_datagram):
+            return None
+
+        async def apply(entries):
+            pass
+
+        async def scenario():
+            api = FakePrintLogApi()
+            url = await api.start()
+            token = api.issue_device_token()
+            device = DeviceToken(token, url)
+            board = StatusBoard(tmp_path)
+            board.start([])
+            found = DiscoveryService([], ask=ask, bind=bind)
+            found.heard(Found("bambu", "192.168.1.60", 8883, name="X1C", serial="01P0A"), "udp")
+            found.heard(Found("moonraker", "8.8.8.8", 7125), "udp")  # never kept
+            try:
+                async with ApiClient(url, device=device) as client:
+                    sync = BridgeSync(
+                        client, tmp_path, board, apply, device=device, discovery=found,
+                        networks=lambda: ["192.168.1.0/24"],
+                        configured=lambda: [Found("moonraker", "192.168.1.50", 7125)],
+                    )  # fmt: skip
+                    await sync.check_in()
+            finally:
+                await api.close()
+            return api.check_ins, token, (tmp_path / "bridge.json").read_text()
+
+        [body], token, state = asyncio.run(scenario())
+        assert set(body) <= CHECK_IN_FIELDS
+        assert all(set(d) == DISCOVERED_FIELDS for d in body["discovered"])
+        assert {d["address"] for d in body["discovered"]} == {"192.168.1.60", "192.168.1.50"}
+        assert token not in json.dumps(body) and token not in state

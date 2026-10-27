@@ -139,6 +139,16 @@ class BridgeConfig:
     """Say in the log, `status` and `doctor` when 3D Print Log reports a newer bridge (#39)."""
     stored_device: DeviceToken | None = None
     """The device token `printlog-bridge pair` stored, whichever API issued it."""
+    adoption: Adoption = field(default_factory=Adoption)
+    """`[bridge]`'s adoption settings, for printers connected in the app."""
+    slicer_settings: bool = True
+    """`[bridge]`'s `slicer_settings`, for printers connected in the app."""
+    discovery: bool = True
+    """`discovery`: look for printers on the network and report them to 3D Print Log, for
+    "Found on your network" (#100). Only with a device token that has `bridge:sync`."""
+    app_secrets: Mapping[int, Mapping[str, str]] = field(default_factory=dict)
+    """`[app_printer <id>]` sections: the secrets of each printer connected in the app, by its
+    entry id, until story 14 brings them from the app."""
 
     @property
     def device(self) -> DeviceToken | None:
@@ -245,8 +255,9 @@ def load_config(
     printers = [
         _load_printer(section, parser[section], adapters, adoption, slicer_settings)
         for section in parser.sections()
-        if section != "bridge"
+        if section != "bridge" and not _is_app_section(section)
     ]
+    app_secrets = _app_secrets(parser, adapters)
     if not printers and printers_required:
         raise ConfigError(f"{path}: no [printer <name>] section, so there is nothing to watch")
 
@@ -262,7 +273,48 @@ def load_config(
         max_attachment_mb=_max_attachment_mb(bridge.get("max_attachment_mb")),
         update_check=_flag(bridge.get("update_check") or "true", "update_check"),
         stored_device=stored_device,
+        adoption=adoption,
+        slicer_settings=slicer_settings,
+        discovery=_flag(bridge.get("discovery") or "true", "[bridge] discovery"),
+        app_secrets=app_secrets,
     )
+
+
+APP_PRINTER_PREFIX = "app_printer"
+
+
+def _is_app_section(section: str) -> bool:
+    return section.partition(" ")[0] == APP_PRINTER_PREFIX
+
+
+def app_section(entry_id: int) -> str:
+    return f"[{APP_PRINTER_PREFIX} {entry_id}]"
+
+
+def _app_secrets(
+    parser: configparser.ConfigParser, adapters: Mapping[str, type[Adapter]]
+) -> dict[int, dict[str, str]]:
+    """Each `[app_printer <id>]`: the secrets of the printer connected in the app as entry `id`.
+    Only options some adapter takes from it, so a typo is caught here."""
+    allowed = sorted({o for a in adapters.values() for o in a.app_secrets})
+    found: dict[int, dict[str, str]] = {}
+    for section in parser.sections():
+        if not _is_app_section(section):
+            continue
+        number = section.partition(" ")[2].strip()
+        if not number.isdigit() or int(number) == 0:
+            raise ConfigError(
+                f"[{section}]: the name must be the printer's number on the bridge in 3D Print "
+                f"Log, as the bridge's log and `status` name it, such as {app_section(7)}"
+            )
+        values = {k: v.strip() for k, v in parser[section].items()}
+        unknown = sorted(set(values) - set(allowed))
+        if unknown:
+            raise ConfigError(
+                f"[{section}]: unknown option {unknown[0]!r} (it takes {', '.join(allowed)})"
+            )
+        found[int(number)] = values
+    return found
 
 
 def _max_attachment_mb(option: str | None) -> int:
@@ -413,7 +465,10 @@ def _load_printer(
 ) -> PrinterConfig:
     kind, _, name = section.partition(" ")
     if kind != PRINTER_PREFIX:
-        raise ConfigError(f"unknown section [{section}]; expected [bridge] or [printer <name>]")
+        raise ConfigError(
+            f"unknown section [{section}]; expected [bridge], [printer <name>] or "
+            f"[{APP_PRINTER_PREFIX} <number>]"
+        )
     name = name.strip()
     if not name:
         raise ConfigError("[printer] needs a name, such as [printer voron]")

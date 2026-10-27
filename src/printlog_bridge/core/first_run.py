@@ -64,8 +64,10 @@ STARTER_CONFIG = """\
 
 
 def setup_problem(config: BridgeConfig) -> str | None:
-    """What keeps `config` from being watched yet, or None when it's ready."""
-    if not config.printers:
+    """What keeps `config` from being watched yet, or None when it's ready. A paired bridge
+    with no `[printer]` is ready: printers connected in 3D Print Log come with no config (#100),
+    and `run` still starts again by itself when the file gains a printer."""
+    if not config.printers and config.device is None:
         if not config.path.exists():
             return f"{config.path} doesn't exist yet: add a [printer <name>] section to it"
         return f"{config.path} has no [printer <name>] section yet"

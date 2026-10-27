@@ -16,13 +16,11 @@ Either way a candidate is only a candidate: `probe` reads its `/server/info` and
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import ipaddress
 import logging
 import os
 import re
 import socket
-import struct
 from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -31,13 +29,17 @@ from urllib.parse import urlsplit, urlunsplit
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.core import mdns
+from printlog_bridge.core.discovery import Discovery
+from printlog_bridge.core.discovery import Found as DiscoveredPrinter
+from printlog_bridge.core.mdns import MdnsAnswer
 
 log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 7125
 PROBE_TIMEOUT_S = 2
 SCAN_CONCURRENCY = 64
-MDNS_GROUP = ("224.0.0.251", 5353)
+MDNS_GROUP = mdns.MDNS_GROUP
 MDNS_SERVICE = "_moonraker._tcp.local"
 MDNS_WAIT_S = 2
 MAX_PREFIX = 24
@@ -301,112 +303,27 @@ async def browse_mdns(
 ) -> list[tuple[str, int]]:
     """Asks the network for `service` over mDNS, and returns each private IPv4 address and port
     that answered within `wait` seconds. Empty when multicast doesn't get through."""
-    loop = asyncio.get_running_loop()
-    answers: list[bytes] = []
-
-    class Listener(asyncio.DatagramProtocol):
-        def datagram_received(self, data: bytes, addr: Any) -> None:
-            answers.append(data)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    try:
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
-        sock.setblocking(False)
-        transport, _ = await loop.create_datagram_endpoint(Listener, sock=sock)
-    except OSError as e:
-        sock.close()
-        log.debug("mDNS isn't available here: %s", e)
-        return []
-    try:
-        # From an ephemeral port, a "legacy" query (RFC 6762 6.7): responders answer it unicast.
-        transport.sendto(mdns_query(service), MDNS_GROUP)
-        await asyncio.sleep(wait)
-    except OSError as e:
-        log.debug("couldn't send the mDNS query: %s", e)
-    finally:
-        transport.close()
-
     found: dict[tuple[str, int], None] = {}
-    for data in answers:
-        with contextlib.suppress(ValueError, IndexError, struct.error):
-            for address, port in parse_mdns_answer(data, service):
-                if private_ipv4(address) is not None:
-                    found[(address, port)] = None
+    for answer in await mdns.ask([service], wait):
+        if private_ipv4(answer.address) is not None:
+            found[(answer.address, answer.port)] = None
     return list(found)
 
 
 def mdns_query(service: str) -> bytes:
     """A DNS query for `service`'s PTR records."""
-    header = struct.pack("!HHHHHH", 0, 0, 1, 0, 0, 0)
-    return header + _encode_name(service) + struct.pack("!HH", 12, 1)  # PTR, IN
+    return mdns.query_packet([service])
 
 
-def _encode_name(name: str) -> bytes:
-    out = b""
-    for label in name.strip(".").split("."):
-        raw = label.encode()
-        out += bytes([len(raw)]) + raw
-    return out + b"\x00"
+_encode_name = mdns.encode_name
+_read_name = mdns.read_name
 
 
 def parse_mdns_answer(data: bytes, service: str) -> list[tuple[str, int]]:
     """Each (IPv4 address, port) an mDNS response gives for instances of `service`: its PTR
     records name the instances, their SRV records the host and port, and the host's A records
     the address."""
-    _, _, questions, answers, authority, additional = struct.unpack_from("!HHHHHH", data)
-    offset = 12
-    for _ in range(questions):
-        _, offset = _read_name(data, offset)
-        offset += 4
-    instances: set[str] = set()
-    srv: dict[str, tuple[str, int]] = {}
-    a_records: dict[str, list[str]] = {}
-    want = service.strip(".").lower()
-    for _ in range(answers + authority + additional):
-        name, offset = _read_name(data, offset)
-        kind, _, _, length = struct.unpack_from("!HHIH", data, offset)
-        offset += 10
-        rdata = offset
-        offset += length
-        if kind == 12 and name.lower() == want:  # PTR
-            instances.add(_read_name(data, rdata)[0].lower())
-        elif kind == 33:  # SRV: priority, weight, port, target
-            port = struct.unpack_from("!H", data, rdata + 4)[0]
-            srv[name.lower()] = (_read_name(data, rdata + 6)[0].lower(), port)
-        elif kind == 1 and length == 4:  # A
-            a_records.setdefault(name.lower(), []).append(str(ipaddress.IPv4Address(
-                data[rdata : rdata + 4]
-            )))  # fmt: skip
-    found = []
-    for instance in sorted(instances):
-        if instance not in srv:
-            continue
-        host, port = srv[instance]
-        found.extend((address, port) for address in a_records.get(host, []))
-    return found
-
-
-def _read_name(data: bytes, offset: int) -> tuple[str, int]:
-    """A (possibly compressed) DNS name at `offset`, and the offset just after it."""
-    labels = []
-    end = None
-    jumps = 0
-    while True:
-        length = data[offset]
-        if length & 0xC0 == 0xC0:
-            if end is None:
-                end = offset + 2
-            jumps += 1
-            if jumps > 32:
-                raise ValueError("DNS name compression loop")
-            offset = ((length & 0x3F) << 8) | data[offset + 1]
-            continue
-        offset += 1
-        if length == 0:
-            break
-        labels.append(data[offset : offset + length].decode("utf-8", errors="replace"))
-        offset += length
-    return ".".join(labels), end if end is not None else offset
+    return [(a.address, a.port) for a in mdns.parse(data, [service])]
 
 
 # -- this host ---------------------------------------------------------------------------------
@@ -429,3 +346,45 @@ def local_subnets() -> list[ipaddress.IPv4Network]:
 
 def in_container() -> bool:
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
+# -- the bridge's discovery hook (#100) ---------------------------------------------------------
+
+
+class MoonrakerDiscovery(Discovery):
+    """Moonraker's `[zeroconf]` answers `_moonraker._tcp`; a sweep scans each /24 on 7125. Each
+    one is asked `/server/info` (and, to tell it apart, `/machine/system_info` and
+    `/printer/info`) without a key, before it is reported."""
+
+    kind = "moonraker"
+    mdns_services = (MDNS_SERVICE,)
+
+    def __init__(self, timeout: float = PROBE_TIMEOUT_S) -> None:
+        self.timeout = timeout
+
+    async def from_mdns(self, answer: MdnsAnswer) -> DiscoveredPrinter | None:
+        one = await probe(
+            f"http://{answer.address}:{answer.port}", timeout=self.timeout, details=True
+        )
+        return reported(one, answer.instance) if one is not None else None
+
+    async def sweep(self, networks: Sequence[ipaddress.IPv4Network]) -> list[DiscoveredPrinter]:
+        found = await scan(
+            networks,
+            lambda address: f"http://{address}:{DEFAULT_PORT}",
+            timeout=self.timeout,
+            details=True,
+        )
+        return [reported(f) for f in found]
+
+
+def reported(found: Found, instance: str | None = None) -> DiscoveredPrinter:
+    """A Moonraker that answered, as a check-in reports it."""
+    hostname = str(found.printer_info.get("hostname") or "") or None
+    return DiscoveredPrinter(
+        kind="moonraker",
+        address=found.address,
+        port=found.port,
+        name=hostname or instance,
+        macs=tuple(sorted(found.fingerprint.macs)),
+    )

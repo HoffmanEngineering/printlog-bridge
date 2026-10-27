@@ -39,6 +39,10 @@ skipped by default.
   API key; the API answers 400 `multiple_credentials` to both. Only 401 `invalid_device_token`
   means re-pair; 429 `device_token_throttled` is waited out. The pairing contract is
   3d-print-log-api PR #286's "Contract for the bridge".
+- Bridges (#100): the check-in, desired list and scan contract is 3d-print-log-api PR #288's
+  "Contract for story 12" (`core/bridge_sync.py`). Discovery only reports; nothing is watched
+  unless a `[printer]` or the desired list names it, and the config file wins. Printers
+  connected in the app run as `app-<entry id>` (`core/app_printers.py`, `core/watchers.py`).
 
 ## Docker and NAS installs
 
@@ -47,7 +51,8 @@ skipped by default.
   `docker exec` is safe too. Only where `PRINTLOG_BRIDGE_DATA_DIR` is set (the image; the app
   stage clears it), and never when started with `user:`. `tests/docker/smoke.sh` covers both.
 - `run` with no config or no printers waits (`core/first_run.py`) instead of exiting: keep it
-  that way, or a NAS container restart-loops before the user has added printers.
+  that way, or a NAS container restart-loops before the user has added printers. A paired bridge
+  runs instead (printers can come from the app) and starts itself again when the file changes.
 - `unraid/printlog-bridge.xml` is listed in Unraid Community Applications, which indexes this
   repo (`ca_profile.xml`); `tests/test_unraid.py` checks it against the code. Keep its path:
   installs update from its `TemplateURL`. No other `.xml` file in the repo.

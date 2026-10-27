@@ -21,16 +21,18 @@ from typing import Any
 
 import aiohttp
 
-from printlog_bridge.core.adapter import Adapter, PrinterDetails
+from printlog_bridge.core.adapter import Adapter, NeedsCredentials, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.current_job import CurrentJob
+from printlog_bridge.core.discovery import Discovery, Found
 from printlog_bridge.core.events import EventSink
 from printlog_bridge.core.state import MemoryState, PrinterState
 from printlog_bridge.core.status import PrinterReport
 from printlog_bridge.core.trace import Trace
 
 from .client import DEFAULT_USER, PrusaLinkClient, Refused
+from .discovery import PrusaLinkDiscovery
 from .files import PrusaLinkFiles
 from .jobs import JobTracker
 
@@ -166,6 +168,29 @@ class PrusaLinkAdapter(Adapter):
 
     def describe(self) -> str:
         return f"prusalink, {self.base_url}"
+
+    app_secrets = ("password", "username", "api_key")
+
+    @classmethod
+    def discovery(cls) -> Discovery:
+        return PrusaLinkDiscovery()
+
+    @classmethod
+    def app_options(
+        cls, host: str, port: int | None, serial: str | None, secrets: Mapping[str, str]
+    ) -> dict[str, str]:
+        values = {k: v for k, v in secrets.items() if v.strip()}
+        if not values.get("password") and not values.get("api_key"):
+            raise NeedsCredentials(
+                "password (on the printer: Settings > Network > PrusaLink), or api_key"
+            )
+        return {"host": host, "port": str(port or 80), **values}
+
+    def watches(self, found: Found) -> bool:
+        return found.kind == self.name and (found.address, found.port) == (self.host, self.port)
+
+    def found_entry(self) -> Found | None:
+        return Found(self.name, self.host, self.port)
 
     def use_trace(self, trace: Trace) -> None:
         self.trace = trace

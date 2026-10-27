@@ -97,8 +97,20 @@ class Heartbeat:
             await asyncio.sleep(self.interval)
 
     async def beat_all(self) -> None:
-        for printer in self.connections:
-            await self.beat(printer)
+        for printer in list(self.connections):
+            if printer in self.connections:  # not stopped meanwhile
+                await self.beat(printer)
+
+    def add(self, connection: Connection) -> None:
+        """Starts beating for a printer the bridge starts watching while it runs (one connected
+        in the app). Its first heartbeat goes with the next round, or before its first print."""
+        self.connections[connection.printer] = connection
+        self._registered.discard(connection.printer)
+
+    def remove(self, printer: str) -> None:
+        """Stops beating for a printer no longer watched: 3D Print Log shows it as offline."""
+        self.connections.pop(printer, None)
+        self._registered.discard(printer)
 
     async def ensure_registered(self, printer: str) -> None:
         """Registers the printer's connection if no heartbeat has got through yet. Raises
@@ -108,7 +120,9 @@ class Heartbeat:
             await self.beat(printer, raise_unavailable=True)
 
     async def beat(self, printer: str, raise_unavailable: bool = False) -> bool:
-        connection = self.connections[printer]
+        connection = self.connections.get(printer)
+        if connection is None:
+            return False
         report = self.board.printer(printer)
         problems = self.problems.problems(printer) if self.problems else NO_PROBLEMS
         body = self._body(connection, problems)

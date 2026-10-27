@@ -125,24 +125,29 @@ class StatusBoard:
             "credentials": credentials,
             "credentials_problem": None,
             "setup_problem": None,
-            "printers": {
-                name: {
-                    "connection": "starting",
-                    "connection_detail": None,
-                    "connection_since": now,
-                    "printer_state": None,
-                    "last_event": None,
-                    "last_event_at": None,
-                    "last_heartbeat_at": None,
-                    "warnings": {},
-                    "moved": None,
-                    "software": {},
-                    "printer_model": None,
-                }
-                for name in printers
-            },
+            "printers": {name: _new_printer(now) for name in printers},
+            "bridge": None,
         }
         self._write()
+
+    def add_printer(self, name: str) -> None:
+        """A printer the bridge started watching while it runs (one connected in the app)."""
+        if name not in self._data["printers"]:
+            self._data["printers"][name] = _new_printer(self._now())
+            self._write()
+
+    def remove_printer(self, name: str) -> None:
+        if self._data["printers"].pop(name, None) is not None:
+            self._write()
+
+    def bridge(self, **fields: Any) -> None:
+        """The bridge's own part (#100): `discovery`, `check_in`, `desired_version`,
+        `app_printers`. Only fields that changed are written."""
+        current = self._data.get("bridge") or {}
+        merged = {**current, **fields}
+        if merged != current:
+            self._data["bridge"] = merged
+            self._write()
 
     def printer(self, name: str) -> BoardReport:
         return BoardReport(self, name)
@@ -155,11 +160,14 @@ class StatusBoard:
         self._write()
 
     def update(self, printer: str, **fields: Any) -> None:
-        self._data["printers"][printer].update(fields)
+        known = self._data["printers"].get(printer)
+        if known is None:
+            return  # no longer watched: an adapter stopping as it was told
+        known.update(fields)
         self._write()
 
     def get(self, printer: str) -> dict[str, Any]:
-        return self._data["printers"][printer]
+        return self._data["printers"].get(printer) or _new_printer(self._now())
 
     def credentials_problem(self, problem: str | None) -> None:
         """What's wrong with the bridge's credentials (a device token that needs a re-pair), or
@@ -206,6 +214,22 @@ class StatusBoard:
             if self._failing:
                 log.info("%s is written again", self.path)
             self._failing = False
+
+
+def _new_printer(now: str) -> dict[str, Any]:
+    return {
+        "connection": "starting",
+        "connection_detail": None,
+        "connection_since": now,
+        "printer_state": None,
+        "last_event": None,
+        "last_event_at": None,
+        "last_heartbeat_at": None,
+        "warnings": {},
+        "moved": None,
+        "software": {},
+        "printer_model": None,
+    }
 
 
 class BoardReport:
@@ -332,6 +356,8 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
     if trace:
         lines.append(trace)
 
+    lines.extend(bridge_lines(config, status, running, now))
+
     for printer in config.printers:
         known = status.get("printers", {}).get(printer.name)
         linked = (
@@ -343,6 +369,64 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
         lines.extend(f"  {line}" for line in _printer_lines(printer, known, running, config, now))
 
     return "\n".join(lines), 0 if running else 1
+
+
+def bridge_lines(
+    config: BridgeConfig, status: Mapping[str, Any], running: bool, now: datetime
+) -> list[str]:
+    """Discovery, the check-in, the desired list and the printers connected in the app (#100)."""
+    bridge = status.get("bridge") or {}
+    if config.device is None:
+        return ["Discovery: off; it needs the bridge paired (`printlog-bridge pair`)"]
+    lines = []
+    discovery = bridge.get("discovery")
+    if not config.discovery:
+        lines.append("Discovery: off ([bridge] discovery = false)")
+    elif running and isinstance(discovery, Mapping):
+        found = discovery.get("found") or 0
+        kinds = ", ".join(discovery.get("kinds") or [])
+        sources = "; ".join(f"{k}: {v}" for k, v in (discovery.get("sources") or {}).items())
+        lines.append(
+            f"Discovery: on, {found} printer{'' if found == 1 else 's'} found"
+            + (f" ({kinds})" if kinds else "")
+            + (f"; {sources}" if sources else "")
+        )
+    elif running:
+        lines.append("Discovery: on, starting after the first check-in")
+    else:
+        lines.append("Discovery: on while the bridge runs")
+    if bridge.get("last_sweep_at"):
+        lines.append(f"Last scan: {_ago(now, bridge['last_sweep_at'])} ago (asked in the app)")
+    check_in = bridge.get("check_in") or {}
+    if running and (check_in.get("at") or check_in.get("problem")):
+        line = "Check-in: " + (
+            f"last {_ago(now, check_in['at'])} ago" if check_in.get("at") else "none yet"
+        )
+        if check_in.get("problem"):
+            line += f"; {check_in['problem']}"
+        lines.append(line)
+    if bridge.get("desired_version"):
+        lines.append(f"Desired printers: version {bridge['desired_version']}")
+    for entry, app in sorted((bridge.get("app_printers") or {}).items(), key=lambda kv: int(kv[0])):
+        name = f" ({app['printer_name']})" if app.get("printer_name") else ""
+        lines.append(
+            f"App printer {entry}: printer {app.get('printer')}{name} in 3D Print Log, "
+            f"{app.get('kind')} at {app.get('host')}: {app.get('state')}"
+            + (f": {app['detail']}" if app.get("detail") else "")
+        )
+        known = status.get("printers", {}).get(f"app-{entry}")
+        if known is not None and running:
+            connection = f"{known['connection']} for {_ago(now, known['connection_since'])}"
+            if known.get("connection_detail"):
+                connection += f": {known['connection_detail']}"
+            lines.append(f"  Connection: {connection}")
+            if known.get("last_event"):
+                lines.append(
+                    f"  Last event: {known['last_event']} ({_ago(now, known['last_event_at'])} ago)"
+                )
+            for warning in (known.get("warnings") or {}).values():
+                lines.append(f"  Warning: {warning}")
+    return lines
 
 
 def _credentials_line(config: BridgeConfig, status: dict[str, Any], running: bool) -> str:
@@ -443,7 +527,8 @@ def _printer_lines(printer, known, running: bool, config: BridgeConfig, now: dat
 
 
 def _time(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    # Python 3.9's fromisoformat doesn't take "Z", which the check-in times use.
+    return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
 
 
 def _clock(value: str) -> str:
