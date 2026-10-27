@@ -372,6 +372,26 @@ class TestDoctor:
         assert "3.12" in text_of(doctor(page))
         assert len(calls) == 1  # one run, however many requests came while it ran
 
+    def test_the_loop_is_current_while_the_checks_run_and_not_after(self):
+        import asyncio
+
+        seen = []
+
+        async def checks():
+            seen.append(asyncio.get_event_loop() is asyncio.get_running_loop())
+
+        def in_a_thread():
+            local_page.run_with_timeout(checks(), 5)
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                seen.append("unset")
+
+        worker = threading.Thread(target=in_a_thread)
+        worker.start()
+        worker.join(10)
+        assert seen == [True, "unset"]
+
     def test_a_hung_executor_thread_doesnt_wedge_the_checks(self):
         # asyncio.run waits for the default executor's threads on shutdown (for good on 3.9 to
         # 3.11): the checks' own loop must not.
@@ -391,6 +411,130 @@ class TestDoctor:
             assert time.monotonic() - started < 3
         finally:
             stuck.set()
+
+
+class TestDoctorRuns:
+    """The background runs: a late one never clobbers a newer one, and few run at once."""
+
+    def blocking(self):
+        """A diagnose whose calls each wait for their own release, returning their number."""
+        releases: list[threading.Event] = []
+        lock = threading.Lock()
+
+        def diagnose():
+            with lock:
+                release = threading.Event()
+                releases.append(release)
+                number = len(releases)
+            release.wait(10)
+            return [CheckResult.ok("Run", f"run {number}")]
+
+        return diagnose, releases
+
+    def test_a_run_replaced_for_taking_too_long_doesnt_overwrite_the_newer_one(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(local_page, "DOCTOR_TIMEOUT_S", 0.05)  # replaced after 0.1 s
+        diagnose, releases = self.blocking()
+        page = make_page(tmp_path, diagnose=diagnose)
+        try:
+            get(page, "/doctor")
+            time.sleep(0.2)
+            get(page, "/doctor")  # the first is overdue: a second run starts
+            deadline = time.monotonic() + 5
+            while len(releases) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(releases) == 2
+            monkeypatch.setattr(local_page, "DOCTOR_TIMEOUT_S", 60)  # the newer one isn't late
+            releases[0].set()  # the stale run ends while the newer one still runs
+            time.sleep(0.2)
+            body = text_of(get(page, "/doctor"))
+            assert RUNNING in body
+            assert "run 1" not in body
+            assert len(releases) == 2  # and its ending didn't let a third one start
+            releases[1].set()
+            assert "run 2" in text_of(doctor(page))
+        finally:
+            for release in releases:
+                release.set()
+
+    def test_no_more_than_two_runs_are_ever_alive(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(local_page, "DOCTOR_TIMEOUT_S", 0.05)
+        diagnose, releases = self.blocking()
+        page = make_page(tmp_path, diagnose=diagnose)
+        try:
+            for _ in range(5):
+                assert RUNNING in text_of(get(page, "/doctor"))
+                time.sleep(0.2)
+            assert len(releases) == local_page.MAX_CHECK_RUNS == 2
+        finally:
+            for release in releases:
+                release.set()
+
+    def test_a_config_error_from_the_checks_is_never_quoted(self, tmp_path):
+        secret = "ACCESS-CODE-SECRET-87654321"
+
+        def diagnose():
+            return [
+                CheckResult.ok("Python", "3.12"),
+                CheckResult.fail("Config", f"line 4: 'access_code {secret}'"),
+            ]
+
+        body = text_of(doctor(make_page(tmp_path, diagnose=diagnose)))
+        assert secret not in body
+        assert "The config file has an error" in body
+        assert "3.12" in body
+
+    def test_the_real_checks_run_in_a_thread_of_their_own(self, tmp_path):
+        """The page's own path: load the config, doctor's diagnose, run_with_timeout, from a
+        thread with no event loop, as the background run is."""
+        from printlog_bridge.core.adapter import Adapter
+
+        class StubAdapter(Adapter):
+            name = "stub"
+
+            @classmethod
+            def from_config(cls, printer, options):
+                return cls()
+
+            def describe(self) -> str:
+                return "stub"
+
+            async def run(self, sink, report) -> None:  # pragma: no cover - never run here
+                raise NotImplementedError
+
+            async def check(self):
+                import asyncio
+
+                await asyncio.sleep(0)  # needs the loop run_with_timeout made current
+                asyncio.get_event_loop()
+                return [CheckResult.ok("Printer stub", "answers")]
+
+        path = tmp_path / "printlog-bridge.cfg"
+        path.write_text(
+            f"[bridge]\napi_url = http://127.0.0.1:9\nstate_dir = {tmp_path / 'state'}\n"
+            "[printer stub]\nadapter = stub\nprinter_id = 1\n",
+            encoding="utf-8",
+        )
+        adapters = {"stub": StubAdapter}
+        env = {"PRINTLOG_API_KEY": API_KEY}
+        page = LocalPage(
+            PageAddress(LOCAL, 0),
+            (),
+            lambda: load_config(path, adapters=adapters, env=env, home=tmp_path),
+            env=env,
+            adapters=adapters,
+            home=tmp_path,
+        )
+        found = []
+        worker = threading.Thread(target=lambda: found.append(page._diagnose()))
+        worker.start()
+        worker.join(60)
+        [results] = found
+        names = {r.name: r for r in results}
+        assert names["Config"].status.value == "ok"
+        assert names["Printer stub"].detail == "answers"
+        assert "3D Print Log API" in names
 
 
 class TestCrossSite:

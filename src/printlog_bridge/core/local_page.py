@@ -63,6 +63,9 @@ T = TypeVar("T")
 DOCTOR_TIMEOUT_S = 60
 DOCTOR_REUSE_S = 30
 """The checks reach the API and every printer, so a result is reused for this long."""
+MAX_CHECK_RUNS = 2
+"""Check runs alive at once: one, and one that replaced it for taking over twice
+DOCTOR_TIMEOUT_S. Past that the page only says they're running."""
 REFRESH_S, REFRESH_PAIRING_S, REFRESH_CHECKS_S = 15, 5, 3
 REQUEST_TIMEOUT_S = 10
 """How long one read or write on a connection may take."""
@@ -126,6 +129,10 @@ class LocalPage:
         self._doctor: tuple[float, list[CheckResult] | None] | None = None
         self._doctor_since: float | None = None
         """When the checks running now started, or None."""
+        self._doctor_run: object | None = None
+        """The current run's token: only that run may record its results."""
+        self._doctor_live = 0
+        """Check runs whose thread hasn't ended, the stale ones included."""
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -304,23 +311,34 @@ class LocalPage:
         less than DOCTOR_REUSE_S ago, and the page refreshes until it has finished."""
         with self._doctor_lock:
             now = time.monotonic()
-            if self._doctor_since is not None and now - self._doctor_since < 2 * DOCTOR_TIMEOUT_S:
+            running = self._doctor_since is not None
+            if running and now - self._doctor_since < 2 * DOCTOR_TIMEOUT_S:
                 return True, None
-            if self._doctor is not None and now - self._doctor[0] < DOCTOR_REUSE_S:
+            if not running and self._doctor is not None and now - self._doctor[0] < DOCTOR_REUSE_S:
                 return False, self._doctor[1]
+            if self._doctor_live >= MAX_CHECK_RUNS:
+                return True, None
+            run = self._doctor_run = object()
             self._doctor_since = now
+            self._doctor_live += 1
         threading.Thread(
-            target=self._run_checks, name="printlog-bridge local page checks", daemon=True
+            target=self._run_checks,
+            args=(run,),
+            name="printlog-bridge local page checks",
+            daemon=True,
         ).start()
         return True, None
 
-    def _run_checks(self) -> None:
+    def _run_checks(self, run: object) -> None:
         try:
-            results: list[CheckResult] | None = list(self.diagnose())
+            results: list[CheckResult] | None = [_quiet(r) for r in self.diagnose()]
         except Exception:
             log.warning("the local page couldn't run the checks", exc_info=True)
             results = None
         with self._doctor_lock:
+            self._doctor_live -= 1
+            if run is not self._doctor_run:
+                return  # replaced for taking too long: the newer run's results count
             self._doctor = (time.monotonic(), results)
             self._doctor_since = None
 
@@ -346,13 +364,23 @@ class LocalPage:
         return [key] if key else []
 
 
+def _quiet(result: CheckResult) -> CheckResult:
+    """doctor's Config failure quotes the config's line, which can hold a secret: never shown."""
+    if result.name == "Config" and result.status is Status.FAIL:
+        return CheckResult.fail(result.name, CONFIG_ERROR)
+    return result
+
+
 def run_with_timeout(work: Awaitable[T], timeout: float) -> T:
-    """Runs `work` in an event loop of this thread's own, for at most `timeout` seconds. Unlike
-    asyncio.run, it never waits for the loop's executor threads when it ends (Python 3.9 to 3.11
-    wait for good), so a lookup stuck in one can't keep the checks from finishing."""
+    """Runs `work` in an event loop of this thread's own (current while it runs), for at most
+    `timeout` seconds. Unlike asyncio.run, it never waits for the loop's executor threads when it
+    ends (Python 3.9 to 3.11 wait for good), so a lookup stuck in one can't keep the checks from
+    finishing or the page from answering. The interpreter still joins such a thread when the
+    bridge exits."""
     loop = asyncio.new_event_loop()
     executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="printlog-bridge checks")
     loop.set_default_executor(executor)
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(asyncio.wait_for(work, timeout))
     finally:
@@ -365,6 +393,7 @@ def run_with_timeout(work: Awaitable[T], timeout: float) -> T:
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
             executor.shutdown(wait=False)
+            asyncio.set_event_loop(None)
             loop.close()
 
 
