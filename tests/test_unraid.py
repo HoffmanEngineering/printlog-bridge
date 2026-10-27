@@ -12,7 +12,12 @@ from pathlib import Path
 import pytest
 
 from printlog_bridge.cli.data_owner import DATA_DIR_ENV, PGID_ENV, PUID_ENV
-from printlog_bridge.core.config import API_KEY_ENV, CONFIG_PATH_ENV, STATE_DIR_ENV
+from printlog_bridge.core.config import (
+    API_KEY_ENV,
+    CONFIG_PATH_ENV,
+    STATE_DIR_ENV,
+    STATUS_PAGE_ENV,
+)
 from printlog_bridge.core.pairing import NAME_ENV
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,7 +26,7 @@ DOCKERFILE = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 COMPOSE = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 IMAGE = "ghcr.io/hoffmanengineering/printlog-bridge"
 RAW = "https://raw.githubusercontent.com/HoffmanEngineering/printlog-bridge/main/"
-VARIABLES = {API_KEY_ENV, NAME_ENV, PUID_ENV, PGID_ENV}
+VARIABLES = {API_KEY_ENV, NAME_ENV, PUID_ENV, PGID_ENV, STATUS_PAGE_ENV}
 """The environment variables the template may set: each one the bridge reads."""
 
 
@@ -159,3 +164,12 @@ def test_ca_finds_no_other_xml_in_the_repository():
         if not skip & set(p.relative_to(ROOT).parts)
     )
     assert found == ["ca_profile.xml", "unraid/printlog-bridge.xml"]
+
+
+def test_the_local_page_is_optional_and_stays_off_the_lan_by_default(template):
+    # Empty: the bridge's own default, 127.0.0.1:7180 (on host networking, the server itself).
+    page = config(template, STATUS_PAGE_ENV)
+    assert (page.get("Required"), page.get("Display")) == ("false", "advanced")
+    assert not page.get("Default") and not (page.text or "").strip()
+    assert "0.0.0.0:7180" in page.get("Description")
+    assert "opens no ports" not in template.findtext("Overview")

@@ -87,7 +87,7 @@ When that file exists, the app uses it instead of the **Printers** option. Devic
 
 ## The status panel
 
-The app's panel (**3D Print Log Bridge** in Home Assistant's sidebar; turn on **Show in sidebar** on the app's page) shows whether the bridge runs, its version, whether it's paired and its encryption key's fingerprint, the last check-in with 3D Print Log, each printer and its connection, and the code to approve while it pairs. **Run the checks** runs the bridge's `doctor`. The panel only shows: printers are managed in 3D Print Log and on the Configuration tab. Home Assistant's ingress serves it, signed in as you; the app answers only Home Assistant's own proxy on its port (7180), even though it's on the host's network. It never shows a key, token, password or access code.
+The app's panel (**3D Print Log Bridge** in Home Assistant's sidebar; turn on **Show in sidebar** on the app's page) shows whether the bridge runs, its version, whether it's paired and its encryption key's fingerprint, the last check-in with 3D Print Log, each printer and its connection, and the code to approve while it pairs. **Run the checks** runs the bridge's `doctor`. The panel only shows: printers are managed in 3D Print Log and on the Configuration tab. Home Assistant's ingress serves it, signed in as you; the app answers only Home Assistant's own proxy on its port (7180), even though it's on the host's network: any other address is closed as it connects. It never shows a key, token, password or access code.
 
 ## Logs, health and updates
 

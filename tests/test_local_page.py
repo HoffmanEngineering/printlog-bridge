@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -63,6 +65,19 @@ def get(page: LocalPage, path: str = "/", *, host: str = "127.0.0.1:7180", peer=
 
 def text_of(response) -> str:
     return response.body.decode("utf-8")
+
+
+def doctor(page: LocalPage, timeout: float = 5, **headers):
+    """/doctor once its checks (run in the background) have finished."""
+    deadline = time.monotonic() + timeout
+    while True:
+        response = get(page, "/doctor", **headers)
+        if RUNNING not in text_of(response) or time.monotonic() > deadline:
+            return response
+        time.sleep(0.02)
+
+
+RUNNING = "The checks are running"
 
 
 def start_board(tmp_path: Path, printers=("voron",)) -> StatusBoard:
@@ -133,6 +148,12 @@ class TestWhatItShows:
         body = text_of(get(make_page(tmp_path, pending=codes)))
         assert "<dd>pairing: waiting for approval (above)</dd>" in body
 
+    def test_the_page_updates_itself_while_pairing(self, tmp_path):
+        codes = PendingCodes()
+        codes.show(DeviceAuthorization("d", "ABCD", "https://a.example/activate", None, 900, 5))
+        body = text_of(get(make_page(tmp_path, pending=codes)))
+        assert '<meta http-equiv="refresh" content="5">' in body
+
     def test_a_verification_address_that_isnt_https_is_not_a_link(self, tmp_path):
         codes = PendingCodes()
         codes.show(DeviceAuthorization("d", "ABCD", "javascript:alert(1)", None, 900, 5))
@@ -156,12 +177,13 @@ class TestWhatItShows:
         assert "Paired as" in body and "bridge on the NAS" in body
         assert credentials.short_fingerprint(key.fingerprint) in body
 
-    def test_a_broken_config_says_why_instead_of_failing(self, tmp_path):
+    def test_a_broken_config_says_where_to_look_instead_of_failing(self, tmp_path):
         page = make_page(tmp_path)
         page.load = lambda: (_ for _ in ()).throw(ConfigError("[bridge] trace must be true"))
         response = get(page)
         assert response.status == 200
-        assert "trace must be true" in text_of(response)
+        assert "trace must be true" not in text_of(response)
+        assert "The config file has an error" in text_of(response)
 
     def test_a_bug_answers_500_without_a_traceback(self, tmp_path):
         page = make_page(tmp_path)
@@ -191,7 +213,7 @@ class TestSecrets:
             return [CheckResult.ok("API", f"signed in with {API_KEY}")]
 
         page = make_page(tmp_path, diagnose=diagnose)
-        bodies = text_of(get(page)) + text_of(get(page, "/doctor"))
+        bodies = text_of(get(page)) + text_of(doctor(page))
 
         for secret in (API_KEY, DEVICE_TOKEN, MOONRAKER_KEY, *pem_lines):
             assert secret not in bodies
@@ -289,14 +311,14 @@ class TestIngress:
     def test_without_ingress_links_are_relative(self, tmp_path):
         body = text_of(get(make_page(tmp_path)))
         assert 'href="doctor"' in body
-        doctor = text_of(get(make_page(tmp_path, diagnose=lambda: []), "/doctor"))
-        assert 'href="./"' in doctor
+        checks = text_of(doctor(make_page(tmp_path, diagnose=lambda: [])))
+        assert 'href="./"' in checks
 
 
 class TestDoctor:
     def test_runs_the_checks_and_shows_them(self, tmp_path):
         results = [CheckResult.ok("Python", "3.12"), CheckResult.fail("3D Print Log API", "<down>")]
-        body = text_of(get(make_page(tmp_path, diagnose=lambda: results), "/doctor"))
+        body = text_of(doctor(make_page(tmp_path, diagnose=lambda: results)))
         assert "Python" in body and "3.12" in body
         assert "&lt;down&gt;" in body
         assert "1 problem found" in body  # doctor's own summary line
@@ -309,15 +331,15 @@ class TestDoctor:
             return []
 
         page = make_page(tmp_path, diagnose=diagnose)
-        get(page, "/doctor")
-        get(page, "/doctor")
+        doctor(page)
+        doctor(page)
         assert len(calls) == 1
 
     def test_checks_that_fail_say_so(self, tmp_path):
         def diagnose():
             raise RuntimeError("adapter bug")
 
-        response = get(make_page(tmp_path, diagnose=diagnose), "/doctor")
+        response = doctor(make_page(tmp_path, diagnose=diagnose))
         assert response.status == 200
         assert "couldn" in text_of(response).lower()
 
@@ -326,6 +348,105 @@ class TestDoctor:
             raise AssertionError("ran")
 
         assert get(make_page(tmp_path, diagnose=diagnose)).status == 200
+
+    def test_a_request_never_waits_for_the_checks(self, tmp_path):
+        release = threading.Event()
+        calls = []
+
+        def diagnose():
+            calls.append(1)
+            release.wait(10)
+            return [CheckResult.ok("Python", "3.12")]
+
+        page = make_page(tmp_path, diagnose=diagnose)
+        try:
+            for _ in range(3):
+                started = time.monotonic()
+                response = get(page, "/doctor")
+                assert time.monotonic() - started < 1
+                body = text_of(response)
+                assert RUNNING in body
+                assert '<meta http-equiv="refresh" content="3">' in body
+        finally:
+            release.set()
+        assert "3.12" in text_of(doctor(page))
+        assert len(calls) == 1  # one run, however many requests came while it ran
+
+    def test_a_hung_executor_thread_doesnt_wedge_the_checks(self):
+        # asyncio.run waits for the default executor's threads on shutdown (for good on 3.9 to
+        # 3.11): the checks' own loop must not.
+        import asyncio
+
+        stuck = threading.Event()
+
+        async def checks():
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, stuck.wait, 30)
+            await asyncio.sleep(10)
+
+        started = time.monotonic()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                local_page.run_with_timeout(checks(), 0.2)
+            assert time.monotonic() - started < 3
+        finally:
+            stuck.set()
+
+
+class TestCrossSite:
+    """No other site can make the bridge run its checks (or load the page) by linking to it."""
+
+    @pytest.mark.parametrize("site", ["cross-site", "same-site"])
+    @pytest.mark.parametrize("path", ["/", "/doctor"])
+    def test_a_request_from_another_site_is_refused(self, tmp_path, site, path):
+        def diagnose():
+            raise AssertionError("ran")
+
+        page = make_page(tmp_path, diagnose=diagnose)
+        response = get(page, path, **{"Sec-Fetch-Site": site, "Sec-Fetch-Dest": "document"})
+        assert response.status == 403
+        assert "voron" not in text_of(response)
+
+    @pytest.mark.parametrize("dest", ["image", "script", "style", "empty"])
+    def test_anything_but_a_page_or_frame_is_refused(self, tmp_path, dest):
+        response = get(
+            make_page(tmp_path),
+            "/doctor",
+            **{"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Dest": dest},
+        )
+        assert response.status == 403
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Sec-Fetch-Site": "none", "Sec-Fetch-Dest": "document"},  # typed or bookmarked
+            {"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Dest": "document"},  # its own links
+            {"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Dest": "iframe"},  # Home Assistant
+            {},  # curl, an older browser
+        ],
+    )
+    def test_a_visit_or_the_ingress_frame_is_answered(self, tmp_path, headers):
+        assert get(make_page(tmp_path, diagnose=lambda: []), "/doctor", **headers).status == 200
+
+
+class TestConfigErrors:
+    SECRET = "ACCESS-CODE-SECRET-12345678"
+
+    def test_a_broken_line_is_never_shown_since_it_can_hold_a_secret(self, tmp_path):
+        page = make_page(tmp_path, extra=f"access_code {self.SECRET}\n")
+        body = text_of(get(page))
+        assert self.SECRET not in body
+        assert "The config file has an error" in body
+        assert "printlog-bridge doctor" in body
+
+    def test_nor_on_the_checks_page(self, tmp_path):
+        def diagnose():
+            return [CheckResult.fail("Config", f"line 4: 'access_code {self.SECRET}'")]
+
+        page = make_page(tmp_path, extra=f"access_code {self.SECRET}\n", diagnose=diagnose)
+        body = text_of(doctor(page))
+        assert self.SECRET not in body
+        assert "The config file has an error" in body
 
 
 class TestServer:
@@ -346,6 +467,50 @@ class TestServer:
             page.stop()
         with pytest.raises(OSError):
             socket.create_connection(("127.0.0.1", port), timeout=1).close()
+
+    def test_a_slow_client_lets_go_of_its_slot_at_the_deadline(self, tmp_path):
+        page = make_page(tmp_path)
+        page.request_deadline = 0.5
+        assert page.start()
+        idle = []
+        try:
+            port = page.port
+            for _ in range(local_page.MAX_REQUESTS + 2):
+                s = socket.create_connection(("127.0.0.1", port), timeout=5)
+                s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n")  # and never the end
+                idle.append(s)
+            time.sleep(1.5)
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as response:
+                assert response.status == 200
+        finally:
+            for s in idle:
+                s.close()
+            page.stop()
+
+    def test_a_peer_not_on_the_list_never_takes_a_slot(self, tmp_path):
+        page = make_page(tmp_path, clients=("127.0.0.1",))
+        assert page.start()
+        idle = []
+        try:
+            port = page.port
+            for _ in range(local_page.MAX_REQUESTS * 2):
+                s = socket.socket()
+                try:
+                    s.bind(("127.0.0.2", 0))
+                except OSError:
+                    s.close()
+                    pytest.skip("can't send from 127.0.0.2 here")
+                s.settimeout(5)
+                s.connect(("127.0.0.1", port))
+                idle.append(s)
+            # Refused before anything is read: closed at once, with no answer.
+            assert idle[0].recv(100) == b""
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as response:
+                assert response.status == 200
+        finally:
+            for s in idle:
+                s.close()
+            page.stop()
 
     def test_a_port_in_use_is_logged_and_the_bridge_carries_on(self, tmp_path, caplog):
         taken = socket.socket()

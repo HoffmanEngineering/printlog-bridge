@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import io
 import ipaddress
 import logging
 import os
@@ -30,12 +31,13 @@ import secrets
 import socket
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from printlog_bridge import __version__
@@ -56,14 +58,30 @@ from printlog_bridge.core.status import (
 from printlog_bridge.core.support import known_secrets
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 DOCTOR_TIMEOUT_S = 60
 DOCTOR_REUSE_S = 30
 """The checks reach the API and every printer, so a result is reused for this long."""
-REFRESH_S, REFRESH_PAIRING_S = 15, 5
+REFRESH_S, REFRESH_PAIRING_S, REFRESH_CHECKS_S = 15, 5, 3
 REQUEST_TIMEOUT_S = 10
+"""How long one read or write on a connection may take."""
+REQUEST_DEADLINE_S = 10
+"""How long a client has to send its whole request line and headers. A slow one is cut off, so
+nobody can hold one of the MAX_REQUESTS slots by trickling bytes."""
 MAX_REQUESTS = 8
 """Requests answered at once; more are dropped, so a flood can't start a thread each."""
+CONFIG_ERROR = (
+    "The config file has an error; see the bridge's log (`printlog-bridge doctor` prints it)."
+)
+"""Shown instead of the error itself, which can quote the line, and a line can hold a secret."""
+FETCH_SITES = ("same-origin", "none")
+"""`Sec-Fetch-Site` values answered: the page's own links and refreshes (Home Assistant's ingress
+is the same origin), and an address typed or bookmarked. Another site, even a sibling one on the
+same domain, can't make the bridge run its checks."""
+FETCH_DESTS = ("document", "iframe")
+"""`Sec-Fetch-Dest` values answered: a page, or Home Assistant's ingress frame. Never an image,
+script or fetch another page embeds."""
 LOCAL_SUFFIXES = (".local", ".lan", ".home", ".internal", ".localdomain", ".home.arpa")
 _INGRESS_PATH = re.compile(r"/api/hassio_ingress/[A-Za-z0-9_-]+")
 _HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
@@ -103,8 +121,11 @@ class LocalPage:
         self.pending = pending or pairing.pending
         self.diagnose = diagnose or self._diagnose
         self.clock = clock
+        self.request_deadline = REQUEST_DEADLINE_S
         self._doctor_lock = threading.Lock()
         self._doctor: tuple[float, list[CheckResult] | None] | None = None
+        self._doctor_since: float | None = None
+        """When the checks running now started, or None."""
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
 
@@ -150,6 +171,11 @@ class LocalPage:
             return f"port {self.port} on every network address of this computer"
         return url
 
+    def allows(self, peer: str) -> bool:
+        """Whether `peer` may open the page at all (`status_page_clients`). Checked as a
+        connection is accepted, before it takes a slot or anything is read."""
+        return not self.clients or _ip(peer) in self.clients
+
     # -- answering -------------------------------------------------------------------------------
 
     def respond(self, method: str, target: str, headers: Mapping[str, str], peer: str) -> Response:
@@ -169,7 +195,7 @@ class LocalPage:
         self, method: str, target: str, headers: Mapping[str, str], peer: str, nonce: str
     ) -> Response:
         if self.clients:
-            if _ip(peer) not in self.clients:
+            if not self.allows(peer):
                 return _plain(403, "Not for this address.")
         elif not _local_host(_header(headers, "Host")):
             return _plain(421, "Open the page with the bridge's IP address or local name.")
@@ -177,6 +203,10 @@ class LocalPage:
             response = _plain(405, "The page only shows; it changes nothing.")
             response.headers["Allow"] = "GET, HEAD"
             return response
+        site = _header(headers, "Sec-Fetch-Site").strip().lower()
+        dest = _header(headers, "Sec-Fetch-Dest").strip().lower()
+        if (site and site not in FETCH_SITES) or (dest and dest not in FETCH_DESTS):
+            return _plain(403, "Open the page itself: another site can't load it.")
         path = urlsplit(target).path
         prefix = _ingress_prefix(_header(headers, "X-Ingress-Path"))
         if path == "/":
@@ -192,9 +222,9 @@ class LocalPage:
         code = self.pending.get()
         try:
             config = self.load()
-        except ConfigError as e:
+        except ConfigError:
             text = _Text(self._env_secrets())
-            body = _section("Config", f"<p class=bad>{text(e)}</p>")
+            body = _section("Config", f"<p class=bad>{text(CONFIG_ERROR)}</p>")
             return _html_page(_page(nonce, text, body, prefix, refresh=REFRESH_S, code=code))
         text = _Text(self._secrets(config))
         status = read_status(config.state_dir)
@@ -230,13 +260,25 @@ class LocalPage:
     # -- doctor ----------------------------------------------------------------------------------
 
     def _doctor_page(self, prefix: str, nonce: str) -> Response:
+        back = f'<p><a href="{prefix or "./"}">Back to the status</a></p>'
         try:
-            config: BridgeConfig | None = self.load()
+            config = self.load()
         except ConfigError:
-            config = None
-        text = _Text(self._secrets(config) if config else self._env_secrets())
-        results = self._checks()
-        if results is None:
+            # doctor would only say the same, quoting the line, which can hold a secret.
+            text = _Text(self._env_secrets())
+            body = _section("Checks", f"<p class=bad>{text(CONFIG_ERROR)}</p>") + back
+            return _html_page(_page(nonce, text, body, prefix, refresh=None, code=None))
+        text = _Text(self._secrets(config))
+        running, results = self._checks()
+        refresh = None
+        if running:
+            refresh = REFRESH_CHECKS_S
+            body = _section(
+                "Checks",
+                "<p>The checks are running: the config, the 3D Print Log API and each printer. "
+                "This page shows them in a few seconds.</p>",
+            )
+        elif results is None:
             body = _section(
                 "Checks",
                 "<p class=bad>The checks couldn't run; the bridge's log says why. Run "
@@ -254,29 +296,40 @@ class LocalPage:
                 f"<p>{text(summary)}</p><table><thead><tr><th>Result</th><th>Check</th>"
                 f"<th>Detail</th></tr></thead><tbody>{rows}</tbody></table>",
             )
-        body += f'<p><a href="{prefix or "./"}">Back to the status</a></p>'
-        return _html_page(_page(nonce, text, body, prefix, refresh=None, code=None))
+        return _html_page(_page(nonce, text, body + back, prefix, refresh=refresh, code=None))
 
-    def _checks(self) -> list[CheckResult] | None:
-        """doctor's results, reused for DOCTOR_REUSE_S; one run at a time. None when they
-        failed."""
+    def _checks(self) -> tuple[bool, list[CheckResult] | None]:
+        """Whether the checks are running, else their last results (None when they failed).
+        Never waits: a request starts one run in the background, unless one is running or ran
+        less than DOCTOR_REUSE_S ago, and the page refreshes until it has finished."""
         with self._doctor_lock:
-            if self._doctor is not None and time.monotonic() - self._doctor[0] < DOCTOR_REUSE_S:
-                return self._doctor[1]
-            try:
-                results: list[CheckResult] | None = list(self.diagnose())
-            except Exception:
-                log.warning("the local page couldn't run the checks", exc_info=True)
-                results = None
+            now = time.monotonic()
+            if self._doctor_since is not None and now - self._doctor_since < 2 * DOCTOR_TIMEOUT_S:
+                return True, None
+            if self._doctor is not None and now - self._doctor[0] < DOCTOR_REUSE_S:
+                return False, self._doctor[1]
+            self._doctor_since = now
+        threading.Thread(
+            target=self._run_checks, name="printlog-bridge local page checks", daemon=True
+        ).start()
+        return True, None
+
+    def _run_checks(self) -> None:
+        try:
+            results: list[CheckResult] | None = list(self.diagnose())
+        except Exception:
+            log.warning("the local page couldn't run the checks", exc_info=True)
+            results = None
+        with self._doctor_lock:
             self._doctor = (time.monotonic(), results)
-            return results
+            self._doctor_since = None
 
     def _diagnose(self) -> list[CheckResult]:
         if self.adapters is None:
             raise RuntimeError("no adapters to check printers with")
         config = self.load()
         work = run_diagnose(config.path, adapters=self.adapters, env=self.env, home=self.home)
-        return asyncio.run(asyncio.wait_for(work, DOCTOR_TIMEOUT_S))  # this thread's own loop
+        return run_with_timeout(work, DOCTOR_TIMEOUT_S)
 
     # -- secrets ---------------------------------------------------------------------------------
 
@@ -291,6 +344,28 @@ class LocalPage:
     def _env_secrets(self) -> list[str]:
         key = (self.env.get(API_KEY_ENV) or "").strip()
         return [key] if key else []
+
+
+def run_with_timeout(work: Awaitable[T], timeout: float) -> T:
+    """Runs `work` in an event loop of this thread's own, for at most `timeout` seconds. Unlike
+    asyncio.run, it never waits for the loop's executor threads when it ends (Python 3.9 to 3.11
+    wait for good), so a lookup stuck in one can't keep the checks from finishing."""
+    loop = asyncio.new_event_loop()
+    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="printlog-bridge checks")
+    loop.set_default_executor(executor)
+    try:
+        return loop.run_until_complete(asyncio.wait_for(work, timeout))
+    finally:
+        try:
+            left = asyncio.all_tasks(loop)
+            for task in left:
+                task.cancel()
+            if left:
+                loop.run_until_complete(asyncio.gather(*left, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            executor.shutdown(wait=False)
+            loop.close()
 
 
 class _Text:
@@ -558,6 +633,11 @@ class _Server(ThreadingHTTPServer):
             self.address_family = socket.AF_INET6
         super().__init__((page.address.host, page.address.port), _Handler)
 
+    def verify_request(self, request: Any, client_address: Any) -> bool:
+        """A peer `status_page_clients` doesn't list is closed at once, before it takes a slot
+        or a byte is read (the Home Assistant app's port is open on the LAN)."""
+        return self.page.allows(client_address[0])
+
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self.slots.acquire(blocking=False):
             self.shutdown_request(request)
@@ -578,11 +658,50 @@ class _Server(ThreadingHTTPServer):
         log.debug("the local page dropped a request", exc_info=True)
 
 
+class _DeadlineReads(io.RawIOBase):
+    """A connection's reads, each given only the time left until `deadline` (when set), so the
+    whole request line and headers must arrive in time however slowly they trickle in."""
+
+    def __init__(self, connection: Any) -> None:
+        """The accepted connection (it never opens one: tests/test_privacy.py)."""
+        self.connection = connection
+        self.deadline: float | None = None
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        if self.deadline is not None:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("the request took too long")
+            self.connection.settimeout(min(left, REQUEST_TIMEOUT_S))
+        return self.connection.recv_into(buffer)
+
+
 class _Handler(BaseHTTPRequestHandler):
     server: _Server
     timeout = REQUEST_TIMEOUT_S
     server_version = "printlog-bridge"
     sys_version = ""
+
+    def setup(self) -> None:
+        super().setup()
+        self.rfile.close()  # the socket stays open; reads go through the deadline instead
+        self._reads = _DeadlineReads(self.connection)
+        self.rfile = io.BufferedReader(self._reads)
+
+    def handle_one_request(self) -> None:
+        # The request line and headers must all come within the deadline: a client that
+        # trickles them (or keeps an idle connection) is cut off and its slot freed.
+        self._reads.deadline = time.monotonic() + self.server.page.request_deadline
+        super().handle_one_request()
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()  # the headers have been read
+        self._reads.deadline = None
+        self.connection.settimeout(REQUEST_TIMEOUT_S)
+        return parsed
 
     def _answer(self) -> None:
         response = self.server.page.respond(
