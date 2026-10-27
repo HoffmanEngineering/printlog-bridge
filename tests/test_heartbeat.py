@@ -22,8 +22,6 @@ NOW = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
 NOTHING_KNOWN = {
     "mode": None,
-    "klipperVersion": None,
-    "moonrakerVersion": None,
     "printerModel": None,
     "outboxDepth": 0,
     "outboxOldestAgeSeconds": None,
@@ -344,17 +342,59 @@ def test_sends_the_printers_software_and_model_once_known(tmp_path):
     async def scenario():
         async with heartbeat(api, tmp_path, VORON) as beat:
             report = beat.board.printer("voron")
-            report.software("klipper", "v0.12.0-123-gabcdef")
-            report.software("moonraker", "v0.9.3-45")
+            report.firmware("Klipper", "v0.12.0-123-gabcdef")
+            report.host_software("Moonraker", "v0.9.3-45")
             report.printer_model("InfiMech EX")
             await beat.beat_all()
 
     run(scenario)
 
     [(_, body)] = api.heartbeats
-    assert body["klipperVersion"] == "v0.12.0-123-gabcdef"
-    assert body["moonrakerVersion"] == "v0.9.3-45"
+    assert body["firmwareName"] == "Klipper"
+    assert body["firmwareVersion"] == "v0.12.0-123-gabcdef"
+    assert body["hostSoftwareName"] == "Moonraker"
+    assert body["hostSoftwareVersion"] == "v0.9.3-45"
     assert body["printerModel"] == "InfiMech EX"
+    assert "klipperVersion" not in body and "moonrakerVersion" not in body
+
+
+def test_software_not_known_yet_is_left_out_not_sent_as_null(tmp_path):
+    # The first check-in goes out before the adapter has asked the printer (#80): a null would
+    # read as "cleared", so the stored versions are kept until they are known.
+    api = FakePrintLogApi()
+
+    async def scenario():
+        async with heartbeat(api, tmp_path, VORON) as beat:
+            await beat.beat_all()
+            beat.board.printer("voron").host_software("Moonraker", "v0.9.3-45")
+            await beat.beat_all()
+            beat.board.printer("voron").firmware("Klipper", "v0.12.0")
+            await beat.beat_all()
+
+    run(scenario)
+
+    first, second, third = (body for _, body in api.heartbeats)
+    software = {"firmwareName", "firmwareVersion", "hostSoftwareName", "hostSoftwareVersion"}
+    assert not software & set(first)
+    assert software & set(second) == {"hostSoftwareName", "hostSoftwareVersion"}
+    assert software <= set(third)
+    assert api.connections["inst-voron"]["firmwareVersion"] == "v0.12.0"
+
+
+def test_a_new_version_replaces_the_old_one(tmp_path):
+    api = FakePrintLogApi()
+
+    async def scenario():
+        async with heartbeat(api, tmp_path, VORON) as beat:
+            report = beat.board.printer("voron")
+            report.firmware("Klipper", "v0.12.0")
+            report.firmware("Klipper", "v0.13.0")
+            await beat.beat_all()
+
+    run(scenario)
+
+    [(_, body)] = api.heartbeats
+    assert (body["firmwareName"], body["firmwareVersion"]) == ("Klipper", "v0.13.0")
 
 
 def test_cuts_the_software_and_model_to_the_apis_limits(tmp_path):
@@ -363,14 +403,15 @@ def test_cuts_the_software_and_model_to_the_apis_limits(tmp_path):
     async def scenario():
         async with heartbeat(api, tmp_path, VORON) as beat:
             report = beat.board.printer("voron")
-            report.software("klipper", "v" * 80)
+            report.firmware("K" * 80, "v" * 80)
             report.printer_model("m" * 150)
             await beat.beat_all()
 
     run(scenario)
 
     [(_, body)] = api.heartbeats
-    assert len(body["klipperVersion"]) == 50
+    assert len(body["firmwareName"]) == 50
+    assert len(body["firmwareVersion"]) == 50
     assert len(body["printerModel"]) == 100
 
 

@@ -53,13 +53,13 @@ Tests: `TestSpoolCalls` assigns spools by tag and by id and checks each call and
 
 ### The heartbeat
 
-Each heartbeat also tells 3D Print Log how the bridge is doing, so the app can show a printer whose prints aren't getting through, and so 3D Print Log can see which Klipper and Moonraker versions cause trouble. It goes only to 3D Print Log, in the same request as the heartbeat. **There is no third-party telemetry**: no analytics service, no crash reporter, nothing else is contacted. These are all of its fields, sent with every heartbeat (`null` when not known yet):
+Each heartbeat also tells 3D Print Log how the bridge is doing, so the app can show a printer whose prints aren't getting through, and so 3D Print Log can see which Klipper and Moonraker versions cause trouble. It goes only to 3D Print Log, in the same request as the heartbeat. **There is no third-party telemetry**: no analytics service, no crash reporter, nothing else is contacted. These are all of its fields, sent with every heartbeat (`null` when not known yet, except the software fields, which are left out until known):
 
 | Field | What it is |
 | --- | --- |
 | `mode` | `local` (Moonraker's socket on this host) or `remote` (Moonraker over the network). Never the address. |
-| `klipperVersion` | Klipper's version, as Moonraker reports it (`software_version` in `printer.info`), at most 50 characters |
-| `moonrakerVersion` | Moonraker's version (`moonraker_version` in `server.info`), at most 50 characters |
+| `firmwareName`, `firmwareVersion` | the printer's firmware and its version, at most 50 characters each: `Klipper` and the version Moonraker reports (`software_version` in `printer.info`) |
+| `hostSoftwareName`, `hostSoftwareVersion` | the software the bridge talks to on the printer's host and its version, at most 50 characters each: `Moonraker` and its version (`moonraker_version` in `server.info`) |
 | `printerModel` | the printer model the slicer wrote in the last job's file (`printer_model`, such as `InfiMech EX`), when it wrote one, at most 100 characters |
 | `outboxDepth` | how many events and pictures for this printer are waiting in the outbox to be sent |
 | `outboxOldestAgeSeconds` | how long the oldest of them has waited, in seconds |

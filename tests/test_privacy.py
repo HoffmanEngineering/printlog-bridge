@@ -123,10 +123,11 @@ SLICER_METADATA_FIELDS = {
 CONNECTION_FIELDS = {
     "kind", "displayName", "agentVersion", "printerId",
     # The printer's health (#37).
-    "mode", "klipperVersion", "moonrakerVersion", "printerModel", "outboxDepth",
-    "outboxOldestAgeSeconds", "lastError", "lastErrorAt", "errorCount", "snapshots",
-    "slicerSettings",
+    "mode", "printerModel", "outboxDepth", "outboxOldestAgeSeconds", "lastError", "lastErrorAt",
+    "errorCount", "snapshots", "slicerSettings",
 }  # fmt: skip
+SOFTWARE_FIELDS = {"firmwareName", "firmwareVersion", "hostSoftwareName", "hostSoftwareVersion"}
+"""Sent once the adapter knows them, and left out until then (#80)."""
 HOSTNAME = "klipper-host-7f3a"
 """The host name Klipper reports in `printer.info`, which never leaves the printer."""
 SLOT_FIELDS = {"filamentId", "slotLabel"}
@@ -312,7 +313,7 @@ class TestWhatIsSent:
         heartbeats = run["api"].heartbeats
         assert heartbeats
         for _, body in heartbeats:
-            assert set(body) == CONNECTION_FIELDS
+            assert CONNECTION_FIELDS <= set(body) <= CONNECTION_FIELDS | SOFTWARE_FIELDS
 
     def test_each_heartbeat_field_holds_what_docs_privacy_md_says(self, run):
         [_, body] = run["api"].heartbeats[-1]
@@ -321,8 +322,10 @@ class TestWhatIsSent:
         assert body["agentVersion"] == __version__
         assert body["printerId"] == 42
         assert body["mode"] == "remote"
-        assert body["klipperVersion"] == "v0.12.0-fake"
-        assert body["moonrakerVersion"] == "v0.9.3-fake"
+        assert body["firmwareName"] == "Klipper"
+        assert body["firmwareVersion"] == "v0.12.0-fake"
+        assert body["hostSoftwareName"] == "Moonraker"
+        assert body["hostSoftwareVersion"] == "v0.9.3-fake"
         assert body["printerModel"] == "Voron 2.4"
         assert isinstance(body["outboxDepth"], int)
         assert body["outboxOldestAgeSeconds"] is None or body["outboxDepth"] > 0
