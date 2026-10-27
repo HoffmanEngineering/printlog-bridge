@@ -31,7 +31,6 @@ USER = "bblp"
 TIMEOUT_S = 15.0
 MAX_FILE_BYTES = 200 * 1024 * 1024
 """A 3MF this large is mostly toolpaths; the bridge gives up on it rather than fill a disk."""
-SPOOL_IN_MEMORY_BYTES = 8 * 1024 * 1024
 SEARCH_FOLDERS = ("/cache/", "/")
 
 
@@ -151,7 +150,9 @@ class BambuFtps:
 
     @staticmethod
     def _retrieve(ftp: ftplib.FTP, path: str, max_bytes: int) -> IO[bytes]:
-        out = tempfile.SpooledTemporaryFile(max_size=SPOOL_IN_MEMORY_BYTES)  # noqa: SIM115
+        # On disk, unnamed, gone when closed. Not a SpooledTemporaryFile: before Python 3.11 it
+        # isn't seekable() as zipfile needs.
+        out = tempfile.TemporaryFile()  # noqa: SIM115
         written = 0
 
         def write(block: bytes) -> None:

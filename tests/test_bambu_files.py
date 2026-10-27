@@ -58,6 +58,15 @@ class TestFetch:
             assert path == "/cache/Benchy.3mf"
             assert file.read() == ftps.files["/cache/Benchy.3mf"]
 
+    def test_the_fetched_file_opens_as_a_3mf(self, ftps):
+        ftps.files["/Box.gcode.3mf"] = make_3mf()
+
+        _, file = client(ftps).fetch(["/Box.gcode.3mf"])
+
+        three = ThreeMF(file)
+        assert three.plate(None) is not None
+        three.close()
+
     def test_nothing_found_is_none(self, ftps):
         assert client(ftps).fetch(["/cache/missing.3mf"]) is None
 
