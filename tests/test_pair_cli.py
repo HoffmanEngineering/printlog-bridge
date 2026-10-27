@@ -20,6 +20,7 @@ from printlog_bridge.cli.main import main
 from printlog_bridge.cli.pair import pair_command, pair_on_first_run
 from printlog_bridge.core.config import load_config, set_printer_ids
 from printlog_bridge.core.device import DEVICE_TOKEN_FILE, read_device_id, read_device_token
+from printlog_bridge.core.status import is_running, read_status, utc_now
 
 UNREACHABLE = "http://127.0.0.1:9"
 """A Moonraker that isn't there: the adapter's suggestions come from the config alone."""
@@ -218,6 +219,44 @@ def test_the_first_run_pairs_in_the_log_with_a_qr_code(tmp_path, caplog):
     assert text.count("scan the QR code") == 2  # the first code expired; a second one is shown
     assert "█" in text
     assert "Here is a new code" in text
+
+
+class _StatusWhenTheCodeShows(logging.Handler):
+    """Reads the status file when the QR code is logged, that is, while pairing waits."""
+
+    def __init__(self, state_dir: Path) -> None:
+        super().__init__()
+        self.state_dir = state_dir
+        self.seen: list = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if "scan the QR code" in record.getMessage():
+            self.seen.append(read_status(self.state_dir))
+
+
+def test_the_first_run_keeps_the_status_file_running_while_it_waits(tmp_path, caplog):
+    # The container's health check (and a Home Assistant app's watchdog with it) goes by the
+    # status file. Without one, a bridge waiting for the user to scan the QR code would be
+    # called unhealthy and restarted, with a new code, every few minutes.
+    caplog.set_level(logging.INFO)
+    watcher = _StatusWhenTheCodeShows(tmp_path / "state")
+    logging.getLogger("printlog_bridge").addHandler(watcher)
+    try:
+        problem, _ = first_run(tmp_path, "[printer u1]\nprinter_id = 42\nurl = http://u1:7125\n")
+    finally:
+        logging.getLogger("printlog_bridge").removeHandler(watcher)
+
+    assert problem is None
+    assert watcher.seen
+    for status in watcher.seen:
+        assert status is not None
+        assert is_running(status, utc_now())
+        assert "waiting for approval" in status["credentials_problem"]
+        assert list(status["printers"]) == ["u1"]
+    # Done pairing: `run` starts its own status from here, and a run that stops after pairing
+    # (a printer without printer_id) doesn't leave a running bridge behind.
+    after = read_status(tmp_path / "state")
+    assert after["stopped_at"] is not None
 
 
 def test_the_first_run_says_which_printer_id_to_set(tmp_path, caplog):

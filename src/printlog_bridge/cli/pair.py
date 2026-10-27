@@ -9,6 +9,7 @@ asks nothing and says what to set.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -28,7 +29,7 @@ from printlog_bridge.core.pairing import (
     instructions,
     pair,
 )
-from printlog_bridge.core.status import read_status
+from printlog_bridge.core.status import TOUCH_INTERVAL_S, StatusBoard, read_status
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +108,32 @@ async def pair_on_first_run(config: BridgeConfig, env: Mapping[str, str]) -> str
     """`run` without an API key or device token: pairs in the log (QR code and all), as long
     as it takes. Returns None once paired, or why it couldn't (pairing off on the server)."""
     log.info("No API key or device token yet, so this bridge pairs with 3D Print Log first.")
+    # The status file says the bridge runs, waiting for approval, so `status` says so and the
+    # container's health check (a Home Assistant app's watchdog) doesn't restart it, and
+    # replace the code, while the user scans it.
+    board = StatusBoard(config.state_dir)
+    board.start([p.name for p in config.printers], trace=config.trace)
+    board.credentials_problem(PAIRING_WAIT)
+    touching = asyncio.ensure_future(_keep_touching(board))
+    try:
+        return await _first_run(config, env)
+    finally:
+        touching.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await touching
+        board.stopped()
+
+
+PAIRING_WAIT = "waiting for approval: scan the QR code in the log, or enter its code"
+
+
+async def _keep_touching(board: StatusBoard) -> None:
+    while True:
+        await asyncio.sleep(TOUCH_INTERVAL_S)
+        board.touch()
+
+
+async def _first_run(config: BridgeConfig, env: Mapping[str, str]) -> str | None:
     try:
         stored, _ = await pair(
             config.api_url,
