@@ -229,7 +229,7 @@ class Spools:
     async def refresh_all(self) -> None:
         """Reads every printer's spools, and retries any tag a reader reported that wasn't
         looked up yet, or is due again. Raises ApiError when a printer's can't be read."""
-        for printer in self.printers:
+        for printer in list(self.printers):
             await self.refresh(printer)
         await self.retry_tags()
 

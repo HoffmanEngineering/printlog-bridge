@@ -115,6 +115,13 @@ class ProblemLog(logging.Handler):
                 self._counts[printer] += 1
                 self._last[printer] = (scrubbed, now)
 
+    def add(self, printer: str) -> None:
+        """Counts problems for a printer the bridge started watching while it runs."""
+        with self._guard:
+            if printer not in self._counts:
+                self.printers.append(printer)
+                self._counts[printer] = 0
+
     def problems(self, printer: str) -> Problems:
         with self._guard:
             last, at = self._last.get(printer, (None, None))

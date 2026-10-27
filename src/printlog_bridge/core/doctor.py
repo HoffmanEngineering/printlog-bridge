@@ -23,7 +23,7 @@ from printlog_bridge.core.config import (
     load_config,
 )
 from printlog_bridge.core.state import PrinterState
-from printlog_bridge.core.status import read_status
+from printlog_bridge.core.status import is_running, read_status
 from printlog_bridge.core.support import SECRET_OPTION
 from printlog_bridge.core.updates import is_newer, update_notice
 
@@ -46,7 +46,12 @@ async def diagnose(
     results = [CheckResult.ok("Python", platform.python_version())]
 
     try:
-        config = load_config(config_path, adapters=adapters, env=env, home=home)
+        config = load_config(
+            config_path, adapters=adapters, env=env, home=home, printers_required=False
+        )
+        if not config.printers and config.device is None:
+            # Unpaired, the config's printers are all it can watch.
+            load_config(config_path, adapters=adapters, env=env, home=home)
     except ConfigError as e:
         results.append(CheckResult.fail("Config", str(e)))
         return results
@@ -68,6 +73,7 @@ async def diagnose(
     if device is not None:
         results.append(device)
     results.extend(_check_printer_secrets(config))
+    results.extend(_check_bridge(config, clock()))
     api, server_time = await _check_api(config)
     results.append(api)
     if server_time is not None:
@@ -254,6 +260,42 @@ def _check_device_token(config: BridgeConfig) -> CheckResult | None:
             )
     paired = f", paired as {stored.name!r}" if stored.name else ""
     return CheckResult.ok(name, f"in {path}{paired}")
+
+
+def _check_bridge(config: BridgeConfig, now: datetime) -> list[CheckResult]:
+    """Discovery, the check-in and the printers connected in the app (#100), as the running
+    bridge last wrote them."""
+    if config.device is None:
+        return []
+    status = read_status(config.state_dir) or {}
+    running = bool(status) and is_running(status, now)
+    bridge = status.get("bridge") or {}
+    results = []
+    discovery = "on" if config.discovery else "off ([bridge] discovery = false)"
+    check_in = bridge.get("check_in") or {}
+    if not running:
+        results.append(CheckResult.ok("Bridge", f"discovery {discovery}; the bridge isn't running"))
+        return results
+    if check_in.get("problem"):
+        results.append(CheckResult.warn("Bridge check-in", check_in["problem"]))
+    elif check_in.get("at"):
+        results.append(
+            CheckResult.ok(
+                "Bridge check-in",
+                f"last at {check_in['at']}; discovery {discovery}; desired printers version "
+                f"{bridge.get('desired_version') or 'none yet'}",
+            )
+        )
+    for entry, app in sorted((bridge.get("app_printers") or {}).items()):
+        name = f"App printer {entry}"
+        detail = f"{app.get('kind')} at {app.get('host')}: {app.get('state')}" + (
+            f": {app['detail']}" if app.get("detail") else ""
+        )
+        if app.get("state") in ("watching", "in the config file"):
+            results.append(CheckResult.ok(name, detail))
+        else:
+            results.append(CheckResult.warn(name, detail))
+    return results
 
 
 def _check_printer_secrets(config: BridgeConfig) -> list[CheckResult]:

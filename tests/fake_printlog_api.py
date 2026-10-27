@@ -100,11 +100,29 @@ Device pairing and device tokens (api#148, PR 286, the "Contract for the bridge"
   `X-Api-Key` too, and 429 `device_token_throttled` (`Retry-After: 60`) while `throttled`.
 - `GET /api/Printers/summary` pages the user's printers (`pageNumber`, `pageSize`), and
   `POST /api/Printers` (`AddPrinterDTO`: `make`, `model`, `name` required) adds one: 201.
+
+Bridges (api#288, "Contract for story 12"), only with a device token holding `bridge:sync`
+(an API key gets 403 `device_token_required`):
+
+- `PUT /api/bridges/me` registers or updates the token's bridge. Every field is optional; a
+  missing one keeps what is stored, and a list replaces. 400 `invalid_check_in` over the caps
+  (16 networks, 50 discovered, 8 MACs) or for a bad `agentVersion`/`mode`/`hostName`. A
+  network or printer that breaks a rule is dropped and listed in `rejected` with its code
+  (`address_not_private`, `invalid_kind`, `invalid_mac`, `network_not_private`,
+  `network_too_large`, `duplicate_printer`...), and the rest stored. The answer is
+  `{bridgeId, checkInSeconds, desiredPollSeconds, desired, rejected}`. `check_in_limited`
+  answers 429 with `Retry-After`, as the connector write budget does.
+- `GET /api/bridges/me/desired`: 404 `bridge_not_registered` before the first check-in; the
+  `desired` object with `ETag: W/"<version>"`, or 304 for a matching `If-None-Match`.
+- A test changes the desired list with `connect`, `disconnect` and `request_scan`, each giving it
+  a new version, as the app's Bridges screen does.
 """
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
+import ipaddress
 import itertools
 import json
 import re
@@ -181,8 +199,12 @@ DEVICE_SCOPES = {
     ("POST", "/api/Prints/{id}/files/upload-url"): "files:write",
     ("POST", "/api/Prints/{id}/files/confirm"): "files:write",
     ("PUT", "/api/Connections/{instance}"): "connections:write",
+    ("PUT", "/api/bridges/me"): "bridge:sync",
+    ("GET", "/api/bridges/me/desired"): "bridge:sync",
 }
 """Where a device token works, and the scope it needs there (None: any grant)."""
+_GRANT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("grant")
+"""The grant of the device token the request being handled came with."""
 ALL_DEVICE_SCOPES = frozenset(s for s in DEVICE_SCOPES.values() if s)
 MAX_PAIRING_TOKEN_AGE_S = 10 * 60
 UUID = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
@@ -206,6 +228,17 @@ class FakePrintLogApi:
         """While True, every device-token request is answered 429 `device_token_throttled`."""
         self.credentials: list[tuple[str, str]] = []
         """The credential each request came with, and its path: "key", "device" or "both"."""
+        self.bridges: dict[int, dict[str, Any]] = {}
+        """Each checked-in bridge, by grant id: what its check-ins stored, and `desired`."""
+        self.check_ins: list[dict[str, Any]] = []
+        """Every check-in body received."""
+        self.desired_polls: list[str | None] = []
+        """Every desired poll's `If-None-Match`."""
+        self.check_in_limited: float | None = None
+        """When set, every check-in is answered 429 with this `Retry-After`."""
+        self.check_in_seconds = 300
+        self.desired_poll_seconds = 60
+        self._entry_ids = itertools.count(1)
         self.created_printers: list[dict[str, Any]] = []
         """Every POST /api/Printers body received."""
         self._spent_pairing_tokens: set[str] = set()
@@ -320,6 +353,8 @@ class FakePrintLogApi:
         app.router.add_post("/api/Prints/{id}/files/confirm", self._confirm)
         app.router.add_get("/api/Subscription/me", self._subscription)
         app.router.add_put("/api/Connections/{instance}", self._put_connection)
+        app.router.add_put("/api/bridges/me", self._check_in)
+        app.router.add_get("/api/bridges/me/desired", self._get_desired)
         self._server = TestServer(app)
         await self._server.start_server()
         store = web.Application()
@@ -359,6 +394,8 @@ class FakePrintLogApi:
         self.credentials.append(("key", request.path))
         if request.headers.get("X-Api-Key") != self.api_key:
             return web.Response(status=401)
+        if request.path.startswith("/api/bridges"):
+            return _coded(403, "device_token_required")
         return await handler(request)
 
     async def _device_request(self, request: web.Request, handler, token: str):
@@ -383,6 +420,7 @@ class FakePrintLogApi:
                 headers={"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{scope}"'},
             )
         grant["lastUsedAt"] = time.time()
+        _GRANT.set(grant)
         return await handler(request)
 
     def grant_for(self, token: str) -> dict[str, Any] | None:
@@ -411,6 +449,137 @@ class FakePrintLogApi:
 
     def grant_by_device(self, device_id: str) -> dict[str, Any] | None:
         return next((g for g in self.grants.values() if g["deviceId"] == device_id), None)
+
+    # -- bridges (api#288) ---------------------------------------------------------------------
+
+    def bridge(self, grant_id: int | None = None) -> dict[str, Any]:
+        """The only bridge (or the grant's)."""
+        if grant_id is None:
+            [grant_id] = self.bridges
+        return self.bridges[grant_id]
+
+    def _new_version(self, bridge: dict[str, Any]) -> None:
+        bridge["desired"]["version"] = uuid.uuid4().hex
+
+    def connect(
+        self,
+        kind: str,
+        host: str,
+        printer_id: int,
+        *,
+        port: int | None = None,
+        serial: str | None = None,
+        grant_id: int | None = None,
+    ) -> int:
+        """The user connects a printer to the bridge in the app. Returns the entry's id."""
+        bridge = self.bridge(grant_id)
+        entry_id = next(self._entry_ids)
+        bridge["desired"]["printers"].append(
+            {
+                "id": entry_id,
+                "printerId": printer_id,
+                "printerName": f"Printer {printer_id}",
+                "kind": kind,
+                "host": host,
+                "port": port,
+                "serial": serial,
+                "identityKey": f"{kind}:sn:{serial}" if serial else f"{kind}:ip:{host}:{port}",
+                "macs": [],
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        self._new_version(bridge)
+        return entry_id
+
+    def disconnect(self, entry_id: int, grant_id: int | None = None) -> None:
+        bridge = self.bridge(grant_id)
+        printers = bridge["desired"]["printers"]
+        printers[:] = [p for p in printers if p["id"] != entry_id]
+        self._new_version(bridge)
+
+    def request_scan(self, grant_id: int | None = None) -> str:
+        bridge = self.bridge(grant_id)
+        when = datetime.now(timezone.utc).isoformat()
+        bridge["desired"]["scanRequestedAt"] = when
+        self._new_version(bridge)
+        return when
+
+    async def _check_in(self, request: web.Request) -> web.Response:
+        grant = _GRANT.get()
+        try:
+            body = await request.json()
+        except ValueError:
+            return _problem(400, "invalid body")
+        if not isinstance(body, dict):
+            return _problem(400, "invalid body")
+        self.check_ins.append(body)
+        if self.check_in_limited is not None:
+            return web.Response(status=429, headers={"Retry-After": str(self.check_in_limited)})
+        networks, discovered = body.get("networks"), body.get("discovered")
+        if (
+            (isinstance(networks, list) and len(networks) > 16)
+            or (isinstance(discovered, list) and len(discovered) > 50)
+            or any(len(d.get("macs") or []) > 8 for d in discovered or [] if isinstance(d, dict))
+            or not _matches(body.get("agentVersion"), r"[0-9A-Za-z.+-]{1,50}")
+            or not _matches(body.get("mode"), r"[a-z][a-z0-9-]{0,19}")
+            or not _text_ok(body.get("hostName"))
+        ):
+            return _coded(400, "invalid_check_in")
+        bridge = self.bridges.setdefault(
+            grant["id"],
+            {
+                "id": grant["id"],
+                "desired": {"version": uuid.uuid4().hex, "scanRequestedAt": None, "printers": []},
+                "networks": [],
+                "discovered": [],
+            },
+        )
+        rejected: list[dict[str, str]] = []
+        for field in ("agentVersion", "mode", "hostName", "lastSweepAt"):
+            if body.get(field) is not None:
+                bridge[field] = body[field]
+        if isinstance(networks, list):
+            kept = []
+            for i, text in enumerate(networks):
+                code = _network_problem(text)
+                if code:
+                    rejected.append({"field": f"networks[{i}]", "code": code})
+                else:
+                    kept.append(str(ipaddress.ip_network(text, strict=False)))
+            bridge["networks"] = kept
+        if isinstance(discovered, list):
+            kept, seen = [], set()
+            for i, printer in enumerate(discovered):
+                code = _printer_problem(printer)
+                identity = _identity(printer) if code is None else None
+                if code is None and identity in seen:
+                    code = "duplicate_printer"
+                if code:
+                    rejected.append({"field": f"discovered[{i}]", "code": code})
+                    continue
+                seen.add(identity)
+                kept.append(printer)
+            bridge["discovered"] = kept
+        return web.json_response(
+            {
+                "bridgeId": grant["id"],
+                "checkInSeconds": self.check_in_seconds,
+                "desiredPollSeconds": self.desired_poll_seconds,
+                "desired": bridge["desired"],
+                "rejected": rejected,
+            }
+        )
+
+    async def _get_desired(self, request: web.Request) -> web.Response:
+        grant = _GRANT.get()
+        self.desired_polls.append(request.headers.get("If-None-Match"))
+        bridge = self.bridges.get(grant["id"])
+        if bridge is None:
+            return _coded(404, "bridge_not_registered")
+        etag = f'W/"{bridge["desired"]["version"]}"'
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers={"ETag": etag})
+        return web.json_response(bridge["desired"], headers={"ETag": etag})
 
     # -- driving it from a test ----------------------------------------------------------------
 
@@ -1282,6 +1451,97 @@ def _metadata_problem(metadata: dict[str, Any]) -> str | None:
         if not low <= value <= high:
             return f"The field {field} must be between {low} and {high}."
     return None
+
+
+_PRIVATE = tuple(
+    ipaddress.ip_network(n)
+    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7")
+)
+BRIDGE_KINDS = ("moonraker", "octoprint", "prusalink", "bambu", "sdcp")
+DEFAULT_BRIDGE_PORTS = {"moonraker": 7125, "bambu": 8883, "prusalink": 80, "octoprint": 80,
+                        "sdcp": 3030}  # fmt: skip
+
+
+def _matches(value: Any, pattern: str) -> bool:
+    return value is None or (isinstance(value, str) and re.fullmatch(pattern, value) is not None)
+
+
+def _text_ok(value: Any, limit: int = 100) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, str) and len(value) <= limit and not re.search(r"[\x00-\x1f\x7f]", value)
+    )
+
+
+def _private(address: Any) -> bool | None:
+    """True or False for an IP literal; None for anything else."""
+    try:
+        ip = ipaddress.ip_address(str(address))
+    except ValueError:
+        return None
+    if "%" in str(address):
+        return None
+    return any(ip in n for n in _PRIVATE)
+
+
+def _network_problem(text: Any) -> str | None:
+    try:
+        network = ipaddress.ip_network(str(text), strict=False)
+    except ValueError:
+        return "invalid_network"
+    if not any(network.subnet_of(n) for n in _PRIVATE if n.version == network.version):
+        return "network_not_private"
+    if network.prefixlen < (24 if network.version == 4 else 64):
+        return "network_too_large"
+    return None
+
+
+def _clean_mac(text: Any) -> str | None:
+    digits = re.sub(r"[:-]", "", str(text).lower())
+    if not re.fullmatch(r"[0-9a-f]{12}", digits):
+        return None
+    if digits in ("000000000000", "ffffffffffff") or int(digits[1], 16) & 1:
+        return None
+    return digits
+
+
+def _printer_problem(printer: Any) -> str | None:
+    if not isinstance(printer, dict):
+        return "invalid_text"
+    if printer.get("kind") not in BRIDGE_KINDS:
+        return "invalid_kind"
+    private = _private(printer.get("address"))
+    if private is None:
+        return "invalid_address"
+    if not private:
+        return "address_not_private"
+    port = printer.get("port")
+    if port is not None and (not isinstance(port, int) or not 0 < port < 65536):
+        return "invalid_port"
+    if any(_clean_mac(m) is None for m in printer.get("macs") or []):
+        return "invalid_mac"
+    for field, code in (("serial", "invalid_serial"), ("mainboardId", "invalid_mainboard_id")):
+        if printer.get(field) is not None and not re.fullmatch(
+            r"[A-Za-z0-9._:-]{1,64}", str(printer[field])
+        ):
+            return code
+    if not _text_ok(printer.get("model")) or not _text_ok(printer.get("name")):
+        return "invalid_text"
+    return None
+
+
+def _identity(printer: dict[str, Any]) -> str:
+    kind = printer["kind"]
+    port = printer.get("port") or DEFAULT_BRIDGE_PORTS[kind]
+    if printer.get("serial"):
+        return f"{kind}:sn:{str(printer['serial']).upper()}"
+    if printer.get("mainboardId"):
+        return f"{kind}:mb:{str(printer['mainboardId']).lower()}"
+    macs = sorted(_clean_mac(m) for m in printer.get("macs") or [])
+    if macs:
+        return f"{kind}:mac:{macs[0]}:{port}"
+    return f"{kind}:ip:{printer['address']}:{port}"
 
 
 def _coded(status: int, code: str, headers: dict[str, str] | None = None) -> web.Response:

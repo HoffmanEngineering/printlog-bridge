@@ -402,3 +402,40 @@ def test_run_also_logs_to_a_file_in_the_state_directory_for_support_bundles(tmp_
             handler.close()
 
     assert "INFO watching voron" in text
+
+
+def test_a_paired_bridge_with_no_printers_runs_and_starts_again_when_one_is_added(tmp_path):
+    """#100: printers can come from the app, so a paired bridge with an empty config checks in
+    instead of waiting; adding a [printer] to the file still starts it, with no restart."""
+    from printlog_bridge.core.device import write_device_token
+
+    config, state = tmp_path / "printlog-bridge.cfg", tmp_path / "state"
+    env = {"PRINTLOG_BRIDGE_CONFIG": str(config), "PRINTLOG_BRIDGE_STATE_DIR": str(state)}
+
+    async def scenario():
+        api = FakePrintLogApi()
+        url = await api.start()
+        token = api.issue_device_token()
+        write_device_token(state, token=token, api_url=url, grant_id=1, name="b",
+                           scopes=sorted(api.grant_for(token)["scopes"]))  # fmt: skip
+        config.write_text(f"[bridge]\napi_url = {url}\ndiscovery = false\n", encoding="utf-8")
+        fake = FakeMoonraker()
+        base = await fake.start()
+        process = await _start_run(env)
+        out = Lines(process)
+        try:
+            await eventually(lambda: api.bridges, timeout=20)
+            status = read_status(state)
+            assert status["stopped_at"] is None and "no printers yet" in status["setup_problem"]
+            with config.open("a", encoding="utf-8") as f:
+                f.write(f"[printer u1]\nprinter_id = 42\nurl = {base}\n")
+            await eventually(lambda: fake.subscriptions, timeout=20)
+            return out.text
+        finally:
+            await _stop(process)
+            await fake.close()
+            await api.close()
+
+    text = asyncio.run(scenario())
+    assert "starting again with it" in text
+    assert "Traceback" not in text

@@ -48,6 +48,18 @@ class FakeAuth0:
         """Issue tokens that carry `offline_access` (a misconfigured tenant)."""
         self.grant_scope: str | None = None
         """The scope tokens carry; None grants what was asked for."""
+        self.scopes = [
+            "bridge:sync",
+            "connections:write",
+            "files:write",
+            "filaments:read",
+            "printers:create",
+            "printers:read",
+            "printers:slots",
+            "prints:read",
+            "prints:write",
+        ]
+        """What the pairing discovery lists (an API before #288 has no `bridge:sync`)."""
         self._codes: dict[str, dict[str, Any]] = {}
         self._ids = itertools.count(1)
         self._server: TestServer | None = None
@@ -74,16 +86,7 @@ class FakeAuth0:
             "tokenEndpoint": self.base_url + "/oauth/token",
             "clientId": self.client_id,
             "audience": self.audience,
-            "scopes": [
-                "connections:write",
-                "files:write",
-                "filaments:read",
-                "printers:create",
-                "printers:read",
-                "printers:slots",
-                "prints:read",
-                "prints:write",
-            ],
+            "scopes": list(self.scopes),
         }
 
     # -- driving it ------------------------------------------------------------------------------

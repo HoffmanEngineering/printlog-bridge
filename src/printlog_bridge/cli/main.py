@@ -39,7 +39,11 @@ from printlog_bridge.core.config import (
     write_key_file,
 )
 from printlog_bridge.core.doctor import API_KEYS_PAGE, diagnose, format_report
-from printlog_bridge.core.first_run import setup_problem, wait_for_printers
+from printlog_bridge.core.first_run import (
+    setup_problem,
+    wait_for_printers,
+    write_starter_config,
+)
 from printlog_bridge.core.status import format_status
 from printlog_bridge.core.support import BUNDLE_NAME, write_support_bundle
 
@@ -546,10 +550,29 @@ def _run(explicit_config: Path | None) -> int:
 
     if not logging_on:
         configure_logging(config.state_dir)
-    logging.getLogger(__name__).info("printlog-bridge %s, config %s", __version__, config.path)
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(until_stopped(run_bridge(config)))
-    return 0
+    logger = logging.getLogger(__name__)
+    logger.info("printlog-bridge %s, config %s", __version__, config.path)
+    if not config.printers:
+        wrote = write_starter_config(config.path)
+        logger.info(
+            "No [printer] sections in %s%s: connect printers to this bridge in 3D Print Log "
+            "(Bridges), or add them to the file; the bridge picks them up with no restart.",
+            config.path,
+            " (the bridge wrote a starter one, with an example of each)" if wrote else "",
+        )
+    while True:
+        outcome: list[BridgeConfig | None] = []
+
+        async def running(
+            config: BridgeConfig = config, outcome: list[BridgeConfig | None] = outcome
+        ) -> None:
+            outcome.append(await run_bridge(config, adapters=ADAPTERS, reload=load))
+
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(until_stopped(running()))
+        if not outcome or outcome[0] is None:
+            return 0
+        config = outcome[0]
 
 
 def _wait_for_printers(

@@ -88,10 +88,12 @@ class ApiUnavailable(ApiError):
 class ApiRejected(ApiError):
     """The API refused this request (400, 403, 413, 415). Sending it again won't change that."""
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, code: str | None = None) -> None:
         super().__init__(message)
         self.status = status
         """The HTTP status the API refused it with."""
+        self.code = code
+        """The problem's `code`, when the API sent one (`insufficient_scope`...)."""
 
 
 class ClaimConflict(ApiError):
@@ -135,6 +137,8 @@ class ApiClient:
         self.on_credentials = on_credentials
         self._session: aiohttp.ClientSession | None = None
         self.server_time: datetime | None = None
+        self.last_etag: str | None = None
+        """The `ETag` of the last answer, if it had one."""
         """The API's clock, from the `Date` of its last answer, to tell when ours is off."""
 
     @classmethod
@@ -429,6 +433,29 @@ class ApiClient:
         _, created = await self._send("POST", "/api/Printers", body)
         return created
 
+    async def check_in(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """The bridge's check-in (`PUT /api/bridges/me`, `bridge:sync`): what it found on its
+        network. The answer carries `checkInSeconds`, `desiredPollSeconds`, `desired` and
+        `rejected`. Raises ApiRejected (`code` says why: `insufficient_scope`...)."""
+        _, answer = await self._send("PUT", "/api/bridges/me", body)
+        return answer if isinstance(answer, dict) else {}
+
+    async def desired(self, etag: str | None) -> tuple[int, dict[str, Any] | None, str | None]:
+        """`GET /api/bridges/me/desired`: the status (200, 304 unchanged, 404 not checked in
+        yet), the desired object on a 200, and its `ETag`."""
+        status, body = await self._send(
+            "GET",
+            "/api/bridges/me/desired",
+            missing_ok=True,
+            extra_headers={"If-None-Match": etag} if etag else None,
+        )
+        return status, body if isinstance(body, dict) else None, self.last_etag
+
+    def use_device(self, device: DeviceToken) -> None:
+        """Signs in with `device` from now on: the bridge paired again while running."""
+        self._device = device
+        self._refused = None
+
     def _credentials(self) -> dict[str, str]:
         """The one credential header to send. Raises RepairNeeded, without asking the API, while
         the refused device token is still the one stored."""
@@ -491,10 +518,11 @@ class ApiClient:
         conflict_ok: bool = False,
         data: aiohttp.FormData | None = None,
         timeout: float = REQUEST_TIMEOUT_S,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> tuple[int, Any]:
         if self._session is None:
             raise RuntimeError("use ApiClient as `async with ApiClient(...) as client`")
-        headers = self._credentials()
+        headers = {**(extra_headers or {}), **self._credentials()}
         sent = self._device.token if self._device is not None else None
 
         try:
@@ -508,6 +536,9 @@ class ApiClient:
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as response:
                 self.server_time = _date(response.headers.get("Date")) or self.server_time
+                self.last_etag = response.headers.get("ETag")
+                if response.status == 304:
+                    return 304, None
                 if response.status == 401:
                     code = await _code(response)
                     if sent is not None and code == INVALID_DEVICE_TOKEN:
@@ -524,7 +555,8 @@ class ApiClient:
                         return 409, None
                 if response.status in (400, 403, 413, 415):
                     reason = (await response.text()).strip()[:300]
-                    if sent is not None and _code_in(reason) == INSUFFICIENT_SCOPE:
+                    code = _code_in(reason)
+                    if sent is not None and code == INSUFFICIENT_SCOPE:
                         reason += (
                             ". The bridge was paired without this permission: run "
                             f"`{REPAIR_COMMAND}` to pair it again"
@@ -533,6 +565,7 @@ class ApiClient:
                         f"the API refused {method} {path} ({response.status})"
                         + (f": {reason}" if reason else ""),
                         status=response.status,
+                        code=code,
                     )
                 if (
                     response.status == 429
