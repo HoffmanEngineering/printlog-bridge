@@ -131,11 +131,11 @@ def test_options_that_cant_work_are_refused_with_what_to_fix(printers, says):
         "12345678\n[printer evil]",  # would add a section
         "1234\r5678",
         "abc\x00",
-        "pass #word",  # an inline comment: the bridge would read "pass"
-        "pass ;word",
-        "pass\t#word",
-        "#password",  # after `key = `, a comment too: the bridge would read nothing
-        ";password",
+        "qx12 #zq9x",  # an inline comment: the bridge would read "qx12"
+        "qx12 ;zq9x",
+        "qx12\t#zq9x",
+        "#zq9x",  # after `key = `, a comment too: the bridge would read nothing
+        ";zq9x",
     ],
 )
 def test_a_value_the_config_file_cant_hold_is_refused_without_showing_it(value):
@@ -144,7 +144,8 @@ def test_a_value_the_config_file_cant_hold_is_refused_without_showing_it(value):
     message = str(raised.value)
     assert "access_code" in message
     assert value not in message
-    assert "5678" not in message and "word" not in message
+    for part in ("5678", "zq9x", "qx12", "evil"):
+        assert part not in message
 
 
 def test_a_hash_without_a_space_before_it_is_kept():
