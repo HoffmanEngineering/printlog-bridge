@@ -1,8 +1,11 @@
 # printlog-bridge in remote mode: watches printers over Moonraker's WebSocket from any host on
 # the network (a NAS, a Pi, a home server). Config, state and the API key live in /data.
 #
-#   docker run -d --name printlog-bridge --restart unless-stopped \
+#   docker run -d --name printlog-bridge --restart unless-stopped --network host \
 #     -v /volume1/docker/printlog-bridge:/data ghcr.io/hoffmanengineering/printlog-bridge
+#
+# With no config it pairs (a QR code in the log), writes a starter printlog-bridge.cfg in
+# /data and waits for printers to be added to it.
 #
 # Built for linux/amd64, linux/arm64 and linux/arm/v7 by .github/workflows/docker.yml. The `addon`
 # stage is the Home Assistant app's image (home-assistant/), ghcr.io/hoffmanengineering/
@@ -31,8 +34,11 @@ LABEL org.opencontainers.image.title="printlog-bridge" \
       org.opencontainers.image.source="https://github.com/HoffmanEngineering/printlog-bridge" \
       org.opencontainers.image.licenses="MIT"
 
-# A fixed non-root user. Run as another one (Synology: the user who owns the folder mounted at
-# /data) with `user: "<uid>:<gid>"`; nothing in the image needs a particular uid.
+# The bridge's own user, 1000:1000. The container starts as root, and every printlog-bridge
+# command (run, and anything run with `docker exec`) first gives /data to the user it runs as
+# and switches to it (cli/data_owner.py): PUID/PGID when set, else the owner of the folder
+# mounted at /data unless that's root, else this user. So a NAS needs no permission step. A
+# container started with `user: "<uid>:<gid>"` runs as that user throughout, as before.
 RUN groupadd --gid 1000 printlog \
     && useradd --uid 1000 --gid 1000 --home-dir /data --no-create-home --shell /usr/sbin/nologin printlog \
     && mkdir /data && chown 1000:1000 /data
@@ -44,12 +50,13 @@ COPY --from=build /opt/printlog-bridge /opt/printlog-bridge
 ENV PATH=/opt/printlog-bridge/bin:$PATH \
     HOME=/data \
     PRINTLOG_BRIDGE_CONFIG=/data/printlog-bridge.cfg \
+    PRINTLOG_BRIDGE_DATA_DIR=/data \
     PRINTLOG_BRIDGE_STATE_DIR=/data/state \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TZ=Etc/UTC
 
-USER 1000:1000
+USER root
 WORKDIR /data
 VOLUME ["/data"]
 
@@ -68,6 +75,8 @@ CMD ["run"]
 # that user. The health check above is the app's watchdog.
 FROM runtime AS addon
 USER root
+# printlog-bridge-addon hands /data over itself and runs the bridge as the printlog user.
+ENV PRINTLOG_BRIDGE_DATA_DIR=
 ENTRYPOINT ["printlog-bridge-addon"]
 CMD []
 

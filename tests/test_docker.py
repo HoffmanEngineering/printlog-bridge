@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import re
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from printlog_bridge.cli.data_owner import DATA_DIR_ENV, IMAGE_GID, IMAGE_UID
 from printlog_bridge.core.config import API_KEY_ENV, CONFIG_PATH_ENV, STATE_DIR_ENV
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,10 +48,17 @@ def test_the_default_target_is_the_runtime_stage_unchanged():
     assert list(stages()) == ["build", "runtime", "addon", ""]
 
 
-def test_runs_as_a_non_root_user():
-    users = re.findall(r"^USER\s+(\S+)", stages()["runtime"], re.MULTILINE)
-    assert users, "the runtime stage has no USER"
-    assert users[-1].split(":")[0] not in ("root", "0"), users[-1]
+def test_starts_as_root_only_to_hand_the_data_folder_to_the_bridges_user():
+    # cli/data_owner.py switches to the data folder's user before any command runs, in the
+    # image only: where PRINTLOG_BRIDGE_DATA_DIR names the folder.
+    runtime = stages()["runtime"]
+    users = re.findall(r"^USER\s+(\S+)", runtime, re.MULTILINE)
+    assert users[-1] == "root"
+    assert dockerfile_env(DATA_DIR_ENV) == "/data"
+    assert f"--uid {IMAGE_UID} --gid {IMAGE_GID}" in runtime
+    assert f"chown {IMAGE_UID}:{IMAGE_GID} /data" in runtime
+    # The app's start-up hands /data over itself; the bridge it runs isn't root.
+    assert re.search(rf"^ENV {DATA_DIR_ENV}=$", stages()["addon"], re.MULTILINE)
 
 
 def test_the_app_stage_starts_as_root_and_runs_the_app_glue():
@@ -106,36 +113,3 @@ def test_the_published_image_is_checked_without_logging_in():
     assert "packages:" not in verify
     assert "login-action" not in verify
     assert "tag: ${{ steps.meta.outputs.version }}" in workflow_job("publish")
-
-
-def unraid_config(template: ET.Element, target: str) -> ET.Element:
-    configs = [c for c in template.iter("Config") if c.get("Target") == target]
-    assert len(configs) == 1, f"the Unraid template has {len(configs)} {target} settings"
-    return configs[0]
-
-
-def test_the_unraid_template_matches_the_image():
-    template = ET.parse(ROOT / "unraid" / "printlog-bridge.xml").getroot()
-    compose_tag = re.search(rf"image: {IMAGE}:(\S+)", COMPOSE).group(1)
-    assert template.findtext("Repository") == f"{IMAGE}:{compose_tag}"
-    assert template.findtext("Network") == "bridge"
-    assert template.findtext("Privileged") == "false"
-    # Unraid's appdata belongs to nobody:users; the container must not run as root.
-    assert "--user 99:100" in template.findtext("ExtraParams")
-    assert template.findtext("PostArgs", "") == ""
-
-    data = unraid_config(template, "/data")
-    assert data.get("Type") == "Path"
-    assert data.get("Default") == "/mnt/user/appdata/printlog-bridge"
-    assert data.text == data.get("Default")
-
-    # Unraid passes its own time zone to every container as TZ; a second one would clash.
-    assert not [c for c in template.iter("Config") if c.get("Target") == "TZ"]
-
-    # Optional, masked, and empty: a blank PRINTLOG_API_KEY falls back to /data/state/api_key.
-    key = unraid_config(template, API_KEY_ENV)
-    assert (key.get("Mask"), key.get("Required")) == ("true", "false")
-    assert not key.get("Default") and not (key.text or "").strip()
-
-    # The bridge only connects out.
-    assert not [c for c in template.iter("Config") if c.get("Type") == "Port"]

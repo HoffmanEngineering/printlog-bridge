@@ -22,6 +22,7 @@ from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.bambu import discovery as bambu_discovery
 from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
+from printlog_bridge.cli.data_owner import drop_root
 from printlog_bridge.cli.discover import discover, format_bambu, format_found, subnets_to_scan
 from printlog_bridge.cli.pair import pair_command, pair_on_first_run
 from printlog_bridge.core.bridge import check_runnable, run_bridge
@@ -120,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    drop_root()  # in the Docker image as root: become the data folder's user first
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -598,9 +600,10 @@ def check_writable(state_dir: Path) -> None:
         uid = f" (uid {os.getuid()})" if hasattr(os, "getuid") else ""
         raise ConfigError(
             f"can't write the state directory {state_dir}: {e.strerror or e}. The bridge "
-            f"runs as a user{uid} that must be able to write it. In Docker, run the container "
-            "as the user and group that own the folder mounted at /data (`user:` in "
-            "docker-compose.yml, `--user` with docker run)."
+            f"runs as a user{uid} that must be able to write it. In Docker, leave out `user:` "
+            "(`--user`): the container then gives itself the folder mounted at /data, as "
+            "PUID/PGID or the folder's owner. Or run it as the user and group that own the "
+            "folder."
         ) from None
 
 
