@@ -14,7 +14,7 @@ import signal
 import stat
 import sys
 import tempfile
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +22,7 @@ from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.bambu import discovery as bambu_discovery
 from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
+from printlog_bridge.cli.data_owner import drop_root
 from printlog_bridge.cli.discover import discover, format_bambu, format_found, subnets_to_scan
 from printlog_bridge.cli.pair import pair_command, pair_on_first_run
 from printlog_bridge.core.bridge import check_runnable, run_bridge
@@ -38,6 +39,7 @@ from printlog_bridge.core.config import (
     write_key_file,
 )
 from printlog_bridge.core.doctor import API_KEYS_PAGE, diagnose, format_report
+from printlog_bridge.core.first_run import setup_problem, wait_for_printers
 from printlog_bridge.core.status import format_status
 from printlog_bridge.core.support import BUNDLE_NAME, write_support_bundle
 
@@ -119,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    drop_root()  # in the Docker image as root: become the data folder's user first
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -175,7 +178,7 @@ def _status(explicit_config: Path | None) -> int:
     home = Path.home()
     config_path = find_config(explicit_config, env=env, home=home)
     try:
-        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        config = _load_for_setup(config_path, explicit_config, env, home)
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
         print("Run `printlog-bridge doctor` to check the setup.", file=sys.stderr)
@@ -192,7 +195,7 @@ def _pair(args: argparse.Namespace) -> int:
     home = Path.home()
     config_path = find_config(args.config, env=env, home=home)
     try:
-        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        config = _load_for_setup(config_path, args.config, env, home)
         check_writable(config.state_dir)
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
@@ -488,13 +491,33 @@ def _ask_for_key() -> str:
     return clean_key(sys.stdin.readline())
 
 
+def _load_for_setup(
+    config_path: Path, explicit_config: Path | None, env: Mapping[str, str], home: Path
+) -> BridgeConfig:
+    """The config for `run`, `status` and `pair`, which work before there are printers: a new
+    container has no config yet. A file named with --config must exist (a typo shouldn't pair
+    a bridge or leave it waiting)."""
+    return load_config(
+        config_path,
+        adapters=ADAPTERS,
+        env=env,
+        home=home,
+        missing_ok=explicit_config is None,
+        printers_required=False,
+    )
+
+
 def _run(explicit_config: Path | None) -> int:
     env = dict(os.environ)
     home = Path.home()
     config_path = find_config(explicit_config, env=env, home=home)
+
+    def load() -> BridgeConfig:
+        return _load_for_setup(config_path, explicit_config, env, home)
+
     logging_on = False
     try:
-        config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+        config = load()
         check_writable(config.state_dir)
         if not config.has_credentials:
             # First run in Docker or an add-on: pair in the log, then carry on.
@@ -504,7 +527,17 @@ def _run(explicit_config: Path | None) -> int:
             if problem is not None:
                 print(f"printlog-bridge: {problem}", file=sys.stderr)
                 return 2
-            config = load_config(config_path, adapters=ADAPTERS, env=env, home=home)
+            config = load()
+        if config.has_credentials and setup_problem(config) is not None:
+            # Nothing to watch yet (no printers, or one without printer_id): wait for the
+            # config instead of exiting into the container's restart loop.
+            if not logging_on:
+                configure_logging(config.state_dir)
+                logging_on = True
+            waited = _wait_for_printers(config, load)
+            if waited is None:
+                return 0
+            config = waited
         check_runnable(config)
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
@@ -517,6 +550,20 @@ def _run(explicit_config: Path | None) -> int:
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(until_stopped(run_bridge(config)))
     return 0
+
+
+def _wait_for_printers(
+    config: BridgeConfig, load: Callable[[], BridgeConfig]
+) -> BridgeConfig | None:
+    """The config once it has printers to watch, or None when stopped while waiting."""
+    found: list[BridgeConfig] = []
+
+    async def waiting() -> None:
+        found.append(await wait_for_printers(config, load))
+
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(until_stopped(waiting()))
+    return found[0] if found else None
 
 
 def _first_run_pairing(config: BridgeConfig, env: Mapping[str, str]) -> str | None:
@@ -553,9 +600,10 @@ def check_writable(state_dir: Path) -> None:
         uid = f" (uid {os.getuid()})" if hasattr(os, "getuid") else ""
         raise ConfigError(
             f"can't write the state directory {state_dir}: {e.strerror or e}. The bridge "
-            f"runs as a user{uid} that must be able to write it. In Docker, run the container "
-            "as the user and group that own the folder mounted at /data (`user:` in "
-            "docker-compose.yml, `--user` with docker run)."
+            f"runs as a user{uid} that must be able to write it. In Docker, leave out `user:` "
+            "(`--user`): the container then gives itself the folder mounted at /data, as "
+            "PUID/PGID or the folder's owner. Or run it as the user and group that own the "
+            "folder."
         ) from None
 
 

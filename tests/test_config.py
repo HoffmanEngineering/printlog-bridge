@@ -172,6 +172,39 @@ def test_needs_at_least_one_printer(tmp_path):
         load(write(tmp_path, "[bridge]\napi_key = k\n"))
 
 
+def test_a_missing_file_can_load_as_an_empty_one_for_run(tmp_path):
+    # `run` in Docker starts with no config at all: it pairs, then waits for printers.
+    config = load_config(
+        tmp_path / "nope.cfg",
+        adapters=ADAPTERS,
+        env={"PRINTLOG_BRIDGE_STATE_DIR": str(tmp_path / "state")},
+        home=tmp_path,
+        missing_ok=True,
+        printers_required=False,
+    )
+
+    assert config.printers == []
+    assert config.api_url == DEFAULT_API_URL
+    assert config.state_dir == tmp_path / "state"
+    assert config.path == tmp_path / "nope.cfg"
+
+
+def test_missing_ok_still_needs_printers_unless_told_otherwise(tmp_path):
+    with pytest.raises(ConfigError, match=r"no \[printer <name>\] section"):
+        load_config(
+            tmp_path / "nope.cfg", adapters=ADAPTERS, env={}, home=tmp_path, missing_ok=True
+        )
+
+
+def test_a_config_without_printers_loads_when_printers_arent_required(tmp_path):
+    path = write(tmp_path, "[bridge]\napi_key = k\n")
+
+    config = load_config(path, adapters=ADAPTERS, env={}, home=tmp_path, printers_required=False)
+
+    assert config.printers == []
+    assert config.api_key == "k"
+
+
 def test_printer_section_needs_a_name(tmp_path):
     with pytest.raises(ConfigError, match=r"\[printer\] needs a name"):
         load(write(tmp_path, "[printer]\nadapter = fake\n"))

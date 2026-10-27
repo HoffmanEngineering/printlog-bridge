@@ -213,10 +213,17 @@ def load_config(
     env: Mapping[str, str],
     home: Path,
     text: str | None = None,
+    *,
+    missing_ok: bool = False,
+    printers_required: bool = True,
 ) -> BridgeConfig:
     """`text` is the config's contents when the caller has already read them (store-key, which
-    checks who owns the file it read); otherwise they are read from `path`."""
-    parser = _parse(path, text)
+    checks who owns the file it read); otherwise they are read from `path`.
+
+    `missing_ok` loads a missing file as an empty one, and `printers_required=False` allows a
+    config with no `[printer]` section: `run` in a new container pairs, then waits for printers
+    (core/first_run.py)."""
+    parser = _parse(path, text, missing_ok=missing_ok)
     bridge = parser["bridge"] if parser.has_section("bridge") else {}
 
     allow_http_on_lan = _flag(bridge.get("allow_http_on_lan", ""), "allow_http_on_lan") or _flag(
@@ -240,7 +247,7 @@ def load_config(
         for section in parser.sections()
         if section != "bridge"
     ]
-    if not printers:
+    if not printers and printers_required:
         raise ConfigError(f"{path}: no [printer <name>] section, so there is nothing to watch")
 
     return BridgeConfig(
@@ -491,12 +498,14 @@ def _printer_id(printer: str, value: str | None) -> int | None:
 def state_dir_of(path: Path, env: Mapping[str, str], home: Path) -> Path:
     """The state directory the config at `path` uses, read without loading its printers: for the
     container's health check, which must not import the adapters (and aiohttp with them)."""
-    parser = _parse(path, None)
+    parser = _parse(path, None, missing_ok=True)
     return _state_dir(parser["bridge"] if parser.has_section("bridge") else {}, env, home)
 
 
-def _parse(path: Path, text: str | None) -> configparser.ConfigParser:
+def _parse(path: Path, text: str | None, missing_ok: bool = False) -> configparser.ConfigParser:
     parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+    if text is None and missing_ok and not path.exists():
+        return parser
     try:
         if text is not None:
             parser.read_string(text, source=str(path))

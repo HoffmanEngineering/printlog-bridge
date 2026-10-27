@@ -48,7 +48,7 @@ def answers(*replies: str):
 
 
 def load(path: Path):
-    return load_config(path, adapters=ADAPTERS, env={}, home=path.parent)
+    return load_config(path, adapters=ADAPTERS, env={}, home=path.parent, printers_required=False)
 
 
 def run_pair(path: Path, *, ask=None, interactive=True, yes=False, switch=False, name=None):
@@ -219,6 +219,16 @@ def test_the_first_run_pairs_in_the_log_with_a_qr_code(tmp_path, caplog):
     assert text.count("scan the QR code") == 2  # the first code expired; a second one is shown
     assert "█" in text
     assert "Here is a new code" in text
+
+
+def test_the_first_run_pairs_a_bridge_with_no_printers_yet(tmp_path, caplog):
+    # A new container: pairing comes first, the printers after (core/first_run.py).
+    caplog.set_level(logging.INFO)
+    problem, api = first_run(tmp_path, "")
+
+    assert problem is None
+    assert len(api.grants) == 1
+    assert "has no printer_id" not in caplog.text
 
 
 class _StatusWhenTheCodeShows(logging.Handler):

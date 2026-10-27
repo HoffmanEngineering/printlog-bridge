@@ -93,8 +93,19 @@ def test_the_config_state_dir_wins_over_the_environment(tmp_path, monkeypatch):
     assert health.main() == 0
 
 
-def test_a_missing_config_is_unhealthy(tmp_path, monkeypatch, capsys):
+def test_a_missing_config_still_finds_the_state_directory(tmp_path, monkeypatch):
+    # A container with no config yet pairs and waits for printers, and is healthy meanwhile.
     monkeypatch.setenv(CONFIG_PATH_ENV, str(tmp_path / "nope.cfg"))
+    monkeypatch.setenv(STATE_DIR_ENV, str(tmp_path / "state"))
+    write_status(tmp_path / "state", timedelta(seconds=10))
+
+    assert health.main() == 0
+
+
+def test_an_unreadable_config_is_unhealthy(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "broken.cfg"
+    path.write_text("not a section\n", encoding="utf-8")
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(path))
 
     assert health.main() == 2
-    assert "Config file not found" in capsys.readouterr().err
+    assert "broken.cfg" in capsys.readouterr().err

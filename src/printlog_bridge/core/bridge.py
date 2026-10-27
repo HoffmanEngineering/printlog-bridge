@@ -78,7 +78,7 @@ async def _run(
     board.start(
         [p.name for p in config.printers],
         trace=config.trace,
-        credentials=_credentials(config),
+        credentials=credentials_label(config),
     )
     traces = _start_tracing(config)
 
@@ -188,7 +188,8 @@ def _secrets(config: BridgeConfig) -> list[str]:
     return secrets
 
 
-def _credentials(config: BridgeConfig) -> str:
+def credentials_label(config: BridgeConfig) -> str:
+    """What the bridge signs in with, for the status file."""
     if config.device is not None:
         name = f", paired as {config.device.name}" if config.device.name else ""
         return f"device token{name}"

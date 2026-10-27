@@ -40,6 +40,18 @@ skipped by default.
   means re-pair; 429 `device_token_throttled` is waited out. The pairing contract is
   3d-print-log-api PR #286's "Contract for the bridge".
 
+## Docker and NAS installs
+
+- The image starts as root; `printlog-bridge` itself (`cli/data_owner.py`, first thing in
+  `main()`) hands `/data` to `PUID`/`PGID`, the folder's owner or 1000 and switches user, so
+  `docker exec` is safe too. Only where `PRINTLOG_BRIDGE_DATA_DIR` is set (the image; the app
+  stage clears it), and never when started with `user:`. `tests/docker/smoke.sh` covers both.
+- `run` with no config or no printers waits (`core/first_run.py`) instead of exiting: keep it
+  that way, or a NAS container restart-loops before the user has added printers.
+- `unraid/printlog-bridge.xml` is listed in Unraid Community Applications, which indexes this
+  repo (`ca_profile.xml`); `tests/test_unraid.py` checks it against the code. Keep its path:
+  installs update from its `TemplateURL`. No other `.xml` file in the repo.
+
 ## Shipping
 
 Public repo; `main` is protected. Branch, PR against `main`, wait for CI, squash merge (`/ship`).
