@@ -108,7 +108,8 @@ T = TypeVar("T")
 PRINTING = 2
 STATUS_FOR = {JobOutcome.COMPLETED: 3, JobOutcome.CANCELLED: 4, JobOutcome.FAILED: 5}
 FINISHED = frozenset({3, 4, 5, 6})  # Success, Cancelled, Failed, PartialSuccess
-WEIGHT, LENGTH = 1, 2
+WEIGHT, LENGTH, VOLUME = 1, 2, 3
+MEASURES = ("amountMg", "lengthInM", "volumeMl")
 PRIVATE = 3
 
 # The account settings the web app's new-print form starts from.
@@ -331,6 +332,8 @@ class JobLogger:
                 start["estimated_filament_g_by_slot"] = {
                     str(slot): grams for slot, grams in event.estimated_filament_g_by_slot.items()
                 }  # as JSON keeps it
+                if start["estimated_volume_ml"] is None:
+                    del start["estimated_volume_ml"]  # a filament job's, as before #97
                 job = state.jobs[event.job_id] = JobRecord(
                     started_at=start["started_at"], start=start
                 )
@@ -1389,7 +1392,7 @@ def _created(print_: Mapping[str, Any]) -> datetime | None:
 
 
 def _finish_payload(event: JobFinished) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "outcome": event.outcome.value,
         "finished_at": event.finished_at.isoformat(),
         "duration_s": event.duration_s,
@@ -1398,6 +1401,9 @@ def _finish_payload(event: JobFinished) -> dict[str, Any]:
         "usage_estimated": event.usage_estimated,
         "note": event.note,
     }
+    if event.volume_ml:  # only then, so a filament job's entry is as it was before #97
+        payload["volume_ml"] = {str(slot): ml for slot, ml in event.volume_ml.items()}
+    return payload
 
 
 def _finish_event(entry: Entry) -> JobFinished:
@@ -1412,6 +1418,7 @@ def _finish_event(entry: Entry) -> JobFinished:
         filament_g={int(slot): g for slot, g in (payload.get("filament_g") or {}).items()},
         usage_estimated=bool(payload.get("usage_estimated")),
         note=payload.get("note"),
+        volume_ml={int(slot): ml for slot, ml in (payload.get("volume_ml") or {}).items()},
     )
 
 
@@ -1439,7 +1446,8 @@ def _estimate_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
     """The slicer's estimate as usage rows, one per slot, which completing fills in.
 
     A file with a weight per tool gets a row for each tool it uses, by weight. Otherwise (one
-    filament, or one tool used) the totals are one row, by length when the slicer gave one.
+    filament, or one tool used) the totals are one row, by length when the slicer gave one,
+    or by volume for resin (#97).
     """
     estimated = start.get("estimated_filament_g_by_slot") or {}
     by_slot = {int(slot): grams for slot, grams in estimated.items()}
@@ -1449,16 +1457,19 @@ def _estimate_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
             for slot, grams in sorted(by_slot.items())
         ]
     mm, grams = start.get("estimated_filament_mm"), start.get("estimated_filament_g")
-    if not mm and not grams:
+    ml = start.get("estimated_volume_ml")
+    if not mm and not grams and not ml:
         return []
     row: dict[str, Any] = {
         "slot": next(iter(by_slot), 0),
-        "estimatedSource": LENGTH if mm else WEIGHT,
+        "estimatedSource": VOLUME if ml else LENGTH if mm else WEIGHT,
     }
     if mm:
         row["estimatedLengthInM"] = round(mm / 1000, 4)
     if grams:
         row["estimatedAmountMg"] = round(grams * 1000)
+    if ml:
+        row["estimatedVolumeMl"] = round(ml, 2)
     return [row]
 
 
@@ -1527,6 +1538,7 @@ def _usage_rows(
     usage: list[dict[str, Any]] = []
     for slot in sorted(_fed(event)):
         mm, grams = event.filament_mm.get(slot, 0.0), event.filament_g.get(slot, 0.0)
+        ml = event.volume_ml.get(slot, 0.0)
         slot_swaps = [swap for swap in on_slot(swaps, slot) if is_split(swap)]
         metres: list[float] = []
         if mm > 0:
@@ -1536,21 +1548,27 @@ def _usage_rows(
             metres = _shares(mm / 1000, [length / 1000 for _, length in pieces], 4)
             fractions = [length / mm for _, length in pieces]
         else:
-            # Weighed only: split where the job had got to (its progress) at each swap.
+            # Weighed only, or a volume: split where the job had got to (its progress) at
+            # each swap.
             by_progress = [{**swap, "fed_mm": _progress(swap)} for swap in slot_swaps]
             pieces = [p for p in segments(1.0, spools.get(slot), by_progress) if p[1] > 0]
             fractions = [share for _, share in pieces]
         milligrams: list[float] = []
         if grams > 0:
             milligrams = _shares(grams * 1000, [grams * 1000 * f for f in fractions], 0)
+        milliliters: list[float] = []
+        if ml > 0:
+            milliliters = _shares(ml, [ml * f for f in fractions], 2)
         for n, (spool, _) in enumerate(pieces):
             piece: dict[str, Any] = {"slot": slot}
             if milligrams:
                 piece["amountMg"] = int(milligrams[n])
             if metres:
                 piece["lengthInM"] = metres[n]
-            piece["source"] = WEIGHT if milligrams else LENGTH
-            if event.usage_estimated:
+            if milliliters:
+                piece["volumeMl"] = milliliters[n]
+            piece["source"] = _source(piece)
+            if event.usage_estimated or milliliters:  # resin's is always the slicer's
                 piece["actualIsEstimate"] = True
             # One row per spool, and one row per slot with no spool (the API matches those by
             # slot, so it takes only one each).
@@ -1566,8 +1584,9 @@ def _usage_rows(
 
 
 def _fed(event: JobFinished) -> dict[int, float]:
-    """Each slot that fed anything, by length or by weight."""
-    fed = {slot: g for slot, g in event.filament_g.items() if g > 0}
+    """Each slot that fed anything, by length, by weight or by volume."""
+    fed = {slot: ml for slot, ml in event.volume_ml.items() if ml > 0}
+    fed.update({slot: g for slot, g in event.filament_g.items() if g > 0})
     fed.update({slot: mm for slot, mm in event.filament_mm.items() if mm > 0})
     return fed
 
@@ -1592,17 +1611,27 @@ def _add(row: dict[str, Any], piece: Mapping[str, Any]) -> None:
     them has is dropped, since it would be part of the spool's usage counted as all of it; an
     adapter reports every slot the same way, so that is only ever a spool on two slots that
     one weighed and the other measured."""
-    common = [m for m in ("amountMg", "lengthInM") if m in row and m in piece]
+    common = [m for m in MEASURES if m in row and m in piece]
     if not common:
         return
-    for measure in ("amountMg", "lengthInM"):
+    for measure in MEASURES:
         if measure not in common:
             row.pop(measure, None)
     if "amountMg" in common:
         row["amountMg"] += piece["amountMg"]
     if "lengthInM" in common:
         row["lengthInM"] = round(row["lengthInM"] + piece["lengthInM"], 4)
-    row["source"] = WEIGHT if "amountMg" in row else LENGTH
+    if "volumeMl" in common:
+        row["volumeMl"] = round(row["volumeMl"] + piece["volumeMl"], 2)
+    row["source"] = _source(row)
+
+
+def _source(row: Mapping[str, Any]) -> int:
+    """The measure a usage row is sent by: its volume, else its weight, else its length. Only a
+    resin printer reports a volume, and 3D Print Log measures its bottles in mL."""
+    if "volumeMl" in row:
+        return VOLUME
+    return WEIGHT if "amountMg" in row else LENGTH
 
 
 def _row_key(row: Mapping[str, Any]) -> tuple[int, str | None] | str:

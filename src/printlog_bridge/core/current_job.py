@@ -110,7 +110,7 @@ class CurrentJob:
             return [start]
         ended = finished_at or self.last_seen or self.clock()
         complete = outcome is None or outcome is JobOutcome.COMPLETED
-        grams, mm = _estimate(start) if complete else ({}, {})
+        grams, mm, ml = _estimate(start) if complete else ({}, {}, {})
         if outcome is None:
             note: str | None = UNSEEN_END_NOTE
         else:
@@ -123,8 +123,9 @@ class CurrentJob:
             duration_s=max(0.0, (ended - start.started_at).total_seconds()),
             filament_mm=mm,
             filament_g=grams,
-            usage_estimated=bool(grams or mm),
+            usage_estimated=bool(grams or mm or ml),
             note=note,
+            volume_ml=ml,
         )
         log.info(
             "[printer %s] job %s ended while the bridge wasn't connected: logged as %s",
@@ -134,18 +135,21 @@ class CurrentJob:
         return [start, finished]
 
 
-def _estimate(start: JobStarted) -> tuple[dict[int, float], dict[int, float]]:
-    """The slicer's estimate as usage: grams per slot when the file has them, else the totals
-    on slot 0."""
+def _estimate(
+    start: JobStarted,
+) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
+    """The slicer's estimate as usage (grams, millimeters, milliliters): grams per slot when
+    the file has them, else the totals on slot 0."""
     if start.estimated_filament_g_by_slot:
-        return dict(start.estimated_filament_g_by_slot), {}
+        return dict(start.estimated_filament_g_by_slot), {}, {}
     grams = {0: start.estimated_filament_g} if start.estimated_filament_g else {}
     mm = {0: start.estimated_filament_mm} if start.estimated_filament_mm else {}
-    return grams, mm
+    ml = {0: start.estimated_volume_ml} if start.estimated_volume_ml else {}
+    return grams, mm, ml
 
 
 def _start_payload(event: JobStarted) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "printer": event.printer,
         "job_id": event.job_id,
         "file_name": event.file_name,
@@ -157,6 +161,9 @@ def _start_payload(event: JobStarted) -> dict[str, Any]:
             str(slot): grams for slot, grams in event.estimated_filament_g_by_slot.items()
         },
     }
+    if event.estimated_volume_ml is not None:  # only then: a filament job's is as before #97
+        payload["estimated_volume_ml"] = event.estimated_volume_ml
+    return payload
 
 
 def _start_event(payload: Mapping[str, Any]) -> JobStarted:
@@ -175,4 +182,5 @@ def _start_event(payload: Mapping[str, Any]) -> JobStarted:
             int(slot): grams
             for slot, grams in (payload.get("estimated_filament_g_by_slot") or {}).items()
         },
+        estimated_volume_ml=payload.get("estimated_volume_ml"),
     )
