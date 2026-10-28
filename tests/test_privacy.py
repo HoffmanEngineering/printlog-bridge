@@ -13,11 +13,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import json
 import logging
 import re
+import subprocess
+import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -594,9 +597,19 @@ class TestOnlyOutboundConnections:
         local_page = {f for f in found if f.startswith("core/local_page.py:")}
         assert local_page
         assert DEFAULT_STATUS_PAGE_HOST == "127.0.0.1"
+        # `printlog-bridge probe`, which you run yourself, listens for announcements (UDP) while
+        # it runs, in probe/discovery.py's `open_udp`; only the `probe` command imports it.
+        probe_udp = {
+            f"probe/discovery.py:{number}"
+            for number, line in enumerate(
+                (SRC / "probe" / "discovery.py").read_text(encoding="utf-8").splitlines(), 1
+            )
+            if "sock.bind((" in line
+        }
+        assert len(probe_udp) == 1
         assert all(
             f.startswith("adapters/bambu/discovery.py:")
-            or f in listens_for_bambu | bind_udp | local_page
+            or f in listens_for_bambu | bind_udp | local_page | probe_udp
             for f in found
         )
         callers = {
@@ -637,7 +650,47 @@ class TestOnlyOutboundConnections:
             "adapters/bambu/ftps.py",
             "adapters/bambu/discovery.py",
             "adapters/prusalink/client.py",
+            # `printlog-bridge probe` only (docs/privacy.md, "The probe").
+            "probe/services.py",
+            "probe/discovery.py",
         }
+
+    def test_only_the_probe_command_imports_the_probe(self):
+        """The running bridge never probes: `printlog_bridge.probe` is imported only by the
+        `probe` command, inside its own functions in cli/main.py."""
+        importers = {
+            path.relative_to(SRC).as_posix()
+            for path in SRC.rglob("*.py")
+            if not path.relative_to(SRC).as_posix().startswith("probe/")
+            and "printlog_bridge.probe" in path.read_text(encoding="utf-8")
+        }
+        assert importers == {"cli/main.py"}
+        main = (SRC / "cli" / "main.py").read_text(encoding="utf-8")
+        top_level = [line for line in main.splitlines() if line.startswith("from printlog_bridge")]
+        assert not any("probe" in line for line in top_level)
+
+    def test_building_the_parser_and_run_load_nothing_of_the_probe(self, tmp_path):
+        """In a fresh interpreter: after `build_parser()`, and after `run` (with a config it
+        rejects, so it returns), no `printlog_bridge.probe` module is loaded."""
+        config = tmp_path / "broken.cfg"
+        config.write_text("[bridge\n", encoding="utf-8")
+        script = (
+            "import sys\n"
+            "from printlog_bridge.cli.main import build_parser, main\n"
+            "def probe_modules():\n"
+            "    return sorted(m for m in sys.modules if m.startswith('printlog_bridge.probe'))\n"
+            "build_parser()\n"
+            "after_parser = probe_modules()\n"
+            f"code = main(['run', '--config', {str(config)!r}])\n"
+            "print(repr((after_parser, code, probe_modules())))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+        )
+        after_parser, code, after_run = ast.literal_eval(result.stdout.strip().splitlines()[-1])
+        assert after_parser == []
+        assert code != 0
+        assert after_run == []
 
     @pytest.mark.parametrize(
         "url", ["http://api.3dprintlog.com", "http://192.168.1.5:5000", "http://example.test"]

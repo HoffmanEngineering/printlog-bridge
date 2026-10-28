@@ -2,6 +2,8 @@
 
 An adapter watches one kind of printer and reports its jobs to the bridge. Moonraker (Klipper) was the first, then Bambu Lab and PrusaLink; OctoPrint or anything else with an API can follow without a change to `core/`.
 
+For a printer whose local protocol isn't documented, start with `printlog-bridge probe <host>` (README, "Probing an unsupported printer"): one read-only trace of what it announces and answers, to work from and to turn into fixtures. Its code is in `src/printlog_bridge/probe/`; a new request it should send goes on the allow-list in `probe/allowlist.py`, with its source, and must be a read-only status query that doesn't return file names it doesn't need.
+
 ## Where things live
 
 ```

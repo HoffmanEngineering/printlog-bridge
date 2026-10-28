@@ -128,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="don't listen for Bambu Lab printers' announcements (UDP port 2021)",
     )
+    _add_probe(commands)
     for command in (doctor, run, status, store_key, pair, rotate_key, discover):
         command.add_argument(
             "--config",
@@ -137,6 +138,115 @@ def build_parser() -> argparse.ArgumentParser:
             "~/.config/printlog-bridge/printlog-bridge.cfg)",
         )
     return parser
+
+
+def _add_probe(commands) -> None:
+    """The `probe` command. Its description and the allow-list are filled in only when its help
+    is shown, so building the parser (for `run` too) imports nothing of `printlog_bridge.probe`.
+    """
+    probe = commands.add_parser(
+        "probe",
+        help="record, read-only, what an unsupported printer offers on the network, for a "
+        "future adapter",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    format_help = probe.format_help
+
+    def lazy_help() -> str:
+        from printlog_bridge.probe import allowlist, ports
+
+        port_list = ", ".join(str(p.port) for p in ports.PORTS)
+        probe.description = (
+            "Records what a printer the bridge doesn't support yet announces and answers on "
+            "the local network, into one JSON trace, and prints a summary. Strictly read-only: "
+            "it never sends anything that changes the printer's state.\n\n"
+            f"Ports checked: {port_list}."
+        )
+        probe.epilog = "Everything the probe sends (the allow-list):\n" + allowlist.describe()
+        return format_help()
+
+    probe.format_help = lazy_help  # type: ignore[method-assign]
+    probe.add_argument("host", help="the printer's IP address or host name")
+    probe.add_argument(
+        "--seconds",
+        type=float,
+        default=30,
+        help="how long to listen (default 30; 5 to 600). Longer during a print records more",
+    )
+    probe.add_argument(
+        "--out", type=Path, help="the trace file (default probe-<host>-<time>.json here)"
+    )
+    probe.add_argument(
+        "--redact",
+        action="store_true",
+        help="replace serial numbers, MAC and IP addresses, Wi-Fi, host and file names in the "
+        "trace with placeholders and remove credentials, for attaching it to a public issue",
+    )
+    probe.add_argument(
+        "--port",
+        type=int,
+        action="append",
+        default=[],
+        metavar="PORT",
+        help="another TCP port to check (connect, read a banner, GET /); repeat for more",
+    )
+    probe.add_argument(
+        "--photon",
+        action="store_true",
+        help="the printer is an Anycubic Photon (Mono X family): ask its TCP port 6000 for "
+        "sysinfo and getstatus. Without it, nothing is sent to port 6000",
+    )
+
+
+def _probe(args: argparse.Namespace) -> int:
+    from printlog_bridge.probe import allowlist
+    from printlog_bridge.probe import run as probe_run
+
+    if not probe_run.MIN_SECONDS <= args.seconds <= probe_run.MAX_SECONDS:
+        print(
+            f"printlog-bridge probe: --seconds must be {probe_run.MIN_SECONDS} to "
+            f"{probe_run.MAX_SECONDS}",
+            file=sys.stderr,
+        )
+        return 2
+    bad = [p for p in args.port if not 0 < p < 65536]
+    if bad:
+        print(f"printlog-bridge probe: not a port: {bad[0]}", file=sys.stderr)
+        return 2
+
+    print("The probe sends only this (the allow-list):")
+    print(allowlist.describe())
+    print(
+        f"\nProbing {args.host} for {args.seconds:g} s, read-only (Ctrl+C to stop)...",
+        flush=True,
+    )
+    probe = probe_run.Probe(
+        args.host, args.seconds, extra_ports=tuple(args.port), photon=args.photon
+    )
+    try:
+        asyncio.run(probe.run())
+    except probe_run.ProbeError as e:
+        print(f"printlog-bridge probe: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        probe.interrupted = True
+        if probe.address is None:
+            print("\nprintlog-bridge probe: stopped before it started", file=sys.stderr)
+            return 130
+        print("\nStopped: writing what was recorded so far.", flush=True)
+    trace = probe.trace()
+    written = probe_run.finish(trace, args.redact)  # `trace` itself keeps its addresses
+    out = args.out or Path(probe_run.default_name(args.host, args.redact))
+    try:
+        probe_run.write(written, out)
+    except OSError as e:
+        print(f"printlog-bridge probe: couldn't write {out}: {e}", file=sys.stderr)
+        out = None
+    print()
+    print(probe_run.summarize(trace, out))
+    if out is None:
+        return 1
+    return 130 if probe.interrupted else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -158,6 +268,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _rotate_key(args)
     if args.command == "discover":
         return _discover(args)
+    if args.command == "probe":
+        return _probe(args)
 
     parser.print_usage(sys.stderr)
     return 2
