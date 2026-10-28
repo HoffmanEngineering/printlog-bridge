@@ -101,11 +101,13 @@ class FakeHttp:
 
 
 class FakeWebsocket:
-    """`kind` is "creality" (path /, pushes a heart_beat and a status frame) or "sdcp" (path
-    /websocket, answers each request with a status message, and "pong" to "ping")."""
+    """`kind` is "creality" (path /, pushes a heart_beat and a status frame), "sdcp" (path
+    /websocket, answers each request with a status message, and "pong" to "ping"), or
+    "redirect" (path /, answers the handshake with a 302 to `location`)."""
 
-    def __init__(self, kind: str) -> None:
+    def __init__(self, kind: str, location: str = "") -> None:
         self.kind = kind
+        self.location = location
         self.received: list[str] = []
         self.http: list[str] = []
         self.protocols: list[str] = []
@@ -114,12 +116,20 @@ class FakeWebsocket:
 
     async def start(self) -> FakeWebsocket:
         app = web.Application()
+        if self.kind == "redirect":
+            app.router.add_get("/", self._redirect)
+            self._runner, self.port = await _serve(app)
+            return self
         path = "/" if self.kind == "creality" else "/websocket"
         app.router.add_get(path, self._ws)
         if self.kind == "sdcp":
             app.router.add_get("/", self._page)
         self._runner, self.port = await _serve(app)
         return self
+
+    async def _redirect(self, request: web.Request) -> web.Response:
+        self.http.append(f"{request.method} {request.raw_path}")
+        raise web.HTTPFound(self.location)
 
     async def _page(self, request: web.Request) -> web.Response:
         self.http.append(f"{request.method} {request.raw_path}")
@@ -185,8 +195,11 @@ def _mqtt_packet(first: int, body: bytes) -> bytes:
 
 
 class FakeMqtt:
-    def __init__(self, refuse: int = 0) -> None:
+    """`short_publish`: after the SUBSCRIBE, also send a PUBLISH too short to hold a topic."""
+
+    def __init__(self, refuse: int = 0, short_publish: bool = False) -> None:
         self.refuse = refuse
+        self.short_publish = short_publish
         self.packets: list[bytes] = []
         self.port = 0
         self._server: asyncio.AbstractServer | None = None
@@ -220,6 +233,8 @@ class FakeMqtt:
                     writer.write(_mqtt_packet(0x90, body[:2] + b"\x00"))
                     topic = f"device/{SERIAL}/report".encode()
                     report = json.dumps({"print": {"gcode_state": "RUNNING", "sn": SERIAL}})
+                    if self.short_publish:
+                        writer.write(_mqtt_packet(0x30, b"\x00"))
                     writer.write(
                         _mqtt_packet(0x30, struct.pack(">H", len(topic)) + topic + report.encode())
                     )
@@ -362,4 +377,89 @@ BAMBU_NOTIFY = (
     b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1990\r\nServer: UPnP/1.0\r\nLocation: "
     b"127.0.0.1\r\nNT: urn:bambulab-com:device:3dprinter:1\r\nUSN: 01S00C123456789\r\n"
     b"DevModel.bambu.com: C12\r\nDevName.bambu.com: P1S\r\n\r\n"
+)
+
+
+def mdns_bad_names(query: bytes) -> bytes | None:
+    """Lists service types a probe must not ask for (not `.local`, a label over 63 bytes) and
+    more good ones than fit in one query."""
+    if b"\x09_services" not in query:
+        return None
+    names = ["_foo._tcp", "_" + "a" * 70 + "._tcp.local"] + [f"_s{i}._tcp.local" for i in range(40)]
+    records = [_record("_services._dns-sd._udp.local", 12, _name_bytes(n)) for n in names]
+    return struct.pack("!HHHHHH", 0, 0x8400, 0, len(records), 0, 0) + b"".join(records)
+
+
+def _name_bytes(name: str) -> bytes:
+    """A DNS name, without encode_name's checks (a label may be too long, as a broken or
+    hostile printer could send: 64 and up are still read as a length)."""
+    out = b""
+    for label in name.strip(".").split("."):
+        raw = label.encode()
+        out += bytes([len(raw)]) + raw
+    return out + b"\x00"
+
+
+# -- what the adversarial review of #116 fed redact_trace -------------------------------------
+
+REVIEW_SERIAL = "00001A9F00030034"
+REVIEW_SSID = "MyHomeWiFi"
+REVIEW_TRACE = {
+    "probe": {"host": "creality-hi-a1b2c3.local", "address": "192.168.1.50"},
+    "allowList": [],
+    "events": [
+        {
+            "channel": "tcp:6000",
+            "message": {
+                "text": f"sysinfo,Photon Mono X 6K,V0.2.2,{REVIEW_SERIAL},{REVIEW_SSID},end"
+            },
+        },
+        {
+            "channel": "ws:9999/",
+            "message": {
+                "text": json.dumps(
+                    {
+                        "deviceSn": "F123456789ABCD",
+                        "printerSN": "Z99887766",
+                        "hostname": "K1C-7F3A",
+                        "printFileName": "/usr/data/printer_data/gcodes/Jane_Doe_gift_box.gcode",
+                        "wifiSsid": REVIEW_SSID,
+                        "webrtcUrl": "rtsp://admin:hunter22@192.168.1.50/live",
+                    }
+                )
+            },
+        },
+        {
+            "channel": "mqtt:1883",
+            "topic": "anycubic/anycubicCloud/v1/printer/public/20025/"
+            "0a1b2c3d4e5f60718293a4b5c6d7e8f9/status",
+            "message": {"text": "{}"},
+        },
+        {
+            "channel": "udp:mdns",
+            "records": [
+                {
+                    "name": "Creality-K1-a4c1381f22e0._http._tcp.local",
+                    "type": "SRV",
+                    "data": {"target": "K1-a4c1381f22e0.local"},
+                }
+            ],
+        },
+        {"channel": "x", "message": {"text": "mac a4c1381f22e0 / bssid A4C1.381F.22E0"}},
+    ],
+}
+REVIEW_LEAKS = (
+    REVIEW_SERIAL,
+    REVIEW_SSID,
+    "F123456789ABCD",
+    "Z99887766",
+    "K1C-7F3A",
+    "Jane_Doe",
+    "hunter22",
+    "admin:",
+    "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "a4c1381f22e0",
+    "A4C1.381F.22E0",
+    "creality-hi-a1b2c3",
+    "192.168.1.50",
 )

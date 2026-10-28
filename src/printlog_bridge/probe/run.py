@@ -4,6 +4,7 @@ one window; then the trace file and the summary."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import platform
 import re
@@ -36,10 +37,23 @@ class ProbeError(Exception):
     """The probe couldn't start (a host that doesn't resolve)."""
 
 
-async def resolve(host: str) -> str:
+RESOLVE_TIMEOUT_S = 5.0
+
+
+async def _getaddrinfo(host: str) -> list:
     loop = asyncio.get_running_loop()
+    return await loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+
+
+async def resolve(host: str) -> str:
+    """`host`'s IPv4 address. Raises `ProbeError` when it doesn't resolve, or not within
+    `RESOLVE_TIMEOUT_S` (a dead DNS server)."""
     try:
-        infos = await loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        infos = await asyncio.wait_for(_getaddrinfo(host), RESOLVE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise ProbeError(
+            f"can't resolve {host}: no answer within {RESOLVE_TIMEOUT_S:g} s"
+        ) from None
     except (socket.gaierror, UnicodeError) as e:
         raise ProbeError(f"can't resolve {host}: {e}") from None
     if not infos:
@@ -48,7 +62,13 @@ async def resolve(host: str) -> str:
 
 
 async def _identify(
-    rec: Recorder, client, address: str, port: ports.Port, deadline: float, disc: Discovery
+    rec: Recorder,
+    client,
+    address: str,
+    port: ports.Port,
+    deadline: float,
+    disc: Discovery,
+    photon: bool,
 ) -> None:
     kind = port.kind
     if kind in (ports.HTTP, ports.MOONRAKER):
@@ -68,41 +88,80 @@ async def _identify(
         await services.creality(rec, client, address, port.port, deadline)
     elif kind in (ports.MQTT, ports.MQTT_TLS):
         await services.mqtt(rec, address, port.port, kind == ports.MQTT_TLS, deadline)
-    elif kind == ports.PHOTON:
+    elif kind == ports.PHOTON and photon:
         await services.photon(rec, address, port.port)
+    elif kind == ports.PHOTON:
+        await services.banner(rec, address, port.port)
+        rec.note(
+            f"port {port.port} is open, and nothing was sent to it but a connect: the "
+            "Anycubic Photon's sysinfo and getstatus go only to a printer known to be a "
+            "Photon (run again with --photon)"
+        )
     else:
         await services.banner(rec, address, port.port)
 
 
-async def probe(
-    host: str,
-    seconds: float = 30,
-    *,
-    port_list: Sequence[ports.Port] = ports.PORTS,
-    extra_ports: Sequence[int] = (),
-    network: Network | None = None,
-) -> dict[str, Any]:
-    """Probes `host` for `seconds` and returns the trace (not redacted)."""
-    address = await resolve(host)
-    rec = Recorder()
-    started = rec.started
-    deadline = time.monotonic() + seconds
-    known = {p.port for p in port_list}
-    checked = list(port_list) + [ports.extra(p) for p in extra_ports if p not in known]
+class Probe:
+    """One probe of `host`. `run` fills the recorder as it goes, so `trace` has whatever was
+    recorded even when the run was stopped (Ctrl+C)."""
 
-    disc = Discovery(rec, address, network)
-    discovery = asyncio.ensure_future(disc.run(deadline))
-    results = await asyncio.gather(*(services.tcp_check(rec, address, p.port) for p in checked))
-    port_rows = [{**p.to_json(), **result} for p, result in zip(checked, results)]
+    def __init__(
+        self,
+        host: str,
+        seconds: float = 30,
+        *,
+        port_list: Sequence[ports.Port] = ports.PORTS,
+        extra_ports: Sequence[int] = (),
+        network: Network | None = None,
+        photon: bool = False,
+    ) -> None:
+        self.host = host
+        self.seconds = seconds
+        known = {p.port for p in port_list}
+        self.checked = list(port_list) + [ports.extra(p) for p in extra_ports if p not in known]
+        self.network = network
+        self.photon = photon
+        self.rec = Recorder()
+        self.address: str | None = None
+        self.port_rows: list[dict[str, Any]] = [{**p.to_json(), "open": None} for p in self.checked]
+        self.interrupted = False
 
-    async with services.session() as client:
-        work = [
-            asyncio.ensure_future(_identify(rec, client, address, p, deadline, disc))
-            for p, result in zip(checked, results)
-            if result["open"]
-        ]
-        everything = work + [discovery]
-        done, pending = await asyncio.wait(everything, timeout=seconds + GRACE_S)
+    async def run(self) -> None:
+        """Raises `ProbeError` when the host doesn't resolve."""
+        rec = self.rec
+        self.address = address = await resolve(self.host)
+        deadline = time.monotonic() + self.seconds
+        disc = Discovery(rec, address, self.network)
+        discovery = asyncio.ensure_future(disc.run(deadline))
+        try:
+            results = await asyncio.gather(
+                *(services.tcp_check(rec, address, p.port) for p in self.checked)
+            )
+            self.port_rows = [{**p.to_json(), **r} for p, r in zip(self.checked, results)]
+            async with services.session() as client:
+                work = [
+                    asyncio.ensure_future(
+                        _identify(rec, client, address, p, deadline, disc, self.photon)
+                    )
+                    for p, result in zip(self.checked, results)
+                    if result["open"]
+                ]
+                await self._wait(work + [discovery])
+        finally:
+            if not discovery.done():
+                discovery.cancel()
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait([discovery], timeout=2)
+
+    async def _wait(self, tasks: list[asyncio.Future]) -> None:
+        rec = self.rec
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=self.seconds + GRACE_S)
+        except asyncio.CancelledError:  # Ctrl+C: stop the work, keep what was recorded
+            for task in tasks:
+                task.cancel()
+            await asyncio.wait(tasks, timeout=2)
+            raise
         for task in pending:
             task.cancel()
         if pending:
@@ -111,51 +170,69 @@ async def probe(
         for task in done:
             error = task.exception()
             if isinstance(error, allowlist.NotAllowed):
-                raise error
-            if error is not None:
+                rec.error("probe", f"a task stopped at a send the allow-list refused: {error}")
+            elif error is not None:
                 rec.error("probe", f"{error.__class__.__name__}: {error}")
 
-    if sys.platform == "win32":
-        rec.note(
-            "Windows: Windows Defender Firewall drops unsolicited UDP (announcements, discovery "
-            "replies) for Python unless it is allowed on private networks. The 'discovery' "
-            "event counts datagrams from other hosts: if every count is 0, the firewall or "
-            "the network kept them out, not the printer."
-        )
+    def trace(self) -> dict[str, Any]:
+        """The trace so far (not redacted)."""
+        rec = self.rec
+        if self.interrupted:
+            rec.note("stopped early with Ctrl+C: the trace holds what was recorded until then")
+        if sys.platform == "win32":
+            rec.note(
+                "Windows: Windows Defender Firewall drops unsolicited UDP (announcements, "
+                "discovery replies) for Python unless it is allowed on private networks. The "
+                "'discovery' event counts datagrams from other hosts: if every count is 0, the "
+                "firewall or the network kept them out, not the printer."
+            )
+        return {
+            "probe": {
+                "tool": "printlog-bridge probe",
+                "version": __version__,
+                "host": self.host,
+                "address": self.address,
+                "started": datetime.fromtimestamp(rec.started, timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                "seconds": self.seconds,
+                "photon": self.photon,
+                "interrupted": self.interrupted,
+                "platform": f"{platform.system()} {platform.release()}",
+                "python": platform.python_version(),
+                "redacted": False,
+            },
+            "allowList": allowlist.to_json(),
+            "limits": {
+                "httpBodyBytes": MAX_BODY,
+                "messageBytes": MAX_MESSAGE,
+                "messagesPerChannel": MAX_PER_CHANNEL,
+                "events": MAX_EVENTS,
+            },
+            "ports": self.port_rows,
+            "events": rec.events,
+            "notCounted": dict(rec.dropped),
+            "notes": rec.notes,
+            "sentCount": len(rec.sent),
+            "refused": [{"rule": r, "error": e} for r, e in rec.refused],
+        }
 
-    return {
-        "probe": {
-            "tool": "printlog-bridge probe",
-            "version": __version__,
-            "host": host,
-            "address": address,
-            "started": datetime.fromtimestamp(started, timezone.utc).isoformat(timespec="seconds"),
-            "seconds": seconds,
-            "platform": f"{platform.system()} {platform.release()}",
-            "python": platform.python_version(),
-            "redacted": False,
-        },
-        "allowList": allowlist.to_json(),
-        "limits": {
-            "httpBodyBytes": MAX_BODY,
-            "messageBytes": MAX_MESSAGE,
-            "messagesPerChannel": MAX_PER_CHANNEL,
-            "events": MAX_EVENTS,
-        },
-        "ports": port_rows,
-        "events": rec.events,
-        "notCounted": dict(rec.dropped),
-        "notes": rec.notes,
-        "sentCount": len(rec.sent),
-    }
+
+async def probe(host: str, seconds: float = 30, **options: Any) -> dict[str, Any]:
+    """Probes `host` for `seconds` and returns the trace (not redacted)."""
+    run = Probe(host, seconds, **options)
+    await run.run()
+    return run.trace()
 
 
 REDACTED_NOTE = (
-    "redacted: credentials removed; serial numbers, MAC and IP addresses replaced with "
-    "placeholders; binary payloads dropped. Look it over before you post it."
+    "redacted: credentials removed; serial numbers, MAC and IP addresses, Wi-Fi and host names "
+    "and file names replaced with placeholders; binary payloads dropped. Look it over before "
+    "you post it: free text, such as a printer's own name, can still identify it."
 )
 RAW_NOTE = (
-    "NOT redacted: it may hold serial numbers, MAC and IP addresses and tokens. Keep it "
+    "NOT redacted: it may hold serial numbers, MAC and IP addresses, Wi-Fi names, file "
+    "names and tokens. Keep it "
     "private, or run the probe again with --redact before attaching it to a public issue."
 )
 
@@ -222,7 +299,8 @@ def _title(html: str) -> str | None:
 
 
 def summarize(trace: dict[str, Any], out: Path | None) -> str:
-    """A short human summary. Credentials, identifiers and MACs are always hidden in it."""
+    """A short human summary. It never shows mDNS records or a Photon's answers as they came
+    (the trace has them), and hides what `--redact` hides but IP addresses."""
     info = trace["probe"]
     events = trace["events"]
     lines = [
@@ -249,14 +327,7 @@ def summarize(trace: dict[str, Any], out: Path | None) -> str:
         heard = True
         lines.append(f"  {label}: {len(received)} datagram(s)")
         if source == "mdns":
-            shown = set()
-            for event in received:
-                for record in event.get("records", []):
-                    if record["type"] in ("SRV", "TXT") and len(shown) < 12:
-                        item = f"    {record['type']} {record['name']}: {record['data']}"
-                        if item not in shown:
-                            shown.add(item)
-                            lines.append(_cut(item, 200))
+            lines += _mdns_lines(received)
         else:
             for text in dict.fromkeys(_text(e.get("message")) for e in received[:3]):
                 lines.append("    " + _cut(text, 200))
@@ -295,12 +366,51 @@ def summarize(trace: dict[str, Any], out: Path | None) -> str:
     ]
     if by_rule:
         lines.append(_cut("  " + ", ".join(f"{k} {v}" for k, v in by_rule.items()), 200))
+    if trace.get("refused"):
+        lines.append(
+            f"Refused by the allow-list and not sent: {len(trace['refused'])} (see 'refused')"
+        )
     if out is not None:
         lines.append(f"Trace: {out}")
         lines.append(f"  {info['mode']}")
-    lines.append("Summary: credentials, serial numbers and MAC addresses hidden.")
+    lines.append(
+        "Summary: credentials, serial numbers, MAC addresses, Wi-Fi, host and file names are "
+        "hidden; IP addresses are shown. mDNS records and raw answers are only in the trace."
+    )
     redactor = summary_redactor(trace)
     return "\n".join(redactor.text(line) for line in lines)
+
+
+def _mdns_lines(received: list[dict[str, Any]]) -> list[str]:
+    """Each service type the printer answered for, its port and its TXT keys (not values)."""
+    services: dict[str, dict[str, Any]] = {}
+    for event in received:
+        for record in event.get("records", []):
+            name = str(record.get("name", ""))
+            service = ".".join(name.split(".")[-3:]) if name.count(".") >= 2 else name
+            if record["type"] == "SRV" and isinstance(record.get("data"), dict):
+                entry = services.setdefault(service, {"ports": set(), "txt": set()})
+                entry["ports"].add(record["data"].get("port"))
+            elif record["type"] == "TXT" and isinstance(record.get("data"), list):
+                entry = services.setdefault(service, {"ports": set(), "txt": set()})
+                entry["txt"].update(str(t).partition("=")[0] for t in record["data"] if t)
+    lines = []
+    for service, entry in sorted(services.items())[:12]:
+        ports_text = ", ".join(str(p) for p in sorted(entry["ports"]) if p) or "?"
+        keys = ", ".join(sorted(entry["txt"])) or "none"
+        lines.append(_cut(f"    {service}: port {ports_text}; TXT keys: {keys}", 200))
+    return lines
+
+
+def _photon_answer(text: str) -> str:
+    """A Photon's answer without its serial or Wi-Fi name: its size, and for `sysinfo` the
+    model and firmware, for `getstatus` the state."""
+    fields = text.split(",")
+    if fields[:1] == ["sysinfo"] and len(fields) >= 3:
+        return _cut(f"model {fields[1]}, firmware {fields[2]} ({len(text)} bytes)", 150)
+    if fields[:1] == ["getstatus"] and len(fields) >= 2:
+        return f"state {fields[1]} ({len(text)} bytes)"
+    return f"{len(text)} bytes"
 
 
 def _port_lines(port: int, by_channel: dict[str, list[dict[str, Any]]]) -> list[str]:
@@ -321,7 +431,7 @@ def _port_lines(port: int, by_channel: dict[str, list[dict[str, Any]]]) -> list[
                 title = _title(text) if "html" in kind else None
                 if title:
                     detail += f', title "{title}"'
-                lines.append(f"    GET {event['path']} -> {event['status']} ({detail})")
+                lines.append(f"    GET {event['request']} -> {event['status']} ({detail})")
                 if "json" in kind and text:
                     lines.append("      " + _cut(text, 150))
             elif event["kind"] == "error":
@@ -355,7 +465,7 @@ def _port_lines(port: int, by_channel: dict[str, list[dict[str, Any]]]) -> list[
         lines.append(_cut(f"    MQTT topics: {', '.join(sorted(topics))}", 200))
     for event in by_channel.get(f"tcp:{port}", []):
         if event["kind"] == "receive" and "query" in event:
-            lines.append(f"    {event['query']}: " + _cut(_text(event["message"]), 150))
+            lines.append(f"    {event['query']}: {_photon_answer(_text(event['message']))}")
         elif event["kind"] == "receive" and event.get("banner"):
             lines.append("    banner: " + _cut(_text(event["banner"]), 150))
         elif event["kind"] == "error":

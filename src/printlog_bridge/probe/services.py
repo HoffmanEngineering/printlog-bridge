@@ -95,11 +95,33 @@ async def banner(rec: Recorder, address: str, port: int, seconds: float = BANNER
         await _close(writer)
 
 
+class RedirectRefused(aiohttp.ClientError):
+    """The device answered with a redirect, which the probe never follows: the new address
+    and path aren't on the allow-list."""
+
+    def __init__(self, status: int, location: str | None) -> None:
+        self.status = status
+        self.location = location
+        super().__init__(f"HTTP {status} redirect to {location or '?'} (not followed)")
+
+
+async def _refuse_redirect(session, context, params) -> None:
+    location = params.response.headers.get("Location")
+    params.response.close()
+    raise RedirectRefused(params.response.status, location)
+
+
 def session() -> aiohttp.ClientSession:
+    """The probe's HTTP client. It never follows a redirect: `http_get` asks not to, and a
+    trace hook stops any request that would (aiohttp's `ws_connect` has no such option and
+    follows up to 10, to any host) before the next request is made."""
+    tracing = aiohttp.TraceConfig()
+    tracing.on_request_redirect.append(_refuse_redirect)
     return aiohttp.ClientSession(
         headers={"User-Agent": USER_AGENT},
         timeout=aiohttp.ClientTimeout(total=None, connect=CONNECT_TIMEOUT_S),
         cookie_jar=aiohttp.DummyCookieJar(),
+        trace_configs=[tracing],
     )
 
 
@@ -115,7 +137,7 @@ async def http_get(
     """GETs `path` and records the status, headers and up to `MAX_BODY` of the body (reading for
     at most `seconds`, as a webcam's stream never ends). Returns the recorded answer."""
     channel = f"{scheme}:{port}"
-    rec.send("http-get", channel, f"GET {path}", path=path)
+    rec.send("http-get", channel, f"GET {path}", request=path)
     host = f"[{address}]" if ":" in address else address
     url = URL(f"{scheme}://{host}:{port}{path}", encoded=True)
     deadline = time.monotonic() + seconds
@@ -153,7 +175,7 @@ async def http_get(
     for name, value in response.headers.items():
         headers[name] = f"{headers[name]}, {value}" if name in headers else value
     answer = {
-        "path": path,
+        "request": path,
         "status": response.status,
         "reason": response.reason,
         "headers": headers,
@@ -200,6 +222,10 @@ async def websocket(
         return
     except aiohttp.WSServerHandshakeError as e:
         rec.error(channel, f"handshake refused: HTTP {e.status} {e.message}")
+        return
+    except RedirectRefused as e:
+        rec.receive(channel, refused=True, status=e.status, location=e.location)
+        rec.error(channel, f"handshake refused: {e}")
         return
     except (aiohttp.ClientError, OSError) as e:
         rec.error(channel, f"couldn't connect: {e.__class__.__name__}: {e}")
@@ -460,7 +486,11 @@ async def mqtt(rec: Recorder, address: str, port: int, tls: bool, deadline: floa
                 continue
             kind = first >> 4
             if kind == 3:  # PUBLISH
-                length = struct.unpack(">H", body[:2])[0]
+                try:
+                    length = struct.unpack(">H", body[:2])[0]
+                except struct.error:
+                    rec.receive(channel, malformed=payload(body), note="a PUBLISH too short")
+                    continue
                 topic = body[2 : 2 + length].decode("utf-8", errors="replace")
                 offset = 2 + length + (2 if first & 0x06 else 0)
                 rec.receive(channel, topic=topic, message=payload(body[offset:]))

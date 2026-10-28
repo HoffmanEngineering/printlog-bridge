@@ -27,6 +27,10 @@ from printlog_bridge.probe import allowlist
 from printlog_bridge.probe.record import Recorder, payload
 
 MDNS_FOLLOW_UP_S = 2.5
+MAX_QUESTIONS = 32
+"""Service types per mDNS query (the allow-list's limit)."""
+MAX_LEARNED = 64
+"""Service types learned from the printer that are asked for, at most."""
 BOARD_WAIT_S = 3.0
 RECORD_TYPES = {1: "A", 12: "PTR", 16: "TXT", 28: "AAAA", 33: "SRV", 13: "HINFO", 47: "NSEC"}
 
@@ -47,6 +51,15 @@ class Network:
     """(source, UDP port, multicast group to join) for passive announcements."""
     chitu_port: int = 3000
     broadcast: str = "255.255.255.255"
+
+
+def valid_service(name: str) -> bool:
+    """Whether a service type the printer listed may be asked for: a `.local` name whose labels
+    are 1 to 63 bytes, as the allow-list takes. Anything else is recorded, never asked."""
+    if not isinstance(name, str) or not name.lower().endswith(".local") or len(name) > 200:
+        return False
+    labels = name.strip(".").split(".")
+    return all(0 < len(label.encode("utf-8")) <= 63 for label in labels)
 
 
 def mdns_query(services: Sequence[str]) -> bytes:
@@ -251,9 +264,12 @@ class Discovery:
                 )
 
     def _sendto(self, transport, rule: str, source: str, data: bytes, target) -> None:
-        self.rec.send(
-            rule, f"udp:{source}", data, to=f"{target[0]}:{target[1]}", message=payload(data)
-        )
+        try:
+            self.rec.send(
+                rule, f"udp:{source}", data, to=f"{target[0]}:{target[1]}", message=payload(data)
+            )
+        except allowlist.NotAllowed:
+            return  # recorded as refused; discovery goes on
         try:
             transport.sendto(data, target)
         except OSError as e:
@@ -264,9 +280,10 @@ class Discovery:
         if not services or self._mdns is None:
             return
         self._services_asked.update(s.lower() for s in services)
-        packet = mdns_query(services)
-        for target in (self.network.mdns_group, (self.address, self.network.mdns_port)):
-            self._sendto(self._mdns, "udp-mdns-query", "mdns", packet, target)
+        for start in range(0, len(services), MAX_QUESTIONS):
+            packet = mdns_query(services[start : start + MAX_QUESTIONS])
+            for target in (self.network.mdns_group, (self.address, self.network.mdns_port)):
+                self._sendto(self._mdns, "udp-mdns-query", "mdns", packet, target)
 
     async def _ask_mdns_again(self) -> None:
         await self._ask_mdns(sorted(self._learned_services))
@@ -275,7 +292,14 @@ class Discovery:
         records = mdns_records(data)
         for record in records:
             if record["type"] == "PTR" and record["name"].lower() == "_services._dns-sd._udp.local":
-                self._learned_services = self._learned_services | {str(record["data"])}
+                name = str(record["data"])
+                if not valid_service(name):
+                    self.rec.note(
+                        f"mDNS: the printer listed a service type that isn't a valid "
+                        f".local name, not asked for: {name[:80]!r}"
+                    )
+                elif len(self._learned_services) < MAX_LEARNED:
+                    self._learned_services = self._learned_services | {name}
         return {"records": records}
 
     def _parse_chitu(self, data: bytes) -> dict[str, Any]:

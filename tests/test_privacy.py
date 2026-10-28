@@ -13,11 +13,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import json
 import logging
 import re
+import subprocess
+import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -665,6 +668,29 @@ class TestOnlyOutboundConnections:
         main = (SRC / "cli" / "main.py").read_text(encoding="utf-8")
         top_level = [line for line in main.splitlines() if line.startswith("from printlog_bridge")]
         assert not any("probe" in line for line in top_level)
+
+    def test_building_the_parser_and_run_load_nothing_of_the_probe(self, tmp_path):
+        """In a fresh interpreter: after `build_parser()`, and after `run` (with a config it
+        rejects, so it returns), no `printlog_bridge.probe` module is loaded."""
+        config = tmp_path / "broken.cfg"
+        config.write_text("[bridge\n", encoding="utf-8")
+        script = (
+            "import sys\n"
+            "from printlog_bridge.cli.main import build_parser, main\n"
+            "def probe_modules():\n"
+            "    return sorted(m for m in sys.modules if m.startswith('printlog_bridge.probe'))\n"
+            "build_parser()\n"
+            "after_parser = probe_modules()\n"
+            f"code = main(['run', '--config', {str(config)!r}])\n"
+            "print(repr((after_parser, code, probe_modules())))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+        )
+        after_parser, code, after_run = ast.literal_eval(result.stdout.strip().splitlines()[-1])
+        assert after_parser == []
+        assert code != 0
+        assert after_run == []
 
     @pytest.mark.parametrize(
         "url", ["http://api.3dprintlog.com", "http://192.168.1.5:5000", "http://example.test"]

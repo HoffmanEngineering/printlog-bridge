@@ -85,12 +85,12 @@ CREALITY_REQUESTS = (
     '{"method":"get","params":{"ReqPrinterPara":1}}',
     '{"method":"get","params":{"reqPrintObjects":1}}',
     '{"method":"get","params":{"boxsInfo":1}}',
-    '{"method":"get","params":{"reqGcodeFile":1}}',
 )
 """Creality's stock websocket (port 9999, subprotocol `wsslicer`): the `get` requests the Home
-Assistant integration 3dg1luk43/ha_creality_ws sends for status, current objects, CFS boxes and
-the current file (docs/internal/reference/01-protocol-and-core.md, "Requests"). Its `set`
-requests (pause, stop, temperatures, fans, lights, G-code) are never sent."""
+Assistant integration 3dg1luk43/ha_creality_ws sends for status, current objects and CFS boxes
+(docs/internal/reference/01-protocol-and-core.md, "Requests"). Its `set` requests (pause, stop,
+temperatures, fans, lights, G-code) are never sent, and neither is `reqGcodeFile`: an adapter
+needs only its shape, and its answer is the largest message and full of file names."""
 CREALITY_HEARTBEAT_REPLY = "ok"
 """The literal text Creality's websocket expects in answer to `{"ModeCode":"heart_beat"}`
 (same source, 1.2)."""
@@ -169,7 +169,9 @@ RULES = (
     ),
     Rule(
         "photon-query",
-        'on TCP 6000: the texts "' + '" and "'.join(PHOTON_QUERIES) + '"',
+        'only with --photon, on TCP 6000: the texts "'
+        + '" and "'.join(PHOTON_QUERIES)
+        + '". Without it, port 6000 only gets a connect and a banner read',
         "adamoutler/anycubic-python README",
     ),
 )
@@ -227,6 +229,8 @@ def _mdns(payload: Any) -> None:
             name, offset = read_name(data, offset)
             kind, klass = struct.unpack_from("!HH", data, offset)
             offset += 4
+            if any(len(label.encode("utf-8")) > 63 for label in name.split(".")):
+                raise NotAllowed(f"an mDNS name with a label over 63 bytes: {name[:80]}")
             if kind != 12 or klass & 0x7FFF != 1 or not name.lower().endswith(".local"):
                 raise NotAllowed(f"an mDNS question other than PTR for .local: {name}")
         if offset != len(data):

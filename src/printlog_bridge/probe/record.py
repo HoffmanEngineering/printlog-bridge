@@ -57,6 +57,8 @@ class Recorder:
         self.notes: list[str] = []
         self.sent: list[tuple[str, Any]] = []
         """Every (rule, payload) sent, in order, for tests."""
+        self.refused: list[tuple[str, str]] = []
+        """Every send the allow-list stopped, as (rule, why)."""
         self._per_channel: Counter[str] = Counter()
         self.dropped: Counter[str] = Counter()
 
@@ -80,9 +82,15 @@ class Recorder:
         self.events.append(event)
 
     def send(self, rule: str, channel: str, checked: Any, **data: Any) -> None:
-        """Checks `checked` against `rule` (raising `allowlist.NotAllowed`), then records it.
-        Call it before the bytes go out."""
-        allowlist.check(rule, checked)
+        """Checks `checked` against `rule`, then records it. Call it before the bytes go out.
+        Something the allow-list refuses is recorded as `refused` (never sent) and raises
+        `allowlist.NotAllowed`, which ends only the task that tried."""
+        try:
+            allowlist.check(rule, checked)
+        except allowlist.NotAllowed as e:
+            self.refused.append((rule, str(e)))
+            self._add(channel, "refused", {"rule": rule, "error": str(e)})
+            raise
         self.sent.append((rule, checked))
         self._add(channel, "send", {"rule": rule, **data})
 
