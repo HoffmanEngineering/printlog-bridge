@@ -2,8 +2,9 @@
 
 PrusaLink advertises itself over mDNS for PrusaSlicer to find: `_prusa-link._tcp`, and also as
 `_octoprint._tcp`, which OctoPrint itself uses. An `_octoprint._tcp` answer counts only when its
-TXT record names Prusa; plain OctoPrint gets its own adapter (#83-#89). Nothing is asked of the
-printer: PrusaLink wants its password for everything, and the bridge doesn't have it yet.
+TXT record names Prusa; any other is OctoPrint's (`adapters/octoprint/discovery.py`). Nothing
+is asked of the printer: PrusaLink wants its password for everything, and the bridge doesn't
+have it yet.
 
 Not seen on a real network yet (October 2026): which TXT keys each firmware sends is a guess from
 PrusaSlicer's browser, so the Prusa test is deliberately loose (any key or value naming Prusa).

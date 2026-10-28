@@ -1,0 +1,69 @@
+{
+ "_credentials_seen": "2026-10-28T01:30:11+00:00",
+ "_is_external_client": false,
+ "_login_mechanism": "apikey",
+ "active": true,
+ "admin": true,
+ "apikey": "<api key>",
+ "groups": [
+  "admins"
+ ],
+ "name": "admin",
+ "needs": {
+  "group": [
+   "admins"
+  ],
+  "role": [
+   "plugin_pluginmanager_manage",
+   "plugin_announcements_read",
+   "connection",
+   "files_select",
+   "files_list",
+   "settings",
+   "timelapse_list",
+   "timelapse_delete",
+   "plugin_pluginmanager_list",
+   "plugin_firmware_check_display",
+   "plugin_file_check_run",
+   "admin",
+   "status",
+   "files_upload",
+   "webcam",
+   "monitor_terminal",
+   "plugin_achievements_view",
+   "plugin_pluginmanager_install",
+   "plugin_achievements_reset",
+   "plugin_action_command_notification_show",
+   "plugin_action_command_prompt_interact",
+   "files_delete",
+   "plugin_announcements_manage",
+   "print",
+   "plugin_appkeys_admin",
+   "plugin_backup_create",
+   "timelapse_download",
+   "plugin_logging_manage",
+   "plugin_appkeys_user",
+   "plugin_softwareupdate_update",
+   "system",
+   "plugin_action_command_notification_clear",
+   "slice",
+   "plugin_health_check_check",
+   "plugin_softwareupdate_configure",
+   "timelapse_manage_unrendered",
+   "gcodeviewer",
+   "plugin_softwareupdate_check",
+   "control",
+   "timelapse_admin",
+   "files_download",
+   "settings_read"
+  ]
+ },
+ "permissions": [],
+ "roles": [
+  "user",
+  "admin"
+ ],
+ "session": "<session>",
+ "settings": {},
+ "user": true
+}

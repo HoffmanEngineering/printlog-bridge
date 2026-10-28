@@ -1,0 +1,54 @@
+{
+ "date": 1793151015,
+ "display": "cube.gcode",
+ "gcodeAnalysis": {
+  "dimensions": {
+   "depth": 0.0,
+   "height": 0.28,
+   "width": 60.0
+  },
+  "estimatedPrintTime": 7.798799999999999,
+  "filament": {
+   "tool0": {
+    "length": 25.0,
+    "volume": 0.06013204688511713
+   }
+  },
+  "printingArea": {
+   "maxX": 60.0,
+   "maxY": 3.0,
+   "maxZ": 0.28,
+   "minX": 0.0,
+   "minY": 3.0,
+   "minZ": 0.0
+  },
+  "travelArea": {
+   "maxX": 70.0,
+   "maxY": 3.0,
+   "maxZ": 0.5800000000000001,
+   "minX": 0.0,
+   "minY": 0.0,
+   "minZ": 0.0
+  },
+  "travelDimensions": {
+   "depth": 3.0,
+   "height": 0.5800000000000001,
+   "width": 70.0
+  }
+ },
+ "hash": "c205ba1dfb69b9bdf788ceec4cc3d7ab1374c747",
+ "name": "cube.gcode",
+ "origin": "local",
+ "path": "cube.gcode",
+ "refs": {
+  "download": "http://127.0.0.1:15180/downloads/files/local/cube.gcode",
+  "resource": "http://127.0.0.1:15180/api/files/local/cube.gcode"
+ },
+ "size": 14984,
+ "type": "machinecode",
+ "typePath": [
+  "machinecode",
+  "gcode"
+ ],
+ "user": "admin"
+}

@@ -12,7 +12,8 @@ configuration:
         name: Adapter
         description: >-
           moonraker for Klipper printers (Voron, Snapmaker U1, Creality K1/K2...), bambu for
-          Bambu Lab printers, prusalink for Prusa printers.
+          Bambu Lab printers, prusalink for Prusa printers, octoprint for printers run by
+          OctoPrint.
       printer_id:
         name: Printer ID
         description: >-
@@ -20,8 +21,10 @@ configuration:
           (www.3dprintlog.com/printers/42). After pairing, the log lists your printers with
           their numbers.
       url:
-        name: Moonraker URL
-        description: "moonraker: the printer's Moonraker address, such as http://192.168.1.20:7125."
+        name: URL
+        description: >-
+          moonraker: the printer's Moonraker address, such as http://192.168.1.20:7125.
+          octoprint: OctoPrint's address, such as http://octopi.local.
       host:
         name: Host
         description: "bambu, prusalink: the printer's IP address or host name."
@@ -38,7 +41,8 @@ configuration:
         name: Printer API key
         description: >-
           moonraker: Moonraker's API key, only when its [authorization] doesn't trust this
-          host. prusalink: the API key of older firmware, instead of a password.
+          host. prusalink: the API key of older firmware, instead of a password. octoprint: a key
+          from OctoPrint's Settings > Application Keys.
       username:
         name: PrusaLink user
         description: "prusalink: the user, when it isn't maker."

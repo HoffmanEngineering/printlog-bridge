@@ -378,3 +378,32 @@ def test_bridge_json_keeps_the_bridge_id_and_only_sealed_values(tmp_path):
     bridge_id, stored = asyncio.run(scenario())
     assert stored["bridge_id"] == bridge_id
     assert "hunter2-password" not in json.dumps(stored)
+
+
+def test_a_sealed_octoprint_key_is_used_and_a_refused_one_reported(tmp_path):
+    from fake_octoprint import FakeOctoPrint
+
+    async def scenario():
+        printer = FakeOctoPrint(api_key="right-key")
+        url = await printer.start()
+        port = int(url.rsplit(":", 1)[1])
+        try:
+            async with running(tmp_path) as (api, _, _):
+                await until(lambda: api.bridge().get("publicKey"), 5)
+                entry = api.connect("octoprint", "127.0.0.1", 42, port=port)
+                await until(lambda: app_state(tmp_path, entry).get("state"), 5)
+                api.set_secret(entry, "api_key", "wrong-key")
+                await until(lambda: issues_now(api), 10)
+                refused = issues_now(api)
+                api.set_secret(entry, "api_key", "right-key")
+                await until(lambda: connection(tmp_path, entry) == "connected", 10)
+                await until(lambda: issues_now(api) == [], 5)
+                return entry, refused, app_state(tmp_path, entry)
+        finally:
+            await printer.close()
+
+    entry, refused, state = asyncio.run(scenario())
+    assert refused == [{"entryId": entry, "field": "api_key", "code": "rejected_by_printer"}]
+    assert state["state"] == "watching"
+    written = b"".join(p.read_bytes() for p in (tmp_path / "state").rglob("*") if p.is_file())
+    assert b"right-key" not in written
