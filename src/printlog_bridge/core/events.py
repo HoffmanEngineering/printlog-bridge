@@ -35,6 +35,9 @@ class JobStarted:
     estimated_filament_g_by_slot: Mapping[int, float] = field(default_factory=dict)
     """The slicer's estimate per slot (tool index), in grams, when the file has one per tool.
     Empty for a file with a single filament, whose estimate is the totals above."""
+    estimated_volume_ml: float | None = None
+    """The slicer's estimate of resin, in milliliters (#97), for a resin printer: its vat is
+    slot 0. From the sliced file's header (`adapters/common/resin_files.py`)."""
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,10 @@ class JobFinished:
     note: str | None = None
     """For the print's notes: why it failed, such as "Klipper shutdown", and what else the
     user would want to know, such as objects they cancelled mid-print."""
+    volume_ml: Mapping[int, float] = field(default_factory=dict)
+    """Material used per slot, in milliliters (#97), for a resin printer (the vat is slot 0). A
+    slot with a volume is sent by volume, and is always marked an estimate: resin usage is the
+    slicer's figure, whatever `usage_estimated` says."""
 
 
 @dataclass(frozen=True)

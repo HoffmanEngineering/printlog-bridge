@@ -1715,6 +1715,7 @@ def _row(sent: dict[str, Any], filament_id: str | None) -> dict[str, Any]:
         "filament": {"id": filament_id} if filament_id else None,
         "estimatedAmountMg": sent.get("estimatedAmountMg"),
         "estimatedLengthInM": sent.get("estimatedLengthInM"),
+        "estimatedVolumeMl": sent.get("estimatedVolumeMl"),
         "estimatedSource": sent.get("estimatedSource"),
         "amountMg": sent.get("amountMg"),
         "lengthInM": sent.get("lengthInM"),
