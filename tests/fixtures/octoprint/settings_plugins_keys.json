@@ -1,0 +1,20 @@
+[
+ "achievements",
+ "action_command_notification",
+ "action_command_prompt",
+ "announcements",
+ "backup",
+ "classicwebcam",
+ "discovery",
+ "errortracking",
+ "eventmanager",
+ "file_check",
+ "firmware_check",
+ "gcodeviewer",
+ "health_check",
+ "logging",
+ "pluginmanager",
+ "softwareupdate",
+ "tracking",
+ "virtual_printer"
+]

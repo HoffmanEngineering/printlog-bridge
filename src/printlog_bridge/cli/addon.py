@@ -63,6 +63,7 @@ ADAPTER_FIELDS: Mapping[str, Mapping[str, str]] = {
     "prusalink": {
         "host": "host", "password": "password", "api_key": "api_key", "username": "username"
     },
+    "octoprint": {"url": "url", "api_key": "api_key"},
 }  # fmt: skip
 REQUIRED: Mapping[str, Sequence[str]] = {"moonraker": ("url",)}
 """Without `url`, a Moonraker printer is watched over the local socket, which an app has not.

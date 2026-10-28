@@ -1,36 +1,34 @@
 """Finding Prusa printers (PrusaLink) on the LAN while the bridge runs (#100).
 
-PrusaLink advertises itself over mDNS for PrusaSlicer to find: `_prusa-link._tcp`, and also as
-`_octoprint._tcp`, which OctoPrint itself uses. An `_octoprint._tcp` answer counts only when its
-TXT record names Prusa; plain OctoPrint gets its own adapter (#83-#89). Nothing is asked of the
-printer: PrusaLink wants its password for everything, and the bridge doesn't have it yet.
+PrusaLink advertises itself over mDNS as `_prusalink._tcp` (Buddy firmware and PrusaLink on a
+Raspberry Pi alike), and PrusaLink on a Pi also as `_octoprint._tcp`, for older PrusaSlicer.
+An `_octoprint._tcp` answer is PrusaLink's only when it isn't OctoPrint's and names Prusa
+(`adapters/common/mdns.py`); the rest is OctoPrint's (`adapters/octoprint/discovery.py`).
+`_prusa-link._tcp`, which the first version asked for, is still asked for too. Nothing is asked
+of the printer: PrusaLink wants its password for everything, and the bridge doesn't have it yet.
 
-Not seen on a real network yet (October 2026): which TXT keys each firmware sends is a guess from
-PrusaSlicer's browser, so the Prusa test is deliberately loose (any key or value naming Prusa).
+Not seen on a real network yet (October 2026): which TXT keys each firmware sends is from
+Prusa's sources (Buddy's `lib/WUI/mdns/mdns.c` sends none; Prusa-Link's
+`service_discovery.py` sends `path`), so the model and serial are read loosely.
 """
 
 from __future__ import annotations
 
+from printlog_bridge.adapters.common.mdns import (
+    OCTOPRINT_SERVICE,
+    PRUSALINK_SERVICES,
+    is_prusalink,
+)
 from printlog_bridge.core.discovery import Discovery, Found
 from printlog_bridge.core.mdns import MdnsAnswer
-
-PRUSALINK_SERVICE = "_prusa-link._tcp.local"
-OCTOPRINT_SERVICE = "_octoprint._tcp.local"
-
-
-def is_prusa(answer: MdnsAnswer) -> bool:
-    if answer.service == PRUSALINK_SERVICE:
-        return True
-    words = [answer.instance, *answer.txt.keys(), *answer.txt.values()]
-    return any("prusa" in w.lower() for w in words)
 
 
 class PrusaLinkDiscovery(Discovery):
     kind = "prusalink"
-    mdns_services = (PRUSALINK_SERVICE, OCTOPRINT_SERVICE)
+    mdns_services = (*PRUSALINK_SERVICES, OCTOPRINT_SERVICE)
 
     async def from_mdns(self, answer: MdnsAnswer) -> Found | None:
-        if not is_prusa(answer):
+        if not is_prusalink(answer):
             return None
         txt = answer.txt
         model = txt.get("printer_type") or txt.get("model") or txt.get("printer")

@@ -1,0 +1,6 @@
+Recorded on 2026-10-27 from OctoPrint 1.11.8 (pip install octoprint, Python 3.11, Windows) with
+its bundled virtual printer, by tests/integration/record_octoprint.py: an upload of
+tests/fixtures/gcode/prusaslicer-2.9.2-calibration-cube.gcode as cube.gcode, a print of it to the
+end, then a second print cancelled after two seconds. socket.jsonl is every message of the push
+socket in order, with `t` the seconds since it opened. The API key and the socket's session are
+replaced by placeholders. Record again rather than edit these files.

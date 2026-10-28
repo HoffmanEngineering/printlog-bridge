@@ -58,6 +58,11 @@ printers:
     printer_id: 45
     host: 192.168.1.60
     password: your-prusalink-password
+  - name: ender
+    adapter: octoprint
+    printer_id: 46
+    url: http://octopi.local
+    api_key: your-octoprint-key
 ```
 
 | Adapter | Fields |
@@ -65,6 +70,7 @@ printers:
 | `moonraker` | **url**: Moonraker's address, such as `http://192.168.1.20:7125`. **api_key** only when Moonraker's `[authorization]` doesn't trust your Home Assistant's address. |
 | `bambu` | **host**, **serial** and **access_code**. On firmware with Bambu's Authorization Control, turn on LAN Only Mode and Developer Mode on the printer first. The access code is on the printer's screen: X1/H2 Settings > LAN Only, P1 Settings > WLAN, A1 Settings > LAN Only Mode. |
 | `prusalink` | **host** and **password** (the printer's Settings > Network > PrusaLink shows them). Older firmware: **api_key** instead of the password. **username** only when it isn't `maker`. |
+| `octoprint` | **url**: OctoPrint's address, such as `http://octopi.local` or `http://192.168.1.70:5000`. **api_key**: a key from OctoPrint's Settings > Application Keys (or your user's Settings > API Key). |
 
 A field an adapter doesn't use must stay empty: the app says which one when it refuses to start. Give each printer a fixed address (a DHCP reservation in your router). A Moonraker printer that moves to a new address is found again on your network.
 
