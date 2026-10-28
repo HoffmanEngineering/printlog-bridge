@@ -521,6 +521,29 @@ Each print records the slicer settings it was sliced with, as the Cura plugin an
 
 Set `slicer_settings = false` in `[bridge]`, or in a printer's section for that one, to turn this off; the G-code file is then never read. [docs/privacy.md](docs/privacy.md) says exactly what is read and sent.
 
+### Probing an unsupported printer
+
+Got a printer the bridge doesn't support yet (a Creality K1, K2 or Hi on stock firmware, an Anycubic Kobra or Photon, an Elegoo or other resin printer, a HeyGears)? `printlog-bridge probe` records what it offers on your network, so an adapter can be written for it. It's strictly read-only: it never sends anything that changes the printer's state (no print, pause, cancel, move, heat, upload, delete or firmware command), and never contacts 3D Print Log. Leave the printer on, ideally printing, and run it from a computer on the same network:
+
+```sh
+printlog-bridge probe 192.168.1.50 --redact             # the printer's IP address
+printlog-bridge probe 192.168.1.50 --seconds 120 --redact   # listen longer, during a print
+```
+
+From a checkout of this repository, with [uv](https://docs.astral.sh/uv/) (Windows Git Bash, macOS or Linux): `uv run printlog-bridge probe 192.168.1.50 --redact`. The first run creates `.venv` and installs the bridge into it; on Windows, set `export UV_LINK_MODE=copy` first if the checkout is on another drive than uv's cache. Without uv: `python -m venv .venv`, `.venv/Scripts/pip install -e .` (`.venv/bin/pip` on macOS and Linux), then `.venv/Scripts/printlog-bridge probe ...`. In Docker, the host's network is needed to hear announcements: `mkdir probe && docker run --rm --network host -v "$PWD/probe:/data" ghcr.io/hoffmanengineering/printlog-bridge:edge probe 192.168.1.50 --redact` writes the file into `probe/`.
+
+For `--seconds` (30 by default) it:
+
+- listens for what the printer announces: mDNS (and asks it which services it has), SSDP, Bambu Lab's NOTIFY, and the answer to the Chitu/SDCP discovery broadcast (`M99999` on UDP 3000);
+- tries a short list of ports that printers are known to use (80, 443, 1883, 3000, 3030, 4408, 4409, 6000, 7125, 8000, 8080, 8883, 9883, 9999, 18910 and a few more; `--help` lists each with what it's suspected to be, and `--port` adds others). It's not a port scan;
+- on each open one, asks only read-only status questions: `GET /` and documented status endpoints (Moonraker, PrusaLink, OctoPrint, Anycubic's `/info`), Creality's websocket on 9999 (its status `get` requests), SDCP's status and attributes, an MQTT broker that needs no login (subscribed to everything, read-only; one that wants credentials is left alone), and the Anycubic Photon's `sysinfo` and `getstatus`.
+
+Everything it may send is on an allow-list that `printlog-bridge probe --help` prints, and that it prints again before it starts; each message is checked against it before it goes out, and tests check that nothing else ever reaches a fake printer.
+
+It writes one JSON file in the current folder, `probe-<address>-<time>.json` (`probe-redacted-<time>.json` with `--redact`; or `--out FILE`), with every request, answer and announcement and when it happened (bodies and messages are cut at 64 KB and 16 KB), and prints a summary. The summary always hides credentials, serial numbers and MAC addresses. The file holds everything unless you add `--redact`: then credentials are removed, serial numbers, MAC and IP addresses are replaced with placeholders that stay the same throughout the file (`<serial-1>`, `<mac-1>`, `<ip-1>`), and binary payloads are dropped. The summary says which you got. Please [open an issue](https://github.com/HoffmanEngineering/printlog-bridge/issues/new) for your printer and attach the redacted file, after a look through it: a printer's name, for one, can still be in it.
+
+On Windows, the firewall drops unsolicited UDP for Python unless it's allowed on private networks (Windows asks the first time; say yes for private networks), and the SSDP Discovery service holds UDP port 1900, so NOTIFY announcements there may not be heard. The probe carries on and says so in its notes. A Docker container needs `--network host` for the same reason.
+
 ### Recording a trace
 
 To report a problem with a printer, or to turn one of its prints into a test, set `trace = true` in `[bridge]` (in Docker, set the environment variable `PRINTLOG_BRIDGE_TRACE=1` instead) and restart the bridge. It then records every message it sends to and receives from each printer's Moonraker, one JSON line each with the time and the direction, in `traces/<printer>-<YYYYMMDD>.jsonl` in the state directory. `status` shows `Trace: on` while it records.

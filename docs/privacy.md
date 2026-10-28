@@ -235,6 +235,16 @@ With `adapter = prusalink`, the bridge connects to the printer itself, over Prus
 
 Tests: `test_the_bridge_logs_a_prusalink_print_with_the_slicers_grams` (`tests/test_prusalink_adapter.py`) runs a print through the whole bridge from the fake printer, checks the usage rows, that only `GET` reached the printer, and that the password isn't in the status file; `test_a_prusalink_password_and_api_key_in_the_config_are_known_secrets` (`tests/test_secrets.py`) and `test_a_prusalink_session_is_traced_without_its_password` (`tests/test_trace.py`) the scrubbing; `test_a_bgcode_file_is_read_up_to_its_gcode` (`tests/test_prusalink_files.py`) that the download stops at the G-code.
 
+## The probe
+
+`printlog-bridge probe <host>` (README, "Probing an unsupported printer") is a one-off command, not part of the running bridge. It contacts nothing but the network it runs on: no 3D Print Log, no vendor cloud, and it reads no config or key.
+
+- **What it sends** is the allow-list in `src/printlog_bridge/probe/allowlist.py`, printed by `--help` and before each run: discovery messages (mDNS questions, an SSDP M-SEARCH, the Chitu/SDCP `M99999`), TCP connects to a fixed list of ports, and read-only status requests. Every send is checked against it first, and a send that isn't on it stops the probe. It never sends credentials, never publishes on MQTT, and never sends a command that changes the printer's state.
+- **What it records** is held only in the file it writes and the summary it prints. Datagrams from other devices on the network are counted, never recorded.
+- **Redaction.** The summary always hides credentials, serial numbers and MAC addresses. The file holds everything unless `--redact` is given; then credentials become `<redacted>`, serial numbers, MAC and IP addresses become stable placeholders, and binary payloads are dropped. Free text such as a printer's name can still identify it: read the file before posting it.
+
+Tests: `tests/test_probe.py` runs the probe against fake printers (HTTP, Creality and SDCP websockets, an MQTT broker, mDNS, SSDP, Chitu discovery, Bambu NOTIFY, the Photon's TCP protocol) and checks that each received only what the allow-list allows, exactly the expected requests, and that redaction leaves no serial, MAC, token or address in the file.
+
 ## Not covered yet
 
 - **Pairing is off on 3D Print Log until its app lists paired bridges and lets you remove them** (3d-print-log-ui#253). Until then `pair` says so, and the bridge uses an API key, which has your account's full API access: keep it to yourself and revoke it at [3dprintlog.com/api-keys](https://www.3dprintlog.com/api-keys) if it leaks.
