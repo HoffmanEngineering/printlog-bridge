@@ -25,6 +25,15 @@ HERE = Path(__file__).parent
 REPO = HERE.parent.parent
 MOONRAKER_REF = os.environ.get("MOONRAKER_REF", "v0.9.3")
 STARTUP_TIMEOUT_S = 60
+TEST_TIMEOUT_S = 300
+"""Per integration test, fixtures included: the first one builds Moonraker's image (a minute or
+two from cold). A test that hangs fails with its name and stack instead of holding CI's job."""
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    for item in items:
+        if item.get_closest_marker("integration") and not item.get_closest_marker("timeout"):
+            item.add_marker(pytest.mark.timeout(TEST_TIMEOUT_S))
 
 
 def docker(*args: str, check: bool = True, timeout: float = 600) -> str:

@@ -28,9 +28,10 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.5", "jinja2>=3", "segno>=1.5", "pyyaml>=5.4"]
+dev = ["pytest>=7", "pytest-timeout>=2", "ruff>=0.5", "jinja2>=3", "segno>=1.5", "pyyaml>=5.4"]
 # jinja2 renders klipper/printlog.cfg in tests; segno checks core/qr.py in tests (never at runtime);
-# pyyaml reads the Home Assistant app's config.yaml in tests
+# pyyaml reads the Home Assistant app's config.yaml in tests; pytest-timeout ends a hung
+# integration test (tests/integration/conftest.py) and names it
 
 [project.scripts]
 printlog-bridge = "printlog_bridge.cli.main:run"

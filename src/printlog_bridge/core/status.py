@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from printlog_bridge import __version__
 from printlog_bridge.core import credentials
+from printlog_bridge.core.device import read_pending_pairing
 from printlog_bridge.core.outbox import read_waiting
 from printlog_bridge.core.trace import trace_dir
 from printlog_bridge.core.updates import is_newer, update_notice
@@ -364,6 +366,16 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
             "may have crashed. Check its log."
         ]
     lines.append(_credentials_line(config, status, running))
+    pending = read_pending_pairing(config.state_dir) if running else None
+    if pending is not None:
+        link = (
+            f" (or open {pending.verification_uri_complete})"
+            if pending.verification_uri_complete
+            else ""
+        )
+        lines.append(
+            f"Pairing code: {pending.user_code}, to enter at {pending.verification_uri}{link}"
+        )
     if running and status.get("setup_problem"):
         lines.append(f"Setup: waiting for printers: {status['setup_problem']}")
     update = _update_line(config, status, running)
@@ -386,6 +398,29 @@ def format_status(config: BridgeConfig, now: datetime | None = None) -> tuple[st
         lines.extend(f"  {line}" for line in _printer_lines(printer, known, running, config, now))
 
     return "\n".join(lines), 0 if running else 1
+
+
+def pairing_state(config: BridgeConfig, now: Callable[[], float] = time.time) -> str:
+    """`printlog-bridge status --pairing`, one line for a script (the one-line Docker install):
+    `pending <code> <address> [<link>]` while a pairing waits for approval (a re-pair of a paired
+    bridge too), else `paired`, `api-key`, or `waiting` (no credentials and no code yet)."""
+    pending = read_pending_pairing(config.state_dir, now=now)
+    if pending is not None:
+        return " ".join(
+            part
+            for part in (
+                "pending",
+                pending.user_code,
+                pending.verification_uri,
+                pending.verification_uri_complete,
+            )
+            if part
+        )
+    if config.device is not None:
+        return "paired"
+    if config.api_key is not None:
+        return "api-key"
+    return "waiting"
 
 
 def bridge_lines(
