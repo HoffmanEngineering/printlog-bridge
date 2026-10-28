@@ -27,9 +27,13 @@ from typing import Any
 
 import aiohttp
 
-from printlog_bridge.adapters.prusalink.bgcode import parse_ini
-from printlog_bridge.adapters.prusalink.files import JobFile, facts_from_meta
-from printlog_bridge.core.events import SlicerFile, SlicerMetadata
+from printlog_bridge.adapters.common.slicer_meta import (
+    JobFile,
+    facts_from_meta,
+    metadata_from,
+    parse_ini,
+)
+from printlog_bridge.core.events import SlicerFile
 from printlog_bridge.core.images import image_type
 from printlog_bridge.core.slicer_settings import config_block_from, header_from
 from printlog_bridge.core.status import PrinterReport
@@ -124,8 +128,11 @@ class OctoPrintFiles:
         size = size if isinstance(size, int) and size > 0 else None
         head = await self._range(url, 0, HEAD_BYTES if size is None else min(HEAD_BYTES, size))
         tail = b""
+        tail_start = 0
         if size is not None and size > len(head):
-            tail = await self._range(url, max(len(head), size - TAIL_BYTES), size)
+            tail_start = max(len(head), size - TAIL_BYTES)
+            tail = await self._range(url, tail_start, size)
+        found.gcode_span = gcode_span(head, tail, tail_start) if size is not None else None
         block = config_block_from(tail, starts_mid_line=True, after_gcode=True) if tail else None
         if not tail and size is not None and size <= HEAD_BYTES:
             block = config_block_from(head, after_gcode=True)  # a small file: all of it read
@@ -138,7 +145,7 @@ class OctoPrintFiles:
         found.printer_model = facts.printer_model
         if block or header:
             found.settings = SlicerFile(header=header, config_block=block)
-            found.metadata = metadata_from(header, settings)
+            found.metadata = _metadata(header, settings)
         found.thumbnail = thumbnail_from(head) or await self._plugin_thumbnail(path)
 
     async def _range(self, url: str, start: int, end: int) -> bytes:
@@ -187,6 +194,28 @@ class OctoPrintFiles:
         return bytes(data) if image_type(bytes(data)) else None
 
 
+def gcode_span(head: bytes, tail: bytes, tail_start: int) -> tuple[int, int] | None:
+    """Where the G-code starts (its first line that isn't a comment, in `head`) and ends (after
+    its last, before the comments `tail` ends with), in bytes; `tail` empty when `head` is all
+    of the file. None when the reads don't show both."""
+    end_part, end_offset = (tail, tail_start) if tail else (head, 0)
+    first = None
+    position = 0
+    for line in head.splitlines(keepends=True):
+        if line.strip() and not line.lstrip().startswith(b";"):
+            first = position
+            break
+        position += len(line)
+    lines = end_part.splitlines(keepends=True)
+    keep = len(lines)
+    while keep and (not lines[keep - 1].strip() or lines[keep - 1].lstrip().startswith(b";")):
+        keep -= 1
+    if first is None or keep == 0 or (tail and keep == 1):
+        return None  # no G-code in the head, or none seen in the tail (its first line is cut)
+    last = end_offset + sum(len(line) for line in lines[:keep])
+    return (first, last) if last > first else None
+
+
 def thumbnail_from(head: bytes) -> bytes | None:
     """The largest PNG or JPEG thumbnail embedded in a G-code file's start."""
     text = head.decode("utf-8", errors="replace")
@@ -207,38 +236,10 @@ def thumbnail_from(head: bytes) -> bytes | None:
     return best[1] if best else None
 
 
-def metadata_from(header: str | None, settings: Mapping[str, str]) -> SlicerMetadata:
+def _metadata(header: str | None, settings: Mapping[str, str]):
     slicer = version = None
     if header:
         match = _GENERATOR.search(header.splitlines()[0])
         if match:
             slicer, version = match.group(1), match.group(2)
-    return SlicerMetadata(
-        slicer=slicer,
-        slicer_version=version,
-        layer_height_mm=_first_number(settings.get("layer_height")),
-        first_layer_height_mm=_first_number(settings.get("first_layer_height")),
-        nozzle_diameter_mm=_first_number(settings.get("nozzle_diameter")),
-        filament_name=_first_text(settings.get("filament_settings_id")),
-        filament_type=_first_text(settings.get("filament_type")),
-        first_layer_nozzle_temperature_c=_first_number(settings.get("first_layer_temperature")),
-        first_layer_bed_temperature_c=_first_number(settings.get("first_layer_bed_temperature")),
-    )
-
-
-def _first_number(value: Any) -> float | None:
-    if not isinstance(value, str):
-        return None
-    first = re.split(r"[,;]", value)[0].strip().rstrip("%")
-    try:
-        number = float(first)
-    except ValueError:
-        return None
-    return number if number == number else None
-
-
-def _first_text(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    first = re.split(r"[;,]", value)[0].strip().strip('"')
-    return first or None
+    return metadata_from(settings, slicer, version)

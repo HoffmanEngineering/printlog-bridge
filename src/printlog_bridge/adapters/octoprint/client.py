@@ -23,6 +23,8 @@ import aiohttp
 from printlog_bridge import __version__
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
+from . import webhooks
+
 REQUEST_TIMEOUT_S = 10.0
 CHUNK_BYTES = 64 * 1024
 SOCKET_PATH = "/sockjs/websocket"
@@ -99,8 +101,7 @@ class OctoPrintClient:
                 with contextlib.suppress(ValueError):
                     answer = json.loads(text)
             if self.trace is not None:
-                # The login's answer carries the session: the trace keeps only its shape.
-                shown = _without_session(answer) if path == "/api/login" else answer
+                shown = traced(path, answer)
                 self.trace.record(
                     RECEIVE, json.dumps({"path": path, "status": response.status, "body": shown})
                 )
@@ -158,6 +159,42 @@ def file_path(origin: str, path: str) -> str:
 def download_path(origin: str, path: str) -> str:
     """Where OctoPrint serves a local file: `/downloads/files/<origin>/<path>`."""
     return f"/downloads/files/{quote(origin, safe='')}/{quote(path)}"
+
+
+def traced(path: str, answer: Any) -> Any:
+    """What a trace keeps of `path`'s answer. The login's carries the session, so only its
+    shape; the settings hold every plugin's settings (a Discord or Slack webhook's token, the
+    Webhooks plugin's headers), so only what the bridge reads of them."""
+    if path == "/api/login":
+        return _without_session(answer)
+    if path == "/api/settings":
+        return _settings_read(answer)
+    return answer
+
+
+def _settings_read(settings: Any) -> Any:
+    if not isinstance(settings, Mapping):
+        return None
+    webcam = settings.get("webcam") if isinstance(settings.get("webcam"), Mapping) else {}
+    cams = []
+    for cam in webcam.get("webcams") or ():  # type: ignore[union-attr]
+        if isinstance(cam, Mapping):
+            compat = cam.get("compat") if isinstance(cam.get("compat"), Mapping) else {}
+            cams.append(
+                {
+                    "name": cam.get("name"),
+                    "canSnapshot": cam.get("canSnapshot"),
+                    "compat": {"snapshot": compat.get("snapshot")},  # type: ignore[union-attr]
+                }
+            )
+    return {
+        "webcam": {
+            "webcamEnabled": webcam.get("webcamEnabled"),  # type: ignore[union-attr]
+            "snapshotUrl": webcam.get("snapshotUrl"),  # type: ignore[union-attr]
+            "webcams": cams,
+        },
+        "webhooks_to_3dprintlog": webhooks.posts_to_printlog(settings),
+    }
 
 
 def _without_session(answer: Any) -> Any:

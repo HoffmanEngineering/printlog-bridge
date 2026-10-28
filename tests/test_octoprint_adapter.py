@@ -477,23 +477,58 @@ class TestPieces:
         assert snapshot_url({"webcam": webcam}, "http://octopi.local") is None
 
 
+UUID = "5c5a8c1e-0d39-4a10-9a1c-1f0b9c2d7e11"
+
+
+def octoprint_answer(instance: str, address: str, **txt: str) -> MdnsAnswer:
+    """As OctoPrint's discovery plugin announces itself: `path`, `version`, `api`, `uuid`."""
+    record = {"path": "/", "version": "1.11.8", "api": "0.1", "uuid": UUID, **txt}
+    return MdnsAnswer("_octoprint._tcp.local", instance, "octopi.local", address, 80, record)
+
+
+def found_by(answer: MdnsAnswer):
+    return (
+        asyncio.run(OctoPrintDiscovery().from_mdns(answer)),
+        asyncio.run(PrusaLinkDiscovery().from_mdns(answer)),
+    )
+
+
 class TestDiscovery:
-    def test_octoprint_is_found_unless_it_is_prusalink(self):
-        octo = MdnsAnswer("_octoprint._tcp.local", "OctoPrint on ender", "octopi.local",
-                          "192.168.1.72", 80,
-                          {"path": "/", "vendor": "Creality", "model": "Ender-3 V2",
-                           "uuid": "5c5a8c1e-0d39-4a10-9a1c-1f0b9c2d7e11"})  # fmt: skip
-        prusa = MdnsAnswer("_octoprint._tcp.local", "PrusaLink MINI", "mini.local",
-                           "192.168.1.71", 80, {})  # fmt: skip
-        hook = OctoPrintDiscovery()
-        found = asyncio.run(hook.from_mdns(octo))
-        assert found == Found(
-            "octoprint", "192.168.1.72", 80, model="Creality Ender-3 V2",
-            name="OctoPrint on ender", serial="5c5a8c1e-0d39-4a10-9a1c-1f0b9c2d7e11",
+    def test_octoprint_is_found_with_its_vendor_model_and_uuid(self):
+        answer = octoprint_answer(
+            "OctoPrint instance on ender", "192.168.1.72", vendor="Creality",
+            model="Ender-3 V2", u="pi", p="raspberry",
         )  # fmt: skip
-        assert asyncio.run(hook.from_mdns(prusa)) is None
-        assert asyncio.run(PrusaLinkDiscovery().from_mdns(octo)) is None
+        octo, prusa = found_by(answer)
+        assert octo == Found(
+            "octoprint", "192.168.1.72", 80, model="Creality Ender-3 V2",
+            name="OctoPrint instance on ender", serial=UUID,
+        )  # fmt: skip
+        assert "raspberry" not in repr(octo)  # the basic auth password isn't kept
+        assert prusa is None
         assert ADAPTERS["octoprint"].discovery().kind == "octoprint"
+
+    def test_octoprint_on_a_prusa_is_octoprint(self):
+        answer = octoprint_answer(
+            "OctoPrint on prusa-mk3s", "192.168.1.73", vendor="Prusa Research", model="MK3S"
+        )
+        octo, prusa = found_by(answer)
+        assert octo is not None and octo.kind == "octoprint" and prusa is None
+
+    def test_prusalink_on_a_pi_answering_as_octoprint_is_prusalink(self):
+        # Prusa-Link's service_discovery.py: "PrusaLink at <host>", TXT path=/ only.
+        answer = MdnsAnswer("_octoprint._tcp.local", "PrusaLink at prusa-mk3", "prusa-mk3.local",
+                            "192.168.1.71", 80, {"path": "/"})  # fmt: skip
+        octo, prusa = found_by(answer)
+        assert octo is None
+        assert prusa is not None and prusa.kind == "prusalink"
+
+    def test_prusalinks_own_service_is_prusalink(self):
+        # Buddy firmware (lib/WUI/mdns/mdns.c) and Prusa-Link both register _prusalink._tcp.
+        answer = MdnsAnswer("_prusalink._tcp.local", "mk4s", "mk4s.local", "192.168.1.74", 80, {})
+        octo, prusa = found_by(answer)
+        assert octo is None and prusa is not None
+        assert "_prusalink._tcp.local" in PrusaLinkDiscovery.mdns_services
 
 
 @contextlib.asynccontextmanager
@@ -540,13 +575,36 @@ def test_the_bridge_logs_an_octoprint_print(tmp_path):
     assert API_KEY not in status
 
 
-def test_a_session_is_traced_without_its_key_or_socket_session(tmp_path):
+DISCORD = "https://discord.com/api/webhooks/1234567890/aBcD-discord-token-XyZ"
+HEADERS = '{"Authorization": "Bearer hook-header-token-123"}'
+
+
+def test_a_session_is_traced_without_its_key_or_socket_session_or_other_plugins(tmp_path):
+    """Neither the trace nor the support bundle holds the key, the socket's session, or the
+    settings of plugins the bridge doesn't read (a Discord webhook's token in its path, the
+    Webhooks plugin's headers): of `/api/settings` only the webcam and a flag are traced."""
+    import zipfile
+
+    from printlog_bridge.core.support import write_support_bundle
     from printlog_bridge.core.trace import Trace, trace_files
 
-    trace = Trace(tmp_path, "ender", secrets=[API_KEY])
+    state = tmp_path / "state"
+    trace = Trace(state, "ender", secrets=[API_KEY])
 
     async def scenario():
         async with octoprint() as fake:
+            fake.settings["plugins"]["discordremote"] = {"webhook_url": DISCORD}
+            fake.settings["plugins"]["webhooks"] = {
+                "hooks": [
+                    {
+                        "enabled": True,
+                        "url": WEBHOOK_URL,
+                        "headers": HEADERS,
+                        "apiSecret": "plain-api-secret",
+                    }
+                ]  # fmt: skip
+            }
+            fake.settings["webcam"]["snapshotUrl"] = "http://127.0.0.1:8080/?action=snapshot"
             adapter = adapter_for(fake)
             adapter.use_trace(trace)
             report = Report()
@@ -557,10 +615,21 @@ def test_a_session_is_traced_without_its_key_or_socket_session(tmp_path):
 
     sessions = asyncio.run(scenario())
     trace.close()
-    text = "".join(p.read_text(encoding="utf-8") for p in trace_files(tmp_path, "ender"))
+    text = "".join(p.read_text(encoding="utf-8") for p in trace_files(state, "ender"))
     assert '"history"' in text and "/api/login" in text
-    assert API_KEY not in text
-    assert sessions and not any(session in text for session in sessions)
+    assert '"webhooks_to_3dprintlog": true' in text and "action=snapshot" in text
+    config = tmp_path / "printlog-bridge.cfg"
+    config.write_text(f"[printer ender]\nadapter = octoprint\napi_key = {API_KEY}\n")
+    bundle = write_support_bundle(
+        tmp_path / "bundle.zip", report="", config_path=config, state_dir=state, env={}
+    )
+    with zipfile.ZipFile(bundle) as z:
+        bundled = "".join(z.read(n).decode("utf-8", "replace") for n in z.namelist())
+    for where in (text, bundled):
+        assert API_KEY not in where
+        assert sessions and not any(session in where for session in sessions)
+        for secret in ("discord-token", "hook-header-token", "plain-api-secret", "discordremote"):
+            assert secret not in where
 
 
 def test_the_recorded_socket_gives_a_completed_and_a_cancelled_job():
@@ -589,4 +658,4 @@ def test_the_recorded_socket_gives_a_completed_and_a_cancelled_job():
     assert done.outcome is JobOutcome.COMPLETED
     assert done.duration_s == pytest.approx(21.062)
     assert cancelled.outcome is JobOutcome.CANCELLED
-    assert cancelled.filament_mm == {0: 1.2}  # 5% of 25 mm
+    assert cancelled.filament_mm == {0: 1.3}  # 5.3% (the last status) of 25 mm

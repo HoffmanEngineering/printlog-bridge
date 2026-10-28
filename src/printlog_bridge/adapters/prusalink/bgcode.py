@@ -23,6 +23,8 @@ import struct
 import zlib
 from dataclasses import dataclass, field
 
+from printlog_bridge.adapters.common.slicer_meta import parse_ini
+
 MAGIC = b"GCDE"
 FILE_HEADER_BYTES = 10
 
@@ -208,17 +210,3 @@ def heatshrink_decode(data: bytes, window_bits: int, lookahead_bits: int, limit:
         for _ in range(count + 1):
             out.append(out[-offset])
     return bytes(out[:limit])
-
-
-def parse_ini(raw: bytes) -> dict[str, str]:
-    """`key=value` lines (spaces around `=` allowed, as `; key = value` in a text file), split at
-    the first `=`: a key such as `filament used [g]` has spaces of its own but never an `=`."""
-    pairs: dict[str, str] = {}
-    for line in raw.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if line.startswith(";"):
-            line = line[1:].strip()
-        key, sep, value = line.partition("=")
-        if sep and key.strip():
-            pairs[key.strip()] = value.strip()
-    return pairs
