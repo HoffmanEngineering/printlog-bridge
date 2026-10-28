@@ -11,6 +11,7 @@ permissions:
 jobs:
   test:
     name: test (Python ${{ matrix.python }})
+    timeout-minutes: 8
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -29,6 +30,7 @@ jobs:
       - run: pytest
 
   shellcheck:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +44,7 @@ jobs:
     # Home Assistant's example app repository uses. tests/test_ha_app.py checks that it agrees
     # with the code.
     name: Home Assistant app lint
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +54,7 @@ jobs:
 
   install-smoke:
     # A clean install from the source tree in the image people will run, without dev tools.
+    timeout-minutes: 6
     runs-on: ubuntu-latest
     container: python:3.9-slim
     steps:
@@ -74,6 +78,7 @@ jobs:
     # The one-line Docker install (scripts/docker-install.sh) against a fake docker, with /bin/sh
     # as dash (Ubuntu's), as on Debian and Raspberry Pi OS. The runner's real docker compose
     # checks the Compose file it writes.
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -82,6 +87,7 @@ jobs:
   integration:
     # The bridge against a real Moonraker (no Klipper) in Docker. See tests/integration/.
     name: integration (Moonraker ${{ matrix.moonraker.name }})
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
