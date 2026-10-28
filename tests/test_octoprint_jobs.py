@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -63,15 +63,17 @@ def status(
     marks: list | None = None,
     path: str = "a.gcode",
     error: bool = False,
+    closed: bool = False,
+    filepos: float | None = None,
 ) -> dict:
     flags = {
-        "printing": state in ("Printing", "Finishing", "Cancelling"),
+        "printing": state in ("Starting", "Printing", "Finishing", "Cancelling"),
         "paused": state == "Paused",
         "finishing": state == "Finishing",
         "cancelling": state == "Cancelling",
         "operational": not error,
         "error": error,
-        "closedOrError": error,
+        "closedOrError": error or closed,
     }
     return {
         "state": {"text": state, "flags": flags},
@@ -80,7 +82,7 @@ def status(
             "estimatedPrintTime": 7200,
             "filament": {"tool0": {"length": 10000.0, "volume": 24.0}},
         },
-        "progress": {"completion": completion, "printTime": print_time},
+        "progress": {"completion": completion, "printTime": print_time, "filepos": filepos},
         "serverTime": t,
         "markings": marks or [],
     }
@@ -315,18 +317,167 @@ def test_times_are_on_one_clock(skew):
     assert start.started_at.timestamp() == T0
 
 
-def test_the_end_is_the_start_plus_octoprints_time():
-    t, sink = tracker(clock=Clock(skew=-50))
+@pytest.mark.parametrize("event", ["PrintDone", "PrintCancelled"])
+def test_a_long_pause_does_not_end_the_print_early(event):
+    """OctoPrint's event `time` leaves out the time paused (comm.py's getPrintTime): the end is
+    when the event came, on OctoPrint's clock, not the start plus that."""
+    clock = Clock()
+    t, sink = tracker(clock=clock)
 
     async def scenario():
+        clock.now = T0 + 60
         await t.on_status(status(T0 + 60, completion=1.0, print_time=60, marks=[START]))
-        await t.on_event("PrintDone", {"path": "a.gcode", "time": 1234.5})
+        clock.now = T0 + 11000
+        pause = [START, {"type": "pause", "time": T0 + 600}]
+        await t.on_status(
+            status(T0 + 11000, state="Paused", completion=50.0, print_time=10400, marks=pause)
+        )
+        clock.now = T0 + 11990
+        resume = [*pause, {"type": "resume", "time": T0 + 11400}]
+        await t.on_status(status(T0 + 11990, completion=99.0, print_time=1190, marks=resume))
+        clock.now = T0 + 12000
+        await t.on_event(event, {"path": "a.gcode", "time": 1200.0, "progress": 99})
 
     asyncio.run(scenario())
     [finished] = sink.of(JobFinished)
-    assert finished.finished_at == datetime.fromtimestamp(T0, timezone.utc) + timedelta(
-        seconds=1234.5
-    )
+    assert finished.finished_at.timestamp() == pytest.approx(T0 + 12000)
+    assert finished.duration_s == pytest.approx(12000)
+
+
+AFTER_A = [START, {"type": "done", "label": "Done", "time": T0 + 600}]
+B_MARK = {"type": "print", "label": "Start", "time": T0 + 700}
+
+
+@pytest.mark.parametrize("path", ["b.gcode", "a.gcode"])
+@pytest.mark.parametrize("first_state", ["Starting", "Printing"])
+def test_a_new_print_before_its_start_mark_is_one_job(path, first_state):
+    """While OctoPrint is starting a print, `printing` is already true but its start mark comes
+    later (with `PrintStarted`): the marks still show the last print, started and done."""
+    clock = Clock()
+    t, sink = tracker(clock=clock)
+
+    async def scenario():
+        clock.now = T0 + 60
+        await t.on_status(status(T0 + 60, completion=1.0, print_time=60, marks=[START]))
+        clock.now = T0 + 600
+        await t.on_event("PrintDone", {"path": "a.gcode", "time": 540.0})
+        await t.on_status(status(T0 + 601, state="Operational", marks=AFTER_A))
+        clock.now = T0 + 700
+        await t.on_event("PrintStarted", {"path": path})
+        await t.on_status(
+            status(T0 + 700, state=first_state, completion=0.0, print_time=0, marks=AFTER_A,
+                   path=path)
+        )  # fmt: skip
+        clock.now = T0 + 702
+        await t.on_status(
+            status(T0 + 702, completion=0.1, print_time=2, marks=[*AFTER_A, B_MARK], path=path)
+        )
+        clock.now = T0 + 900
+        await t.on_status(
+            status(T0 + 900, completion=10.0, print_time=200, marks=[*AFTER_A, B_MARK], path=path)
+        )
+
+    asyncio.run(scenario())
+    first, second = sink.of(JobStarted)
+    assert first.started_at.timestamp() == T0
+    assert second.file_name == path and second.job_id != first.job_id
+    assert abs(second.started_at.timestamp() - (T0 + 700)) <= 2
+    [finished] = sink.of(JobFinished)  # a's, and nothing made up for b
+    assert finished.job_id == first.job_id
+
+
+def test_octoprint_restarted_under_a_print_is_not_a_failure():
+    """After a restart OctoPrint has no printer connection yet: Offline, with `closedOrError`
+    but not `error` (standard.py's is_closed_or_error). That's no error of the print's."""
+    t, sink = tracker()
+
+    async def scenario():
+        await t.on_status(status(T0 + 60, completion=1.0, print_time=60, marks=[START]))
+        await t.on_status(status(T0 + 600, completion=20.0, print_time=600, marks=[START]))
+        t.connected()
+        await t.on_status(status(T0 + 700, state="Offline", closed=True))
+
+    asyncio.run(scenario())
+    [finished] = sink.of(JobFinished)
+    assert finished.outcome is JobOutcome.CANCELLED
+    assert finished.filament_mm == {0: 2000.0}
+    assert "error" not in finished.note
+
+
+def test_an_error_event_seen_makes_a_closed_printer_a_failure():
+    t, sink = tracker()
+
+    async def scenario():
+        await t.on_status(status(T0 + 60, completion=30.0, print_time=60, marks=[START]))
+        await t.on_event("Error", {"error": "Heater decoupled"})
+        await t.on_status(status(T0 + 90, state="Offline", closed=True))
+
+    asyncio.run(scenario())
+    [finished] = sink.of(JobFinished)
+    assert finished.outcome is JobOutcome.FAILED and "Heater decoupled" in finished.note
+
+
+def test_the_same_file_reprinted_while_the_bridge_was_away_is_a_new_job(tmp_path):
+    """The kept job reached byte 50,000; the bridge comes back to the same file at byte 1,000,
+    with no start mark left to tell (a pause more than 30 minutes after it started)."""
+    state = PrinterState.load(tmp_path, "p")
+    t, sink = tracker(state)
+
+    async def scenario():
+        await t.on_status(
+            status(T0 + 60, completion=1.0, print_time=60, marks=[START], filepos=600)
+        )
+        await t.on_status(
+            status(T0 + 3000, completion=50.0, print_time=3000, marks=[START], filepos=50_000)
+        )
+        state.save()
+        t2, _ = tracker(PrinterState.load(tmp_path, "p"))
+        t2.sink = sink
+        pause = [{"type": "pause", "time": T0 + 9000}]
+        await t2.on_status(
+            status(T0 + 9500, state="Paused", completion=1.0, print_time=3000, marks=pause,
+                   filepos=1_000)
+        )  # fmt: skip
+
+    asyncio.run(scenario())
+    first, again, second = sink.of(JobStarted)
+    assert again.job_id == first.job_id and second.job_id != first.job_id
+    [finished] = sink.of(JobFinished)
+    assert finished.job_id == first.job_id
+    assert finished.outcome is JobOutcome.CANCELLED and finished.filament_mm == {0: 5000.0}
+
+
+def test_a_restart_keeps_the_gcode_span(tmp_path):
+    """After a bridge restart a cancel is still charged by the G-code sent, not by bytes."""
+    from printlog_bridge.adapters.common.slicer_meta import JobFile
+
+    class SpanFiles:
+        async def read(self, job):
+            return JobFile(mm={0: 10000.0}, gcode_span=(200_000, 300_000))
+
+    state = PrinterState.load(tmp_path, "p")
+    sink = Sink()
+    t = JobTracker("p", sink, CurrentJob(state), files=SpanFiles(), clock=Clock())
+    t.connected()
+
+    async def scenario():
+        await t.on_status(
+            status(T0 + 60, completion=50.0, print_time=60, marks=[START], filepos=150_000)
+        )
+        state.save()
+        t2 = JobTracker(
+            "p", sink, CurrentJob(PrinterState.load(tmp_path, "p")), files=SpanFiles(),
+            clock=Clock(),
+        )  # fmt: skip
+        t2.connected()
+        await t2.on_status(
+            status(T0 + 600, completion=62.5, print_time=600, marks=[START], filepos=250_000)
+        )
+        await t2.on_event("PrintCancelled", {"path": "a.gcode"})
+
+    asyncio.run(scenario())
+    [finished] = sink.of(JobFinished)
+    assert finished.filament_mm == {0: 5000.0}
 
 
 def test_progress_leaves_out_the_header_and_thumbnails():

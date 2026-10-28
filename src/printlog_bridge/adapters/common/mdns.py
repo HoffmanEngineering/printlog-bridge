@@ -20,8 +20,14 @@ PRUSALINK_SERVICES = ("_prusalink._tcp.local", "_prusa-link._tcp.local")
 
 
 def is_octoprint(answer: MdnsAnswer) -> bool:
-    """OctoPrint itself: its TXT record has the keys only OctoPrint sends."""
-    return answer.service == OCTOPRINT_SERVICE and "api" in answer.txt and "version" in answer.txt
+    """OctoPrint itself: its TXT record has the keys only OctoPrint sends. An answer without
+    the TXT (it can come in another packet) is OctoPrint too, unless it's named PrusaLink's
+    way ("PrusaLink at <host>"): PrusaLink on a Pi also announces this service."""
+    if answer.service != OCTOPRINT_SERVICE:
+        return False
+    if not answer.txt:
+        return "prusalink" not in answer.instance.lower().replace("-", "")
+    return "api" in answer.txt and "version" in answer.txt
 
 
 def is_prusalink(answer: MdnsAnswer) -> bool:

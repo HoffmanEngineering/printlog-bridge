@@ -523,6 +523,19 @@ class TestDiscovery:
         assert octo is None
         assert prusa is not None and prusa.kind == "prusalink"
 
+    def test_an_octoprint_answer_without_its_txt_is_octoprint(self):
+        # The TXT record can come in another packet than the service's answer.
+        answer = MdnsAnswer("_octoprint._tcp.local", "OctoPrint instance on ender",
+                            "octopi.local", "192.168.1.75", 80, {})  # fmt: skip
+        octo, prusa = found_by(answer)
+        assert octo is not None and octo.kind == "octoprint" and prusa is None
+
+    def test_prusalink_without_its_txt_is_still_prusalink(self):
+        answer = MdnsAnswer("_octoprint._tcp.local", "PrusaLink at prusa-mk3", "prusa-mk3.local",
+                            "192.168.1.71", 80, {})  # fmt: skip
+        octo, prusa = found_by(answer)
+        assert octo is None and prusa is not None
+
     def test_prusalinks_own_service_is_prusalink(self):
         # Buddy firmware (lib/WUI/mdns/mdns.c) and Prusa-Link both register _prusalink._tcp.
         answer = MdnsAnswer("_prusalink._tcp.local", "mk4s", "mk4s.local", "192.168.1.74", 80, {})
@@ -579,6 +592,9 @@ DISCORD = "https://discord.com/api/webhooks/1234567890/aBcD-discord-token-XyZ"
 HEADERS = '{"Authorization": "Bearer hook-header-token-123"}'
 
 
+PLUGIN_SECRET = "plugin-message-secret-0123"
+
+
 def test_a_session_is_traced_without_its_key_or_socket_session_or_other_plugins(tmp_path):
     """Neither the trace nor the support bundle holds the key, the socket's session, or the
     settings of plugins the bridge doesn't read (a Discord webhook's token in its path, the
@@ -610,6 +626,9 @@ def test_a_session_is_traced_without_its_key_or_socket_session_or_other_plugins(
             report = Report()
             async with running(adapter, Sink(), report):
                 await eventually(lambda: report.connects)
+                await fake.send(
+                    {"plugin": {"plugin": "octolapse", "data": {"token": PLUGIN_SECRET}}}
+                )
                 await asyncio.sleep(0.2)
             return fake.sessions
 
@@ -618,6 +637,7 @@ def test_a_session_is_traced_without_its_key_or_socket_session_or_other_plugins(
     text = "".join(p.read_text(encoding="utf-8") for p in trace_files(state, "ender"))
     assert '"history"' in text and "/api/login" in text
     assert '"webhooks_to_3dprintlog": true' in text and "action=snapshot" in text
+    assert "octolapse" in text and PLUGIN_SECRET not in text  # other plugins' messages
     config = tmp_path / "printlog-bridge.cfg"
     config.write_text(f"[printer ender]\nadapter = octoprint\napi_key = {API_KEY}\n")
     bundle = write_support_bundle(
@@ -656,6 +676,6 @@ def test_the_recorded_socket_gives_a_completed_and_a_cancelled_job():
     assert first.estimated_filament_mm == 25.0  # OctoPrint's analysis, the file unread here
     done, cancelled = sink.of(JobFinished)
     assert done.outcome is JobOutcome.COMPLETED
-    assert done.duration_s == pytest.approx(21.062)
+    assert done.duration_s == pytest.approx(21.062, abs=2)
     assert cancelled.outcome is JobOutcome.CANCELLED
     assert cancelled.filament_mm == {0: 1.3}  # 5.3% (the last status) of 25 mm

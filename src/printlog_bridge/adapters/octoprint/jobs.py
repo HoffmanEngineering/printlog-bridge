@@ -116,12 +116,25 @@ class View:
         return any(self.flags.get(f) is True for f in BUSY_FLAGS)
 
     @property
+    def starting(self) -> bool:
+        """OctoPrint is starting a print: `printing` is true, but its start mark comes later."""
+        return self.state.lower().startswith("starting")
+
+    @property
     def failed(self) -> bool:
-        return self.flags.get("error") is True or self.flags.get("closedOrError") is True
+        """The printer in error. Not `closedOrError` alone: OctoPrint without a printer
+        connection (Offline, as after its own restart) says that too."""
+        return self.flags.get("error") is True or "error" in self.state.lower()
 
     def start_mark(self) -> float | None:
+        """The latest start mark not followed by an end: the running print's. A start already
+        ended is the last print's, while the running one's mark isn't there yet."""
         starts = [t for kind, t in self.marks if kind == "print"]
-        return max(starts) if starts else None
+        if not starts:
+            return None
+        latest = max(starts)
+        ended = any(kind in ("done", "cancel") and t >= latest for kind, t in self.marks)
+        return None if ended else latest
 
     def end_mark(self, after: float) -> tuple[str, float] | None:
         """The first `done` or `cancel` mark after `after` (epoch seconds), less a second."""
@@ -170,6 +183,14 @@ class Job:
     file: JobFile | None = None
     progress: float = 0.0
     """Percent of the G-code sent, as OctoPrint last said."""
+    marked: bool = False
+    """`started_at` is its start mark's, so a later start mark is another print's."""
+    span: tuple[int, int] | None = None
+    """Where its file's G-code is, in bytes (`JobFile.gcode_span`), kept across restarts."""
+    filepos: float | None = None
+    print_time: float | None = None
+    first_seen: float = 0.0
+    """When the bridge first saw it, on OctoPrint's clock: an end mark before that isn't its."""
 
 
 @dataclass(frozen=True)
@@ -177,6 +198,7 @@ class Ended:
     job_id: str
     path: str | None
     started_at: datetime
+    filepos: float | None = None
 
 
 class JobTracker:
@@ -236,6 +258,11 @@ class JobTracker:
             "job_id": job.job_id,
             "path": job.path,
             "progress": round(job.progress, 2),
+            "marked": job.marked,
+            "span": list(job.span) if job.span is not None else None,
+            "filepos": job.filepos,
+            "print_time": job.print_time,
+            "first_seen": job.first_seen,
         }
 
     def _remembered(self) -> Job | None:
@@ -245,8 +272,24 @@ class JobTracker:
         kept = self._kept()
         same = kept.get("job_id") == start.job_id
         path = kept.get("path") if same and isinstance(kept.get("path"), str) else None
-        progress = _number(kept.get("progress")) if same else None
-        return Job(start.job_id, path, start, None, progress or 0.0)
+        if not same:
+            return Job(start.job_id, None, start)
+        span = kept.get("span")
+        good_span = (
+            isinstance(span, list) and len(span) == 2 and all(isinstance(n, int) for n in span)
+        )
+        return Job(
+            start.job_id,
+            path,
+            start,
+            None,
+            _number(kept.get("progress")) or 0.0,
+            marked=kept.get("marked") is True,
+            span=(span[0], span[1]) if good_span else None,  # type: ignore[index]
+            filepos=_number(kept.get("filepos")),
+            print_time=_number(kept.get("print_time")),
+            first_seen=_number(kept.get("first_seen")) or 0.0,
+        )
 
     # -- statuses -------------------------------------------------------------------------
 
@@ -289,7 +332,15 @@ class JobTracker:
             same_file = view.path == job.path
         else:
             same_file = view.name == job.start.file_name  # kept before paths were
-        return same_file and not self._newer_start(view, job.start.started_at)
+        if not same_file:
+            return False
+        if job.marked and self._newer_start(view, job.start.started_at):
+            return False  # a later start mark: another print of the same file
+        # A new print of the same file starts its bytes again. (Not `printTime`: it drops at
+        # each resume by the time paused, comm.py's getPrintTime.)
+        return not (
+            view.filepos is not None and job.filepos is not None and view.filepos < job.filepos
+        )
 
     async def _reconcile(self, view: View) -> None:
         if self.job is None:
@@ -312,7 +363,7 @@ class JobTracker:
                     self._progress(view)
                     return
                 await self._finish_unseen(view)  # another job: this one's end wasn't seen
-            if view.active and not view.busy and not self._just_ended(view):
+            if view.active and not view.busy and not view.starting and not self._just_ended(view):
                 await self._start(view)
             return
         if self.job is not None:
@@ -324,16 +375,21 @@ class JobTracker:
         ended = self._ended
         if ended is None or self._started_again or view.path != ended.path:
             return False
+        if view.filepos is not None and ended.filepos is not None and view.filepos < ended.filepos:
+            return False  # its bytes started again: a new print of the same file
         return not self._newer_start(view, ended.started_at)
 
     def _progress(self, view: View) -> None:
         job = self.job
         assert job is not None
-        percent = _gcode_percent(job.file, view.filepos)
+        percent = _gcode_percent(job.span, view.filepos)
         if percent is None:
             percent = view.completion
-        if percent is not None and view.active:
-            job.progress = min(max(percent, 0.0), 100.0)
+        if view.active:
+            if percent is not None:
+                job.progress = min(max(percent, 0.0), 100.0)
+            job.filepos = view.filepos if view.filepos is not None else job.filepos
+            job.print_time = view.print_time if view.print_time is not None else job.print_time
             self._keep(job)
         self.current.seen()
 
@@ -355,8 +411,19 @@ class JobTracker:
             estimated_filament_g=round(sum(file.grams.values()), 3) or None,
             estimated_filament_g_by_slot=dict(file.grams) if len(file.grams) > 1 else {},
         )
-        percent = _gcode_percent(file, view.filepos)
-        self.job = Job(job_id, view.path, start, file, percent or view.completion or 0.0)
+        percent = _gcode_percent(file.gcode_span, view.filepos)
+        self.job = Job(
+            job_id,
+            view.path,
+            start,
+            file,
+            percent or view.completion or 0.0,
+            marked=view.start_mark() is not None,
+            span=file.gcode_span,
+            filepos=view.filepos,
+            print_time=view.print_time,
+            first_seen=view.server_time or self._now().timestamp(),
+        )
         self._started_again = False
         self._error = None
         self._keep(self.job)
@@ -398,26 +465,27 @@ class JobTracker:
         path = payload.get("path")
         if isinstance(path, str) and self.job.path is not None and path != self.job.path:
             return  # not this job's: its own end was missed, which a status will tell
-        seconds = _number(payload.get("time"))
+        # Ends now, on OctoPrint's clock: the payload's `time` leaves out the time paused.
         if kind == "PrintDone":
-            await self._finish(JobOutcome.COMPLETED, None, seconds=seconds, live=True)
+            await self._finish(JobOutcome.COMPLETED, None, live=True)
         elif kind == "PrintCancelled" or payload.get("reason") == "cancelled":
-            await self._finish(JobOutcome.CANCELLED, None, seconds=seconds, live=True)
+            await self._finish(JobOutcome.CANCELLED, None, live=True)
         else:
             note = f"{ERROR_NOTE}: {self._error}." if self._error else f"{ERROR_NOTE}."
-            await self._finish(JobOutcome.FAILED, note, seconds=seconds, live=True)
+            await self._finish(JobOutcome.FAILED, note, live=True)
 
     async def _finish_unseen(self, view: View) -> None:
         job = self.job
         assert job is not None
-        end = view.end_mark(job.start.started_at.timestamp())
+        # An end mark before the bridge first saw the job running is another print's.
+        end = view.end_mark(max(job.start.started_at.timestamp(), job.first_seen))
         note = None
         finished_at = None
         if end is not None:
             kind, t = end
             outcome = JobOutcome.COMPLETED if kind == "done" else JobOutcome.CANCELLED
             finished_at = datetime.fromtimestamp(t, timezone.utc)
-        elif view.failed:
+        elif view.failed or self._error is not None:
             outcome = JobOutcome.FAILED
             note = f"{ERROR_NOTE}: {self._error}." if self._error else f"{ERROR_NOTE}."
         else:
@@ -434,17 +502,13 @@ class JobTracker:
         outcome: JobOutcome,
         note: str | None,
         *,
-        seconds: float | None = None,
         finished_at: datetime | None = None,
         live: bool = False,
     ) -> None:
         job = self.job
         assert job is not None
         started = job.start.started_at
-        if seconds is not None and seconds >= 0:
-            finished = started + timedelta(seconds=seconds)
-        else:
-            finished = max(finished_at or self._now(), started)
+        finished = max(finished_at or self._now(), started)
         fraction = 1.0 if outcome is JobOutcome.COMPLETED else job.progress / 100
         grams, mm = _usage(job, fraction)
         await self.sink.emit(
@@ -462,7 +526,7 @@ class JobTracker:
         )
         self.current.state.discovery.pop(KEY, None)
         self.current.ended()
-        self._ended = Ended(job.job_id, job.path, started)
+        self._ended = Ended(job.job_id, job.path, started, job.filepos)
         self._started_again = False
         self.job = None
         log.info("[printer %s] job %s %s", self.printer, job.job_id, outcome.value)
@@ -472,10 +536,9 @@ class JobTracker:
             )
 
 
-def _gcode_percent(file: JobFile | None, filepos: float | None) -> float | None:
+def _gcode_percent(span: tuple[int, int] | None, filepos: float | None) -> float | None:
     """How much of the file's G-code was sent, in percent, leaving out the header with its
     thumbnails and the settings block after it: those are a large share of a small file."""
-    span = file.gcode_span if file is not None else None
     if span is None or filepos is None:
         return None
     first, last = span

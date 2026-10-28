@@ -278,12 +278,13 @@ class OctoPrintAdapter(Adapter):
                 raise UnexpectedAnswer("OctoPrint closed the socket")
             if msg.type != aiohttp.WSMsgType.TEXT:
                 continue
-            if self.trace is not None:
-                self.trace.record(RECEIVE, msg.data)
+            body = None
             with contextlib.suppress(ValueError):
                 body = json.loads(msg.data)
-                if isinstance(body, Mapping):
-                    return body
+            if self.trace is not None:
+                self.trace.record(RECEIVE, _traced_message(body, msg.data))
+            if isinstance(body, Mapping):
+                return body
 
     async def _receive(
         self, ws: aiohttp.ClientWebSocketResponse, kind: str, timeout: float
@@ -456,3 +457,20 @@ def _unreachable(error: BaseException, url: str) -> str:
     if isinstance(error, (aiohttp.ClientConnectorError, ConnectionRefusedError)):
         return f"can't reach {url}. Is it OctoPrint's address, and is it running?"
     return f"can't reach {url} ({error})"
+
+
+TRACED_MESSAGES = ("connected", "current", "history", "event", "reauthRequired")
+
+
+def _traced_message(body: Any, raw: str) -> str:
+    """What the trace keeps of a socket message: in full only the kinds the bridge reads.
+    Other plugins' messages (`plugin`) and the rest are named, not kept: they can hold
+    anything, a token among them."""
+    if not isinstance(body, Mapping):
+        return "(not a JSON object)"
+    if any(key in TRACED_MESSAGES for key in body):
+        return raw
+    kinds = sorted(str(key) for key in body)
+    plugin = body.get("plugin")
+    name = plugin.get("plugin") if isinstance(plugin, Mapping) else None
+    return json.dumps({"type": kinds, "plugin": name} if name else {"type": kinds})
