@@ -4,8 +4,10 @@ E3D ToolChanger, Jubilee and many custom builds), over their HTTP API, standalon
 
 RepRapFirmware has no push channel the bridge uses, so it polls the object model: every
 `poll_interval` (5 s) while a job is under way, every `idle_poll_interval` (30 s) otherwise. A
-board's session lapses after 8 s without a request, so between jobs each poll may connect again
-first; that's two small requests every 30 s. Unreachable, the wait doubles from `retry_s` to a
+board's session lapses after 8 s without a request, so between polls a cheap read of the live
+fields (`keep_alive`) runs every half session timeout: rr_connect, which carries the password
+over plain HTTP, is sent once per connection, and a job that starts between idle polls is
+seen within seconds. Unreachable, the wait doubles from `retry_s` to a
 minute; after a refused password it is five minutes. On stop the session is closed
 (`rr_disconnect`), so it doesn't hold one of the board's few sessions until it lapses.
 
@@ -31,12 +33,13 @@ from printlog_bridge.core.config import BOOLEANS, ConfigError
 from printlog_bridge.core.current_job import CurrentJob
 from printlog_bridge.core.discovery import Discovery, Found
 from printlog_bridge.core.events import EventSink
+from printlog_bridge.core.secrets import scrub
 from printlog_bridge.core.state import MemoryState, PrinterState
 from printlog_bridge.core.status import PrinterReport
 from printlog_bridge.core.trace import Trace
 
 from . import model as om
-from .client import SBC, Busy, DuetClient, NotDuet, Refused
+from .client import REQUEST_TIMEOUT_S, SBC, Busy, DuetClient, NotDuet, Refused
 from .discovery import DuetDiscovery
 from .files import DuetFiles
 from .jobs import JobTracker
@@ -52,6 +55,8 @@ DEFAULT_IDLE_POLL_S = 30.0
 MIN_POLL_S = 1.0
 RETRY_S, MAX_RETRY_S = 5.0, 60.0
 REFUSED_RETRY_S = 300.0
+KEEP_ALIVE_SHARE = 0.5
+"""Of the board's session timeout, between keep-alive reads."""
 MAX_BUSY = 5
 """Polls in a row a board may answer 503 before it counts as gone."""
 ACCESS_WARNING = "access"
@@ -87,6 +92,7 @@ class DuetAdapter(Adapter):
         self.files = files
         """Whether to ask the board for each job's file info and thumbnail."""
         self.retry_s = RETRY_S
+        self.request_timeout = REQUEST_TIMEOUT_S
         self.trace: Trace | None = None
         self.state: PrinterState | None = None
         self._was_connected = False
@@ -195,7 +201,9 @@ class DuetAdapter(Adapter):
         self.state = state
 
     def _client(self, trace: Trace | None = None) -> DuetClient:
-        return DuetClient(self.base_url, password=self.password, trace=trace)
+        return DuetClient(
+            self.base_url, password=self.password, trace=trace, timeout=self.request_timeout
+        )
 
     # -- run ------------------------------------------------------------------------------
 
@@ -225,12 +233,14 @@ class DuetAdapter(Adapter):
                 except (aiohttp.ClientError, OSError, asyncio.TimeoutError, NotDuet, Busy) as e:
                     if self._was_connected:
                         retry = self.retry_s
-                    reason = _unreachable(e, self.base_url)
+                    reason = _unreachable(e, self.base_url, self.password)
                     log.info("[printer %s] %s; trying again in %gs", self.printer, reason, retry)
                     report.disconnected(reason)
                 except Exception as e:  # a bug: keep watching rather than stop the bridge
-                    log.exception("[printer %s] polling failed unexpectedly", self.printer)
-                    report.disconnected(f"unexpected error: {e!r}")
+                    # Not log.exception: the traceback's message can hold a request's URL.
+                    text = client.safe_error(e)
+                    log.error("[printer %s] polling failed unexpectedly: %s", self.printer, text)
+                    report.disconnected(f"unexpected error: {text}")
                     retry = MAX_RETRY_S
                 finally:
                     if self._was_connected and self.trace is not None:
@@ -263,7 +273,7 @@ class DuetAdapter(Adapter):
         while True:
             await tracker.on_model(model)
             interval = self.poll_interval if tracker.active else self.idle_poll_interval
-            await asyncio.sleep(interval)
+            await self._wait(client, interval)
             try:
                 model = await client.model()
                 busy = 0
@@ -271,6 +281,26 @@ class DuetAdapter(Adapter):
                 busy += 1
                 if busy >= MAX_BUSY:
                     raise
+
+    async def _wait(self, client: DuetClient, interval: float) -> None:
+        """Waits `interval`, keeping the session alive meanwhile with a cheap read every half
+        session timeout (4 s on RepRapFirmware), so it never lapses between idle polls and
+        rr_connect, which carries the password, is sent once per connection. Ends early when
+        that read shows the job or the state changed."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + interval
+        keep = max(0.05, KEEP_ALIVE_SHARE * client.session_timeout_s)
+        while True:
+            left = deadline - loop.time()
+            if left <= keep:
+                await asyncio.sleep(max(left, 0.0))
+                return
+            await asyncio.sleep(keep)
+            try:
+                if await client.keep_alive():
+                    return
+            except Busy:
+                continue
 
     def _versions(self, model: Mapping[str, Any], report: PrinterReport) -> None:
         firmware = om.firmware(model)
@@ -311,7 +341,7 @@ class DuetAdapter(Adapter):
         except Refused as e:
             return [CheckResult.fail(name, f"{e}. {WHERE_IS_THE_PASSWORD}")]
         except (aiohttp.ClientError, OSError, asyncio.TimeoutError, NotDuet, Busy) as e:
-            return [CheckResult.fail(name, _unreachable(e, self.base_url))]
+            return [CheckResult.fail(name, _unreachable(e, self.base_url, self.password))]
         mode = client.mode
         await client.close()
         parts = [self.describe()]
@@ -354,7 +384,9 @@ def _valid_host(host: str) -> bool:
         return bool(_HOST_NAME.fullmatch(host)) and len(host) <= 253
 
 
-def _unreachable(error: BaseException, url: str) -> str:
+def _unreachable(error: BaseException, url: str, password: str | None = None) -> str:
+    """Why the board can't be had, in words safe to log: never an error's own text unscrubbed,
+    which can name a request's URL, and rr_connect's holds the password."""
     if isinstance(error, Busy):
         return f"{url}: {error}"
     if isinstance(error, NotDuet):
@@ -363,4 +395,5 @@ def _unreachable(error: BaseException, url: str) -> str:
         return f"no answer from {url}"
     if isinstance(error, (aiohttp.ClientConnectorError, ConnectionRefusedError)):
         return f"can't reach {url}. Is it the board's address, and is the printer on?"
-    return f"can't reach {url} ({error})"
+    text = scrub(str(error), [password] if password else [])
+    return f"can't reach {url} ({type(error).__name__}{': ' + text if text else ''})"

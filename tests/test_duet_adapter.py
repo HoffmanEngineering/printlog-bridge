@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 
+import aiohttp
 import bridge_helpers as helpers
 import pytest
 from fake_duet import BOARD, FIRMWARE, PASSWORD, PNG, FakeDuet
@@ -573,3 +575,135 @@ class TestDiscoverCommand:
 
         assert "No Duet answered" in format_duet([], None, 2)
         assert "Couldn't ask" in format_duet(None, None, 2, "no network")
+
+
+class TestSessions:
+    """What the review of #120 found: sessions kept, reconnects and reboots, secrets in errors."""
+
+    def test_an_idle_stretch_keeps_one_session(self):
+        """Between jobs the cheap live-fields read runs often enough (half the board's session
+        timeout) that the session never lapses, so rr_connect, which carries the password over
+        plain HTTP, is sent once. Scaled down: a 0.2 s session and a 1 s idle poll."""
+        report = Report()
+
+        async def scenario():
+            async with board() as fake:
+                fake.session_timeout_ms = 200
+                adapter = adapter_for(fake, poll=1.0, idle=1.0)
+                async with running(adapter, Sink(), report):
+                    await eventually(lambda: report.states)
+                    await asyncio.sleep(2.5)
+                return fake
+
+        fake = asyncio.run(scenario())
+        assert fake.requests_of("/rr_connect") == ["/rr_connect"]
+        assert report.disconnects == []
+        assert len(report.states) <= 4  # the job logic still runs at the idle pace
+
+    def test_a_job_seen_by_the_keepalive_is_polled_at_once(self):
+        sink, report = Sink(), Report()
+
+        async def scenario():
+            async with board() as fake:
+                fake.session_timeout_ms = 200
+                adapter = adapter_for(fake, poll=0.05, idle=30.0)
+                async with running(adapter, sink, report):
+                    await eventually(lambda: report.states)
+                    fake.print_file("a.gcode")
+                    await eventually(lambda: sink.of(JobStarted), timeout=3)
+
+        asyncio.run(scenario())
+
+    def test_an_sbc_that_answers_403_to_a_lapsed_session_is_reconnected(self):
+        report = Report()
+
+        async def scenario():
+            async with board(sbc=True) as fake, running(adapter_for(fake), Sink(), report):
+                await eventually(lambda: report.states)
+                fake.expire_sessions()
+                await eventually(lambda: len(fake.requests_of("/machine/connect")) == 2)
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert report.connects == 1 and report.disconnects == []
+
+    def test_a_reconnect_reads_the_whole_model_again(self):
+        async def scenario():
+            async with board(extruders=1) as fake:
+                client = DuetClient(f"http://127.0.0.1:{fake.port}", password=PASSWORD)
+                try:
+                    await client.connect()
+                    await client.model()
+                    # The board restarted with another config: nothing counts in seqs.
+                    fake.model["tools"].append({"number": 1, "name": "T1", "extruders": [0]})
+                    fake.expire_sessions()
+                    return await client.model()
+                finally:
+                    await client.close()
+
+        model = asyncio.run(scenario())
+        assert [t["number"] for t in model["tools"]] == [0, 1]
+
+    def test_a_board_restart_mid_print_fails_the_job(self, tmp_path):
+        sink, report = Sink(), Report()
+
+        async def scenario():
+            async with board() as fake:
+                adapter = adapter_for(fake)
+                adapter.use_state(PrinterState.load(tmp_path, "railcore"))
+                async with running(adapter, sink, report):
+                    await eventually(lambda: report.states)
+                    fake.print_file("a.gcode")
+                    await eventually(lambda: sink.of(JobStarted))
+                    fake.extrude([250.0])
+                    await asyncio.sleep(0.2)
+                    fake.reset()  # a power cut: sessions, totals and upTime start again
+                    await eventually(lambda: sink.of(JobFinished))
+
+        asyncio.run(scenario())
+        [finished] = sink.of(JobFinished)
+        assert finished.outcome is JobOutcome.FAILED
+        assert finished.filament_mm == {0: 250.0}
+
+    def test_a_timeout_while_reconnecting_never_logs_the_password(self, caplog):
+        report = Report()
+
+        async def scenario():
+            async with board() as fake:
+                adapter = adapter_for(fake)
+                adapter.request_timeout = 0.2
+                async with running(adapter, Sink(), report):
+                    await eventually(lambda: report.states)
+                    fake.connect_delay = 1.0
+                    fake.expire_sessions()
+                    await eventually(lambda: report.disconnects, timeout=5)
+
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(scenario())
+        lines = [r.getMessage() for r in caplog.records if r.name != "aiohttp.access"]
+        assert lines and not any(PASSWORD in line for line in lines)
+        assert not any(PASSWORD in reason for reason in report.disconnects)
+
+    def test_an_error_naming_the_url_is_told_without_the_password(self):
+        from printlog_bridge.adapters.duet.adapter import _unreachable
+
+        error = aiohttp.ClientConnectionError(
+            f"Connection timeout to host http://192.168.1.88/rr_connect?password={PASSWORD}"
+        )
+        text = _unreachable(error, "http://192.168.1.88", PASSWORD)
+        assert PASSWORD not in text and "192.168.1.88" in text
+
+    def test_a_file_info_error_is_logged_without_its_text(self, caplog):
+        from printlog_bridge.adapters.duet.files import DuetFiles
+
+        class Failing:
+            async def file_info(self, path):
+                raise aiohttp.ClientConnectionError(f"http://h/rr_fileinfo?password={PASSWORD}")
+
+            async def thumbnail(self, path, entry):  # pragma: no cover
+                return None
+
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(DuetFiles("railcore", Failing()).read("0:/gcodes/a.gcode"))
+        assert "ClientConnectionError" in caplog.text
+        assert PASSWORD not in caplog.text

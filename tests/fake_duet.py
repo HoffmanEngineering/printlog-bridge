@@ -26,6 +26,7 @@ ASSUMPTION throughout: none of it has been checked against a real board yet.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import secrets
@@ -160,6 +161,10 @@ class FakeDuet:
         self.disconnects = 0
         self.down = False
         self.busy = 0
+        self.connect_delay = 0.0
+        """Seconds rr_connect (or /machine/connect) waits before it answers."""
+        self.sbc_refusal = 403
+        """What DSF answers a request without a live session (ASSUMPTION: 403 or 401)."""
         """Answer the next this many requests 503, as a busy board does."""
         self._runner: web.AppRunner | None = None
         self.port = 0
@@ -171,6 +176,7 @@ class FakeDuet:
         if self.sbc:
             app.router.add_get("/machine/connect", self._machine_connect)
             app.router.add_get("/machine/disconnect", self._machine_disconnect)
+            app.router.add_get("/machine/noop", self._machine_noop)
             app.router.add_get("/machine/model", self._machine_model)
             app.router.add_get("/machine/status", self._machine_model)
             app.router.add_get("/machine/fileinfo/{path:.*}", self._machine_fileinfo)
@@ -287,6 +293,7 @@ class FakeDuet:
     def reset(self) -> None:
         """The board restarted: the job, the sessions and the totals are gone."""
         self.end()
+        self.model["state"]["upTime"] = 3
         self.job["lastFileName"] = None
         self.job["lastDuration"] = None
         for e in self.model["move"]["extruders"]:
@@ -344,6 +351,8 @@ class FakeDuet:
         return key
 
     async def _connect(self, request: web.Request) -> web.Response:
+        if self.connect_delay:
+            await asyncio.sleep(self.connect_delay)
         if not self._password_ok(request.query.get("password")):
             return web.json_response({"err": 1})
         body: dict[str, Any] = {
@@ -369,6 +378,8 @@ class FakeDuet:
         return web.json_response({"err": 0})
 
     def _unauthorized(self) -> web.Response:
+        if self.sbc:
+            return web.Response(status=self.sbc_refusal)
         return web.Response(status=401, text="Not authorized")
 
     def frequent(self) -> dict[str, Any]:
@@ -442,7 +453,14 @@ class FakeDuet:
 
     # --- DuetSoftwareFramework -----------------------------------------------------------
 
+    async def _machine_noop(self, request: web.Request) -> web.Response:
+        if not self._authorized(request):
+            return self._unauthorized()
+        return web.Response(status=204)
+
     async def _machine_connect(self, request: web.Request) -> web.Response:
+        if self.connect_delay:
+            await asyncio.sleep(self.connect_delay)
         if not self._password_ok(request.query.get("password")):
             return web.Response(status=403)
         key = self._new_session()

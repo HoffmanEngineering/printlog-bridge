@@ -70,7 +70,11 @@ class DuetFiles:
         try:
             info = await self.source.file_info(path)
         except Exception as e:  # never holds up the job's start
-            log.info("[printer %s] couldn't read the job's file info: %s", self.printer, e)
+            # Only the kind of error: aiohttp's text can hold the request's URL.
+            log.info(
+                "[printer %s] couldn't read the job's file info (%s)",
+                self.printer, type(e).__name__,
+            )  # fmt: skip
             return JobFile()
         if not isinstance(info, Mapping):
             return JobFile()
@@ -96,7 +100,9 @@ def file_from(info: Mapping[str, Any], path: str, source: Source | None = None) 
             except asyncio.TimeoutError:
                 raise ImageUnavailable("the board took too long to send the thumbnail") from None
             except Exception as e:  # the board's gone, or busy: no thumbnail
-                raise ImageUnavailable(f"the board didn't send the thumbnail ({e})") from None
+                raise ImageUnavailable(
+                    f"the board didn't send the thumbnail ({type(e).__name__})"
+                ) from None
 
         thumbnail = fetch
     return JobFile(

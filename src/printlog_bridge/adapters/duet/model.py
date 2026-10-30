@@ -14,6 +14,7 @@ What the bridge reads of it:
 - `move.extruders[]`: `rawPosition`, the mm each extruder has fed since the job started, before
   the extrusion factor (M221) is applied, and that `factor`. Counted from the start of each
   print, so a bridge that restarts mid-print still gets the job's whole total.
+- `state.upTime`: seconds since the board started, so a restart (a power cut) shows.
 - `tools[]`: each tool's `number` and the `extruders` it drives (a toolchanger's T2 may well
   drive extruder 0).
 - `boards[0]`: `firmwareName`, `firmwareVersion`, `name` (the board); `sbc.dsf.version` with an
@@ -100,17 +101,29 @@ def extruders(model: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [e if isinstance(e, Mapping) else {} for e in value] if isinstance(value, list) else []
 
 
-def raw_by_extruder(model: Mapping[str, Any]) -> dict[int, float] | None:
-    """What each extruder has fed in the job, in mm, its extrusion factor applied; None when the
+def raw_positions(model: Mapping[str, Any]) -> dict[int, float] | None:
+    """What each extruder has fed in the job, in mm, before its extrusion factor; None when the
     board doesn't report `rawPosition` (older firmware)."""
     found: dict[int, float] = {}
     for i, extruder in enumerate(extruders(model)):
         raw = number(extruder.get("rawPosition"))
-        if raw is None:
-            continue
-        factor = number(extruder.get("factor"))
-        found[i] = raw * (factor if factor is not None and factor > 0 else 1.0)
+        if raw is not None:
+            found[i] = raw
     return found or None
+
+
+def factors(model: Mapping[str, Any]) -> dict[int, float]:
+    """Each extruder's extrusion factor (M221), 1.0 when it doesn't say."""
+    found: dict[int, float] = {}
+    for i, extruder in enumerate(extruders(model)):
+        factor = number(extruder.get("factor"))
+        found[i] = factor if factor is not None and factor > 0 else 1.0
+    return found
+
+
+def up_time(model: Mapping[str, Any]) -> float | None:
+    """Seconds since the board started (`state.upTime`): lower than before, it restarted."""
+    return number(_get(model, "state", "upTime"))
 
 
 def slots_of(model: Mapping[str, Any]) -> dict[int, int]:

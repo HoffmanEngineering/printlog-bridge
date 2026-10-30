@@ -94,6 +94,7 @@ class Rig:
     def poll(self, seconds: float = 5.0) -> None:
         """`seconds` pass, on the board's job clock too while it prints."""
         self.clock.tick(seconds)
+        self.fake.model["state"]["upTime"] += int(seconds)
         job = self.fake.job
         if job["duration"] is not None and self.fake.model["state"]["status"] == "processing":
             job["duration"] += seconds
@@ -291,7 +292,28 @@ def test_a_reprint_of_the_same_file_while_away_is_another_job():
     assert starts[-1].job_id != first.job_id
 
 
-def test_after_a_board_reset_the_job_is_logged_with_the_estimate():
+def test_a_board_that_restarted_mid_print_fails_the_job_with_what_it_had_fed():
+    for restart_bridge in (False, True):
+        fake = FakeDuet()
+        rig = Rig(fake)
+        fake.print_file("a.gcode")
+        rig.poll()
+        fake.extrude([400.0])
+        rig.poll()
+
+        if restart_bridge:
+            rig.restart()
+        fake.reset()  # a power cut: upTime starts again, rawPosition is 0
+        rig.poll()
+
+        [finished] = rig.sink.of(JobFinished)
+        assert finished.outcome is JobOutcome.FAILED
+        assert "restarted" in (finished.note or "")
+        assert finished.filament_mm == {0: 400.0}
+        assert finished.usage_estimated is False
+
+
+def test_after_another_print_ran_while_away_the_job_is_logged_with_the_estimate():
     fake = FakeDuet()
     rig = Rig(fake)
     fake.print_file("a.gcode")
@@ -300,13 +322,93 @@ def test_after_a_board_reset_the_job_is_logged_with_the_estimate():
     rig.poll()
 
     rig.restart()
-    fake.reset()
-    rig.poll()
+    fake.end()
+    fake.print_file("b.gcode")
+    fake.end()
+    rig.poll(3600)
 
     [finished] = rig.sink.of(JobFinished)
     assert finished.outcome is JobOutcome.COMPLETED
     assert finished.usage_estimated is True  # nothing on the board says how it went
     assert finished.filament_mm == {0: 4130.2}
+
+
+def test_a_clock_jump_doesnt_split_the_job():
+    fake = FakeDuet()
+    rig = Rig(fake)
+    fake.print_file("a.gcode")
+    rig.poll()
+    rig.clock.tick(3600)  # NTP sets the clock of a Pi without a battery
+    fake.extrude([10.0])
+    rig.poll()
+    fake.end()
+    rig.poll()
+
+    assert len(rig.sink.of(JobStarted)) == 1
+    [finished] = rig.sink.of(JobFinished)
+    assert finished.outcome is JobOutcome.COMPLETED and finished.filament_mm == {0: 10.0}
+
+
+def test_a_cancel_after_a_long_pause_is_a_cancel():
+    fake = FakeDuet()
+    rig = Rig(fake)
+    fake.print_file("a.gcode")
+    rig.poll(600)
+    fake.status("paused")
+    rig.poll(7200)  # duration stands still while paused
+    fake.status("cancelling")
+    rig.poll()
+    fake.end(cancelled=True)
+    rig.poll()
+
+    assert len(rig.sink.of(JobStarted)) == 1
+    [finished] = rig.sink.of(JobFinished)
+    assert finished.outcome is JobOutcome.CANCELLED
+
+
+def test_a_job_whose_duration_goes_back_is_another_print_of_the_file():
+    fake = FakeDuet()
+    rig = Rig(fake)
+    fake.print_file("a.gcode")
+    rig.poll(600)
+    fake.print_file("a.gcode")  # printed again between two polls
+    rig.poll()
+
+    assert len(rig.sink.of(JobStarted)) == 2
+    assert len(rig.sink.of(JobFinished)) == 1
+
+
+def test_each_stretch_counts_at_the_extrusion_factor_it_had():
+    fake = FakeDuet()
+    rig = Rig(fake)
+    fake.print_file("a.gcode")
+    rig.poll()
+    fake.extrude([1000.0])
+    rig.poll()
+    fake.model["move"]["extruders"][0]["factor"] = 0.5
+    fake.extrude([1000.0])
+    rig.poll()
+    fake.end()
+    rig.poll()
+
+    assert rig.sink.of(JobFinished)[0].filament_mm == {0: 1500.0}
+
+
+def test_the_slicers_estimate_is_per_tool_not_per_extruder():
+    fake = FakeDuet(extruders=2, tools=[[1], [0]])
+    rig = Rig(fake)
+    rig.files.mm = (300.0, 100.0)
+    fake.print_file("a.gcode")
+    for e in fake.model["move"]["extruders"]:
+        del e["rawPosition"]
+    fake.job["rawExtrusion"] = None
+    rig.poll()
+    fake.end()
+    rig.poll()
+
+    [finished] = rig.sink.of(JobFinished)
+    assert finished.usage_estimated is True
+    assert finished.filament_mm == {0: 300.0, 1: 100.0}  # T0's and T1's, whatever they drive
 
 
 def test_without_measured_positions_the_estimate_is_scaled_by_progress():
@@ -334,13 +436,16 @@ def test_the_job_total_is_used_when_extruders_dont_report_theirs():
     for e in fake.model["move"]["extruders"]:
         del e["rawPosition"]
     rig.poll()
-    fake.job["rawExtrusion"] = 777.0
+    fake.job["rawExtrusion"] = 700.0
+    rig.poll()
+    fake.model["move"]["extruders"][0]["factor"] = 1.1
+    fake.job["rawExtrusion"] = 800.0
     rig.poll()
     fake.end()
     rig.poll()
 
     [finished] = rig.sink.of(JobFinished)
-    assert finished.filament_mm == {0: 777.0}
+    assert finished.filament_mm == {0: 810.0}  # 700 at 1.0, then 100 at 1.1
     assert finished.usage_estimated is False
 
 

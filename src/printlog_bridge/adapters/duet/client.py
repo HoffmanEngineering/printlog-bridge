@@ -8,9 +8,12 @@ DuetSoftwareFramework on a Raspberry Pi beside a Duet 3 ("SBC").
   `sessionTimeout` in ms and, from RRF 3.5, a `sessionKey` the bridge sends as `X-Session-Key`
   on every later request), 1 for a wrong password, 2 when every session is taken. The bridge
   never sends `time` (which sets the board's clock).
-- A session lapses after `sessionTimeout` (8 s) without a request, which a poll every 30 s
-  between jobs lets happen: the next request answers 401, and the client connects again and
-  repeats it, once. 503 is a board too busy to answer (`Busy`).
+- A session lapses after `sessionTimeout` (8 s) without a request. `keep_alive` (the live
+  fields) runs every half of that between polls, so it shouldn't; when it does anyway, the next
+  request answers 401 (DSF: 401 or 403), and the client connects again and repeats it, once,
+  and reads the whole model again (a new session can be a board that restarted with another
+  config). 503 is a board too busy to answer (`Busy`). Error texts go out through
+  `safe_error`: aiohttp's can hold the request's URL, and rr_connect's has the password.
 - `rr_model?key=<key>&flags=d99vn` is one key of the object model in full, and
   `rr_model?flags=d99fn` the fields that change often, with `seqs`, a counter per key that moves
   when anything else in it changes. So each poll is one `rr_model`, plus a full read of each key
@@ -52,6 +55,7 @@ import aiohttp
 from printlog_bridge import __version__
 from printlog_bridge.adapters.common.timeouts import bounded
 from printlog_bridge.core.images import image_type
+from printlog_bridge.core.secrets import scrub
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 from .files import MAX_THUMBNAIL_TEXT
@@ -62,6 +66,8 @@ log = logging.getLogger(__name__)
 DEFAULT_PASSWORD = "reprap"
 """RepRapFirmware's password when none is set (M551): the board then takes any."""
 REQUEST_TIMEOUT_S = 10.0
+DEFAULT_SESSION_TIMEOUT_S = 8.0
+"""RepRapFirmware's, and what DSF is taken to keep (ASSUMPTION) when nothing says."""
 DISCONNECT_TIMEOUT_S = 2.0
 KEYS = ("boards", "job", "move", "network", "sbc", "state", "tools")
 """The object model's keys the bridge reads in full when their `seqs` move."""
@@ -103,6 +109,8 @@ class DuetClient:
         self.emulated = False
         """DSF answering `rr_` requests for the board."""
         self.session_key: str | None = None
+        self.session_timeout_s = DEFAULT_SESSION_TIMEOUT_S
+        """How long the board keeps a session without a request (`sessionTimeout`)."""
         self.reconnects = 0
         self._http: aiohttp.ClientSession | None = None
         self._model: dict[str, Any] = {}
@@ -135,7 +143,12 @@ class DuetClient:
         key = body.get("sessionKey")
         self.session_key = str(key) if isinstance(key, (int, str)) and key != "" else None
         self.emulated = body.get("isEmulated") is True
+        timeout = body.get("sessionTimeout")
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+            self.session_timeout_s = timeout / 1000
         self.mode = STANDALONE
+        # A new session may be a board that restarted with another config: read it all again.
+        self._model, self._seqs = {}, {}
 
     async def _connect_sbc(self, password: str) -> None:
         status, body = await self._request("/machine/connect", {"password": password}, auth=False)
@@ -172,14 +185,40 @@ class DuetClient:
         """The object model as it is now: what changed since the last call read again."""
         if self.mode == SBC:
             return await self._sbc_model()
-        if not self._model:
-            self._model = {}
-            for key in KEYS:
-                self._model[key] = await self._key(key)
-            frequent = await self._frequent()
-            self._seqs = dict(frequent.get("seqs") or {})
-            merge(self._model, frequent)
-            return self._model
+        for _ in range(2):
+            before = self.reconnects
+            if not self._model:
+                await self._full_model()
+            else:
+                await self._changes()
+            if self.reconnects == before:
+                break
+            self._model, self._seqs = {}, {}  # a new session part way: read it all again
+        return self._model
+
+    async def _full_model(self) -> None:
+        model: dict[str, Any] = {}
+        self._model = model
+        for key in KEYS:
+            model[key] = await self._key(key)
+        frequent = await self._frequent()
+        self._seqs = dict(frequent.get("seqs") or {})
+        merge(model, frequent)
+
+    async def keep_alive(self) -> bool:
+        """A cheap request that keeps the session from lapsing between polls: the fields that
+        change often (standalone) or `/machine/noop` (SBC). True when it shows something
+        changed that the next `model()` should read now (standalone: `seqs` of `job` or
+        `state` moved)."""
+        if self.mode == SBC:
+            status, _ = await self._get("/machine/noop", None)
+            return False if status in (200, 204) else bool(await self.model())
+        frequent = await self._frequent()
+        seqs = frequent.get("seqs")
+        seqs = seqs if isinstance(seqs, Mapping) else {}
+        return any(seqs.get(k) != self._seqs.get(k) for k in ("job", "state") if k in seqs)
+
+    async def _changes(self) -> None:
         frequent = await self._frequent()
         seqs = frequent.get("seqs")
         seqs = seqs if isinstance(seqs, Mapping) else {}
@@ -188,7 +227,6 @@ class DuetClient:
                 self._model[key] = await self._key(key)
         self._seqs = dict(seqs)
         merge(self._model, frequent)
-        return self._model
 
     async def _frequent(self) -> Mapping[str, Any]:
         body = await self._get_model("", FREQUENT_FLAGS)
@@ -275,7 +313,7 @@ class DuetClient:
     async def _get(self, path: str, params: Mapping[str, str] | None) -> tuple[int, Any]:
         """A request in the session, connecting again once when the session has lapsed."""
         status, body = await self._request(path, params, auth=True)
-        if status == 401:
+        if self._lapsed(status):
             if self._lock is None:
                 self._lock = asyncio.Lock()
             async with self._lock:
@@ -285,9 +323,20 @@ class DuetClient:
             status, body = await self._request(path, params, auth=True)
         if status == 503:
             raise Busy(f"the board is busy (HTTP 503 from {path})")
-        if status == 401:
+        if self._lapsed(status):
             raise Refused("the board keeps refusing the bridge's session")
         return status, body
+
+    def _lapsed(self, status: int) -> bool:
+        """A session the board no longer has: 401 from RepRapFirmware, 401 or 403 from DSF."""
+        return status == 401 or (status == 403 and self.mode == SBC)
+
+    def safe_error(self, error: BaseException) -> str:
+        """`error` as text safe to log: aiohttp's messages can hold the request's URL, and
+        rr_connect's carries the password."""
+        text = scrub(str(error), [self.password] if self.password else [])
+        name = type(error).__name__
+        return f"{name}: {text}" if text else name
 
     def _session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
