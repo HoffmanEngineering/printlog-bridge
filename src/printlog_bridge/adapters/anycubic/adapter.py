@@ -64,8 +64,25 @@ CHECK_S = 8.0
 FIRMWARE_NAME = "Anycubic"
 IDENTITY_KEY = "anycubic_identity"
 LAN_WARNING = "lan_mode"
-TRACE_DROPPED = frozenset({"urls", "ip", "mac", "fileUploadUrl", "fileUploadurl", "rtspUrl"})
-"""What a trace never keeps of a report: `urls` holds a signed upload address."""
+TAKEOVER_WARNING = "takeover"
+TAKEOVER_S = 30.0
+"""A session of a fixed client id (a Photon's) that drops this soon was taken over."""
+TAKEOVER_BACKOFF_S = 300.0
+TAKEOVER_MESSAGE = (
+    "another client (Photon Workshop, or Anycubic's app in LAN mode) took the printer's "
+    "connection: a Photon takes one LAN client at a time. The bridge tries again every "
+    "5 minutes; close Photon Workshop's printer page to let it watch"
+)
+ONE_CLIENT = (
+    "the printer takes one LAN client at a time: while the bridge watches it, Photon Workshop "
+    "can't connect, and connecting it pushes the bridge off for 5 minutes"
+)
+TRACE_DROPPED = frozenset({"urls", "ip", "fileuploadurl", "rtspurl", "rtsp", "cn", "sn", "usn",
+                           "deviceid", "device_id", "clientid", "client_id", "bssid"})  # fmt: skip
+"""Keys a trace never keeps of a report (`urls` holds a signed upload address), lowercased."""
+TRACE_DROPPED_WORDS = frozenset({"mac", "ssid", "wifi", "wlan", "serial", "sn", "cn", "ip"})
+"""Words of a key a trace never keeps: the printer's identifiers and the Wi-Fi network's."""
+_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
 _HOST_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 
 
@@ -87,6 +104,10 @@ class AnycubicAdapter(Adapter):
         self.retry_s = RETRY_S
         self.connect_s = CONNECT_TIMEOUT_S
         self.query_s = protocol.QUERY_INTERVAL_S
+        self.takeover_s = TAKEOVER_S
+        self.takeover_backoff_s = TAKEOVER_BACKOFF_S
+        self._connected_at = 0.0
+        self._taken_over = False
         self.trace: Trace | None = None
         self.state: PrinterState | None = None
         self._was_connected = False
@@ -192,9 +213,17 @@ class AnycubicAdapter(Adapter):
                     OSError, ssl.SSLError, asyncio.TimeoutError) as e:  # fmt: skip
                 if self._was_connected:
                     retry = self.retry_s
-                reason = _unreachable(e, self.describe())
-                log.info("[printer %s] %s; trying again in %gs", self.printer, reason, retry)
-                report.disconnected(reason)
+                if self._was_taken_over(e, credentials_fixed=tracker is not None and tracker.resin):
+                    retry = self.takeover_backoff_s
+                    report.disconnected("another client took the printer's connection")
+                    if not self._taken_over:
+                        self._taken_over = True
+                        log.warning("[printer %s] %s", self.printer, TAKEOVER_MESSAGE)
+                        report.warn(TAKEOVER_WARNING, f"{TAKEOVER_MESSAGE}.")
+                else:
+                    reason = _unreachable(e, self.describe())
+                    log.info("[printer %s] %s; trying again in %gs", self.printer, reason, retry)
+                    report.disconnected(reason)
             except Exception as e:  # a bug: keep watching rather than stop the bridge
                 log.exception("[printer %s] watching the printer failed unexpectedly", self.printer)
                 report.disconnected(f"unexpected error: {e!r}")
@@ -203,7 +232,17 @@ class AnycubicAdapter(Adapter):
                 if self._was_connected and self.trace is not None:
                     self.trace.mark("close")
             await asyncio.sleep(retry)
-            retry = min(retry * 2, MAX_RETRY_S)
+            if retry < self.takeover_backoff_s:
+                retry = min(retry * 2, MAX_RETRY_S)
+
+    def _was_taken_over(self, error: BaseException, *, credentials_fixed: bool) -> bool:
+        """A connection of the one client id a Photon takes that ended within seconds: another
+        client connected with it (MQTT gives the first one no reason, it just ends)."""
+        if not (self._was_connected and credentials_fixed):
+            return False
+        if not isinstance(error, (MqttClosed, Dropped)):
+            return False
+        return asyncio.get_running_loop().time() - self._connected_at < self.takeover_s
 
     async def _connect(self, credentials: Credentials) -> MqttClient:
         return await MqttClient.connect(
@@ -222,6 +261,8 @@ class AnycubicAdapter(Adapter):
         client = await self._connect(credentials)
         topics = protocol.Topics(info.model_id, credentials.device_id, resin=info.resin)
         self._was_connected = True
+        loop = asyncio.get_running_loop()
+        self._connected_at = loop.time()
         if self.trace is not None:
             self.trace.mark("open")
         report.connected()
@@ -229,12 +270,27 @@ class AnycubicAdapter(Adapter):
                  info.model_name or f"model {info.model_id}")  # fmt: skip
         tracker.connected()
         querier: asyncio.Task | None = None
+        receiving: asyncio.Future | None = None
         try:
             for topic in topics.subscriptions:
                 await client.subscribe(topic)
             querier = asyncio.ensure_future(self._query(client, topics, info.resin))
             while True:
-                topic, payload = await client.receive()
+                # One receive at a time, kept across waits (a packet is never cut short), and
+                # the querier beside it: a query that fails ends the session at once.
+                if receiving is None:
+                    receiving = asyncio.ensure_future(client.receive())
+                done, _ = await asyncio.wait(
+                    {receiving, querier}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if querier in done:
+                    error = None if querier.cancelled() else querier.exception()
+                    raise Dropped(f"sending a query failed ({error or 'stopped'})")
+                topic, payload = receiving.result()
+                receiving = None
+                if self._taken_over and loop.time() - self._connected_at >= self.takeover_s:
+                    self._taken_over = False
+                    report.warn(TAKEOVER_WARNING, None)
                 if not topics.is_report(topic):
                     continue
                 message = self._read(payload)
@@ -245,14 +301,19 @@ class AnycubicAdapter(Adapter):
                     continue
                 self._on_firmware(kind, message, report)
                 await tracker.on_message(kind, message)
-                if querier.done() and not querier.cancelled() and querier.exception():
-                    raise Dropped(f"sending a query failed ({querier.exception()})")
         finally:
             if querier is not None:
                 querier.cancel()
-                with contextlib.suppress(BaseException):
-                    await asyncio.wait({querier}, timeout=2)
-            await client.close()
+            await client.close()  # a pending receive ends with the connection
+            for task in (querier, receiving):
+                if task is None:
+                    continue
+                if not task.done():
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait({task}, timeout=2)
+                    task.cancel()
+                elif not task.cancelled():
+                    task.exception()  # retrieved: the session already ended for its own reason
 
     async def _query(self, client: MqttClient, topics: protocol.Topics, resin: bool) -> None:
         """The queries now, then the periodic ones every `query_s`, until cancelled."""
@@ -350,7 +411,10 @@ class AnycubicAdapter(Adapter):
         state = data.get("state") if isinstance(data, Mapping) else answer.get("state")
         if isinstance(state, str) and state:
             parts.append(state)
-        return [CheckResult.ok(name, ", ".join(parts))]
+        text = ", ".join(parts)
+        if info.resin:
+            text += f". Note: {ONE_CLIENT}"
+        return [CheckResult.ok(name, text)]
 
 
 def firmware_of(kind: str, message: Mapping[str, Any]) -> str | None:
@@ -367,20 +431,27 @@ def firmware_of(kind: str, message: Mapping[str, Any]) -> str | None:
 
 
 def traced(body: Any) -> str:
-    """What a trace keeps of a report: the whole of it but its addresses (`urls` holds a signed
-    upload address, `ip` and `mac` the printer's). Secret-looking fields are scrubbed by the
-    trace itself."""
+    """What a trace keeps of a report: the whole of it but its addresses and identifiers: `urls`
+    (a signed upload address), the printer's IP and MAC addresses, serial (`cn`, `sn`), device
+    and client ids, and anything naming the Wi-Fi network, at any depth. Secret-looking fields
+    are scrubbed by the trace itself."""
     if not isinstance(body, Mapping):
         return json.dumps({"kind": "not a JSON object"})
 
     def strip(value: Any) -> Any:
         if isinstance(value, Mapping):
-            return {k: strip(v) for k, v in value.items() if k not in TRACE_DROPPED}
+            return {k: strip(v) for k, v in value.items() if not _dropped(str(k))}
         if isinstance(value, list):
             return [strip(v) for v in value]
         return value
 
     return json.dumps(strip(body))
+
+
+def _dropped(key: str) -> bool:
+    if key.lower() in TRACE_DROPPED:
+        return True
+    return any(w.lower() in TRACE_DROPPED_WORDS for w in _WORD.findall(key))
 
 
 def _port(printer: str, options: Mapping[str, str], option: str, default: int | None) -> int:

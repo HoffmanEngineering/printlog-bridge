@@ -198,10 +198,14 @@ class JobTracker:
         """The job block, each `print` report merged in (a report may carry only part)."""
         self._reconciled = False
         self._ended: Job | None = None
+        self._idle_at: datetime | None = None
+        """When a resin printer said `idle` while its job hadn't reached its end: the job's own
+        `print` report may still be on its way."""
 
     def connected(self) -> None:
         self.project = {}
         self._reconciled = False
+        self._idle_at = None
 
     # -- reports --------------------------------------------------------------------------
 
@@ -220,6 +224,11 @@ class JobTracker:
             if self.resin and isinstance(state, str) and state.strip():
                 block["state"] = state  # the resin job's state is the envelope's
             self.project = block
+            self._idle_at = None
+            if not _has_file(block):
+                # Only part of the job (after a reconnect, before `info` sets the block): it
+                # can't say which job it is, so it decides nothing.
+                return
             await self._decide(view_of(block))
         elif kind == "status" and self.resin:
             state = message.get("state")
@@ -227,7 +236,30 @@ class JobTracker:
                 self.report.printer_state(state)
             if isinstance(state, str) and state.strip().lower() in ("idle", "free"):
                 self.project = {}
-                await self._decide(view_of(None))
+                await self._on_idle()
+
+    async def _on_idle(self) -> None:
+        """A resin printer went idle. A job at its last layer has ended: completed. One short of
+        it waits for its `print` report, which says how it ended, until the next status; still
+        idle then, it ends by its progress, at when the printer first said idle."""
+        job = self.job
+        if job is None or not self._reconciled:
+            await self._decide(view_of(None))
+            return
+        if _at_end(job):
+            self._idle_at = None
+            await self._finish(JobOutcome.COMPLETED, None)
+            return
+        if self._idle_at is None:
+            self._idle_at = self.clock()
+            return
+        at, self._idle_at = self._idle_at, None
+        complete = job.progress >= COMPLETE_AT_PERCENT
+        await self._finish(
+            JobOutcome.COMPLETED if complete else JobOutcome.CANCELLED,
+            UNSEEN_END_NOTE,
+            finished_at=at,
+        )
 
     async def _decide(self, view: View) -> None:
         if not self._reconciled:
@@ -450,6 +482,18 @@ class JobTracker:
         if job.usage:
             return {0: round(job.usage, 1)}, {}
         return {}, {}
+
+
+def _has_file(block: Mapping[str, Any]) -> bool:
+    name = block.get("filename")
+    return isinstance(name, str) and bool(name.strip())
+
+
+def _at_end(job: Job) -> bool:
+    """The job reached its last layer, or 99%."""
+    if job.layer is not None and job.total_layers and job.layer >= job.total_layers:
+        return True
+    return job.progress >= COMPLETE_AT_PERCENT
 
 
 def _is_job(data: Mapping[str, Any]) -> bool:

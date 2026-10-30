@@ -31,7 +31,9 @@ SSDP_PORT = 1900
 SEARCH_TARGETS = ("ac:3dprinter:fdm", "ac:3dprinter:lcd")
 ASK_S = 3.0
 MAX_REPLY = 4096
-_MAC = re.compile(r"([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}")
+_MAC = re.compile(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}|[0-9A-Fa-f]{12}")
+"""The MAC address after `uuid:<kind>:` in `USN`: the S1 wrote `uuid:fdm:28-F5-...`, the P1 Max
+`uuid:lcd:50:31:...`; 12 hex digits without separators are taken too."""
 
 
 def search(target: str) -> bytes:
@@ -74,8 +76,9 @@ def parse_reply(data: bytes, sender: str) -> FoundAnycubic | None:
         fields = dict(parse_qsl(urlsplit(location).query))
     except ValueError:
         fields = {}
-    mac_match = _MAC.search(headers.get("usn", ""))
-    mac = mac_match.group(0).replace("-", ":").lower() if mac_match else None
+    usn = headers.get("usn", "")
+    tail = usn.split(":", 2)[2] if usn.lower().startswith("uuid:") and usn.count(":") >= 2 else ""
+    mac = _mac(tail) if _MAC.fullmatch(tail) else None
     kind = target.rsplit(":", 1)[-1]
     return FoundAnycubic(
         address=sender,
@@ -86,6 +89,11 @@ def parse_reply(data: bytes, sender: str) -> FoundAnycubic | None:
         resin=kind == "lcd",
         lan_mode=fields.get("ctrlType", "lan") in ("lan", "net"),
     )
+
+
+def _mac(text: str) -> str:
+    bare = re.sub(r"[:-]", "", text).lower()
+    return ":".join(bare[i : i + 2] for i in range(0, 12, 2))
 
 
 class _Collector(asyncio.DatagramProtocol):

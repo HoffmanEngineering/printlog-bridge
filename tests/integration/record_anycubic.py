@@ -66,7 +66,7 @@ async def record(host: str, out: Path, seconds: float) -> Path:
     path = out / f"anycubic-{kind}-{int(start)}.json"
     try:
         client = await MqttClient.connect(
-            credentials.broker_host,
+            host,  # as the adapter: the login goes to the printer asked, never elsewhere
             credentials.broker_port,
             protocol.tls_context(),
             client_id=credentials.client_id or protocol.client_id(),

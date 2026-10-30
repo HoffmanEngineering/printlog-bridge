@@ -394,6 +394,127 @@ class TestRunResin:
         assert done.volume_ml == {0: round(19.25 * 73 / 292, 2)}
 
 
+class TestAnotherClient:
+    """A Photon's broker takes only the client id `/ctrl` gives, so Photon Workshop and the
+    bridge push each other off. A session taken over within seconds backs off for minutes,
+    with one warning, instead of taking the printer back every few seconds."""
+
+    def test_a_session_taken_over_backs_off_with_one_warning(self, cert, caplog):
+        import logging
+
+        report = Report()
+
+        async def scenario():
+            async with printer(cert, resin=True) as fake:
+                adapter = adapter_for(fake)
+                adapter.takeover_s = 5.0
+                adapter.takeover_backoff_s = 60.0
+                async with running(adapter, Sink(), report):
+                    await eventually(lambda: fake.subscribed)
+                    fake.drop()  # Photon Workshop connected with the same client id
+                    await eventually(lambda: report.warnings.get("takeover"))
+                    await asyncio.sleep(0.5)
+                return fake
+
+        with caplog.at_level(logging.INFO):
+            fake = asyncio.run(scenario())
+        assert fake.handshakes == 1  # no fresh /ctrl: the bridge waits its turn
+        assert "Photon Workshop" in report.warnings["takeover"]
+        warned = [r for r in caplog.records if r.levelno >= logging.WARNING and "another" in
+                  r.getMessage()]  # fmt: skip
+        assert len(warned) == 1
+
+    def test_a_long_session_isnt_a_takeover(self, cert):
+        report = Report()
+
+        async def scenario():
+            async with printer(cert, resin=True) as fake:
+                adapter = adapter_for(fake)
+                adapter.takeover_s = 0.2
+                async with running(adapter, Sink(), report):
+                    await eventually(lambda: fake.subscribed)
+                    await asyncio.sleep(0.4)
+                    fake.drop()
+                    await eventually(lambda: fake.handshakes >= 2)
+
+        asyncio.run(scenario())
+        assert not report.warnings.get("takeover")
+
+    def test_an_fdm_printer_is_never_taken_over(self, cert):
+        report = Report()
+
+        async def scenario():
+            async with printer(cert) as fake:
+                adapter = adapter_for(fake)
+                adapter.takeover_s = 5.0
+                async with running(adapter, Sink(), report):
+                    await eventually(lambda: fake.subscribed)
+                    fake.drop()
+                    await eventually(lambda: fake.handshakes >= 2)
+
+        asyncio.run(scenario())
+        assert not report.warnings.get("takeover")
+
+    def test_doctor_says_a_photon_takes_one_client(self, cert):
+        async def scenario():
+            async with printer(cert, resin=True) as fake:
+                return await adapter_for(fake).check()
+
+        [result] = asyncio.run(scenario())
+        assert result.status is Status.OK and "one LAN client" in result.detail
+
+
+def test_a_failed_query_ends_the_session_at_once(cert, monkeypatch):
+    """A query that can't be sent drops the connection now, not at the next report."""
+    from printlog_bridge.adapters.common.mqtt import MqttClient, MqttClosed
+
+    report = Report()
+    sent = []
+
+    async def failing(self, topic, payload):
+        sent.append(topic)
+        if len(sent) > 4:
+            raise MqttClosed("connection lost (test)")
+
+    monkeypatch.setattr(MqttClient, "publish", failing)
+
+    async def scenario():
+        async with printer(cert) as fake:
+            adapter = adapter_for(fake)
+            adapter.query_s = 0.05
+            async with running(adapter, Sink(), report):
+                await eventually(lambda: report.disconnects, timeout=3)
+
+    asyncio.run(scenario())
+    assert any("query" in d or "connection lost" in d for d in report.disconnects)
+
+
+def test_a_trace_keeps_no_identifier_of_the_printer_or_the_network():
+    from printlog_bridge.adapters.anycubic.adapter import traced
+
+    lan_info = {
+        "type": "lanInfo",
+        "action": "query",
+        "data": {
+            "firmware_version": "1.0.3",
+            "cn": "SERIAL-CANARY",
+            "sn": "SN-CANARY",
+            "deviceId": "DEVICE-CANARY",
+            "device_id": "DEVICE2-CANARY",
+            "ssid": "WIFI-CANARY",
+            "wifiName": "WIFI2-CANARY",
+            "wlan": {"name": "WIFI3-CANARY"},
+            "serialNumber": "SERIAL2-CANARY",
+            "macAddress": "MAC-CANARY",
+            "ip": "IP-CANARY",
+            "machine_state": "kept",
+        },
+    }
+    text = traced(lan_info)
+    assert "CANARY" not in text
+    assert "1.0.3" in text and "kept" in text
+
+
 def test_a_trace_keeps_no_secret(cert, tmp_path):
     from printlog_bridge.core.trace import Trace, trace_files
 
@@ -430,6 +551,18 @@ class TestDiscovery:
         for f in by_kind.values():
             assert f.lan_mode and f.serial and f.serial.startswith("<serial")
             assert "token" not in repr(f)
+
+    def test_a_usn_mac_with_or_without_separators(self):
+        for usn, mac in (("uuid:fdm:28-F5-2B-00-11-22", "28:f5:2b:00:11:22"),
+                         ("uuid:lcd:50:31:23:00:11:22", "50:31:23:00:11:22"),
+                         ("uuid:fdm:28F52B001122", "28:f5:2b:00:11:22")):  # fmt: skip
+            reply = (
+                "HTTP/1.1 200 OK\r\nST: ac:3dprinter:fdm\r\nUSN: " + usn + "\r\n"
+                "LOCATION: http://192.168.4.9:18910/info?cn=X1&ctrlType=lan&modelId=20025"
+                "&token=secret\r\n\r\n"
+            ).encode()
+            found = parse_reply(reply, "192.168.4.9")
+            assert found is not None and found.mac == mac
 
     def test_ignores_other_ssdp_answers(self):
         reply = b"HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\nLOCATION: http://x/\r\n\r\n"
