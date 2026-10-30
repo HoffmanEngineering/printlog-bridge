@@ -16,7 +16,13 @@ from printlog_bridge.core.doctor import diagnose
 
 
 def diagnose_with(
-    tmp_path: Path, *, api_key: str = "", revoke=False, other_api=False, mode: int | None = None
+    tmp_path: Path,
+    *,
+    api_key: str = "",
+    revoke=False,
+    other_api=False,
+    mode: int | None = None,
+    supersede=False,
 ):
     async def scenario():
         api = FakePrintLogApi()
@@ -25,6 +31,8 @@ def diagnose_with(
             token = api.issue_device_token()
             if revoke:
                 api.revoke(api.grant_for(token)["id"])
+            if supersede:
+                api.supersede(token)  # paired again somewhere else
             write_device_token(
                 tmp_path / "state",
                 token=token,
@@ -67,6 +75,16 @@ def test_doctor_says_a_revoked_token_needs_a_re_pair(tmp_path):
     api = results["3D Print Log API"]
     assert api.status is Status.FAIL
     assert "Re-pair needed: run `printlog-bridge pair`" in api.detail
+
+
+def test_doctor_says_another_pairing_replaced_this_token(tmp_path):
+    results, _ = diagnose_with(tmp_path, supersede=True)
+
+    api = results["3D Print Log API"]
+    assert api.status is Status.WARN
+    assert "paired again somewhere else" in api.detail
+    assert "still logs prints" in api.detail
+    assert "Printer voron in 3D Print Log" not in results  # the API check says it all
 
 
 def test_doctor_warns_about_a_token_from_another_api(tmp_path):

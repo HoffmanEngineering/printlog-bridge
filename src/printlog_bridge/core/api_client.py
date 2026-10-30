@@ -9,12 +9,20 @@ replaced by pairing again) raises RepairNeeded, and from then on every call rais
 asking the API, until `printlog-bridge pair` stores a new token, which the next call picks up.
 429 `device_token_throttled` is the API limiting guesses from this address: ApiUnavailable, to
 wait out, never a reason to pair again.
+
+403 `device_token_superseded` (api#299) is a token another pairing replaced, during the
+re-pair's grace (until the new token's first use, at most 10 minutes): it still logs prints and
+sends heartbeats, and nothing else. When the state folder holds a newer token (another
+`printlog-bridge pair` run), it is used and the request sent again, once. Otherwise another
+install holds the new token: TokenSuperseded (ApiUnavailable, so nothing is dropped), and the
+401 after the grace is the re-pair. Never a reason to pair again by itself.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json as jsonlib
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,6 +40,8 @@ from printlog_bridge.core.images import mask_url, scrub_url
 
 if TYPE_CHECKING:
     from printlog_bridge.core.config import BridgeConfig
+
+log = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_S = 15
 UPLOAD_TIMEOUT_S = 30
@@ -65,11 +75,14 @@ class RepairNeeded(AuthRejected):
         super().__init__(REPAIR_NEEDED)
 
 
-INVALID_DEVICE_TOKEN = "invalid_device_token"
-DEVICE_TOKEN_THROTTLED = "device_token_throttled"
-INSUFFICIENT_SCOPE = "insufficient_scope"
-THROTTLED_RETRY_S = 60.0
-"""How long to wait on a `device_token_throttled` without a `Retry-After` (the API sends 60)."""
+SUPERSEDED = (
+    "3D Print Log has a newer device token for this bridge: it was paired again somewhere else "
+    "(another install of it, or `printlog-bridge pair` with another state folder). Until that "
+    "token is first used, for at most 10 minutes, this one still logs prints and sends "
+    "heartbeats, but it no longer checks in or gets the printers connected in the app. If this "
+    "is the install to keep, run `printlog-bridge pair` here (the other one then stops); "
+    "otherwise remove this one"
+)
 
 
 class ApiUnavailable(ApiError):
@@ -83,6 +96,24 @@ class ApiUnavailable(ApiError):
         """Seconds the API asked the bridge to wait (`Retry-After`), when it said."""
         self.status = status
         """The HTTP status the API answered with, or None when it couldn't be reached."""
+
+
+class TokenSuperseded(ApiUnavailable):
+    """403 `device_token_superseded` (api#299): another pairing replaced this device token, and
+    no newer one is stored here. During the re-pair's grace the token still logs prints and
+    sends heartbeats; everything else is refused. Unavailable, never rejected, so nothing is
+    dropped for it: after the grace the same request gets 401, which is a re-pair."""
+
+    def __init__(self) -> None:
+        super().__init__(SUPERSEDED, status=403)
+
+
+INVALID_DEVICE_TOKEN = "invalid_device_token"
+DEVICE_TOKEN_SUPERSEDED = "device_token_superseded"
+DEVICE_TOKEN_THROTTLED = "device_token_throttled"
+INSUFFICIENT_SCOPE = "insufficient_scope"
+THROTTLED_RETRY_S = 60.0
+"""How long to wait on a `device_token_throttled` without a `Retry-After` (the API sends 60)."""
 
 
 class ApiRejected(ApiError):
@@ -134,6 +165,9 @@ class ApiClient:
         self._state_dir = state_dir
         self._refused: str | None = None
         """The device token the API refused, while no other has replaced it."""
+        self._superseded: str | None = None
+        """The device token the API answered `device_token_superseded`, while no newer one is
+        stored."""
         self.on_credentials = on_credentials
         self._session: aiohttp.ClientSession | None = None
         self.server_time: datetime | None = None
@@ -158,8 +192,28 @@ class ApiClient:
         return self._device is not None
 
     @property
+    def device(self) -> DeviceToken | None:
+        """The device token in use, if any."""
+        return self._device
+
+    @property
     def repair_needed(self) -> bool:
         return self._refused is not None
+
+    @property
+    def superseded(self) -> bool:
+        """Whether another pairing replaced the device token in use, and no newer one is
+        stored here (as of the last request, or `still_superseded`)."""
+        return self._superseded is not None
+
+    def still_superseded(self) -> bool:
+        """Looks for a newer stored token now, and uses it if there is one. False once the token
+        isn't superseded any more: a newer one is in use, or the grace ended (`repair_needed`)."""
+        if self._superseded is not None:
+            stored = self._stored_device()
+            if stored is not None and stored.token != self._superseded:
+                self._use_newer(stored)
+        return self.superseded
 
     def __repr__(self) -> str:
         return f"ApiClient({self.base_url!r})"
@@ -455,6 +509,12 @@ class ApiClient:
         """Signs in with `device` from now on: the bridge paired again while running."""
         self._device = device
         self._refused = None
+        self._superseded = None
+
+    def _use_newer(self, stored: DeviceToken) -> None:
+        log.info("this bridge was paired again: using its new device token")
+        self._device = stored
+        self._superseded = None
 
     def _credentials(self) -> dict[str, str]:
         """The one credential header to send. Raises RepairNeeded, without asking the API, while
@@ -467,8 +527,11 @@ class ApiClient:
                 raise RepairNeeded()
             self._device = stored
             self._refused = None
+            self._superseded = None
             if self.on_credentials is not None:
                 self.on_credentials(None)
+        elif self._superseded is not None:
+            self.still_superseded()
         return {"Authorization": f"Bearer {self._device.token}"}
 
     def _stored_device(self) -> DeviceToken | None:
@@ -485,9 +548,22 @@ class ApiClient:
     def _refuse(self, token: str) -> None:
         if self._refused == token:
             return
+        self._superseded = None  # the grace is over: only a re-pair helps now
         self._refused = token
         if self.on_credentials is not None:
             self.on_credentials(REPAIR_NEEDED)
+
+    def _superseded_by_another(self, sent: str, newer_ok: bool) -> None:
+        """`sent` was answered `device_token_superseded`: uses a newer stored token and raises
+        _NewerToken (when `newer_ok`), or raises TokenSuperseded."""
+        stored = self._stored_device()
+        if newer_ok and stored is not None and stored.token != sent:
+            if self._device is None or self._device.token != stored.token:
+                self._use_newer(stored)
+            raise _NewerToken()
+        if self._device is not None and self._device.token == sent:
+            self._superseded = sent
+        raise TokenSuperseded()
 
     async def _get_json(self, path: str) -> Any:
         try:
@@ -520,6 +596,39 @@ class ApiClient:
         timeout: float = REQUEST_TIMEOUT_S,
         extra_headers: Mapping[str, str] | None = None,
     ) -> tuple[int, Any]:
+        args = (method, path, json, params)
+        options: dict[str, Any] = dict(
+            missing_ok=missing_ok,
+            conflict_ok=conflict_ok,
+            data=data,
+            timeout=timeout,
+            extra_headers=extra_headers,
+        )
+        try:
+            return await self._send_once(*args, **options, newer_ok=True)
+        except _NewerToken:
+            if data is not None:  # a form is sent once: the caller's retry sends it again
+                raise ApiUnavailable(
+                    "this bridge was paired again; sending again with its new device token"
+                ) from None
+            return await self._send_once(*args, **options, newer_ok=False)
+
+    async def _send_once(
+        self,
+        method: str,
+        path: str,
+        json: Mapping[str, Any] | None,
+        params: Mapping[str, str] | None,
+        *,
+        missing_ok: bool,
+        conflict_ok: bool,
+        data: aiohttp.FormData | None,
+        timeout: float,
+        extra_headers: Mapping[str, str] | None,
+        newer_ok: bool,
+    ) -> tuple[int, Any]:
+        """One request. On `device_token_superseded`, raises _NewerToken when `newer_ok` and a
+        newer token is stored (now in use), else TokenSuperseded."""
         if self._session is None:
             raise RuntimeError("use ApiClient as `async with ApiClient(...) as client`")
         headers = {**(extra_headers or {}), **self._credentials()}
@@ -556,6 +665,8 @@ class ApiClient:
                 if response.status in (400, 403, 413, 415):
                     reason = (await response.text()).strip()[:300]
                     code = _code_in(reason)
+                    if sent is not None and code == DEVICE_TOKEN_SUPERSEDED:
+                        self._superseded_by_another(sent, newer_ok)
                     if sent is not None and code == INSUFFICIENT_SCOPE:
                         reason += (
                             ". The bridge was paired without this permission: run "
@@ -595,6 +706,10 @@ class ApiClient:
 
 
 PRINTERS_PAGE_SIZE = 100
+
+
+class _NewerToken(Exception):
+    """A newer stored token replaced the superseded one: send the request again."""
 
 
 async def _code(response: aiohttp.ClientResponse) -> str | None:

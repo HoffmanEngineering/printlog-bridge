@@ -13,7 +13,13 @@ from pathlib import Path
 from printlog_bridge import __version__
 from printlog_bridge.core import credentials
 from printlog_bridge.core.adapter import Adapter
-from printlog_bridge.core.api_client import ApiClient, ApiUnavailable, AuthRejected, RepairNeeded
+from printlog_bridge.core.api_client import (
+    ApiClient,
+    ApiUnavailable,
+    AuthRejected,
+    RepairNeeded,
+    TokenSuperseded,
+)
 from printlog_bridge.core.checks import CheckResult, Status
 from printlog_bridge.core.config import (
     API_KEY_ENV,
@@ -403,6 +409,8 @@ async def _check_api(config: BridgeConfig) -> tuple[CheckResult, datetime | None
             user = await client.current_user()
     except RepairNeeded as e:
         return CheckResult.fail(name, f"{config.api_url}: {e}."), None
+    except TokenSuperseded as e:
+        return CheckResult.warn(name, f"{config.api_url}: {e}."), None
     except AuthRejected:
         if config.device is not None:
             return CheckResult.fail(
