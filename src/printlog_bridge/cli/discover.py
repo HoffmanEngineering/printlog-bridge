@@ -1,5 +1,5 @@
-"""`printlog-bridge discover`: lists the Moonraker and Bambu Lab printers on the local network,
-with a `[printer]` section for each, ready to paste into the config."""
+"""`printlog-bridge discover`: lists the Moonraker, Bambu Lab and Elegoo (SDCP) printers on the
+local network, with a `[printer]` section for each, ready to paste into the config."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from collections.abc import Sequence
 from printlog_bridge.adapters.bambu.discovery import SSDP_PORT, FoundBambu
 from printlog_bridge.adapters.moonraker import discovery
 from printlog_bridge.adapters.moonraker.discovery import Found
+from printlog_bridge.adapters.sdcp.discovery import FoundSdcp
+from printlog_bridge.adapters.sdcp.protocol import DISCOVERY_PORT as SDCP_DISCOVERY_PORT
 from printlog_bridge.core.config import BridgeConfig
 
 
@@ -192,5 +194,69 @@ def format_bambu(
     lines.append(
         "Fill in printer_id and access_code. Bambu firmware with Authorization Control also "
         "needs LAN Only Mode and Developer Mode on the printer."
+    )
+    return "\n".join(lines)
+
+
+def format_sdcp(
+    found: Sequence[FoundSdcp] | None,
+    config: BridgeConfig | None,
+    seconds: float,
+    error: str | None = None,
+) -> str:
+    """The Elegoo (SDCP) printers that answered `M99999`, once per address, with a section for
+    each. `found` is None when the bridge couldn't ask (`error` says why)."""
+    if found is None:
+        return f"Couldn't ask for Elegoo printers on UDP port {SDCP_DISCOVERY_PORT}: {error}."
+    lines = [
+        f"Asked for Elegoo (SDCP) printers on UDP port {SDCP_DISCOVERY_PORT} and waited "
+        f"{seconds:g}s."
+    ]
+    by_address: dict[str, FoundSdcp] = {}
+    for f in found:
+        by_address.setdefault(f.address, f)
+    if not by_address:
+        lines.append("No Elegoo printer answered.")
+        if discovery.in_container():
+            lines.append(
+                "This looks like a container: the question is a broadcast, which only reaches "
+                "the printers from the host's network (network_mode: host)."
+            )
+        return "\n".join(lines)
+    configured = {
+        getattr(p.adapter, "host", None): p.name
+        for p in (config.printers if config else [])
+        if getattr(p.adapter, "name", None) == "sdcp"
+    }
+    count = len(by_address)
+    lines.append(f"Found {count} Elegoo printer{'' if count == 1 else 's'}:")
+    for f in by_address.values():
+        details = [
+            f.model or "",
+            f'"{f.name}"' if f.name else "",
+            f"firmware {f.firmware}" if f.firmware else "",
+        ]
+        lines.append("")
+        lines.append(f"{f.address}: {', '.join(d for d in details if d)}")
+        name = configured.get(f.address)
+        if name is not None:
+            lines.append(f"  already in the config as [printer {name}]")
+            continue
+        if f.resin:
+            lines.append(
+                "  a resin printer: the sdcp adapter doesn't follow resin prints yet (#97)"
+            )
+            continue
+        lines.extend(
+            [
+                f"  [printer {_section_name(f.name or f.model or f.address)}]",
+                "  adapter = sdcp",
+                "  printer_id =      ; the number at the end of its page in 3D Print Log",
+                f"  host = {f.address}",
+            ]
+        )
+    lines.append("")
+    lines.append(
+        "Fill in printer_id. SDCP has no password: the bridge only reads the printer's status."
     )
     return "\n".join(lines)

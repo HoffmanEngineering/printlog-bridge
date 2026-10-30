@@ -22,8 +22,15 @@ from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.bambu import discovery as bambu_discovery
 from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
+from printlog_bridge.adapters.sdcp import discovery as sdcp_discovery
 from printlog_bridge.cli.data_owner import drop_root
-from printlog_bridge.cli.discover import discover, format_bambu, format_found, subnets_to_scan
+from printlog_bridge.cli.discover import (
+    discover,
+    format_bambu,
+    format_found,
+    format_sdcp,
+    subnets_to_scan,
+)
 from printlog_bridge.cli.pair import pair_command, pair_on_first_run
 from printlog_bridge.core import credentials
 from printlog_bridge.core.bridge import check_runnable, run_bridge
@@ -106,8 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_key.add_argument("--yes", "-y", action="store_true", help="don't ask for confirmation")
     discover = commands.add_parser(
         "discover",
-        help="list the Moonraker and Bambu Lab printers on the local network, with a [printer] "
-        "section for each",
+        help="list the Moonraker, Bambu Lab and Elegoo (SDCP) printers on the local network, "
+        "with a [printer] section for each",
     )
     discover.add_argument(
         "--subnet",
@@ -127,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-bambu",
         action="store_true",
         help="don't listen for Bambu Lab printers' announcements (UDP port 2021)",
+    )
+    discover.add_argument(
+        "--no-sdcp",
+        action="store_true",
+        help="don't ask for Elegoo printers (SDCP: M99999 broadcast to UDP port 3000)",
     )
     _add_probe(commands)
     for command in (doctor, run, status, store_key, pair, rotate_key, discover):
@@ -404,23 +416,35 @@ def _discover(args: argparse.Namespace) -> int:
     zeroconf = not args.no_zeroconf
     print(f"printlog-bridge {__version__} discover")
     bambu = not args.no_bambu
+    sdcp = not args.no_sdcp
 
-    async def both() -> tuple[list, list | None, str | None]:
-        listening = asyncio.ensure_future(bambu_discovery.listen()) if bambu else None
-        found = await discover(networks, port=args.port, zeroconf=zeroconf)
-        if listening is None:
-            return found, None, None
+    async def outcome(task: asyncio.Future | None) -> tuple[list | None, str | None]:
+        if task is None:
+            return None, None
         try:
-            return found, await listening, None
+            return await task, None
         except OSError as e:
-            return found, None, e.strerror or str(e)
+            return None, e.strerror or str(e)
 
-    found, bambus, error = asyncio.run(both())
+    async def every_kind():
+        listening = asyncio.ensure_future(bambu_discovery.listen()) if bambu else None
+        asking = (
+            asyncio.ensure_future(sdcp_discovery.ask(sdcp_discovery.targets_for(networks)))
+            if sdcp
+            else None
+        )
+        found = await discover(networks, port=args.port, zeroconf=zeroconf)
+        return found, await outcome(listening), await outcome(asking)
+
+    found, (bambus, error), (elegoos, sdcp_error) = asyncio.run(every_kind())
     print(format_found(found, networks, config, zeroconf=zeroconf))
     if bambu:
         print()
         print(format_bambu(bambus, config, bambu_discovery.LISTEN_S, error))
-    return 0 if found or bambus else 1
+    if sdcp:
+        print()
+        print(format_sdcp(elegoos, config, sdcp_discovery.ASK_S, sdcp_error))
+    return 0 if found or bambus or elegoos else 1
 
 
 def _store_key(explicit_config: Path | None) -> int:

@@ -63,6 +63,10 @@ printers:
     printer_id: 46
     url: http://octopi.local
     api_key: your-octoprint-key
+  - name: centauri
+    adapter: sdcp
+    printer_id: 47
+    host: 192.168.1.77
 ```
 
 | Adapter | Fields |
@@ -71,6 +75,7 @@ printers:
 | `bambu` | **host**, **serial** and **access_code**. On firmware with Bambu's Authorization Control, turn on LAN Only Mode and Developer Mode on the printer first. The access code is on the printer's screen: X1/H2 Settings > LAN Only, P1 Settings > WLAN, A1 Settings > LAN Only Mode. |
 | `prusalink` | **host** and **password** (the printer's Settings > Network > PrusaLink shows them). Older firmware: **api_key** instead of the password. **username** only when it isn't `maker`. |
 | `octoprint` | **url**: OctoPrint's address, such as `http://octopi.local` or `http://192.168.1.70:5000`. **api_key**: a key from OctoPrint's Settings > Application Keys (or your user's Settings > API Key). |
+| `sdcp` | **host**: the Elegoo Centauri Carbon's IP address, shown in its network settings. Nothing else: the printer's local protocol (SDCP) has no password, and the bridge only reads its status. Not yet checked on a real printer. |
 
 A field an adapter doesn't use must stay empty: the app says which one when it refuses to start. Give each printer a fixed address (a DHCP reservation in your router). A Moonraker printer that moves to a new address is found again on your network.
 
