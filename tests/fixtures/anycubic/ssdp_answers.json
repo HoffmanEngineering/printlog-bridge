@@ -1,0 +1,10 @@
+[
+ {
+  "sender": "<ip-1>",
+  "answer": "HTTP/1.1 200 OK\r\nST: ac:3dprinter:lcd\r\nUSN: <serial-3>\r\nEXT: \r\nLOCATION: http://<ip-1>:18910/info?cn=<serial-1>&ctrlType=net&deviceName=ANYCUBIC&env=test&ip=<ip-1>&modelId=132&modelName=Anycubic Photon P1 Max&token=<redacted>&zone=cn\r\nSERVER: ac:lcd:ssdp\r\nCACHE-CONTROL: max-age=0\r\n\r\n"
+ },
+ {
+  "sender": "<ip-2>",
+  "answer": "HTTP/1.1 200 OK\r\nEXT: \r\nST: ac:3dprinter:fdm\r\nUSN: <serial-4>\r\nLOCATION: http://<ip-2>:18910/info?cn=<serial-2>&ctrlType=lan&deviceName=Anycubic+Kobra+S1&env=prod&ip=<ip-2>&modelId=20025&modelName=Anycubic+Kobra+S1&token=<redacted>&zone=global\r\nSERVER: ac:fdm:ssdp\r\nCACHE-CONTROL: max-age=0\r\n\r\n"
+ }
+]

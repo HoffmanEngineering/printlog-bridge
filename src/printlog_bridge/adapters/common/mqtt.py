@@ -1,11 +1,11 @@
-"""The part of MQTT 3.1.1 the bridge needs to listen to a Bambu Lab printer's own broker.
+"""The part of MQTT 3.1.1 the bridge needs to listen to a printer's own broker: a Bambu Lab
+printer's (`adapters/bambu`) and an Anycubic printer's in LAN mode (`adapters/anycubic`).
 
-The printer runs an MQTT broker on port 8883 (TLS) for its slicer: it publishes its status on
-`device/<serial>/report` and takes requests on `device/<serial>/request`. The bridge connects
-with a clean session, subscribes to the reports, and publishes two requests (`pushall` and
-`get_version`), all at QoS 0. So this is five packets (CONNECT, SUBSCRIBE, PUBLISH, PINGREQ,
-DISCONNECT) and their answers, on asyncio streams: no thread, and no dependency to build on every
-platform the Docker image is made for.
+Each printer runs an MQTT broker over TLS for its slicer: it publishes its status on a report
+topic and takes requests on another. The bridge connects with a clean session, subscribes to the
+reports, and publishes its read-only requests, all at QoS 0. So this is five packets (CONNECT,
+SUBSCRIBE, PUBLISH, PINGREQ, DISCONNECT) and their answers, on asyncio streams: no thread, and no
+dependency to build on every platform the Docker image is made for.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import contextlib
 import ssl
 import struct
 from collections.abc import Callable
+
+from .timeouts import bounded
 
 MAX_PACKET_BYTES = 8 * 1024 * 1024
 """A whole status report is a few tens of KB; anything this big is a broken stream."""
@@ -72,7 +74,7 @@ class MqttClient:
         """Connects and logs in. `verify` is given the broker's certificate (DER) before the
         password is sent, and raises to stop there. Raises `MqttRefused` when the broker says
         no, and OSError, `ssl.SSLError` or `asyncio.TimeoutError` when it can't be reached."""
-        reader, writer = await asyncio.wait_for(
+        reader, writer = await bounded(
             asyncio.open_connection(host, port, ssl=context, server_hostname=None), timeout
         )
         try:
@@ -82,7 +84,7 @@ class MqttClient:
             writer.write(_connect_packet(client_id, username, password, keepalive))
             await writer.drain()
             try:
-                first, body = await asyncio.wait_for(_read_packet(reader), timeout)
+                first, body = await bounded(_read_packet(reader), timeout)
             except asyncio.IncompleteReadError:
                 raise MqttClosed("the printer closed the connection before answering") from None
             kind = first >> 4
@@ -112,9 +114,9 @@ class MqttClient:
         keepalive periods (the pings get answers, so silence means it's gone)."""
         while True:
             try:
-                first, body = await asyncio.wait_for(
-                    _read_packet(self._reader), self._keepalive * 1.5
-                )
+                # `bounded`, not wait_for: on Python 3.9 wait_for can drop a cancel that comes
+                # as a packet arrives (bpo-42130), and the adapter would never stop.
+                first, body = await bounded(_read_packet(self._reader), self._keepalive * 1.5)
             except asyncio.TimeoutError:
                 await self.close()
                 raise MqttClosed("the printer stopped answering") from None

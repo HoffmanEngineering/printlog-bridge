@@ -1,7 +1,7 @@
 """Bambu Lab printers (X1, P1, A1, H2), over their local MQTT broker and FTPS server.
 
 The bridge connects to the printer itself on the LAN, as Bambu Studio does in LAN mode: MQTT over
-TLS on port 8883 (`mqtt.py`), user `bblp` and the printer's LAN access code, for its status
+TLS on port 8883 (`common/mqtt.py`), user `bblp` and the printer's LAN access code, for its status
 (`jobs.py`), and FTPS on port 990 (`ftps.py`) for the job's 3MF, which has the slicer's grams per
 filament, the plate's thumbnail and the project's settings. It never sends the printer a command:
 only `pushall` (send the whole status) and `get_version`, and it never writes a file.
@@ -24,6 +24,7 @@ import ssl
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from printlog_bridge.adapters.common.mqtt import MqttClient, MqttClosed, MqttRefused
 from printlog_bridge.core.adapter import Adapter, NeedsCredentials, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
@@ -38,7 +39,6 @@ from .discovery import BambuDiscovery
 from .files import BambuFiles
 from .ftps import FTPS_PORT, BambuFtps, FilesRefused
 from .jobs import JobTracker
-from .mqtt import MqttClient, MqttClosed, MqttRefused
 from .tls import CertificateChanged, CertificatePin, client_context, parse_fingerprint
 
 log = logging.getLogger(__name__)

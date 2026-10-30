@@ -1,0 +1,473 @@
+[
+ {
+  "t": 0.21,
+  "kind": "http",
+  "request": "GET /info",
+  "answer": {
+   "deviceType": "fdm",
+   "modelId": "20025",
+   "modelName": "Anycubic Kobra S1",
+   "cn": "<serial-1>",
+   "ctrlType": "lan",
+   "ctrlInfoUrl": "http://<ip-1>:18910/ctrl",
+   "ip": "<ip-1>",
+   "deviceName": "Anycubic Kobra S1",
+   "zone": "global",
+   "env": "prod",
+   "usn": "<serial-2>",
+   "token": "<redacted>"
+  }
+ },
+ {
+  "t": 0.367,
+  "kind": "http",
+  "request": "POST /ctrl",
+  "answer": {
+   "code": 200,
+   "message": "success",
+   "data": {
+    "info": "<redacted>",
+    "token": "<redacted>"
+   }
+  }
+ },
+ {
+  "t": 0.486,
+  "kind": "opened",
+  "value": {
+   "deviceType": "fdm",
+   "accountDeleteUrl": "",
+   "broker": "mqtts://<ip-1>:9883",
+   "deviceId": "<device-1>",
+   "username": "<redacted>",
+   "password": "<redacted>",
+   "devicecrt": "<redacted>",
+   "devicepk": "<redacted>",
+   "modeId": "20025",
+   "modelName": "Anycubic Kobra S1",
+   "ip": "<ip-1>"
+  }
+ },
+ {
+  "t": 0.589,
+  "kind": "mqtt",
+  "event": "connected"
+ },
+ {
+  "t": 0.589,
+  "kind": "mqtt",
+  "event": "subscribe",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/#"
+ },
+ {
+  "t": 0.59,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/info",
+  "payload": {
+   "type": "info",
+   "action": "query",
+   "timestamp": 1793329970665,
+   "msgid": "4f46bc55-5000-49c1-bbad-<mac-1>",
+   "data": null
+  }
+ },
+ {
+  "t": 0.59,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/print",
+  "payload": {
+   "type": "print",
+   "action": "query",
+   "timestamp": 1793329970665,
+   "msgid": "d98b8b21-6cb9-491b-ad08-<mac-2>",
+   "data": null
+  }
+ },
+ {
+  "t": 0.59,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/multiColorBox",
+  "payload": {
+   "type": "multiColorBox",
+   "action": "getInfo",
+   "timestamp": 1793329970665,
+   "msgid": "f8a9e701-a67f-4e26-aa6a-<mac-3>",
+   "data": null
+  }
+ },
+ {
+  "t": 0.59,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/peripherie",
+  "payload": {
+   "type": "peripherie",
+   "action": "query",
+   "timestamp": 1793329970665,
+   "msgid": "dbdee58c-c011-4ed0-80ab-<mac-4>",
+   "data": null
+  }
+ },
+ {
+  "t": 0.617,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "4f46bc55-5000-49c1-bbad-<mac-1>"
+  }
+ },
+ {
+  "t": 0.617,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "d98b8b21-6cb9-491b-ad08-<mac-2>"
+  }
+ },
+ {
+  "t": 0.617,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/info/report",
+  "payload": {
+   "type": "info",
+   "action": "report",
+   "timestamp": 1793329997385,
+   "msgid": "7f5846e1-e070-4b90-8b89-<mac-5>",
+   "state": "done",
+   "code": 200,
+   "msg": "done",
+   "data": {
+    "printerName": "Anycubic Kobra S1",
+    "urls": {
+     "fileUploadurl": "<redacted>",
+     "rtspUrl": "<redacted>"
+    },
+    "project": null,
+    "model": "Anycubic Kobra S1",
+    "ip": "<ip-1>",
+    "version": "2.5.6.4",
+    "state": "free",
+    "temp": {
+     "curr_hotbed_temp": 28,
+     "curr_nozzle_temp": 32,
+     "target_hotbed_temp": 0,
+     "target_nozzle_temp": 0
+    },
+    "print_speed_mode": 2,
+    "fan_speed_pct": 0,
+    "aux_fan_speed_pct": 0,
+    "box_fan_level": 0,
+    "features": {
+     "auto_leveling_support": true,
+     "vibration_compensation_support": true,
+     "flow_calibration_support": true,
+     "drying_first_support": true,
+     "camera_timelapse_support": true,
+     "gcode_3mf_support": true,
+     "delete_batch_support": true,
+     "preheating_support": true,
+     "fod_support": true
+    }
+   }
+  }
+ },
+ {
+  "t": 0.617,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "f8a9e701-a67f-4e26-aa6a-<mac-3>"
+  }
+ },
+ {
+  "t": 0.617,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "dbdee58c-c011-4ed0-80ab-<mac-4>"
+  }
+ },
+ {
+  "t": 0.617,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/peripherie/report",
+  "payload": {
+   "type": "peripherie",
+   "action": "query",
+   "timestamp": 1793329997392,
+   "msgid": "4aadb19f-146f-4572-9c87-<mac-6>",
+   "state": "done",
+   "code": 200,
+   "msg": "done",
+   "data": {
+    "camera": 1,
+    "multiColorBox": 0,
+    "udisk": 1
+   }
+  }
+ },
+ {
+  "t": 0.702,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/multiColorBox/report",
+  "payload": {
+   "type": "multiColorBox",
+   "action": "getInfo",
+   "timestamp": 1793329997478,
+   "msgid": "9646c9fb-4d2f-4f47-afc3-<mac-7>",
+   "state": "success",
+   "code": 200,
+   "msg": "done",
+   "data": {
+    "multi_color_box": []
+   }
+  }
+ },
+ {
+  "t": 30.77,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/info",
+  "payload": {
+   "type": "info",
+   "action": "query",
+   "timestamp": 1793330000845,
+   "msgid": "29fb0c15-f2df-496b-bc40-<mac-8>",
+   "data": null
+  }
+ },
+ {
+  "t": 30.77,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/print",
+  "payload": {
+   "type": "print",
+   "action": "query",
+   "timestamp": 1793330000845,
+   "msgid": "47dab4f3-d914-4335-9965-<mac-9>",
+   "data": null
+  }
+ },
+ {
+  "t": 30.77,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/multiColorBox",
+  "payload": {
+   "type": "multiColorBox",
+   "action": "getInfo",
+   "timestamp": 1793330000845,
+   "msgid": "aea11ee3-4299-4551-99ab-<mac-10>",
+   "data": null
+  }
+ },
+ {
+  "t": 30.924,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "29fb0c15-f2df-496b-bc40-<mac-8>"
+  }
+ },
+ {
+  "t": 30.928,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "47dab4f3-d914-4335-9965-<mac-9>"
+  }
+ },
+ {
+  "t": 30.928,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "aea11ee3-4299-4551-99ab-<mac-10>"
+  }
+ },
+ {
+  "t": 30.935,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/info/report",
+  "payload": {
+   "type": "info",
+   "action": "report",
+   "timestamp": 1793330027700,
+   "msgid": "18eca818-f7ca-410e-8c71-<mac-11>",
+   "state": "done",
+   "code": 200,
+   "msg": "done",
+   "data": {
+    "printerName": "Anycubic Kobra S1",
+    "urls": {
+     "fileUploadurl": "<redacted>",
+     "rtspUrl": "<redacted>"
+    },
+    "project": null,
+    "model": "Anycubic Kobra S1",
+    "ip": "<ip-1>",
+    "version": "2.5.6.4",
+    "state": "free",
+    "temp": {
+     "curr_hotbed_temp": 28,
+     "curr_nozzle_temp": 32,
+     "target_hotbed_temp": 0,
+     "target_nozzle_temp": 0
+    },
+    "print_speed_mode": 2,
+    "fan_speed_pct": 0,
+    "aux_fan_speed_pct": 0,
+    "box_fan_level": 0,
+    "features": {
+     "auto_leveling_support": true,
+     "vibration_compensation_support": true,
+     "flow_calibration_support": true,
+     "drying_first_support": true,
+     "camera_timelapse_support": true,
+     "gcode_3mf_support": true,
+     "delete_batch_support": true,
+     "preheating_support": true,
+     "fod_support": true
+    }
+   }
+  }
+ },
+ {
+  "t": 31.043,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/multiColorBox/report",
+  "payload": {
+   "type": "multiColorBox",
+   "action": "getInfo",
+   "timestamp": 1793330027821,
+   "msgid": "3a97fd53-d74e-4e84-a9a5-<mac-12>",
+   "state": "success",
+   "code": 200,
+   "msg": "done",
+   "data": {
+    "multi_color_box": []
+   }
+  }
+ },
+ {
+  "t": 61.107,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/info",
+  "payload": {
+   "type": "info",
+   "action": "query",
+   "timestamp": 1793330031181,
+   "msgid": "00830438-587f-4587-af60-<mac-13>",
+   "data": null
+  }
+ },
+ {
+  "t": 61.107,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/print",
+  "payload": {
+   "type": "print",
+   "action": "query",
+   "timestamp": 1793330031181,
+   "msgid": "856b2c70-a329-4681-b838-<mac-14>",
+   "data": null
+  }
+ },
+ {
+  "t": 61.107,
+  "kind": "send",
+  "topic": "anycubic/anycubicCloud/v1/web/printer/20025/<device-1>/multiColorBox",
+  "payload": {
+   "type": "multiColorBox",
+   "action": "getInfo",
+   "timestamp": 1793330031181,
+   "msgid": "d4b03aae-994c-45e3-a699-<mac-15>",
+   "data": null
+  }
+ },
+ {
+  "t": 61.233,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "00830438-587f-4587-af60-<mac-13>"
+  }
+ },
+ {
+  "t": 61.248,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "856b2c70-a329-4681-b838-<mac-14>"
+  }
+ },
+ {
+  "t": 61.249,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/info/report",
+  "payload": {
+   "type": "info",
+   "action": "report",
+   "timestamp": 1793330058019,
+   "msgid": "202de23a-a023-4a02-aee6-<mac-16>",
+   "state": "done",
+   "code": 200,
+   "msg": "done",
+   "data": {
+    "printerName": "Anycubic Kobra S1",
+    "urls": {
+     "fileUploadurl": "<redacted>",
+     "rtspUrl": "<redacted>"
+    },
+    "project": null,
+    "model": "Anycubic Kobra S1",
+    "ip": "<ip-1>",
+    "version": "2.5.6.4",
+    "state": "free",
+    "temp": {
+     "curr_hotbed_temp": 28,
+     "curr_nozzle_temp": 32,
+     "target_hotbed_temp": 0,
+     "target_nozzle_temp": 0
+    },
+    "print_speed_mode": 2,
+    "fan_speed_pct": 0,
+    "aux_fan_speed_pct": 0,
+    "box_fan_level": 0,
+    "features": {
+     "auto_leveling_support": true,
+     "vibration_compensation_support": true,
+     "flow_calibration_support": true,
+     "drying_first_support": true,
+     "camera_timelapse_support": true,
+     "gcode_3mf_support": true,
+     "delete_batch_support": true,
+     "preheating_support": true,
+     "fod_support": true
+    }
+   }
+  }
+ },
+ {
+  "t": 61.249,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/response",
+  "payload": {
+   "msgid": "d4b03aae-994c-45e3-a699-<mac-15>"
+  }
+ },
+ {
+  "t": 61.392,
+  "kind": "receive",
+  "topic": "anycubic/anycubicCloud/v1/printer/public/20025/<device-1>/multiColorBox/report",
+  "payload": {
+   "type": "multiColorBox",
+   "action": "getInfo",
+   "timestamp": 1793330058171,
+   "msgid": "f8c27925-32e8-43f9-8e0b-<mac-17>",
+   "state": "success",
+   "code": 200,
+   "msg": "done",
+   "data": {
+    "multi_color_box": []
+   }
+  }
+ }
+]

@@ -8,13 +8,13 @@ import json
 import pytest
 from fake_bambu import ACCESS_CODE, SERIAL, FakeBambu, certificate
 
-from printlog_bridge.adapters.bambu import mqtt
 from printlog_bridge.adapters.bambu.tls import (
     CertificateChanged,
     CertificatePin,
     client_context,
     fingerprint,
 )
+from printlog_bridge.adapters.common import mqtt
 from printlog_bridge.core.state import PrinterState
 
 

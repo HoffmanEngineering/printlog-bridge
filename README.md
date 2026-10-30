@@ -4,7 +4,7 @@ An open-source bridge agent that watches Klipper/Moonraker printers and logs eve
 
 It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1.
 
-It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, **Prusa printers with PrusaLink** (MK4/MK4S, MK3.5/3.9, Core One, MINI, XL) over its local API, **printers run by OctoPrint** over OctoPrint's API, the **Elegoo Centauri Carbon** over its local protocol (SDCP), and **Duet boards with RepRapFirmware** over their HTTP API (SDCP and Duet not yet checked on a real printer), from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers), [Prusa printers (PrusaLink)](#prusa-printers-prusalink), [OctoPrint](#octoprint), [Elegoo Centauri Carbon (SDCP)](#elegoo-centauri-carbon-sdcp) and [Duet / RepRapFirmware](#duet--reprapfirmware).
+It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, **Prusa printers with PrusaLink** (MK4/MK4S, MK3.5/3.9, Core One, MINI, XL) over its local API, **printers run by OctoPrint** over OctoPrint's API, the **Elegoo Centauri Carbon** over its local protocol (SDCP), **Duet boards with RepRapFirmware** over their HTTP API (SDCP and Duet not yet checked on a real printer), and **Anycubic printers in LAN mode** (Kobra S1, Kobra 3, Photon P1) over their own MQTT broker, from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers), [Prusa printers (PrusaLink)](#prusa-printers-prusalink), [OctoPrint](#octoprint), [Elegoo Centauri Carbon (SDCP)](#elegoo-centauri-carbon-sdcp), [Duet / RepRapFirmware](#duet--reprapfirmware) and [Anycubic (LAN mode)](#anycubic-lan-mode).
 
 > Status: early development. `run` logs each print when it starts and completes it when it ends, with its outcome, duration and filament used, adds the slicer's thumbnail and a webcam snapshot (and, with Pro, the moonraker-timelapse video), and keeps what it can't send yet until 3D Print Log is reachable again. On a multi-tool printer the filament is split per tool. See the [issues](https://github.com/HoffmanEngineering/printlog-bridge/issues) and milestones for the roadmap.
 
@@ -482,6 +482,29 @@ RepRapFirmware keeps no job history, so **a print that starts and ends while the
 
 Not yet: a webcam snapshot, and spools by tool (RepRapFirmware's loaded filament names). Firmware versions checked: none yet.
 
+### Anycubic (LAN mode)
+
+`adapter = anycubic` watches an Anycubic printer in LAN mode over its own MQTT broker, from any host on the same network: the **Kobra S1** and **Kobra 3** (FDM) and the **Photon P1 / P1 Max** (resin). **Checked on a real Kobra S1 (firmware 2.5.6.4) while idle; no print has been recorded yet** ([#96](https://github.com/HoffmanEngineering/printlog-bridge/issues/96), [#97](https://github.com/HoffmanEngineering/printlog-bridge/issues/97)): the job states and fields come from community protocol notes, so a trace of a print (`trace = true`, [Recording a trace](#recording-a-trace)) attached to those issues helps most.
+
+```ini
+[printer kobra]
+adapter = anycubic
+printer_id = 49
+host = 192.168.1.89
+```
+
+1. Turn on **LAN mode** on the printer's screen (on the Kobra S1: Settings > Network; LAN mode and Anycubic's cloud don't run together). Give the printer a fixed address (a DHCP reservation in your router).
+2. `host` is its IP address. Nothing else: in LAN mode the printer hands the bridge a login for its broker itself (`/info`, then `/ctrl`, on port 18910), a new one each time. `printlog-bridge discover` finds Anycubic printers with an SSDP search and prints a section for each.
+3. Run `printlog-bridge doctor`: it says whether the printer answered, its model, firmware and state.
+
+The bridge asks for the printer's state every 30 seconds (and the printer reports changes in between); every message it sends is a read-only query (`info`, `print`, `multiColorBox`, `peripherie`; `status`, `lanInfo` and `print` on a resin printer). It never starts, pauses or stops a print, or changes a setting, a light, a fan or a file. A print is logged when it starts printing (not while it heats up or levels), and ends completed, cancelled or failed as the printer says. The FDM printers report the filament fed so far in millimeters, which the bridge sends (marked estimated until a recorded print shows how it's measured), and 3D Print Log turns into grams with the spool's density. A resin printer reports the job's resin in mL, which is sent as the print's volume: all of it for a completed print, by layers printed for one that didn't finish, always marked estimated. The printer serves no download of the job's file, so there's no thumbnail or slicer header yet.
+
+**A Photon accepts one LAN client at a time**: the bridge and Photon Workshop (or Anycubic's app in LAN mode) push each other off. When another client takes the connection within 30 seconds of the bridge connecting, the bridge leaves it alone for 5 minutes before it tries again (so an upload or a print started from Photon Workshop isn't cut off), and says so once in its log, in `status` and in `doctor`. Close Photon Workshop's printer page while the bridge runs. **The Photon P1 Max in our shop answered the handshake but kept its MQTT port closed**, so resin prints aren't checked yet.
+
+The printer keeps no job history the bridge can read, so **a print that starts and ends while the bridge is down isn't logged**. One that ends while the bridge is down is logged when it's back, with how it ended when the printer still shows it as its last job, otherwise by how far it got (99% or more: completed), with a note.
+
+Not yet: ACE Pro slots (the S1 in our shop has none), thumbnails, the webcam, and firmware versions other than 2.5.6.4.
+
 ### Timelapse videos (Pro)
 
 If the printer runs [moonraker-timelapse](https://github.com/mainsail-crew/moonraker-timelapse) and your 3D Print Log account has Pro, the video it renders after a print is attached to that print. The bridge waits up to 10 minutes after the print ends for the render (a render that `TIMELAPSE_RENDER` in your end macro finished just before the end counts too), downloads the video from Moonraker and uploads it straight to 3D Print Log's file storage. The print itself is completed right away; the video follows. Without Pro the bridge only asks whether you have it, and never downloads or uploads the video.
@@ -495,9 +518,9 @@ A paired bridge checks in with 3D Print Log every few minutes (`PUT /api/bridges
 How it looks, while it runs:
 
 - **Always, and cheaply:** an mDNS query every 5 minutes for Moonraker (`[zeroconf]`), PrusaLink, OctoPrint and Duet boards (`_http._tcp`, kept only when the answer says RepRapFirmware), and listening for Bambu Lab printers' announcements on UDP port 2021.
-- **Only when you tap "Scan now" in the app:** the per-address scan `printlog-bridge discover` does, on this computer's /24 and those of the printers it knows, and the question Elegoo printers answer (`M99999`, broadcast to UDP port 3000). A scan looks like a port scan to network security tools, so it never runs on its own.
+- **Only when you tap "Scan now" in the app:** the per-address scan `printlog-bridge discover` does, on this computer's /24 and those of the printers it knows, the question Elegoo printers answer (`M99999`, broadcast to UDP port 3000), and an SSDP search Anycubic printers answer (UDP port 1900). A scan looks like a port scan to network security tools, so it never runs on its own.
 
-It reports only printers an adapter recognizes (Moonraker, Bambu Lab, PrusaLink, OctoPrint, Elegoo's SDCP, Duet), never any other host. Printers in the config file are reported too, as "managed by config": they stay read-only in the app, and the config file wins when both name the same printer. `discovery = false` in `[bridge]` turns the looking off; printers you connect in the app by address are still watched.
+It reports only printers an adapter recognizes (Moonraker, Bambu Lab, PrusaLink, OctoPrint, Elegoo's SDCP, Duet, Anycubic), never any other host. Printers in the config file are reported too, as "managed by config": they stay read-only in the app, and the config file wins when both name the same printer. `discovery = false` in `[bridge]` turns the looking off; printers you connect in the app by address are still watched.
 
 **A password or access code** (a Bambu Lab printer's access code, a PrusaLink password, an OctoPrint API key, a Duet's password, the API key of a Moonraker with `[authorization]`) is entered in the app, next to the printer on the bridge's page. The app encrypts it in your browser to this bridge's own key, so 3D Print Log stores and forwards only something it can't read, and only this bridge can open it ([privacy](docs/privacy.md#printer-credentials-entered-in-the-app)). The bridge starts watching within a minute. If the printer refuses it, or the bridge can't open it, the app says so next to the printer, and so do `status` and `doctor`.
 

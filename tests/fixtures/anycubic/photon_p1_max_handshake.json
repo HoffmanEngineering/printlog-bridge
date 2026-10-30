@@ -1,0 +1,61 @@
+[
+ {
+  "t": 0.756,
+  "kind": "http",
+  "request": "GET /info",
+  "answer": {
+   "cn": "<serial-1>",
+   "code": 0,
+   "ctrlInfoUrl": "http://<ip-1>:18910/ctrl",
+   "ctrlType": "net",
+   "deviceName": "Anycubic Photon P1 Max",
+   "deviceType": "lcd",
+   "env": "prod",
+   "ip": "<ip-1>",
+   "message": "OK",
+   "modelId": "132",
+   "modelName": "Anycubic Photon P1 Max",
+   "token": "<redacted>",
+   "zone": "cn"
+  }
+ },
+ {
+  "t": 0.82,
+  "kind": "http",
+  "request": "POST /ctrl",
+  "answer": {
+   "code": 200,
+   "data": {
+    "info": "<redacted>",
+    "token": "<redacted>"
+   },
+   "message": "success"
+  }
+ },
+ {
+  "t": 0.834,
+  "kind": "opened",
+  "value": {
+   "deviceType": "lcd",
+   "accountDeleteUrl": "accountDeleteUrl",
+   "broker": "<ip-1>:8883",
+   "clientId": "clientId",
+   "deviceId": "<device-1>",
+   "username": "<redacted>",
+   "password": "<redacted>",
+   "cacrt": "",
+   "modeId": "132",
+   "modelName": "Anycubic Photon P1 Max",
+   "ip": "<ip-1>",
+   "mac": "<mac-1>",
+   "fileUploadUrl": "<redacted>",
+   "rtsp": ""
+  }
+ },
+ {
+  "t": 3.395,
+  "kind": "mqtt",
+  "event": "connect failed",
+  "error": "ConnectionRefusedError: [WinError 1225] The remote computer refused the network connection"
+ }
+]

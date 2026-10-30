@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from printlog_bridge.adapters.anycubic import AnycubicAdapter
 from printlog_bridge.adapters.bambu import BambuAdapter
 from printlog_bridge.adapters.duet import DuetAdapter
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
@@ -23,4 +24,5 @@ ADAPTERS: Mapping[str, type[Adapter]] = {
     OctoPrintAdapter.name: OctoPrintAdapter,
     SdcpAdapter.name: SdcpAdapter,
     DuetAdapter.name: DuetAdapter,
+    AnycubicAdapter.name: AnycubicAdapter,
 }
