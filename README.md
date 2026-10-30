@@ -4,7 +4,7 @@ An open-source bridge agent that watches Klipper/Moonraker printers and logs eve
 
 It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1.
 
-It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, **Prusa printers with PrusaLink** (MK4/MK4S, MK3.5/3.9, Core One, MINI, XL) over its local API, and **printers run by OctoPrint** over OctoPrint's API, from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers), [Prusa printers (PrusaLink)](#prusa-printers-prusalink) and [OctoPrint](#octoprint).
+It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, **Prusa printers with PrusaLink** (MK4/MK4S, MK3.5/3.9, Core One, MINI, XL) over its local API, **printers run by OctoPrint** over OctoPrint's API, and the **Elegoo Centauri Carbon** over its local protocol (SDCP; not yet checked on a real printer), from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers), [Prusa printers (PrusaLink)](#prusa-printers-prusalink), [OctoPrint](#octoprint) and [Elegoo Centauri Carbon (SDCP)](#elegoo-centauri-carbon-sdcp).
 
 > Status: early development. `run` logs each print when it starts and completes it when it ends, with its outcome, duration and filament used, adds the slicer's thumbnail and a webcam snapshot (and, with Pro, the moonraker-timelapse video), and keeps what it can't send yet until 3D Print Log is reachable again. On a multi-tool printer the filament is split per tool. See the [issues](https://github.com/HoffmanEngineering/printlog-bridge/issues) and milestones for the roadmap.
 
@@ -439,6 +439,27 @@ OctoPrint keeps no job history, so **a print that starts and ends while the brid
 
 **Moving from the Webhooks plugin.** If you set up 3D Print Log's [OctoPrint webhook](https://www.3dprintlog.com/docs/octoprint-webhook) before the bridge, both would log each print. The bridge reads OctoPrint's settings each time it connects, and while the Webhooks plugin has a hook posting to 3dprintlog.com it warns in its log, `status` and `doctor`: turn that hook off in OctoPrint's Settings > Webhooks. It never shows the hook's settings, which hold your API key.
 
+### Elegoo Centauri Carbon (SDCP)
+
+`adapter = sdcp` watches an Elegoo Centauri Carbon over SDCP, the local protocol Elegoo's slicer and app use: a websocket on the printer's port 3030. Run the bridge in Docker, on a NAS or on another computer on the same network. **It is built from the published protocol and other people's notes, not yet checked on a real printer** ([#94](https://github.com/HoffmanEngineering/printlog-bridge/issues/94)): if you have one, a trace (`trace = true`, [Recording a trace](#recording-a-trace)) attached to that issue is the most useful thing you can send.
+
+```ini
+[printer centauri]
+adapter = sdcp
+printer_id = 47
+host = 192.168.1.77
+```
+
+1. `host` is the printer's IP address (its screen shows it in the network settings), or run `printlog-bridge discover`, which asks the network for Elegoo printers and prints a section for each. Give it a fixed address (a DHCP reservation in your router).
+2. There is no password: SDCP has no authentication, so anything on your network can talk to the printer. The bridge only reads: it asks for the printer's status and attributes and says `ping` now and then, and never sends a command that starts, pauses or stops a print or touches a file. When a print starts it downloads the first 256 KB of the print's file from the printer's web server (port 80), for the slicer's estimate and the thumbnail; `files = false` turns that off, and `http_port` changes the port.
+3. Run `printlog-bridge doctor`: it says whether the printer answered, its model and its firmware version.
+
+Each print is logged when the printer starts printing it (not during its start routine of homing, heating and leveling, which may still show the last print's file), with its start time from the printer's own print time, and stays that print through pauses, however long, and reconnects. It is completed when the printer says complete, cancelled when it says stopped, and failed on an error, at the time the printer says. The printer doesn't report the filament it used, so **the filament is the slicer's estimate**, read from the header Elegoo Slicer (and OrcaSlicer) writes at the top of the file, marked as an estimate, and for a print that didn't complete scaled by how far it got. That download is reported by one community write-up, not by Elegoo: if it doesn't work on your printer, the print is logged without filament usage, and the duration estimate is the printer's.
+
+The printer keeps no job history the bridge can use, so **a print that starts and ends while the bridge is down isn't logged**. One that ends while the bridge is down is logged when it's back: as the printer says when it still shows how that print ended, else by how far it had got (completed at 99% or more, cancelled below, with a note). A printer that was switched off or restarted isn't taken as a failure.
+
+Not yet: a camera snapshot; Elegoo's resin printers that speak SDCP (Saturn 4 Ultra and others: they print through other states, so discovery leaves them out and `discover` names them without a section); and the Centauri Carbon 2, which speaks MQTT instead. Firmware versions checked: none yet.
+
 ### Timelapse videos (Pro)
 
 If the printer runs [moonraker-timelapse](https://github.com/mainsail-crew/moonraker-timelapse) and your 3D Print Log account has Pro, the video it renders after a print is attached to that print. The bridge waits up to 10 minutes after the print ends for the render (a render that `TIMELAPSE_RENDER` in your end macro finished just before the end counts too), downloads the video from Moonraker and uploads it straight to 3D Print Log's file storage. The print itself is completed right away; the video follows. Without Pro the bridge only asks whether you have it, and never downloads or uploads the video.
@@ -452,9 +473,9 @@ A paired bridge checks in with 3D Print Log every few minutes (`PUT /api/bridges
 How it looks, while it runs:
 
 - **Always, and cheaply:** an mDNS query every 5 minutes for Moonraker (`[zeroconf]`), PrusaLink and OctoPrint, and listening for Bambu Lab printers' announcements on UDP port 2021.
-- **Only when you tap "Scan now" in the app:** the per-address scan `printlog-bridge discover` does, on this computer's /24 and those of the printers it knows. A scan looks like a port scan to network security tools, so it never runs on its own.
+- **Only when you tap "Scan now" in the app:** the per-address scan `printlog-bridge discover` does, on this computer's /24 and those of the printers it knows, and the question Elegoo printers answer (`M99999`, broadcast to UDP port 3000). A scan looks like a port scan to network security tools, so it never runs on its own.
 
-It reports only printers an adapter recognizes (Moonraker, Bambu Lab, PrusaLink, OctoPrint), never any other host. Printers in the config file are reported too, as "managed by config": they stay read-only in the app, and the config file wins when both name the same printer. `discovery = false` in `[bridge]` turns the looking off; printers you connect in the app by address are still watched.
+It reports only printers an adapter recognizes (Moonraker, Bambu Lab, PrusaLink, OctoPrint, Elegoo's SDCP), never any other host. Printers in the config file are reported too, as "managed by config": they stay read-only in the app, and the config file wins when both name the same printer. `discovery = false` in `[bridge]` turns the looking off; printers you connect in the app by address are still watched.
 
 **A password or access code** (a Bambu Lab printer's access code, a PrusaLink password, an OctoPrint API key, the API key of a Moonraker with `[authorization]`) is entered in the app, next to the printer on the bridge's page. The app encrypts it in your browser to this bridge's own key, so 3D Print Log stores and forwards only something it can't read, and only this bridge can open it ([privacy](docs/privacy.md#printer-credentials-entered-in-the-app)). The bridge starts watching within a minute. If the printer refuses it, or the bridge can't open it, the app says so next to the printer, and so do `status` and `doctor`.
 

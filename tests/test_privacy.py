@@ -626,8 +626,9 @@ class TestOnlyOutboundConnections:
         """3D Print Log's API client, the image fetcher (Moonraker's thumbnails and its webcam),
         the Moonraker session, discovery (finding Moonraker on the local network), a Bambu
         printer's MQTT and FTPS clients and its discovery (`discover` only), PrusaLink's
-        HTTP client, OctoPrint's HTTP client and socket, and pairing (3D Print Log's sign-in
-        service, Auth0).
+        HTTP client, OctoPrint's HTTP client and socket, an SDCP printer's websocket, its
+        file download and its discovery (`M99999`, from an ephemeral port), and pairing (3D
+        Print Log's sign-in service, Auth0).
         docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
@@ -652,6 +653,9 @@ class TestOnlyOutboundConnections:
             "adapters/bambu/discovery.py",
             "adapters/prusalink/client.py",
             "adapters/octoprint/client.py",
+            "adapters/sdcp/adapter.py",
+            "adapters/sdcp/discovery.py",
+            "adapters/sdcp/files.py",
             # `printlog-bridge probe` only (docs/privacy.md, "The probe").
             "probe/services.py",
             "probe/discovery.py",

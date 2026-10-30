@@ -12,6 +12,7 @@ from printlog_bridge.adapters.bambu import BambuAdapter
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.adapters.octoprint import OctoPrintAdapter
 from printlog_bridge.adapters.prusalink import PrusaLinkAdapter
+from printlog_bridge.adapters.sdcp import SdcpAdapter
 from printlog_bridge.core.adapter import Adapter
 
 ADAPTERS: Mapping[str, type[Adapter]] = {
@@ -19,4 +20,5 @@ ADAPTERS: Mapping[str, type[Adapter]] = {
     BambuAdapter.name: BambuAdapter,
     PrusaLinkAdapter.name: PrusaLinkAdapter,
     OctoPrintAdapter.name: OctoPrintAdapter,
+    SdcpAdapter.name: SdcpAdapter,
 }

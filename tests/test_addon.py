@@ -52,6 +52,7 @@ OCTOPRINT = {
     "url": "http://octopi.local",
     "api_key": "octo-key",
 }
+SDCP = {"name": "cc", "adapter": "sdcp", "printer_id": 47, "host": "192.168.1.77"}
 
 
 def load(tmp_path: Path, text: str):
@@ -65,7 +66,7 @@ def load(tmp_path: Path, text: str):
 
 
 def test_every_adapter_becomes_a_printer_section_the_bridge_loads(tmp_path):
-    printers = [MOONRAKER, BAMBU, PRUSALINK, OCTOPRINT]
+    printers = [MOONRAKER, BAMBU, PRUSALINK, OCTOPRINT, SDCP]
     config = load(tmp_path, render_config({"printers": printers}))
 
     assert [(p.name, p.adapter.name, p.printer_id) for p in config.printers] == [
@@ -73,6 +74,7 @@ def test_every_adapter_becomes_a_printer_section_the_bridge_loads(tmp_path):
         ("x1c", "bambu", 44),
         ("mk4s", "prusalink", 45),
         ("ender", "octoprint", 46),
+        ("cc", "sdcp", 47),
     ]
     assert config.printers[3].adapter.api_key == "octo-key"
     assert config.update_check is False  # Home Assistant shows the app's updates itself
@@ -126,7 +128,7 @@ def test_values_are_stripped():
         ([dict(MOONRAKER, url=None)], "printer 'voron' (moonraker) needs url"),
         ([dict(MOONRAKER, host="x")], "printer 'voron' (moonraker) doesn't use host"),
         ([dict(BAMBU, password="x")], "printer 'x1c' (bambu) doesn't use password"),
-        ([dict(MOONRAKER, adapter="sdcp")], "unknown adapter 'sdcp'"),
+        ([dict(MOONRAKER, adapter="creality")], "unknown adapter 'creality'"),
         ([dict(MOONRAKER, name="")], "every printer needs a name"),
         ([dict(MOONRAKER, name="a]b")], "can't contain"),
         ([MOONRAKER, dict(BAMBU, name="voron")], "two printers are called 'voron'"),
