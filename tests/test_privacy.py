@@ -628,7 +628,8 @@ class TestOnlyOutboundConnections:
         printer's MQTT and FTPS clients and its discovery (`discover` only), PrusaLink's
         HTTP client, OctoPrint's HTTP client and socket, an SDCP printer's websocket, its
         file download and its discovery (`M99999`, from an ephemeral port), a Duet's HTTP
-        client, and pairing (3D Print Log's sign-in service, Auth0).
+        client, an Anycubic printer's handshake and its discovery (an SSDP search, from an
+        ephemeral port), and pairing (3D Print Log's sign-in service, Auth0).
         docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
@@ -648,7 +649,7 @@ class TestOnlyOutboundConnections:
             "core/discovery.py",
             "adapters/moonraker/session.py",
             "adapters/moonraker/discovery.py",
-            "adapters/bambu/mqtt.py",
+            "adapters/common/mqtt.py",
             "adapters/bambu/ftps.py",
             "adapters/bambu/discovery.py",
             "adapters/prusalink/client.py",
@@ -657,6 +658,8 @@ class TestOnlyOutboundConnections:
             "adapters/sdcp/discovery.py",
             "adapters/sdcp/files.py",
             "adapters/duet/client.py",
+            "adapters/anycubic/handshake.py",
+            "adapters/anycubic/discovery.py",
             # `printlog-bridge probe` only (docs/privacy.md, "The probe").
             "probe/services.py",
             "probe/discovery.py",
@@ -1194,3 +1197,68 @@ class TestDuet:
                 assert PASSWORD.encode() not in path.read_bytes(), path
         connect = [q for q in fake.queries if q.startswith("/rr_connect")]
         assert connect and all("time=" not in q for q in connect)  # never sets the clock
+
+
+class TestAnycubic:
+    """An Anycubic printer in LAN mode (`adapter = anycubic`): the handshake token and the MQTT
+    login `/ctrl` hands out reach no log, trace, state file or status, and the printer gets only
+    read-only queries (docs/privacy.md, "Anycubic")."""
+
+    def test_the_login_stays_between_the_bridge_and_the_printer(self, tmp_path, caplog):
+        from fake_anycubic import FakeAnycubic, certificate, job_block
+
+        cert = certificate(tmp_path / "tls", "anycubic")
+
+        async def scenario():
+            api, fake = FakePrintLogApi(), FakeAnycubic(*cert)
+            tokens: list[str] = []
+            original = fake._info
+
+            async def recording(request):
+                answer = await original(request)
+                tokens.append(fake._token)
+                return answer
+
+            fake._info = recording  # type: ignore[method-assign]
+            api_url = await api.start()
+            await fake.start()
+            try:
+                config = tmp_path / "printlog-bridge.cfg"
+                config.write_text(
+                    f"[bridge]\napi_url = {api_url}\napi_key = key-123\n"
+                    f"state_dir = {tmp_path / 'state'}\ntrace = true\n"
+                    f"[printer s1]\nadapter = anycubic\nprinter_id = 42\nhost = 127.0.0.1\n"
+                    f"port = {fake.http_port}\n",
+                    encoding="utf-8",
+                )
+                async with helpers.bridge(
+                    config, connected=lambda: fake.subscribed, disconnected=lambda: True
+                ):
+                    fake.project = job_block()
+                    await fake.push_info()
+                    await eventually(lambda: api.prints, timeout=10)
+                    fake.project = job_block(state="finished", print_status=2, progress=100)
+                    await fake.push_info()
+                    await eventually(lambda: api.prints[1]["status"] != 2, timeout=10)
+                return fake, tokens
+            finally:
+                await fake.close()
+                await api.close()
+
+        with caplog.at_level(logging.DEBUG):
+            fake, tokens = asyncio.run(scenario())
+
+        secrets = [*fake.login, fake.device_id, *tokens]
+        assert tokens and all(secrets)
+        bridge_log = [r.getMessage() for r in caplog.records if r.name != "aiohttp.access"]
+        assert bridge_log and not any(s in line for s in secrets for line in bridge_log)
+        for path in (tmp_path / "state").rglob("*"):
+            if path.is_file():
+                data = path.read_bytes()
+                assert not any(s.encode() in data for s in secrets), path
+        assert b"gcode_upload" not in b"".join(
+            p.read_bytes() for p in (tmp_path / "state").rglob("*") if p.is_file()
+        )
+        assert fake.refused == []
+        assert {m for m, _ in fake.http_methods} == {"GET", "POST"}
+        assert {path for _, path in fake.http_methods} == {"/info", "/ctrl"}

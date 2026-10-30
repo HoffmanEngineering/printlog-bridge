@@ -1,5 +1,6 @@
-"""`printlog-bridge discover`: lists the Moonraker, Bambu Lab, Elegoo (SDCP) and Duet printers on
-the local network, with a `[printer]` section for each, ready to paste into the config."""
+"""`printlog-bridge discover`: lists the Moonraker, Bambu Lab, Elegoo (SDCP), Duet and Anycubic
+printers on the local network, with a `[printer]` section for each, ready to paste into the
+config."""
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ import ipaddress
 import re
 from collections.abc import Sequence
 
+from printlog_bridge.adapters.anycubic.discovery import FoundAnycubic
 from printlog_bridge.adapters.bambu.discovery import SSDP_PORT, FoundBambu
 from printlog_bridge.adapters.duet.discovery import DuetDiscovery
 from printlog_bridge.adapters.moonraker import discovery
@@ -261,6 +263,58 @@ def format_sdcp(
     lines.append("")
     lines.append(
         "Fill in printer_id. SDCP has no password: the bridge only reads the printer's status."
+    )
+    return "\n".join(lines)
+
+
+def format_anycubic(
+    found: Sequence[FoundAnycubic] | None,
+    config: BridgeConfig | None,
+    seconds: float,
+    error: str | None = None,
+) -> str:
+    """The Anycubic printers that answered the SSDP search, with a section for each in LAN mode.
+    `found` is None when the bridge couldn't ask (`error` says why)."""
+    if found is None:
+        return f"Couldn't ask for Anycubic printers over SSDP: {error}."
+    lines = [f"Asked for Anycubic printers (SSDP, UDP port 1900) and waited {seconds:g}s."]
+    if not found:
+        lines.append("No Anycubic printer answered.")
+        if discovery.in_container():
+            lines.append(
+                "This looks like a container: the question is a broadcast, which only reaches "
+                "the printers from the host's network (network_mode: host)."
+            )
+        return "\n".join(lines)
+    configured = {
+        getattr(p.adapter, "host", None): p.name
+        for p in (config.printers if config else [])
+        if getattr(p.adapter, "name", None) == "anycubic"
+    }
+    lines.append(f"Found {len(found)} Anycubic printer{'' if len(found) == 1 else 's'}:")
+    for f in found:
+        lines.append("")
+        kind = "resin" if f.resin else "FDM"
+        lines.append(f"{f.address}: {f.model or 'Anycubic printer'} ({kind})")
+        name = configured.get(f.address)
+        if name is not None:
+            lines.append(f"  already in the config as [printer {name}]")
+            continue
+        if not f.lan_mode:
+            lines.append("  LAN mode is off: turn it on on the printer's screen first")
+            continue
+        lines.extend(
+            [
+                f"  [printer {_section_name(f.model or f.address)}]",
+                "  adapter = anycubic",
+                "  printer_id =      ; the number at the end of its page in 3D Print Log",
+                f"  host = {f.address}",
+            ]
+        )
+    lines.append("")
+    lines.append(
+        "Fill in printer_id. Nothing else is needed: the printer hands the bridge its MQTT login "
+        "in LAN mode, and the bridge only reads its status."
     )
     return "\n".join(lines)
 

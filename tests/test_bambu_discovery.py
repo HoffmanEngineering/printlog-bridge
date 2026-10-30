@@ -80,7 +80,16 @@ def test_the_command_lists_a_printer_heard(capsys, tmp_path, monkeypatch):
     monkeypatch.setattr(discovery, "listen", heard)
 
     code = main(
-        ["discover", "--subnet", "127.0.6.0/30", "--port", "1", "--no-zeroconf", "--no-sdcp"]
+        [
+            "discover",
+            "--subnet",
+            "127.0.6.0/30",
+            "--port",
+            "1",
+            "--no-zeroconf",
+            "--no-sdcp",
+            "--no-anycubic",
+        ]
     )
 
     out = capsys.readouterr().out
