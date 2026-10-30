@@ -22,6 +22,7 @@ from printlog_bridge import __version__
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.anycubic import discovery as anycubic_discovery
 from printlog_bridge.adapters.bambu import discovery as bambu_discovery
+from printlog_bridge.adapters.flashforge import discovery as flashforge_discovery
 from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_subnet
 from printlog_bridge.adapters.sdcp import discovery as sdcp_discovery
 from printlog_bridge.cli.data_owner import drop_root
@@ -31,6 +32,7 @@ from printlog_bridge.cli.discover import (
     format_anycubic,
     format_bambu,
     format_duet,
+    format_flashforge,
     format_found,
     format_sdcp,
     subnets_to_scan,
@@ -117,8 +119,8 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_key.add_argument("--yes", "-y", action="store_true", help="don't ask for confirmation")
     discover = commands.add_parser(
         "discover",
-        help="list the Moonraker, Bambu Lab, Elegoo (SDCP), Duet and Anycubic printers on the "
-        "local network, with a [printer] section for each",
+        help="list the Moonraker, Bambu Lab, Elegoo (SDCP), Duet, FlashForge and Anycubic printers "
+        "on the local network, with a [printer] section for each",
     )
     discover.add_argument(
         "--subnet",
@@ -154,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-anycubic",
         action="store_true",
         help="don't ask for Anycubic printers in LAN mode (an SSDP search, UDP port 1900)",
+    )
+    discover.add_argument(
+        "--no-flashforge",
+        action="store_true",
+        help="don't ask for FlashForge printers (an empty datagram to 225.0.0.9 and the "
+        "broadcast address, UDP ports 19000, 8899 and 48899)",
     )
     _add_probe(commands)
     for command in (doctor, run, status, store_key, pair, rotate_key, discover):
@@ -434,6 +442,7 @@ def _discover(args: argparse.Namespace) -> int:
     sdcp = not args.no_sdcp
     duet = zeroconf and not args.no_duet
     anycubic = not args.no_anycubic
+    flashforge = not args.no_flashforge
 
     async def outcome(task: asyncio.Future | None) -> tuple[list | None, str | None]:
         if task is None:
@@ -456,6 +465,13 @@ def _discover(args: argparse.Namespace) -> int:
             if anycubic
             else None
         )
+        flashforges = (
+            asyncio.ensure_future(
+                flashforge_discovery.ask(flashforge_discovery.targets_for(networks))
+            )
+            if flashforge
+            else None
+        )
         found = await discover(networks, port=args.port, zeroconf=zeroconf)
         return (
             found,
@@ -463,11 +479,17 @@ def _discover(args: argparse.Namespace) -> int:
             await outcome(asking),
             await outcome(duets),
             await outcome(anycubics),
+            await outcome(flashforges),
         )
 
-    found, (bambus, error), (elegoos, sdcp_error), (boards, duet_error), (acs, ac_error) = (
-        asyncio.run(every_kind())
-    )
+    (
+        found,
+        (bambus, error),
+        (elegoos, sdcp_error),
+        (boards, duet_error),
+        (acs, ac_error),
+        (ffs, ff_error),
+    ) = asyncio.run(every_kind())
     print(format_found(found, networks, config, zeroconf=zeroconf))
     if bambu:
         print()
@@ -481,7 +503,10 @@ def _discover(args: argparse.Namespace) -> int:
     if anycubic:
         print()
         print(format_anycubic(acs, config, anycubic_discovery.ASK_S, ac_error))
-    return 0 if found or bambus or elegoos or boards or acs else 1
+    if flashforge:
+        print()
+        print(format_flashforge(ffs, config, flashforge_discovery.ASK_S, ff_error))
+    return 0 if found or bambus or elegoos or boards or acs or ffs else 1
 
 
 def _store_key(explicit_config: Path | None) -> int:

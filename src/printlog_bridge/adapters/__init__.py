@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from printlog_bridge.adapters.anycubic import AnycubicAdapter
 from printlog_bridge.adapters.bambu import BambuAdapter
 from printlog_bridge.adapters.duet import DuetAdapter
+from printlog_bridge.adapters.flashforge import FlashForgeAdapter
 from printlog_bridge.adapters.moonraker import MoonrakerAdapter
 from printlog_bridge.adapters.octoprint import OctoPrintAdapter
 from printlog_bridge.adapters.prusalink import PrusaLinkAdapter
@@ -24,5 +25,6 @@ ADAPTERS: Mapping[str, type[Adapter]] = {
     OctoPrintAdapter.name: OctoPrintAdapter,
     SdcpAdapter.name: SdcpAdapter,
     DuetAdapter.name: DuetAdapter,
+    FlashForgeAdapter.name: FlashForgeAdapter,
     AnycubicAdapter.name: AnycubicAdapter,
 }

@@ -55,6 +55,14 @@ OCTOPRINT = {
 SDCP = {"name": "cc", "adapter": "sdcp", "printer_id": 47, "host": "192.168.1.77"}
 DUET = {"name": "railcore", "adapter": "duet", "printer_id": 48, "host": "192.168.1.88"}
 ANYCUBIC = {"name": "kobra", "adapter": "anycubic", "printer_id": 49, "host": "192.168.1.89"}
+FLASHFORGE = {
+    "name": "ad5x",
+    "adapter": "flashforge",
+    "printer_id": 50,
+    "host": "192.168.1.60",
+    "serial": "SNMOMC9900728",
+    "check_code": "8f3a2c71",
+}
 
 
 def load(tmp_path: Path, text: str):
@@ -68,7 +76,7 @@ def load(tmp_path: Path, text: str):
 
 
 def test_every_adapter_becomes_a_printer_section_the_bridge_loads(tmp_path):
-    printers = [MOONRAKER, BAMBU, PRUSALINK, OCTOPRINT, SDCP, DUET, ANYCUBIC]
+    printers = [MOONRAKER, BAMBU, PRUSALINK, OCTOPRINT, SDCP, DUET, ANYCUBIC, FLASHFORGE]
     config = load(tmp_path, render_config({"printers": printers}))
 
     assert [(p.name, p.adapter.name, p.printer_id) for p in config.printers] == [
@@ -79,7 +87,9 @@ def test_every_adapter_becomes_a_printer_section_the_bridge_loads(tmp_path):
         ("cc", "sdcp", 47),
         ("railcore", "duet", 48),
         ("kobra", "anycubic", 49),
+        ("ad5x", "flashforge", 50),
     ]
+    assert config.printers[7].adapter.check_code == "8f3a2c71"
     assert config.printers[3].adapter.api_key == "octo-key"
     assert config.update_check is False  # Home Assistant shows the app's updates itself
 

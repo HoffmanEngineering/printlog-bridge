@@ -66,6 +66,7 @@ ADAPTER_FIELDS: Mapping[str, Mapping[str, str]] = {
     "octoprint": {"url": "url", "api_key": "api_key"},
     "sdcp": {"host": "host"},
     "duet": {"host": "host", "password": "password"},
+    "flashforge": {"host": "host", "serial": "serial", "check_code": "check_code"},
     "anycubic": {"host": "host"},
 }  # fmt: skip
 REQUIRED: Mapping[str, Sequence[str]] = {"moonraker": ("url",)}

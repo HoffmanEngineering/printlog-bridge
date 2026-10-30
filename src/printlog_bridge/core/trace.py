@@ -65,7 +65,7 @@ SECRET_ANSWERS = frozenset(
 apart from the rest (moonraker.conf's Apprise notifier URLs, `tgram://<bot>:<token>/...`)."""
 
 _SECRET_FIELD = re.compile(
-    r'("[^"\\]*(?:key|token|secret|passw|access_code)[^"\\]*"\s*:\s*)"(?:[^"\\]|\\.)*"',
+    r'("[^"\\]*(?:key|token|secret|passw|access_code|check_?code)[^"\\]*"\s*:\s*)"(?:[^"\\]|\\.)*"',
     re.IGNORECASE,
 )
 _SECRET_METHOD = re.compile(r'"method"\s*:\s*"(access\.[^"]+|server\.config)"')

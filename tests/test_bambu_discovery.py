@@ -89,6 +89,7 @@ def test_the_command_lists_a_printer_heard(capsys, tmp_path, monkeypatch):
             "--no-zeroconf",
             "--no-sdcp",
             "--no-anycubic",
+            "--no-flashforge",
         ]
     )
 

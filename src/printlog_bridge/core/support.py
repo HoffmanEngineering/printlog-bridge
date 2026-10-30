@@ -42,9 +42,9 @@ LOG_FILES = ("bridge.log", "bridge.log.1")
 TRACE_BYTES = 20 * 1024 * 1024
 """How much of the newest traces (`trace = true`) goes into the bundle, before compression."""
 
-SECRET_OPTION = re.compile(r"(key|token|secret|password|access_code)", re.IGNORECASE)
+SECRET_OPTION = re.compile(r"(key|token|secret|password|access_code|check_code)", re.IGNORECASE)
 """A config option whose value is a secret: an API key, a password, a Bambu printer's LAN
-access code."""
+access code, a FlashForge printer's check code."""
 _OPTION_LINE = re.compile(r"^(\s*)([^=:\s\[;#][^=:]*?)(\s*[=:]\s*)(.*)$")
 _SECRET_ENV = (API_KEY_ENV,)
 MIN_SECRET_LENGTH = 4

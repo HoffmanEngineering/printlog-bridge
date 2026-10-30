@@ -75,7 +75,7 @@ def test_secrets_are_password_fields():
     schema = CONFIG["schema"]
     [printer] = schema["printers"]
     assert schema["api_key"] == "password?"
-    for secret in ("access_code", "password", "api_key"):
+    for secret in ("access_code", "check_code", "password", "api_key"):
         assert printer[secret] == "password?", secret
 
 
