@@ -1,5 +1,5 @@
-"""`printlog-bridge discover`: lists the Moonraker, Bambu Lab and Elegoo (SDCP) printers on the
-local network, with a `[printer]` section for each, ready to paste into the config."""
+"""`printlog-bridge discover`: lists the Moonraker, Bambu Lab, Elegoo (SDCP) and Duet printers on
+the local network, with a `[printer]` section for each, ready to paste into the config."""
 
 from __future__ import annotations
 
@@ -8,11 +8,14 @@ import re
 from collections.abc import Sequence
 
 from printlog_bridge.adapters.bambu.discovery import SSDP_PORT, FoundBambu
+from printlog_bridge.adapters.duet.discovery import DuetDiscovery
 from printlog_bridge.adapters.moonraker import discovery
 from printlog_bridge.adapters.moonraker.discovery import Found
 from printlog_bridge.adapters.sdcp.discovery import FoundSdcp
 from printlog_bridge.adapters.sdcp.protocol import DISCOVERY_PORT as SDCP_DISCOVERY_PORT
+from printlog_bridge.core import mdns
 from printlog_bridge.core.config import BridgeConfig
+from printlog_bridge.core.discovery import Found as Found_
 
 
 def subnets_to_scan(
@@ -259,4 +262,68 @@ def format_sdcp(
     lines.append(
         "Fill in printer_id. SDCP has no password: the bridge only reads the printer's status."
     )
+    return "\n".join(lines)
+
+
+async def ask_duets(wait: float = mdns.WAIT_S) -> list[Found_]:
+    """The Duets that answer an mDNS question for `_http._tcp` with RepRapFirmware's TXT record
+    (`adapters/duet/discovery.py`). Raises OSError when the question can't be sent."""
+    hook = DuetDiscovery()
+    found: dict[tuple[str, int], Found_] = {}
+    for answer in await mdns.ask(list(hook.mdns_services), wait):
+        one = await hook.from_mdns(answer)
+        if one is not None:
+            found.setdefault((one.address, one.port), one)
+    return sorted(found.values(), key=lambda f: (f.address, f.port))
+
+
+def format_duet(
+    found: Sequence[Found_] | None,
+    config: BridgeConfig | None,
+    seconds: float,
+    error: str | None = None,
+) -> str:
+    """The Duets that answered over mDNS, with a section for each. `found` is None when the
+    bridge couldn't ask (`error` says why)."""
+    if found is None:
+        return f"Couldn't ask for Duet boards over mDNS: {error}."
+    lines = [f"Asked for Duet boards over mDNS (_http._tcp) and waited {seconds:g}s."]
+    if not found:
+        lines.append(
+            "No Duet answered. A Duet on Wi-Fi or behind an SBC may not say it's one: add it "
+            "by address (adapter = duet, host = ...)."
+        )
+        if discovery.in_container():
+            lines.append(
+                "This looks like a container: mDNS only reaches one on the host's network "
+                "(network_mode: host)."
+            )
+        return "\n".join(lines)
+    configured = {
+        (getattr(p.adapter, "host", None), getattr(p.adapter, "port", None)): p.name
+        for p in (config.printers if config else [])
+        if getattr(p.adapter, "name", None) == "duet"
+    }
+    lines.append(f"Found {len(found)} Duet board{'' if len(found) == 1 else 's'}:")
+    for f in found:
+        details = [f.model or "", f'"{f.name}"' if f.name else ""]
+        lines.append("")
+        lines.append(f"{f.address}: {', '.join(d for d in details if d)}")
+        name = configured.get((f.address, f.port))
+        if name is not None:
+            lines.append(f"  already in the config as [printer {name}]")
+            continue
+        lines.extend(
+            [
+                f"  [printer {_section_name(f.name or f.address)}]",
+                "  adapter = duet",
+                "  printer_id =      ; the number at the end of its page in 3D Print Log",
+                f"  host = {f.address}",
+            ]
+        )
+        if f.port != 80:
+            lines.append(f"  port = {f.port}")
+        lines.append("  password =        ; only when config.g sets one with M551")
+    lines.append("")
+    lines.append("Fill in printer_id, and the password if the board has one.")
     return "\n".join(lines)

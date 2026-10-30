@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from printlog_bridge.adapters.common.timeouts import bounded
 from printlog_bridge.core.events import SlicerFile, SlicerMetadata
 from printlog_bridge.core.images import RangeUnavailable, fetch_range, read_range
 from printlog_bridge.core.slicer_settings import (
@@ -41,7 +42,7 @@ from printlog_bridge.core.slicer_settings import (
 )
 
 from .images import FETCH_TIMEOUT_S, MoonrakerImages, _http_base, _inside
-from .session import Call, ConnectionLost, MoonrakerRpcError, bounded
+from .session import Call, ConnectionLost, MoonrakerRpcError
 
 log = logging.getLogger(__name__)
 

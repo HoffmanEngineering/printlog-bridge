@@ -13,7 +13,8 @@ configuration:
         description: >-
           moonraker for Klipper printers (Voron, Snapmaker U1, Creality K1/K2...), bambu for
           Bambu Lab printers, prusalink for Prusa printers, octoprint for printers run by
-          OctoPrint, sdcp for the Elegoo Centauri Carbon.
+          OctoPrint, sdcp for the Elegoo Centauri Carbon, duet for Duet boards
+          (RepRapFirmware).
       printer_id:
         name: Printer ID
         description: >-
@@ -27,7 +28,7 @@ configuration:
           octoprint: OctoPrint's address, such as http://octopi.local.
       host:
         name: Host
-        description: "bambu, prusalink, sdcp: the printer's IP address or host name."
+        description: "bambu, prusalink, sdcp, duet: the printer's IP address or host name."
       serial:
         name: Serial number
         description: "bambu: the printer's serial number."
@@ -35,8 +36,10 @@ configuration:
         name: Access code
         description: "bambu: the LAN access code on the printer's screen."
       password:
-        name: PrusaLink password
-        description: "prusalink: the password in the printer's Settings > Network > PrusaLink."
+        name: Printer password
+        description: >-
+          prusalink: the password in the printer's Settings > Network > PrusaLink. duet: the
+          board's password (M551 in config.g), only when it has one.
       api_key:
         name: Printer API key
         description: >-
