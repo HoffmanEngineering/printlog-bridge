@@ -14,8 +14,8 @@ configuration:
           moonraker for Klipper printers (Voron, Snapmaker U1, Creality K1/K2...), bambu for
           Bambu Lab printers, prusalink for Prusa printers, octoprint for printers run by
           OctoPrint, sdcp for the Elegoo Centauri Carbon, duet for Duet boards
-          (RepRapFirmware), anycubic for Anycubic printers in LAN mode (Kobra S1, Kobra 3,
-          Photon P1).
+          (RepRapFirmware), flashforge for the FlashForge Adventurer 5M series and AD5X,
+          anycubic for Anycubic printers in LAN mode (Kobra S1, Kobra 3, Photon P1).
       printer_id:
         name: Printer ID
         description: >-
@@ -29,13 +29,20 @@ configuration:
           octoprint: OctoPrint's address, such as http://octopi.local.
       host:
         name: Host
-        description: "bambu, prusalink, sdcp, duet, anycubic: the printer's IP address or host name."
+        description: >-
+          bambu, prusalink, sdcp, duet, flashforge, anycubic: the printer's IP address or host
+          name.
       serial:
         name: Serial number
-        description: "bambu: the printer's serial number."
+        description: "bambu, flashforge: the printer's serial number."
       access_code:
         name: Access code
         description: "bambu: the LAN access code on the printer's screen."
+      check_code:
+        name: Check code
+        description: >-
+          flashforge: the check code on the printer's screen (Settings > Network, with LAN-only
+          mode on).
       password:
         name: Printer password
         description: >-

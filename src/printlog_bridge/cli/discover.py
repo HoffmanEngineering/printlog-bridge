@@ -1,6 +1,6 @@
-"""`printlog-bridge discover`: lists the Moonraker, Bambu Lab, Elegoo (SDCP), Duet and Anycubic
-printers on the local network, with a `[printer]` section for each, ready to paste into the
-config."""
+"""`printlog-bridge discover`: lists the Moonraker, Bambu Lab, Elegoo (SDCP), Duet, FlashForge
+and Anycubic printers on the local network, with a `[printer]` section for each, ready to paste
+into the config."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from printlog_bridge.adapters.anycubic.discovery import FoundAnycubic
 from printlog_bridge.adapters.bambu.discovery import SSDP_PORT, FoundBambu
 from printlog_bridge.adapters.duet.discovery import DuetDiscovery
+from printlog_bridge.adapters.flashforge.discovery import FoundFlashForge
 from printlog_bridge.adapters.moonraker import discovery
 from printlog_bridge.adapters.moonraker.discovery import Found
 from printlog_bridge.adapters.sdcp.discovery import FoundSdcp
@@ -380,4 +381,60 @@ def format_duet(
         lines.append("  password =        ; only when config.g sets one with M551")
     lines.append("")
     lines.append("Fill in printer_id, and the password if the board has one.")
+    return "\n".join(lines)
+
+
+def format_flashforge(
+    found: Sequence[FoundFlashForge] | None,
+    config: BridgeConfig | None,
+    seconds: float,
+    error: str | None = None,
+) -> str:
+    """The FlashForge printers that answered, with a section for each. `found` is None when the
+    bridge couldn't ask (`error` says why)."""
+    if found is None:
+        return f"Couldn't ask for FlashForge printers: {error}."
+    lines = [
+        "Asked for FlashForge printers (UDP: 225.0.0.9 ports 19000 and 8899, broadcast port "
+        f"48899) and waited {seconds:g}s."
+    ]
+    if not found:
+        lines.append("No FlashForge printer answered.")
+        if discovery.in_container():
+            lines.append(
+                "This looks like a container: the question is a broadcast, which only reaches "
+                "the printers from the host's network (network_mode: host)."
+            )
+        return "\n".join(lines)
+    configured = {
+        str(getattr(p.adapter, "serial", "")).upper(): p.name
+        for p in (config.printers if config else [])
+        if getattr(p.adapter, "name", None) == "flashforge"
+    }
+    lines.append(f"Found {len(found)} FlashForge printer{'' if len(found) == 1 else 's'}:")
+    for f in found:
+        details = [f.model or "", f'"{f.name}"' if f.name else "", f"serial {f.serial}"]
+        lines.append("")
+        lines.append(f"{f.address}: {', '.join(d for d in details if d)}")
+        name = configured.get(f.serial.upper())
+        if name is not None:
+            lines.append(f"  already in the config as [printer {name}]")
+            continue
+        lines.extend(
+            [
+                f"  [printer {_section_name(f.name or f.model or f.serial)}]",
+                "  adapter = flashforge",
+                "  printer_id =      ; the number at the end of its page in 3D Print Log",
+                f"  host = {f.address}",
+                f"  serial = {f.serial}",
+                "  check_code =      ; on the printer's screen (Settings > Network, LAN-only mode)",
+            ]
+        )
+        if f.http_port != 8898:
+            lines.append(f"  port = {f.http_port}")
+    lines.append("")
+    lines.append(
+        "Fill in printer_id and check_code. The bridge only reads the printer's status over its "
+        "HTTP API (firmware 2.x or newer on an Adventurer 5M or 5M Pro, any AD5X)."
+    )
     return "\n".join(lines)

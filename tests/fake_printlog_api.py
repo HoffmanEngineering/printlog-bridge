@@ -1560,9 +1560,11 @@ _PRIVATE = tuple(
     ipaddress.ip_network(n)
     for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7")
 )
-BRIDGE_KINDS = ("moonraker", "octoprint", "prusalink", "bambu", "sdcp", "duet", "anycubic")
+BRIDGE_KINDS = ("moonraker", "octoprint", "prusalink", "bambu", "sdcp", "duet", "flashforge",
+                "anycubic")  # fmt: skip
 DEFAULT_BRIDGE_PORTS = {"moonraker": 7125, "bambu": 8883, "prusalink": 80, "octoprint": 80,
-                        "sdcp": 3030, "duet": 80, "anycubic": 18910}  # fmt: skip
+                        "sdcp": 3030, "duet": 80, "flashforge": 8898,
+                        "anycubic": 18910}  # fmt: skip
 
 
 def _matches(value: Any, pattern: str) -> bool:
@@ -1732,6 +1734,7 @@ SECRET_FIELDS = {
     "moonraker": ("moonraker_api_key",),
     "octoprint": ("api_key",),
     "duet": ("password",),
+    "flashforge": ("check_code",),
 }
 _SPKI_PREFIX = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE"
 

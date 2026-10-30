@@ -478,7 +478,7 @@ class TestDiscovery:
 
         monkeypatch.setattr(sdcp_discovery, "ask", heard)
         args = ["discover", "--subnet", "127.0.6.0/30", "--port", "1", "--no-zeroconf",
-                "--no-bambu", "--no-anycubic"]  # fmt: skip
+                "--no-bambu", "--no-anycubic", "--no-flashforge"]  # fmt: skip
         code = main(args)
 
         out = capsys.readouterr().out

@@ -41,7 +41,7 @@ KEY_FILE = "credential-key.pem"
 BAD_SUFFIX = ".bad"
 VERSION = "v1"
 INFO = b"printlog-credential:v1:aes-256-gcm"
-FIELDS = ("access_code", "password", "username", "api_key", "moonraker_api_key")
+FIELDS = ("access_code", "password", "username", "api_key", "moonraker_api_key", "check_code")
 """Every field the app can seal, as the adapters' `app_secrets` name them."""
 MIN_BLOB, MAX_BLOB = 94, 349
 MAX_PLAINTEXT = 256

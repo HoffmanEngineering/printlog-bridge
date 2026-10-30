@@ -47,10 +47,10 @@ MAX_MACS = 8
 _SERIAL = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _MAC = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 
-KINDS = ("moonraker", "octoprint", "prusalink", "bambu", "sdcp", "duet", "anycubic")
+KINDS = ("moonraker", "octoprint", "prusalink", "bambu", "sdcp", "duet", "flashforge", "anycubic")
 """What 3D Print Log accepts as a discovered printer's `kind`."""
 DEFAULT_PORTS = {"moonraker": 7125, "bambu": 8883, "prusalink": 80, "octoprint": 80, "sdcp": 3030,
-                 "duet": 80, "anycubic": 18910}  # fmt: skip
+                 "duet": 80, "flashforge": 8898, "anycubic": 18910}  # fmt: skip
 
 _PRIVATE = tuple(
     ipaddress.ip_network(n)

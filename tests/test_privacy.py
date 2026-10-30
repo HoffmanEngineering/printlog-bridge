@@ -629,8 +629,9 @@ class TestOnlyOutboundConnections:
         HTTP client, OctoPrint's HTTP client and socket, an SDCP printer's websocket, its
         file download and its discovery (`M99999`, from an ephemeral port), a Duet's HTTP
         client, an Anycubic printer's handshake and its discovery (an SSDP search, from an
-        ephemeral port), and pairing (3D Print Log's sign-in service, Auth0).
-        docs/privacy.md lists what each connects to."""
+        ephemeral port), a FlashForge printer's HTTP client, `doctor`'s look at its Moonraker and
+        legacy port, and its discovery (from an ephemeral port), and pairing (3D Print Log's
+        sign-in service, Auth0). docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
             r"create_datagram_endpoint|urllib\.request|http\.client|import requests|"
@@ -660,6 +661,9 @@ class TestOnlyOutboundConnections:
             "adapters/duet/client.py",
             "adapters/anycubic/handshake.py",
             "adapters/anycubic/discovery.py",
+            "adapters/flashforge/client.py",
+            "adapters/flashforge/adapter.py",
+            "adapters/flashforge/discovery.py",
             # `printlog-bridge probe` only (docs/privacy.md, "The probe").
             "probe/services.py",
             "probe/discovery.py",
@@ -1262,3 +1266,66 @@ class TestAnycubic:
         assert fake.refused == []
         assert {m for m, _ in fake.http_methods} == {"GET", "POST"}
         assert {path for _, path in fake.http_methods} == {"/info", "/ctrl"}
+
+
+class TestFlashForge:
+    """A FlashForge printer (`adapter = flashforge`): its check code reaches no log, trace, state
+    file, status or support bundle, and the printer gets only the read-only requests
+    (docs/privacy.md, "FlashForge")."""
+
+    def test_the_check_code_stays_between_the_bridge_and_the_printer(self, tmp_path, caplog):
+        from fake_flashforge import CHECK_CODE, SERIAL, FakeFlashForge
+
+        async def scenario():
+            api, fake = FakePrintLogApi(), FakeFlashForge()
+            api_url = await api.start()
+            await fake.start()
+            try:
+                config = tmp_path / "printlog-bridge.cfg"
+                config.write_text(
+                    f"[bridge]\napi_url = {api_url}\napi_key = key-123\n"
+                    f"state_dir = {tmp_path / 'state'}\ntrace = true\n"
+                    f"[printer ad5m]\nadapter = flashforge\nprinter_id = 42\nhost = 127.0.0.1\n"
+                    f"port = {fake.port}\nserial = {SERIAL}\ncheck_code = {CHECK_CODE}\n"
+                    "poll_interval = 1\nidle_poll_interval = 1\n",
+                    encoding="utf-8",
+                )
+                async with helpers.bridge(
+                    config, connected=lambda: fake.paths("/detail"), disconnected=lambda: True
+                ):
+                    fake.print_file("Benchy.gcode")
+                    await eventually(lambda: api.prints, timeout=10)
+                    fake.complete()
+                    await eventually(lambda: api.prints[1]["status"] != 2, timeout=10)
+                return fake, config
+            finally:
+                await fake.close()
+                await api.close()
+
+        with caplog.at_level(logging.DEBUG):
+            fake, config = asyncio.run(scenario())
+
+        bridge_log = [r.getMessage() for r in caplog.records if r.name != "aiohttp.access"]
+        assert bridge_log and not any(CHECK_CODE in line for line in bridge_log)
+        for path in (tmp_path / "state").rglob("*"):
+            if path.is_file():
+                assert CHECK_CODE.encode() not in path.read_bytes(), path
+        assert fake.methods == {"POST"}
+        assert {p for _, p in fake.requests} <= {"/detail", "/gcodeList", "/gcodeThumb"}
+
+        state = tmp_path / "state"
+        bundle = write_support_bundle(
+            state / "bundle.zip", report="", config_path=config, state_dir=state, env={}
+        )
+        with zipfile.ZipFile(bundle) as z:
+            for name in z.namelist():
+                assert CHECK_CODE not in z.read(name).decode("utf-8", "replace"), name
+
+    def test_a_check_code_in_a_trace_line_is_masked(self, tmp_path):
+        from printlog_bridge.core.trace import Trace, trace_files
+
+        trace = Trace(tmp_path, "ad5m", secrets=[])
+        trace.record("send", json.dumps({"checkCode": "TRACE-CANARY", "check_code": "CANARY-2"}))
+        trace.close()
+        text = "".join(p.read_text(encoding="utf-8") for p in trace_files(tmp_path))
+        assert "TRACE-CANARY" not in text and "CANARY-2" not in text
