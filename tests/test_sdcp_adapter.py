@@ -506,3 +506,58 @@ class TestResinPrinters:
         text = format_sdcp([self.resin()], None, 3)
         assert "192.168.1.80: ELEGOO Saturn 4 Ultra" in text
         assert "resin" in text and "adapter = sdcp" not in text
+
+
+@contextlib.asynccontextmanager
+async def silent_server():
+    """Accepts a connection and never answers, not even the websocket upgrade."""
+    held = []
+
+    async def hold(reader, writer):
+        held.append(writer)
+        await reader.read()  # until the client gives up
+
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    try:
+        yield server.sockets[0].getsockname()[1]
+    finally:
+        for writer in held:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+class TestSilentHost:
+    """A host that accepts the connection but never answers the upgrade."""
+
+    def adapter(self, port: int) -> SdcpAdapter:
+        adapter = SdcpAdapter.from_config("cc", {"host": "127.0.0.1", "port": str(port)})
+        adapter.connect_s = 0.3
+        adapter.retry_s = 0.05
+        return adapter
+
+    def test_check_gives_up(self):
+        async def scenario():
+            async with silent_server() as port:
+                return await asyncio.wait_for(self.adapter(port).check(), 5)
+
+        [result] = asyncio.run(scenario())
+        assert result.status is Status.FAIL
+
+    def test_printer_details_give_up(self):
+        async def scenario():
+            async with silent_server() as port:
+                return await asyncio.wait_for(self.adapter(port).printer_details(), 5)
+
+        assert asyncio.run(scenario()).name == "cc"
+
+    def test_run_reports_it_and_tries_again(self):
+        report = Report()
+
+        async def scenario():
+            async with silent_server() as port:  # noqa: SIM117 - the port comes from the first
+                async with running(self.adapter(port), Sink(), report):
+                    await eventually(lambda: len(report.disconnects) >= 2, timeout=5)
+
+        asyncio.run(scenario())
+        assert "no answer" in report.disconnects[0]

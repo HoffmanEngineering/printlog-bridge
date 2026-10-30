@@ -96,6 +96,12 @@ def status(
     }
 
 
+def partial(t: float, fields: dict) -> dict:
+    """A push with only what changed."""
+    return {"Status": fields, "MainboardID": "board", "TimeStamp": int(t),
+            "Topic": "sdcp/status/board"}  # fmt: skip
+
+
 def tracker(state=None, clock=None, files=None, sink=None):
     sink = sink or Sink()
     clock = clock or Clock()
@@ -346,6 +352,37 @@ class TestReconnects:
         [done] = sink2.of(JobFinished)
         assert done.outcome is JobOutcome.COMPLETED
         assert done.duration_s == 4360  # from its start, kept: T0 less 360 s printing
+
+    def test_a_partial_push_first_after_a_reconnect_waits_for_the_state(self, tmp_path):
+        """A first push after a connect may hold only what changed: nothing is decided until
+        the merged status has the print state."""
+        t, sink, _ = tracker(PrinterState.load(tmp_path, "cc"))
+        feed(t, status(T0, 13, progress=10))
+        t.connected()
+        feed(
+            t,
+            partial(T0 + 60, {"TempOfNozzle": 211.0}),
+            partial(T0 + 61, {"PrintInfo": {"Progress": 30, "CurrentLayer": 60}}),
+            status(T0 + 62, 13, progress=31),
+            status(T0 + 900, 9, progress=100),
+        )
+        assert len(sink.of(JobStarted)) == 1
+        [done] = sink.of(JobFinished)
+        assert done.outcome is JobOutcome.COMPLETED
+
+    def test_a_partial_push_first_after_a_restart_waits_for_the_state(self, tmp_path):
+        t, sink, _ = tracker(PrinterState.load(tmp_path, "cc"))
+        feed(t, status(T0, 13, progress=10))
+        again, sink2, _ = tracker(PrinterState.load(tmp_path, "cc"))
+        feed(
+            again,
+            partial(T0 + 60, {"PrintInfo": {"Progress": 30}}),
+            status(T0 + 61, 13, progress=31),
+            status(T0 + 900, 9, progress=100),
+        )
+        assert [s.job_id for s in sink2.of(JobStarted)] == [sink.of(JobStarted)[0].job_id]
+        [done] = sink2.of(JobFinished)
+        assert done.outcome is JobOutcome.COMPLETED
 
     def test_a_job_paused_through_a_restart_is_the_same_job(self, tmp_path):
         t, sink, _ = tracker(PrinterState.load(tmp_path, "cc"))

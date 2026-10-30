@@ -255,6 +255,8 @@ class JobTracker:
             self._offset = timedelta(seconds=view.timestamp - self.clock().timestamp())
         if self.report is not None and view.words is not None:
             self.report.printer_state(view.words)
+        if view.state is None:
+            return  # a push with only what changed, before a full status: nothing to decide
         if not self._reconciled:
             self._reconciled = True
             await self._reconcile(view)

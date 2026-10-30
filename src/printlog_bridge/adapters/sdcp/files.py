@@ -132,10 +132,13 @@ class SdcpFiles:
         return facts_from(head)
 
     async def _head(self, url: str) -> bytes:
-        """The first `HEAD_BYTES` of the file, never more."""
+        """The first `HEAD_BYTES` of the file, never more: uncompressed is asked for, and a
+        compressed answer is not inflated (it would grow past the cap first)."""
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10.0)
-        headers = {"Range": f"bytes=0-{HEAD_BYTES - 1}"}
-        async with aiohttp.ClientSession(timeout=timeout) as http:  # noqa: SIM117 - py39
+        headers = {"Range": f"bytes=0-{HEAD_BYTES - 1}", "Accept-Encoding": "identity"}
+        async with aiohttp.ClientSession(  # noqa: SIM117 - py39
+            timeout=timeout, auto_decompress=False
+        ) as http:
             async with http.get(url, headers=headers, allow_redirects=False) as response:
                 if response.status not in (200, 206):
                     raise ValueError(f"HTTP {response.status} for the job's file")

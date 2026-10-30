@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
 import json
 import time
 import uuid
@@ -135,6 +136,10 @@ class FakeElegoo:
         self.downloads: list[tuple[str, str | None]] = []
         """Every download asked for: the path and its `Range` header."""
         self.honor_range = True
+        self.download_encodings: list[str | None] = []
+        """Each download's `Accept-Encoding`."""
+        self.gzip = False
+        """Serve downloads gzip-compressed, whatever the client accepts."""
         self._runner: web.AppRunner | None = None
         self.host = "127.0.0.1"
         self.port = 0
@@ -193,6 +198,7 @@ class FakeElegoo:
         unless `honor_range` is off."""
         path = "/" + request.match_info["path"]
         asked = request.headers.get("Range")
+        self.download_encodings.append(request.headers.get("Accept-Encoding"))
         self.downloads.append((path, asked))
         data = self.files.get(path)
         if data is None:
@@ -206,6 +212,8 @@ class FakeElegoo:
                 body=data[start:end],
                 headers={"Content-Range": f"bytes {start}-{end - 1}/{len(data)}"},
             )
+        if self.gzip:
+            return web.Response(body=gzip.compress(data), headers={"Content-Encoding": "gzip"})
         return web.Response(body=data)
 
     async def _on_message(self, ws: web.WebSocketResponse, text: str) -> None:

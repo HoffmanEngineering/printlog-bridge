@@ -28,6 +28,7 @@ from typing import Any
 
 import aiohttp
 
+from printlog_bridge.adapters.moonraker.session import bounded
 from printlog_bridge.core.adapter import Adapter, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError
@@ -102,6 +103,7 @@ class SdcpAdapter(Adapter):
         self.retry_s = RETRY_S
         self.ping_s = PING_S
         self.answer_s = ANSWER_S
+        self.connect_s = CONNECT_TIMEOUT_S
         self.trace: Trace | None = None
         self.state: PrinterState | None = None
         self._was_connected = False
@@ -243,10 +245,7 @@ class SdcpAdapter(Adapter):
                     msg, receiving = receiving.result(), None
                     heard = await self._on_message(msg, tracker, report, heard)
             finally:
-                if receiving is not None:
-                    receiving.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await receiving
+                await _end_receive(ws, receiving)
 
     async def _on_message(
         self, msg: aiohttp.WSMessage, tracker: JobTracker, report: PrinterReport, heard: float
@@ -278,10 +277,13 @@ class SdcpAdapter(Adapter):
 
     @contextlib.asynccontextmanager
     async def _socket(self) -> AsyncIterator[aiohttp.ClientWebSocketResponse]:
-        """The printer's websocket (the client answers websocket pings itself)."""
-        timeout = aiohttp.ClientTimeout(total=None, sock_connect=CONNECT_TIMEOUT_S)
-        async with aiohttp.ClientSession(timeout=timeout) as http:  # noqa: SIM117 - py39
-            async with http.ws_connect(self.url, max_msg_size=MAX_MESSAGE) as ws:
+        """The printer's websocket (the client answers websocket pings itself). The connect and
+        the upgrade together are bounded by `connect_s`: a host that accepts the connection but
+        never answers the upgrade raises asyncio.TimeoutError."""
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=self.connect_s)
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            ws = await bounded(http.ws_connect(self.url, max_msg_size=MAX_MESSAGE), self.connect_s)
+            async with ws:
                 yield ws
 
     async def _send(self, ws: aiohttp.ClientWebSocketResponse, text: str) -> None:
@@ -370,6 +372,28 @@ class SdcpAdapter(Adapter):
         if isinstance(version, str) and version.strip():
             parts.append(f"firmware {_version(version)}")
         return [CheckResult.ok(name, ", ".join(parts))]
+
+
+END_RECEIVE_S = 2.0
+
+
+async def _end_receive(
+    ws: aiohttp.ClientWebSocketResponse, receiving: asyncio.Future | None
+) -> None:
+    """Ends a receive still pending when the session ends, by closing the socket: aiohttp hands
+    a waiting receive the close. Cancelling it instead can leave it waiting for good (seen with
+    aiohttp 3.13's compiled reader on Python 3.12), and the socket's close would then wait on
+    it too. Bounded either way."""
+    if receiving is None:
+        return
+    if not receiving.done():
+        with contextlib.suppress(Exception):
+            await asyncio.wait({asyncio.ensure_future(ws.close())}, timeout=END_RECEIVE_S)
+        await asyncio.wait({receiving}, timeout=END_RECEIVE_S)
+    if not receiving.done():
+        receiving.cancel()
+    elif not receiving.cancelled():
+        receiving.exception()  # retrieved: the session already ended for its own reason
 
 
 def _port(printer: str, options: Mapping[str, str], option: str, default: int) -> int:

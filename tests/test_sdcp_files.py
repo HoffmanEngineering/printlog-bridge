@@ -115,6 +115,21 @@ class TestReader:
 
         assert asyncio.run(scenario()).grams == {0: 12.34}
 
+    def test_asks_for_the_file_uncompressed_and_never_inflates_one(self):
+        """A compressed answer would grow past the cap when inflated: it is read as it came,
+        no further than the cap, and gives nothing."""
+
+        async def scenario():
+            async with printer() as fake:
+                fake.gzip, fake.honor_range = True, False
+                fake.files["/local/Benchy.gcode"] = orca_gcode() + b"G1 X1\n" * 2_000_000
+                found = await reader(fake).read("/local/Benchy.gcode")
+                return found, fake.download_encodings
+
+        found, encodings = asyncio.run(scenario())
+        assert encodings == ["identity"]
+        assert found.grams == {}
+
     def test_a_missing_file_or_no_web_server_is_no_usage(self):
         async def scenario():
             async with printer() as fake:
