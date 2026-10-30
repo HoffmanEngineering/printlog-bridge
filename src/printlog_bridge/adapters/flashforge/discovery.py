@@ -26,7 +26,8 @@ import struct
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-from printlog_bridge.core.discovery import Discovery, Found
+from printlog_bridge.adapters.common.timeouts import bounded
+from printlog_bridge.core.discovery import Discovery, Found, is_private
 
 from .protocol import HTTP_PORT, MODELS
 
@@ -34,6 +35,10 @@ ASK_S = 3.0
 MULTICAST = "225.0.0.9"
 MULTICAST_PORTS = (19000, 8899)
 BROADCAST_PORT = 48899
+DIRECT_PORTS = (BROADCAST_PORT, *MULTICAST_PORTS)
+"""Where one printer is asked directly for its serial."""
+LEARN_S = 2.0
+LOOKUP_S = 2.0
 ASK = b""
 MIN_REPLY = 0x92 + 1
 MAX_REPLY = 1024
@@ -86,11 +91,67 @@ class _Collector(asyncio.DatagramProtocol):
             self.found.setdefault(printer.serial.upper(), printer)
 
 
-async def ask(targets: Sequence[tuple[str, int]], seconds: float = ASK_S) -> list[FoundFlashForge]:
-    """Sends an empty datagram to each `(address, port)` from one ephemeral port, and returns
+def local_addresses() -> list[str]:
+    """This host's private IPv4 addresses: the one on its default route, and those its name
+    resolves to (every interface's, on most systems). Connecting a UDP socket sends nothing."""
+    found: list[str] = []
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))  # TEST-NET-1: any address with a route will do
+        found.append(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    with contextlib.suppress(OSError, UnicodeError):
+        found.extend(socket.gethostbyname_ex(socket.gethostname())[2])
+    return [a for a in dict.fromkeys(found) if is_private(a)]
+
+
+def _multicast(address: str) -> bool:
+    try:
+        return ipaddress.ip_address(address).is_multicast
+    except ValueError:
+        return False
+
+
+def _send(sock: socket.socket, target: tuple[str, int], interfaces: Sequence[str]) -> int:
+    """Sends the ask to `target`: a multicast group once from each of `interfaces` (a host with
+    several networks would otherwise send it on one only), anything else once."""
+    if not _multicast(target[0]) or not interfaces:
+        sock.sendto(ASK, target)
+        return 1
+    sent, error = 0, None
+    for interface in interfaces:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(interface))
+            sock.sendto(ASK, target)
+            sent += 1
+        except OSError as e:
+            error = e
+    if not sent:
+        raise error or OSError("no interface to send on")
+    return sent
+
+
+async def ask(
+    targets: Sequence[tuple[str, int]],
+    seconds: float = ASK_S,
+    *,
+    interfaces: Sequence[str] | None = None,
+) -> list[FoundFlashForge]:
+    """Sends an empty datagram to each `(address, port)` from one ephemeral port (to a multicast
+    group, from each of `interfaces`: by default every private one of this host's), and returns
     every printer that answered within `seconds`, once each (by serial), by address. Raises
     OSError when it can't send at all. As `sdcp.discovery.ask`: the socket isn't bound, and the
     asks go out before asyncio takes it."""
+    if interfaces is None and any(_multicast(t[0]) for t in targets):
+        try:  # the host name's lookup may block: off the loop, bounded
+            interfaces = await bounded(
+                asyncio.get_running_loop().run_in_executor(None, local_addresses), LOOKUP_S
+            )
+        except asyncio.TimeoutError:
+            interfaces = ()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -100,24 +161,39 @@ async def ask(targets: Sequence[tuple[str, int]], seconds: float = ASK_S) -> lis
         error: OSError | None = None
         for target in dict.fromkeys(targets):
             try:
-                sock.sendto(ASK, target)
-                sent += 1
-            except OSError as e:
+                sent += _send(sock, target, interfaces or ())
+            except OSError as e:  # an unreachable network: the others may still answer
                 error = e
         if not sent:
             raise error or OSError("nowhere to ask")
         sock.setblocking(False)
-    except OSError:
+        loop = asyncio.get_running_loop()
+        transport, collector = await loop.create_datagram_endpoint(_Collector, sock=sock)
+    except BaseException:
         sock.close()
         raise
-    loop = asyncio.get_running_loop()
-    transport, collector = await loop.create_datagram_endpoint(_Collector, sock=sock)
     try:
         await asyncio.sleep(seconds)
     finally:
         with contextlib.suppress(Exception):
             transport.close()
     return sorted(collector.found.values(), key=lambda f: ipaddress.ip_address(f.address))
+
+
+async def learn_serial(
+    host: str, ports: Sequence[int] = DIRECT_PORTS, seconds: float = LEARN_S
+) -> str | None:
+    """The serial number of the printer at `host`, asked with the discovery datagram sent to it
+    alone (for a printer added by address, which comes without one), or None when nothing
+    answered. When more than one printer answers, only the one at `host` counts."""
+    try:
+        found = await ask([(host, port) for port in ports], seconds, interfaces=())
+    except OSError:
+        return None
+    if len(found) == 1:
+        return found[0].serial
+    at_host = [f for f in found if f.address == host]
+    return at_host[0].serial if len(at_host) == 1 else None
 
 
 def targets_for(networks: Iterable[ipaddress.IPv4Network]) -> list[tuple[str, int]]:

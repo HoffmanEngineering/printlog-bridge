@@ -63,10 +63,10 @@ class TestConfig:
         assert (adapter.serial, adapter.check_code) == (SERIAL, CHECK_CODE)
         assert (adapter.poll_interval, adapter.idle_poll_interval) == (2.0, 20.0)
         assert adapter.files is True
-        assert adapter.describe() == "flashforge, http://192.168.1.60:8898"
+        assert adapter.describe() == f"flashforge, http://192.168.1.60:8898 (serial {SERIAL})"
         assert CHECK_CODE not in adapter.describe()
         assert ADAPTERS["flashforge"] is FlashForgeAdapter
-        assert FlashForgeAdapter.app_secrets == ("check_code",)
+        assert FlashForgeAdapter.app_secrets == ("check_code", "serial")
 
     def test_the_check_code_is_used_as_given(self):
         adapter = FlashForgeAdapter.from_config("ad5m", options(check_code=" ab12 "))
@@ -77,8 +77,8 @@ class TestConfig:
         [
             ({"host": ""}, "needs host"),
             ({"host": "http://192.168.1.60"}, "host"),
-            ({"serial": ""}, "needs serial"),
-            ({"serial": "SN 1"}, "needs serial"),
+            ({"serial": "SN/1"}, "serial"),
+            ({"serial": "SN 1"}, "serial"),
             ({"check_code": "  "}, "needs check_code"),
             ({"port": "0"}, "port"),
             ({"poll_interval": "0.1"}, "poll_interval"),
@@ -103,13 +103,21 @@ class TestConfig:
         assert not adapter.watches(Found("bambu", "192.168.1.60", 8898, serial=SERIAL))
         assert adapter.found_entry() == Found("flashforge", "192.168.1.60", 8898, serial=SERIAL)
 
-    def test_the_app_must_send_a_serial_and_a_check_code(self):
+    def test_the_app_must_send_a_check_code(self):
         with pytest.raises(NeedsCredentials) as missing:
             FlashForgeAdapter.app_options("192.168.1.60", 8898, SERIAL, {})
         assert missing.value.fields == ("check_code",)
-        with pytest.raises(NeedsCredentials) as no_serial:
-            FlashForgeAdapter.app_options("192.168.1.60", 8898, None, {"check_code": "x"})
-        assert no_serial.value.fields == ()
+
+    def test_a_serial_comes_from_the_app_or_its_section_or_the_printer(self):
+        no_serial = FlashForgeAdapter.app_options("192.168.1.60", 8898, None, {"check_code": "x"})
+        assert no_serial == {"host": "192.168.1.60", "check_code": "x"}
+        local = FlashForgeAdapter.app_options(
+            "192.168.1.60", 8898, None, {"check_code": "x", "serial": " SNLOCAL1 "}
+        )
+        assert local["serial"] == "SNLOCAL1"
+        assert "serial" in FlashForgeAdapter.app_secrets  # [app_printer N] serial = ...
+        adapter = FlashForgeAdapter.from_config("app-3", no_serial)
+        assert adapter.serial is None and "serial" not in adapter.describe()
 
 
 @contextlib.asynccontextmanager
@@ -249,8 +257,8 @@ class TestRun:
                     await eventually(lambda: fake.paths("/detail") > 6)
                     fake.complete()
                     await eventually(lambda: sink.of(JobFinished))
-                [image] = sink.of(JobImage)
-                thumbnail = await image.fetch()
+                    [image] = sink.of(JobImage)
+                    thumbnail = await image.fetch()  # as the sink does, while it runs
                 return fake, thumbnail
 
         fake, thumbnail = asyncio.run(scenario())
@@ -510,3 +518,216 @@ class TestDiscovery:
         out = capsys.readouterr().out
         assert code == 0
         assert "Found 1 FlashForge printer:" in out and "adapter = flashforge" in out
+
+
+class TestReview:
+    """Findings of the #122 review: the serial learned from the printer, stopping cleanly,
+    discovery's socket, and the serial shown."""
+
+    def test_a_printer_without_a_serial_is_asked_for_it(self, tmp_path):
+        sink, report = Sink(), Report()
+
+        async def scenario():
+            responder = await FakeDiscovery().start()
+            try:
+                async with printer() as fake:
+                    made = FlashForgeAdapter.app_options(
+                        "127.0.0.1", fake.port, None, {"check_code": CHECK_CODE}
+                    )
+                    assert "serial" not in made
+                    adapter = FlashForgeAdapter.from_config("app-3", made)
+                    adapter.discovery_ports = (responder.port,)
+                    adapter.poll_interval = adapter.idle_poll_interval = 0.05
+                    state = PrinterState.load(tmp_path, "app-3")
+                    adapter.use_state(state)
+                    async with running(adapter, sink, report):
+                        await eventually(lambda: report.connects)
+                    return fake, state, responder.asked
+            finally:
+                responder.close()
+
+        fake, state, asked = asyncio.run(scenario())
+        assert asked == [b""]
+        assert state.discovery["flashforge_serial"] == SERIAL
+        assert PrinterState.load(tmp_path, "app-3").discovery["flashforge_serial"] == SERIAL
+        assert fake.bodies and all(b["serialNumber"] == SERIAL for b in fake.bodies)
+
+    def test_a_cached_serial_isnt_asked_again(self, tmp_path):
+        async def scenario():
+            async with printer() as fake:
+                adapter = FlashForgeAdapter.from_config(
+                    "app-3",
+                    {"host": "127.0.0.1", "port": str(fake.port), "check_code": CHECK_CODE},
+                )
+                adapter.discovery_ports = (await closed_udp_port(),)
+                adapter.learn_s = 0.2
+                state = PrinterState.load(tmp_path, "app-3")
+                state.discovery["flashforge_serial"] = SERIAL
+                adapter.use_state(state)
+                report = Report()
+                async with running(adapter, Sink(), report):
+                    await eventually(lambda: report.connects)
+
+        asyncio.run(scenario())
+
+    def test_no_answer_says_to_add_the_serial(self):
+        report = Report()
+
+        async def scenario():
+            async with printer() as fake:
+                adapter = FlashForgeAdapter.from_config(
+                    "app-3",
+                    {"host": "127.0.0.1", "port": str(fake.port), "check_code": CHECK_CODE},
+                )
+                adapter.discovery_ports = (await closed_udp_port(),)
+                adapter.learn_s = 0.2
+                [check] = await adapter.check()
+                async with running(adapter, Sink(), report):
+                    await eventually(lambda: report.warnings.get("serial"))
+                return check, fake.requests
+
+        check, requests = asyncio.run(scenario())
+        assert check.status is Status.FAIL
+        for text in (check.detail, report.warnings["serial"]):
+            assert "serial = " in text and "[app_printer 3]" in text
+        assert requests == []  # nothing is sent without a serial
+
+    def test_a_config_printer_without_a_serial_names_its_section(self):
+        async def scenario():
+            adapter = FlashForgeAdapter.from_config(
+                "ad5m", {"host": "127.0.0.1", "check_code": CHECK_CODE}
+            )
+            adapter.discovery_ports = (await closed_udp_port(),)
+            adapter.learn_s = 0.2
+            return await adapter.check()
+
+        [check] = asyncio.run(scenario())
+        assert "[printer ad5m]" in check.detail and "serial = " in check.detail
+
+    def test_the_serial_is_shown(self):
+        adapter = FlashForgeAdapter.from_config("ad5m", options())
+        assert SERIAL in adapter.describe()
+
+    def test_stopping_leaves_no_session_or_task(self):
+        async def scenario():
+            stuck = asyncio.get_running_loop().create_future()
+
+            class Spools:
+                async def spool_reading(self, reading):
+                    await stuck  # never answers
+
+                async def spool_command(self, command):  # pragma: no cover
+                    return ""
+
+            async with printer("AD5X") as fake:
+                adapter = adapter_for(fake)
+                adapter.use_spools(Spools())
+                sink = Sink()
+                before = set(asyncio.all_tasks())
+                task = asyncio.ensure_future(adapter.run(sink, Report()))
+                fake.print_file("Benchy.gcode")
+                await eventually(lambda: sink.of(JobImage))
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                await asyncio.sleep(0)
+                left = [  # the adapter's own (the fake server's accept loop is the fake's)
+                    t
+                    for t in asyncio.all_tasks() - before
+                    if not t.done() and "flashforge" in _source(t)
+                ]
+                [image] = sink.of(JobImage)
+                thumbnail = await image.fetch()
+                return left, thumbnail, fake.paths("/gcodeThumb")
+
+        left, thumbnail, asked = asyncio.run(scenario())
+        assert left == []
+        assert thumbnail is None and asked == 0  # a closed client opens no new session
+
+    def test_a_failed_endpoint_closes_the_socket(self, monkeypatch):
+        made = []
+        real = ff_discovery.socket.socket
+
+        class Recording(real):  # type: ignore[misc, valid-type]
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                made.append(self)
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+
+            async def broken(*args, **kwargs):
+                raise OSError("no endpoint")
+
+            monkeypatch.setattr(loop, "create_datagram_endpoint", broken)
+            monkeypatch.setattr(ff_discovery.socket, "socket", Recording)
+            try:
+                with pytest.raises(OSError):
+                    await ask([("127.0.0.1", 9)], seconds=0.1, interfaces=())
+            finally:
+                monkeypatch.setattr(ff_discovery.socket, "socket", real)
+
+        asyncio.run(scenario())
+        assert made and all(s.fileno() == -1 for s in made)
+
+    def test_the_multicast_goes_out_on_each_private_interface(self, monkeypatch):
+        sent = []
+        real = ff_discovery.socket.socket
+
+        class FakeSocket:
+            def __init__(self, *args):
+                self.interface = None
+
+            def setsockopt(self, level, option, value):
+                if option == ff_discovery.socket.IP_MULTICAST_IF:
+                    self.interface = ff_discovery.socket.inet_ntoa(value)
+
+            def sendto(self, data, target):
+                sent.append((target, self.interface))
+
+            def setblocking(self, flag):
+                pass
+
+            def close(self):
+                pass
+
+        class Transport:
+            def close(self):
+                pass
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+
+            async def endpoint(factory, sock):
+                return Transport(), factory()
+
+            monkeypatch.setattr(loop, "create_datagram_endpoint", endpoint)
+            monkeypatch.setattr(ff_discovery.socket, "socket", FakeSocket)
+            try:
+                await ask(
+                    [("225.0.0.9", 19000), ("192.168.1.255", 48899)],
+                    seconds=0.01,
+                    interfaces=["192.168.1.5", "10.0.0.7"],
+                )
+            finally:
+                monkeypatch.setattr(ff_discovery.socket, "socket", real)
+
+        asyncio.run(scenario())
+        assert (("225.0.0.9", 19000), "192.168.1.5") in sent
+        assert (("225.0.0.9", 19000), "10.0.0.7") in sent
+        assert [t for t, _ in sent].count(("192.168.1.255", 48899)) == 1
+
+
+async def closed_udp_port() -> int:
+    import socket as socket_module
+
+    sock = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _source(task: asyncio.Task) -> str:
+    code = getattr(task.get_coro(), "cr_code", None)
+    return code.co_filename.replace("\\", "/") if code is not None else ""

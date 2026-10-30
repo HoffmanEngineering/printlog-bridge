@@ -34,7 +34,9 @@ configuration:
           name.
       serial:
         name: Serial number
-        description: "bambu, flashforge: the printer's serial number."
+        description: >-
+          bambu: the printer's serial number. flashforge: its serial number, only when the bridge
+          can't learn it from the printer.
       access_code:
         name: Access code
         description: "bambu: the LAN access code on the printer's screen."

@@ -406,17 +406,18 @@ def format_flashforge(
                 "the printers from the host's network (network_mode: host)."
             )
         return "\n".join(lines)
-    configured = {
-        str(getattr(p.adapter, "serial", "")).upper(): p.name
-        for p in (config.printers if config else [])
-        if getattr(p.adapter, "name", None) == "flashforge"
-    }
+    configured: dict[str, str] = {}
+    for p in config.printers if config else []:
+        if getattr(p.adapter, "name", None) != "flashforge":
+            continue
+        serial = getattr(p.adapter, "serial", None)  # by serial, else (none set) by address
+        configured[f"sn:{serial.upper()}" if serial else f"ip:{p.adapter.host}"] = p.name
     lines.append(f"Found {len(found)} FlashForge printer{'' if len(found) == 1 else 's'}:")
     for f in found:
         details = [f.model or "", f'"{f.name}"' if f.name else "", f"serial {f.serial}"]
         lines.append("")
         lines.append(f"{f.address}: {', '.join(d for d in details if d)}")
-        name = configured.get(f.serial.upper())
+        name = configured.get(f"sn:{f.serial.upper()}") or configured.get(f"ip:{f.address}")
         if name is not None:
             lines.append(f"  already in the config as [printer {name}]")
             continue

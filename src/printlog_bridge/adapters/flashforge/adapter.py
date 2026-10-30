@@ -40,7 +40,7 @@ from printlog_bridge.core.status import PrinterReport
 from printlog_bridge.core.trace import Trace
 
 from .client import REQUEST_TIMEOUT_S, FlashForgeClient, NotFlashForge, Refused
-from .discovery import FlashForgeDiscovery
+from .discovery import DIRECT_PORTS, LEARN_S, FlashForgeDiscovery, learn_serial
 from .jobs import JobTracker
 from .protocol import HTTP_PORT, MOONRAKER_PORT, TCP_PORT, filament_by_slot, view_of
 
@@ -58,12 +58,17 @@ PROBE_S = 3.0
 """How long `doctor` waits on Moonraker and the legacy port when the HTTP API doesn't answer."""
 ACCESS_WARNING = "access"
 FIRMWARE_WARNING = "firmware"
+SERIAL_WARNING = "serial"
+SERIAL_KEY = "flashforge_serial"
+"""Where in `state.discovery` a serial learned from the printer is kept."""
 MAKE = "FlashForge"
 WHERE_IS_THE_CHECK_CODE = (
     "The serial number and check code are on the printer's screen: Settings > Network, turn on "
-    "LAN-only mode, and the screen shows the check code (the serial number is under Settings > "
-    "About, and starts with SN)."
+    "LAN-only mode, and the screen shows the check code (the serial number starts with SN; "
+    "printlog-bridge discover lists it)."
 )
+APP_PREFIX = "app-"
+"""How the bridge names a printer connected in the app (`core/app_printers.py`)."""
 TOO_OLD = (
     "the printer answers only on FlashForge's old TCP port (8899), not the HTTP API on 8898: "
     "update its firmware (2.x or newer on an Adventurer 5M or 5M Pro). The bridge doesn't use "
@@ -79,14 +84,17 @@ _SERIAL = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 class FlashForgeAdapter(Adapter):
     name = "flashforge"
-    app_secrets = ("check_code",)
+    app_secrets = ("check_code", "serial")
+    """`serial` isn't a secret: it is here so a printer connected in the app by address (which
+    comes without one) can be given it in `[app_printer <id>]`, should the printer not answer
+    when the bridge asks it (`learn_serial`)."""
 
     def __init__(
         self,
         printer: str,
         host: str,
         *,
-        serial: str,
+        serial: str | None,
         check_code: str,
         port: int = HTTP_PORT,
         poll_interval: float = DEFAULT_POLL_S,
@@ -107,6 +115,8 @@ class FlashForgeAdapter(Adapter):
         self.probe_s = PROBE_S
         self.moonraker_port = MOONRAKER_PORT
         self.tcp_port = TCP_PORT
+        self.discovery_ports: tuple[int, ...] = DIRECT_PORTS
+        self.learn_s = LEARN_S
         self.trace: Trace | None = None
         self.state: PrinterState | None = None
         self.spools: SpoolSink | None = None
@@ -142,12 +152,11 @@ class FlashForgeAdapter(Adapter):
         port_text = values.get("port") or str(HTTP_PORT)
         if not port_text.isdigit() or not 0 < int(port_text) < 65536:
             raise ConfigError(f"[printer {printer}] port must be a port number, not {port_text!r}")
-        serial = values.get("serial", "")
-        if not serial or not _SERIAL.fullmatch(serial):
+        serial = values.get("serial") or None
+        if serial is not None and not _SERIAL.fullmatch(serial):
             raise ConfigError(
-                f"[printer {printer}] needs serial for adapter = flashforge: the printer's "
-                "serial number, such as SNMOMC9900728 (Settings > About on its screen; "
-                "printlog-bridge discover lists it)"
+                f"[printer {printer}] serial must be the printer's serial number, such as "
+                f"SNMOMC9900728 (printlog-bridge discover lists it), not {serial!r}"
             )
         # The check code is used as given (one opened from the app exactly as it opened).
         check_code = options.get("check_code")
@@ -173,7 +182,44 @@ class FlashForgeAdapter(Adapter):
         )
 
     def describe(self) -> str:
-        return f"flashforge, {self.base_url}"
+        serial = self._known_serial()
+        return f"flashforge, {self.base_url}" + (f" (serial {serial})" if serial else "")
+
+    def _known_serial(self) -> str | None:
+        """The configured serial, else one learned from the printer before."""
+        if self.serial:
+            return self.serial
+        learned = self.state.discovery.get(SERIAL_KEY) if self.state is not None else None
+        return learned if isinstance(learned, str) and _SERIAL.fullmatch(learned) else None
+
+    def _section(self) -> str:
+        if self.printer.startswith(APP_PREFIX) and self.printer[len(APP_PREFIX) :].isdigit():
+            return f"[app_printer {self.printer[len(APP_PREFIX) :]}]"
+        return f"[printer {self.printer}]"
+
+    def no_serial(self) -> str:
+        return (
+            f"the printer at {self.host} didn't answer when the bridge asked for its serial "
+            f"number, which every request needs: add serial = SN... to {self._section()} in the "
+            "config file (printlog-bridge discover, or the label on the printer, gives it)"
+        )
+
+    async def _serial(self) -> str | None:
+        """The serial to ask with: configured, kept, or asked of the printer (a discovery
+        datagram to it alone) and kept in the printer's state."""
+        serial = self._known_serial()
+        if serial is not None:
+            return serial
+        serial = await learn_serial(self.host, self.discovery_ports, self.learn_s)
+        if serial is None or not _SERIAL.fullmatch(serial):
+            return None
+        log.info(
+            "[printer %s] the printer at %s says its serial is %s", self.printer, self.host, serial
+        )
+        if self.state is not None:
+            self.state.discovery[SERIAL_KEY] = serial
+            self.state.save()
+        return serial
 
     # -- discovery and the app ------------------------------------------------------------
 
@@ -185,17 +231,18 @@ class FlashForgeAdapter(Adapter):
     def app_options(
         cls, host: str, port: int | None, serial: str | None, secrets: Mapping[str, str]
     ) -> dict[str, str]:
-        if not serial:
-            raise NeedsCredentials(
-                "a serial number, which 3D Print Log sends for a printer found on the network"
-            )
         check_code = secrets.get("check_code")
         if check_code is None or not check_code.strip():
             raise NeedsCredentials(
                 "check_code (on the printer's screen: Settings > Network, LAN-only mode)",
                 fields=("check_code",),
             )
-        options = {"host": host, "serial": serial, "check_code": check_code}
+        options = {"host": host, "check_code": check_code}
+        # A printer found on the network comes with its serial; one added by address doesn't,
+        # and is asked for it (`_serial`) unless its [app_printer] section gives it.
+        serial = serial or (secrets.get("serial") or "").strip()
+        if serial:
+            options["serial"] = serial
         if port and port != HTTP_PORT:
             options["port"] = str(port)
         return options
@@ -203,12 +250,13 @@ class FlashForgeAdapter(Adapter):
     def watches(self, found: Found) -> bool:
         if found.kind != self.name:
             return False
-        if found.serial:
-            return found.serial.upper() == self.serial.upper()
+        serial = self._known_serial()
+        if found.serial and serial:
+            return found.serial.upper() == serial.upper()
         return (found.address, found.port) == (self.host, self.port)
 
     def found_entry(self) -> Found | None:
-        return Found(self.name, self.host, self.port, serial=self.serial)
+        return Found(self.name, self.host, self.port, serial=self._known_serial())
 
     def use_trace(self, trace: Trace) -> None:
         self.trace = trace
@@ -251,7 +299,17 @@ class FlashForgeAdapter(Adapter):
         try:
             while True:
                 try:
-                    await self._session(client, tracker, report)
+                    if not client.serial:
+                        client.serial = await self._serial()
+                    if not client.serial:
+                        message = self.no_serial()
+                        log.warning("[printer %s] %s", self.printer, message)
+                        report.disconnected("the printer's serial number isn't known")
+                        report.warn(SERIAL_WARNING, message)
+                        retry = MAX_RETRY_S
+                    else:
+                        report.warn(SERIAL_WARNING, None)
+                        await self._session(client, tracker, report)
                 except Refused as e:
                     message = f"{e}. {WHERE_IS_THE_CHECK_CODE}"
                     log.warning("[printer %s] %s", self.printer, message)
@@ -284,6 +342,7 @@ class FlashForgeAdapter(Adapter):
                 retry = self.retry_s if retry >= REFUSED_RETRY_S else min(retry * 2, MAX_RETRY_S)
         finally:
             await client.close()
+            await tracker.close()
 
     async def _session(
         self, client: FlashForgeClient, tracker: JobTracker, report: PrinterReport
@@ -312,6 +371,9 @@ class FlashForgeAdapter(Adapter):
 
     async def _detail(self) -> Mapping[str, Any]:
         client = self._client()
+        client.serial = await self._serial()
+        if not client.serial:
+            raise NoSerial(self.no_serial())
         try:
             return await client.detail()
         finally:
@@ -320,7 +382,14 @@ class FlashForgeAdapter(Adapter):
     async def printer_details(self) -> PrinterDetails:
         try:
             detail = await self._detail()
-        except (aiohttp.ClientError, OSError, asyncio.TimeoutError, NotFlashForge, Refused):
+        except (
+            aiohttp.ClientError,
+            OSError,
+            asyncio.TimeoutError,
+            NotFlashForge,
+            Refused,
+            NoSerial,
+        ):
             return PrinterDetails(name=self.printer, make=MAKE)
         view = view_of(detail)
         return PrinterDetails(
@@ -336,6 +405,8 @@ class FlashForgeAdapter(Adapter):
             detail = await self._detail()
         except Refused as e:
             return [CheckResult.fail(name, f"{e}. {WHERE_IS_THE_CHECK_CODE}")]
+        except NoSerial as e:
+            return [CheckResult.fail(name, str(e))]
         except (aiohttp.ClientError, OSError, asyncio.TimeoutError, NotFlashForge) as e:
             other = await self._other_firmware()
             if other is not None:
@@ -383,6 +454,11 @@ class FlashForgeAdapter(Adapter):
         with contextlib.suppress(Exception):
             await bounded(writer.wait_closed(), 1.0)
         return TOO_OLD
+
+
+class NoSerial(Exception):
+    """The printer's serial isn't configured and it didn't answer when asked. The message says
+    where to add it."""
 
 
 class _Files:

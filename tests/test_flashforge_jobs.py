@@ -180,7 +180,8 @@ class TestLifecycle:
 
         async def scenario():
             await t.on_detail(detail(progress=0.2))
-            await t.on_detail(detail("error", progress=0.2, errorCode="E0015"))
+            for _ in range(3):  # held two polls in case the printer resumes
+                await t.on_detail(detail("error", progress=0.2, errorCode="E0015"))
 
         run(scenario())
         [end] = sink.of(JobFinished)
@@ -366,3 +367,126 @@ class TestAd5x:
             (3, "PLA", "#FF0000", 4),
             (1, None, None, 4),  # taken out: forgets the slot's lookup
         ]
+
+
+class TestReview:
+    """Findings of the #122 review."""
+
+    def test_a_reprint_after_an_early_cancel_is_a_new_job(self):
+        t, sink, clock = tracker()
+
+        async def scenario():
+            await t.on_detail(detail(progress=0.03, duration=1500))  # 25 min, 3%
+            clock.advance(30)
+            await t.on_detail(detail("cancel", progress=0.03, duration=1500))
+            clock.advance(30)
+            await t.on_detail(detail(progress=0.0, duration=10))  # the same file again
+            for i in range(1, 10):
+                clock.advance(600)
+                await t.on_detail(detail(progress=0.1 * i, duration=600 * i + 10))
+            await t.on_detail(detail("completed", progress=1.0, duration=6000))
+
+        run(scenario())
+        starts = sink.of(JobStarted)
+        assert len(starts) == 2 and starts[0].job_id != starts[1].job_id
+        assert [e.outcome for e in sink.of(JobFinished)] == [
+            JobOutcome.CANCELLED,
+            JobOutcome.COMPLETED,
+        ]
+
+    def test_once_the_printer_moved_on_a_printing_status_is_a_new_job(self):
+        t, sink, clock = tracker()
+
+        async def scenario():
+            await t.on_detail(detail(progress=0.5, duration=1800))
+            await t.on_detail(detail("completed", progress=1.0, duration=3600))
+            await t.on_detail(idle_detail())
+            clock.advance(5)
+            await t.on_detail(detail(progress=0.0, duration=3600))  # odd, but a new print
+
+        run(scenario())
+        assert len(sink.of(JobStarted)) == 2
+
+    def test_an_unknown_status_keeps_the_job(self, caplog):
+        t, sink, _ = tracker()
+
+        async def scenario():
+            await t.on_detail(detail(progress=0.4, duration=1500))
+            await t.on_detail(detail("resuming", progress=0.4, duration=1505))
+            await t.on_detail(detail("resuming", progress=0.4, duration=1506))
+            await t.on_detail(detail(progress=0.41, duration=1510))
+            await t.on_detail(detail("completed", progress=1.0, duration=3000))
+
+        with caplog.at_level("INFO"):
+            run(scenario())
+        assert len(sink.of(JobStarted)) == 1
+        [end] = sink.of(JobFinished)
+        assert end.outcome is JobOutcome.COMPLETED
+        assert sum("resuming" in r.getMessage() for r in caplog.records) == 1
+
+    def test_ready_or_another_file_ends_the_job(self):
+        t, sink, _ = tracker()
+
+        async def scenario():
+            await t.on_detail(detail(progress=0.4))
+            await t.on_detail(detail("ready", progress=0.4))
+
+        run(scenario())
+        [end] = sink.of(JobFinished)
+        assert end.outcome is JobOutcome.CANCELLED
+
+    def test_an_error_followed_by_a_resume_isnt_a_failure(self):
+        t, sink, _ = tracker()
+
+        async def scenario():
+            await t.on_detail(detail(progress=0.4, duration=1500))
+            await t.on_detail(detail("error", progress=0.4, duration=1505, errorCode="E0001"))
+            await t.on_detail(detail("paused", progress=0.4, duration=1510))
+            await t.on_detail(detail(progress=0.5, duration=1800))
+            await t.on_detail(detail("completed", progress=1.0, duration=3000))
+
+        run(scenario())
+        assert len(sink.of(JobStarted)) == 1
+        [end] = sink.of(JobFinished)
+        assert end.outcome is JobOutcome.COMPLETED
+
+    def test_an_error_that_stays_fails_the_job_when_it_began(self):
+        t, sink, clock = tracker()
+
+        async def scenario():
+            await t.on_detail(detail(progress=0.4, duration=1500))
+            clock.advance(5)
+            await t.on_detail(detail("error", progress=0.4, errorCode="E0015"))
+            first_error = clock()
+            for _ in range(2):
+                clock.advance(5)
+                await t.on_detail(detail("error", progress=0.4, errorCode="E0015"))
+            return first_error
+
+        first_error = run(scenario())
+        [end] = sink.of(JobFinished)
+        assert end.outcome is JobOutcome.FAILED and "E0015" in end.note
+        assert end.finished_at == first_error
+
+    def test_an_estimate_that_shrinks_is_what_is_left(self):
+        t, sink, _ = tracker()
+
+        async def scenario():
+            await t.on_detail(detail(progress=0.2, grams=8.0, mm=2400.0))
+            await t.on_detail(detail(progress=0.6, grams=4.0, mm=1200.0))
+            await t.on_detail(detail("completed", progress=1.0, grams=0.0, mm=0.0))
+
+        run(scenario())
+        [end] = sink.of(JobFinished)
+        assert end.filament_g == {0: 10.0} and end.filament_mm == {0: 3000.0}
+
+    def test_slot_zero_is_not_slot_one(self):
+        def answer(*slots):
+            tools = [{"slotId": s, "filamentWeight": 2.0} for s in slots]
+            return {"gcodeListDetail": [{"gcodeFileName": FILE, "gcodeToolDatas": tools}]}
+
+        assert filament_by_slot(answer(0), FILE) == {}
+        assert filament_by_slot(answer(0, 1), FILE) == {}
+        assert filament_by_slot(answer(1, 2), FILE) == {0: 2.0, 1: 2.0}
+        assert filament_by_slot(answer(1, 1), FILE) == {0: 4.0}
+        assert filament_by_slot(answer(7), FILE) == {}

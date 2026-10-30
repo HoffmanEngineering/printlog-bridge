@@ -63,6 +63,8 @@ MODELS = {35: "Adventurer 5M", 36: "Adventurer 5M Pro", 38: "AD5X", 40: "Creator
           41: "Creator 5 Pro"}  # fmt: skip
 """`/detail`'s `pid`, also the product id in a discovery answer."""
 NO_SENSOR_C = -50.0
+IFS_SLOTS = 4
+"""Slots on an AD5X's IFS."""
 
 
 @dataclass(frozen=True)
@@ -185,8 +187,10 @@ def _station(detail: Mapping[str, Any]) -> tuple[tuple[Slot, ...], int, int | No
 
 def filament_by_slot(answer: Any, path: str) -> dict[int, float]:
     """The grams per IFS slot of the file `path` from `/gcodeList`'s `gcodeListDetail` (AD5X
-    only): each `gcodeToolDatas` entry's `slotId` (1 to 4; 0 is the direct feed, slot 0) and
-    `filamentWeight`. Empty for another model or a file not listed.
+    only): each `gcodeToolDatas` entry's `slotId` (1 to 4 is slot 0 to 3) and `filamentWeight`.
+    It is the slicer's mapping, which may differ from what was picked on the screen. Empty for
+    another model, a file not listed, or slots that aren't clear: `slotId` 0 means not mapped (or
+    the direct feed), which isn't slot 1, so then the job stays on one slot.
     ASSUMPTION: from ff-5mp-api-py's models; the units (grams) are its."""
     if not isinstance(answer, Mapping):
         return {}
@@ -202,9 +206,13 @@ def filament_by_slot(answer: Any, path: str) -> dict[int, float]:
             if not isinstance(tool, Mapping):
                 continue
             slot_id, weight = tool.get("slotId"), _positive(tool.get("filamentWeight"))
-            if not isinstance(slot_id, int) or isinstance(slot_id, bool) or weight is None:
+            if weight is None:
                 continue
-            slot = max(slot_id - 1, 0)
+            if not isinstance(slot_id, int) or isinstance(slot_id, bool):
+                return {}
+            if not 1 <= slot_id <= IFS_SLOTS:
+                return {}  # 0 (not mapped, direct feed) or a slot the IFS hasn't
+            slot = slot_id - 1
             grams[slot] = round(grams.get(slot, 0.0) + weight, 3)
         return grams
     return {}

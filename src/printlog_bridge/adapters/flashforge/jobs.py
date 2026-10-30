@@ -6,25 +6,36 @@ no times or outcomes), so `CurrentJob` keeps the running job, as for PrusaLink a
 
 **A job's identity is fixed once**, when a status first shows a file printing or paused:
 `started_at` is now less `printDuration`, and `job_id` is `<epoch seconds>-<file stem>`. Its
-file, last progress and duration are kept beside `CurrentJob`'s (`state.discovery
+file, last progress, duration and estimates are kept beside `CurrentJob`'s (`state.discovery
 ["flashforge_job"]`), so a reconnect or a bridge restart finds the job again by its file, never
-by recomputing a time. It stays that job while the status shows that file printing, paused or
-busy (heating, calibrating), however long; another file, or the duration and progress going back
-while printing (another print of the same file), is another job.
+by recomputing a time.
 
-**The end seen live** is the status turning `completed`, `cancel` or `error` (an end naming no
-file is this job's), at the poll that saw it. **An end missed** (the bridge was away, or the
-printer unreachable) is decided on the first status after a connect: the printer still in an
-end state for this file says how, at when the bridge last saw the job; anything else (`ready`,
-another file) ends it by the progress kept: 99% or more complete, less cancelled, with a note.
+**It stays that job** through every status but an end, `ready`, another file, or the duration
+and progress going back while printing (another print of the same file). Busy states (heating,
+calibrating) keep it, and so does a status the bridge doesn't know (logged once, at info, so a
+trace shows it): a new firmware's word for resuming must not end a print.
+
+**The end seen live** is the status turning `completed` or `cancel` (an end naming no file is
+this job's), at the poll that saw it. `error` is held for `ERROR_POLLS` polls in a row before the
+job fails, at the first of them: a filament runout may show `error` and then resume (ASSUMPTION).
+`ready`, or another file, ends it by the progress kept: 99% or more complete, less cancelled,
+with a note. **An end missed** (the bridge was away, or the printer unreachable) is decided on
+the first status after a connect, the same way, at when the bridge last saw the job.
+
+**After an end**, a status still showing that file printing (a late answer) starts nothing, while
+the start it implies (now less `printDuration`) is the ended job's. Once a status shows the
+printer moved on (nothing under way), or the implied start is another, printing is a new job: a
+reprint of the same file right after a cancel is logged.
 
 **Usage is the slicer's estimate, as the printer read it from the file**: `/detail`'s
-`estimatedRightWeight` (grams) and `estimatedRightLen` (millimeters) for the whole job (the
-largest seen, since the printer may report 0 until it has read the file), times the progress for
-a job that didn't complete, sent with `usage_estimated=True`. The printer measures nothing. On an
-AD5X, `/gcodeList`'s tools for the file split the grams by IFS slot (`files.grams_by_slot`); a
-one-slot print puts everything on its slot. The job's file is never downloaded: the API has no
-read-only way to.
+`estimatedRightWeight` (grams) and `estimatedRightLen` (millimeters). ASSUMPTION, from
+ff-5mp-api-py's code: they are the job's totals. Should one shrink between polls, it is taken as
+what is left instead, and the total is its first value over the share of the job left then
+(`Estimate`). All of it for a completed job, times the progress otherwise, sent with
+`usage_estimated=True`. The printer measures nothing. On an AD5X, `/gcodeList`'s tools for the
+file split the grams by IFS slot (`files.grams_by_slot`: the slicer's mapping, which may differ
+from what was picked on the screen); a one-slot print puts everything on its slot. The job's file
+is never downloaded: the API has no read-only way to.
 
 The AD5X's IFS slots (`matlStationInfo.slotInfos`) are reported as spool readings (material and
 color; no tag) whenever one changes, for 3D Print Log's note when a slot holds something other
@@ -56,7 +67,19 @@ from printlog_bridge.core.events import (
 from printlog_bridge.core.health import utc_now
 from printlog_bridge.core.status import PrinterReport
 
-from .protocol import CANCEL, COMPLETED, ERROR, PRINTING, Slot, View, view_of
+from .protocol import (
+    BUSY,
+    CANCEL,
+    COMPLETED,
+    ENDS,
+    ERROR,
+    PRINTING,
+    READY,
+    UNDER_WAY,
+    Slot,
+    View,
+    view_of,
+)
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +89,14 @@ COMPLETE_AT_PERCENT = 99.0
 MAX_NAME_IN_ID = 80
 SECONDS_BACK, PERCENT_BACK = 120.0, 5.0
 """How far the duration and progress may go back while printing before it's another print."""
+SAME_START_S = 120.0
+"""How far apart two implied starts of one job may be."""
+ERROR_POLLS = 3
+"""`error` on this many polls in a row fails the job (it is held for the two after the first)."""
+SHRINK = 0.999
+"""An estimate below this share of the last one shrank."""
+MAX_SHARE_DONE = 0.95
+KNOWN = UNDER_WAY | BUSY | ENDS | {READY}
 OUTCOMES = {COMPLETED: JobOutcome.COMPLETED, CANCEL: JobOutcome.CANCELLED, ERROR: JobOutcome.FAILED}
 UNSEEN_END_NOTE = (
     "The bridge didn't see this job end, so it is logged by how far it got: completed at 99% "
@@ -89,17 +120,66 @@ SpoolReporter = Callable[[SpoolReading], Awaitable[Any]]
 
 
 @dataclass
+class Estimate:
+    """One of the printer's estimates for the job, as polls report it: the job's total
+    (ASSUMPTION), unless it shrinks between polls, when it is what is left."""
+
+    first: float = 0.0
+    at: float = 0.0
+    """How much of the job was done (0 to 1) when `first` was seen."""
+    last: float = 0.0
+    remaining: bool = False
+
+    def see(self, value: float | None, done: float) -> None:
+        if not value:
+            return  # none yet (the file not read), or nothing left at the end
+        if self.first and value < self.last * SHRINK:
+            self.remaining = True
+        elif not self.remaining and value >= self.last:
+            self.first, self.at = value, done
+        self.last = value
+
+    @property
+    def total(self) -> float:
+        if not self.remaining:
+            return self.first
+        return self.first / (1.0 - min(self.at, MAX_SHARE_DONE))
+
+    def kept(self) -> dict[str, Any]:
+        return {"first": self.first, "at": self.at, "last": self.last, "remaining": self.remaining}
+
+    @classmethod
+    def from_kept(cls, kept: Any, default: float) -> Estimate:
+        if not isinstance(kept, Mapping):
+            return cls(default, 0.0, default)
+        return cls(
+            _number(kept.get("first")),
+            _number(kept.get("at")),
+            _number(kept.get("last")),
+            kept.get("remaining") is True,
+        )
+
+
+@dataclass
 class Job:
     job_id: str
     path: str | None
     start: JobStarted
     progress: float = 0.0
     duration_s: float = 0.0
-    grams: float = 0.0
-    mm: float = 0.0
+    grams_estimate: Estimate = field(default_factory=Estimate)
+    mm_estimate: Estimate = field(default_factory=Estimate)
     by_slot: dict[int, float] = field(default_factory=dict)
     slot: int = 0
     """Where a one-slot print's filament goes: the IFS slot feeding at its start, else 0."""
+
+    @property
+    def grams(self) -> float:
+        return self.grams_estimate.total
+
+    @property
+    def mm(self) -> float:
+        return self.mm_estimate.total
 
 
 def error_note(view: View) -> str:
@@ -129,9 +209,17 @@ class JobTracker:
         self.job: Job | None = None
         self.view: View | None = None
         self._reconciled = False
+        self._polls = 0
         self._ended: Job | None = None
         """The job that just ended, until the printer moves on: a late status still showing it
         printing doesn't start it again."""
+        self._ended_poll = 0
+        self._moved_on = False
+        self._errors = 0
+        """Polls in a row showing `error` for the job."""
+        self._error_at: datetime | None = None
+        self._error_unseen = False
+        self._unknown: set[str] = set()
         self._slots: dict[int, tuple[str | None, str | None]] = {}
         self._tasks: set[asyncio.Future] = set()
 
@@ -145,6 +233,15 @@ class JobTracker:
         """A new connection: the next status is checked against the kept job."""
         self._reconciled = False
 
+    async def close(self) -> None:
+        """Stops the spool readings still being sent."""
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+
     # -- the kept job ---------------------------------------------------------------------
 
     def _keep(self, job: Job) -> None:
@@ -154,8 +251,8 @@ class JobTracker:
             "path": job.path,
             "progress": round(job.progress, 2),
             "duration_s": round(job.duration_s, 1),
-            "grams": job.grams,
-            "mm": job.mm,
+            "grams": job.grams_estimate.kept(),
+            "mm": job.mm_estimate.kept(),
             "by_slot": {str(k): v for k, v in job.by_slot.items()},
             "slot": job.slot,
         }
@@ -164,9 +261,11 @@ class JobTracker:
         start = self.current.job
         if start is None:
             return None
+        grams = start.estimated_filament_g or 0.0
+        mm = start.estimated_filament_mm or 0.0
         job = Job(start.job_id, None, start)
-        job.grams = start.estimated_filament_g or 0.0
-        job.mm = start.estimated_filament_mm or 0.0
+        job.grams_estimate = Estimate(grams, 0.0, grams)
+        job.mm_estimate = Estimate(mm, 0.0, mm)
         job.by_slot = dict(start.estimated_filament_g_by_slot)
         kept = self.current.state.discovery.get(KEY)
         if not isinstance(kept, Mapping) or kept.get("job_id") != start.job_id:
@@ -175,8 +274,8 @@ class JobTracker:
         job.path = path if isinstance(path, str) else None
         job.progress = _number(kept.get("progress"))
         job.duration_s = _number(kept.get("duration_s"))
-        job.grams = _number(kept.get("grams")) or job.grams
-        job.mm = _number(kept.get("mm")) or job.mm
+        job.grams_estimate = Estimate.from_kept(kept.get("grams"), grams)
+        job.mm_estimate = Estimate.from_kept(kept.get("mm"), mm)
         by_slot = kept.get("by_slot")
         if isinstance(by_slot, Mapping):
             job.by_slot = {
@@ -193,27 +292,27 @@ class JobTracker:
     async def on_detail(self, detail: Mapping[str, Any]) -> None:
         view = view_of(detail)
         self.view = view
+        self._polls += 1
         if self.report is not None and view.state is not None:
             self.report.printer_state(view.state)
         self._readings(view)
         if view.state is None:
             return
+        if view.state not in KNOWN and view.state not in self._unknown:
+            self._unknown.add(view.state)
+            log.info(
+                "[printer %s] the printer says %r, a status the bridge doesn't know: any job "
+                "carries on", self.printer, view.state,
+            )  # fmt: skip
         if not self._reconciled:
             self._reconciled = True
             await self._reconcile(view)
         await self._step(view)
 
-    def _continues(self, view: View, job: Job) -> bool:
-        """`view` shows `job` still printing, paused or busy."""
-        if not (view.under_way or view.busy):
-            return False
-        if view.path is None:
-            return view.busy  # heating or calibrating may show no file (ASSUMPTION)
-        if job.path is not None and view.path != job.path:
-            return False
-        if job.path is None and view.name != job.start.file_name:
-            return False
-        return not self._went_back(view, job)
+    def _same_file(self, view: View, job: Job) -> bool:
+        if job.path is not None:
+            return view.path == job.path
+        return view.name == job.start.file_name
 
     @staticmethod
     def _went_back(view: View, job: Job) -> bool:
@@ -224,12 +323,18 @@ class JobTracker:
             return False
         return view.progress is None or view.progress < job.progress - PERCENT_BACK
 
-    def _ends(self, view: View, job: Job) -> bool:
-        if not view.ended:
-            return False
-        if view.path is None:
-            return True
-        return view.path == job.path if job.path is not None else view.name == job.start.file_name
+    def _decide(self, view: View, job: Job) -> str:
+        """What `view` says of `job`: `end` (an end state of it), `gone` (`ready`), `other`
+        (another file, or another print of it) or `keep` (anything else, unknown included)."""
+        if view.ended and (view.path is None or self._same_file(view, job)):
+            return "end"
+        if view.path is not None and not self._same_file(view, job):
+            return "other"
+        if view.state == READY:
+            return "gone"
+        if view.under_way and self._went_back(view, job):
+            return "other"
+        return "keep"
 
     async def _reconcile(self, view: View) -> None:
         if self.job is None:
@@ -240,36 +345,59 @@ class JobTracker:
             # job carries on or it ended while the bridge was away.
             self.job = remembered
             await self.sink.emit(remembered.start)
-        if self._continues(view, self.job):
+        decision = self._decide(view, self.job)
+        if decision == "keep":
             self.current.seen()
+        elif decision == "end" and view.state == ERROR:
+            self._error_unseen = True  # held as a live error is, then ended when last seen
         else:
-            await self._finish_unseen(view)
+            await self._finish_unseen(view, decision)
 
     async def _step(self, view: View) -> None:
         job = self.job
         if job is not None:
-            if self._ends(view, job):
-                outcome = OUTCOMES[view.state]  # type: ignore[index]
-                note = error_note(view) if outcome is JobOutcome.FAILED else None
-                if view.progress:  # the end's own progress, when it keeps one, is the latest
-                    job.progress = view.progress
-                await self._finish(outcome, note)
+            decision = self._decide(view, job)
+            if view.state != ERROR:
+                self._errors, self._error_at, self._error_unseen = 0, None, False
+            if decision == "end":
+                await self._end(view, job)
                 return
-            if self._continues(view, job):
+            if decision == "keep":
                 self._progress(view, job)
                 return
-            await self._finish_unseen(view)  # another job, or none: this one's end wasn't seen
+            await self._finish_unseen(view, decision)
         if self._ended is not None and not self._just_ended(view):
             self._ended = None
         if view.under_way and self._ended is None:
             await self._start(view)
 
+    async def _end(self, view: View, job: Job) -> None:
+        if view.progress:  # the end's own progress, when it keeps one, is the latest
+            job.progress = view.progress
+        if view.state != ERROR:
+            await self._finish(OUTCOMES[view.state], None)  # type: ignore[index]
+            return
+        self._errors += 1
+        if self._errors == 1:
+            self._error_at = self.current.last_seen if self._error_unseen else self.clock()
+        if self._errors < ERROR_POLLS:
+            self.current.seen()
+            return
+        note = error_note(view) + (f" {UNSEEN_TIME_NOTE}" if self._error_unseen else "")
+        await self._finish(JobOutcome.FAILED, note, finished_at=self._error_at)
+
     def _just_ended(self, view: View) -> bool:
+        """`view` is still the job that just ended (a late answer), not a new print."""
         ended = self._ended
         assert ended is not None
-        if view.ended or view.busy:
-            return True
-        return view.under_way and view.path == ended.path and not self._went_back(view, ended)
+        if not view.under_way:
+            if self._polls > self._ended_poll:
+                self._moved_on = True
+            return True  # nothing to start anyway
+        if self._moved_on or view.path != ended.path or self._went_back(view, ended):
+            return False
+        implied = self.clock() - timedelta(seconds=view.duration_s or 0.0)
+        return abs((implied - ended.start.started_at).total_seconds()) <= SAME_START_S
 
     def _progress(self, view: View, job: Job) -> None:
         if view.under_way:
@@ -277,8 +405,9 @@ class JobTracker:
                 job.progress = view.progress
             if view.duration_s is not None:
                 job.duration_s = view.duration_s
-            job.grams = max(job.grams, view.estimated_g or 0.0)
-            job.mm = max(job.mm, view.estimated_mm or 0.0)
+            done = job.progress / 100
+            job.grams_estimate.see(view.estimated_g, done)
+            job.mm_estimate.see(view.estimated_mm, done)
             self._keep(job)
         self.current.seen()
 
@@ -306,7 +435,10 @@ class JobTracker:
             estimated_filament_g_by_slot=dict(by_slot) if len(by_slot) > 1 else {},
         )
         job = Job(job_id, view.path, start, view.progress or 0.0, view.duration_s or 0.0)
-        job.grams, job.mm, job.by_slot = grams or 0.0, view.estimated_mm or 0.0, by_slot
+        done = job.progress / 100
+        job.grams_estimate.see(grams, done)
+        job.mm_estimate.see(view.estimated_mm, done)
+        job.by_slot = by_slot
         if len(by_slot) == 1:
             job.slot = next(iter(by_slot))
         elif view.current_slot is not None:
@@ -326,14 +458,12 @@ class JobTracker:
                 JobImage(self.printer, job_id, ImageKind.THUMBNAIL, fetch_thumbnail)
             )
 
-    async def _finish_unseen(self, view: View) -> None:
+    async def _finish_unseen(self, view: View, decision: str) -> None:
         job = self.job
         assert job is not None
-        if self._ends(view, job):
+        if decision == "end":
             outcome = OUTCOMES[view.state]  # type: ignore[index]
             note = UNSEEN_TIME_NOTE
-            if outcome is JobOutcome.FAILED:
-                note = f"{error_note(view)} {UNSEEN_TIME_NOTE}"
         else:
             complete = job.progress >= COMPLETE_AT_PERCENT
             outcome = JobOutcome.COMPLETED if complete else JobOutcome.CANCELLED
@@ -364,7 +494,8 @@ class JobTracker:
         )
         self.current.state.discovery.pop(KEY, None)
         self.current.ended()
-        self._ended = job
+        self._ended, self._ended_poll, self._moved_on = job, self._polls, False
+        self._errors, self._error_at, self._error_unseen = 0, None, False
         self.job = None
         log.info("[printer %s] job %s %s", self.printer, job.job_id, outcome.value)
 

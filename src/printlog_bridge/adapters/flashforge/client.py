@@ -58,7 +58,7 @@ class FlashForgeClient:
         self,
         base_url: str,
         *,
-        serial: str,
+        serial: str | None,
         check_code: str,
         trace: Trace | None = None,
         timeout: float = REQUEST_TIMEOUT_S,
@@ -69,6 +69,9 @@ class FlashForgeClient:
         self.trace = trace
         self.timeout = timeout
         self._http: aiohttp.ClientSession | None = None
+        self.closed = False
+        """Closed for good (`run` stopped): a late request, such as the sink fetching a
+        thumbnail, opens no new session."""
 
     async def detail(self) -> Mapping[str, Any]:
         """`/detail`'s `detail`: the whole status."""
@@ -99,6 +102,7 @@ class FlashForgeClient:
         return image if image_type(image) is not None else None
 
     async def close(self) -> None:
+        self.closed = True
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -118,6 +122,10 @@ class FlashForgeClient:
         if self.trace is not None:
             traced = {k: v for k, v in (extra or {}).items()}
             self.trace.record(SEND, json.dumps({"method": "POST", "path": path, **traced}))
+        if not self.serial:
+            raise ValueError("no serial number to ask with")
+        if self.closed:
+            raise aiohttp.ClientConnectionError("the bridge stopped watching this printer")
         if self._http is None or self._http.closed:
             self._http = aiohttp.ClientSession(
                 headers={"User-Agent": f"printlog-bridge/{__version__}"}
@@ -145,8 +153,10 @@ class FlashForgeClient:
         if answer.get("code") != 0:
             message = answer.get("message")
             said = f" ({message.strip()[:80]})" if isinstance(message, str) and message else ""
-            text = scrub(f"code {answer.get('code')}{said}", [self.check_code, self.serial])
-            raise Refused(f"the printer refused the serial number or check code: {text}")
+            text = scrub(f"code {answer.get('code')}{said}", [self.check_code])
+            raise Refused(
+                f"the printer refused serial number {self.serial} or its check code: {text}"
+            )
         return answer
 
 
