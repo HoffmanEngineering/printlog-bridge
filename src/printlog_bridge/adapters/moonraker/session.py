@@ -16,12 +16,13 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any, Optional, Protocol, TypeVar
+from typing import Any, Optional, Protocol
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.adapters.common.timeouts import bounded
 from printlog_bridge.core.images import mask_url, scrub_url
 from printlog_bridge.core.status import NullReport, PrinterReport
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
@@ -52,7 +53,6 @@ OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "save_variables": ["variables"],  # each tool's spool in the user's own Spoolman (#38)
 }
 
-T = TypeVar("T")
 RemoteMethod = Callable[[Mapping[str, Any]], Awaitable[None]]
 Call = Callable[[str, Optional[Mapping[str, Any]]], Awaitable[Any]]
 
@@ -669,29 +669,6 @@ class _UnixTransport:
 
 def _why(error: BaseException) -> str:
     return str(error) or type(error).__name__
-
-
-async def bounded(awaitable: Awaitable[T], timeout: float) -> T:
-    """`asyncio.wait_for` for code that must stop when cancelled. Before Python 3.12, wait_for
-    returns the result and drops the cancel when both happen at once (bpo-42130). Awaiting the
-    task itself always honours a cancel."""
-    task = asyncio.ensure_future(awaitable)
-    timed_out = False
-
-    def time_out() -> None:
-        nonlocal timed_out
-        timed_out = True
-        task.cancel()
-
-    timer = asyncio.get_running_loop().call_later(timeout, time_out)
-    try:
-        return await task
-    except asyncio.CancelledError:
-        if timed_out:
-            raise asyncio.TimeoutError from None
-        raise
-    finally:
-        timer.cancel()
 
 
 def _time_out(future: asyncio.Future, method: str) -> None:

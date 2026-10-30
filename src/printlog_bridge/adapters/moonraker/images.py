@@ -17,9 +17,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 
+from printlog_bridge.adapters.common.timeouts import bounded
 from printlog_bridge.core.images import ImageUnavailable, fetch_image, read_image_file
 
-from .session import Call, ConnectionLost, MoonrakerRpcError, bounded
+from .session import Call, ConnectionLost, MoonrakerRpcError
 
 log = logging.getLogger(__name__)
 

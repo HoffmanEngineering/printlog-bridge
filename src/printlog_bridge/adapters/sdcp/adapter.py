@@ -28,7 +28,7 @@ from typing import Any
 
 import aiohttp
 
-from printlog_bridge.adapters.moonraker.session import bounded
+from printlog_bridge.adapters.common.timeouts import bounded
 from printlog_bridge.core.adapter import Adapter, PrinterDetails
 from printlog_bridge.core.checks import CheckResult
 from printlog_bridge.core.config import BOOLEANS, ConfigError

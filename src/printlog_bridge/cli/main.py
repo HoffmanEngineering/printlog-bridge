@@ -25,14 +25,16 @@ from printlog_bridge.adapters.moonraker.discovery import DEFAULT_PORT, parse_sub
 from printlog_bridge.adapters.sdcp import discovery as sdcp_discovery
 from printlog_bridge.cli.data_owner import drop_root
 from printlog_bridge.cli.discover import (
+    ask_duets,
     discover,
     format_bambu,
+    format_duet,
     format_found,
     format_sdcp,
     subnets_to_scan,
 )
 from printlog_bridge.cli.pair import pair_command, pair_on_first_run
-from printlog_bridge.core import credentials
+from printlog_bridge.core import credentials, mdns
 from printlog_bridge.core.bridge import check_runnable, run_bridge
 from printlog_bridge.core.checks import Status
 from printlog_bridge.core.config import (
@@ -113,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_key.add_argument("--yes", "-y", action="store_true", help="don't ask for confirmation")
     discover = commands.add_parser(
         "discover",
-        help="list the Moonraker, Bambu Lab and Elegoo (SDCP) printers on the local network, "
+        help="list the Moonraker, Bambu Lab, Elegoo (SDCP) and Duet printers on the local network, "
         "with a [printer] section for each",
     )
     discover.add_argument(
@@ -139,6 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-sdcp",
         action="store_true",
         help="don't ask for Elegoo printers (SDCP: M99999 broadcast to UDP port 3000)",
+    )
+    discover.add_argument(
+        "--no-duet",
+        action="store_true",
+        help="don't ask for Duet boards (an mDNS question for _http._tcp; also off with "
+        "--no-zeroconf)",
     )
     _add_probe(commands)
     for command in (doctor, run, status, store_key, pair, rotate_key, discover):
@@ -417,6 +425,7 @@ def _discover(args: argparse.Namespace) -> int:
     print(f"printlog-bridge {__version__} discover")
     bambu = not args.no_bambu
     sdcp = not args.no_sdcp
+    duet = zeroconf and not args.no_duet
 
     async def outcome(task: asyncio.Future | None) -> tuple[list | None, str | None]:
         if task is None:
@@ -433,10 +442,11 @@ def _discover(args: argparse.Namespace) -> int:
             if sdcp
             else None
         )
+        duets = asyncio.ensure_future(ask_duets()) if duet else None
         found = await discover(networks, port=args.port, zeroconf=zeroconf)
-        return found, await outcome(listening), await outcome(asking)
+        return found, await outcome(listening), await outcome(asking), await outcome(duets)
 
-    found, (bambus, error), (elegoos, sdcp_error) = asyncio.run(every_kind())
+    found, (bambus, error), (elegoos, sdcp_error), (boards, duet_error) = asyncio.run(every_kind())
     print(format_found(found, networks, config, zeroconf=zeroconf))
     if bambu:
         print()
@@ -444,7 +454,10 @@ def _discover(args: argparse.Namespace) -> int:
     if sdcp:
         print()
         print(format_sdcp(elegoos, config, sdcp_discovery.ASK_S, sdcp_error))
-    return 0 if found or bambus or elegoos else 1
+    if duet:
+        print()
+        print(format_duet(boards, config, mdns.WAIT_S, duet_error))
+    return 0 if found or bambus or elegoos or boards else 1
 
 
 def _store_key(explicit_config: Path | None) -> int:

@@ -15,11 +15,11 @@ from fake_moonraker import FakeMoonraker, eventually
 from session_helpers import Recorder, ReportRecorder, running
 
 from printlog_bridge import __version__
+from printlog_bridge.adapters.common.timeouts import bounded
 from printlog_bridge.adapters.moonraker.session import (
     Backoff,
     MoonrakerSession,
     _JsonRpc,
-    bounded,
     websocket_url,
 )
 

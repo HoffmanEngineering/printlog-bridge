@@ -67,6 +67,10 @@ printers:
     adapter: sdcp
     printer_id: 47
     host: 192.168.1.77
+  - name: railcore
+    adapter: duet
+    printer_id: 48
+    host: 192.168.1.88
 ```
 
 | Adapter | Fields |
@@ -76,6 +80,7 @@ printers:
 | `prusalink` | **host** and **password** (the printer's Settings > Network > PrusaLink shows them). Older firmware: **api_key** instead of the password. **username** only when it isn't `maker`. |
 | `octoprint` | **url**: OctoPrint's address, such as `http://octopi.local` or `http://192.168.1.70:5000`. **api_key**: a key from OctoPrint's Settings > Application Keys (or your user's Settings > API Key). |
 | `sdcp` | **host**: the Elegoo Centauri Carbon's IP address, shown in its network settings. Nothing else: the printer's local protocol (SDCP) has no password, and the bridge only reads its status. Not yet checked on a real printer. |
+| `duet` | **host**: the Duet board's IP address or host name (Duet Web Control's address). **password** only when the board's `config.g` sets one with `M551`. Works with or without an SBC. Not yet checked on a real board. |
 
 A field an adapter doesn't use must stay empty: the app says which one when it refuses to start. Give each printer a fixed address (a DHCP reservation in your router). A Moonraker printer that moves to a new address is found again on your network.
 

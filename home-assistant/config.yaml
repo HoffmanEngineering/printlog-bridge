@@ -45,7 +45,7 @@ schema:
   trace: bool
   printers:
     - name: "str(1,64)"
-      adapter: "list(moonraker|bambu|prusalink|octoprint|sdcp)"
+      adapter: "list(moonraker|bambu|prusalink|octoprint|sdcp|duet)"
       printer_id: "int(1,)?"
       url: "url?"
       host: "str?"

@@ -53,6 +53,7 @@ OCTOPRINT = {
     "api_key": "octo-key",
 }
 SDCP = {"name": "cc", "adapter": "sdcp", "printer_id": 47, "host": "192.168.1.77"}
+DUET = {"name": "railcore", "adapter": "duet", "printer_id": 48, "host": "192.168.1.88"}
 
 
 def load(tmp_path: Path, text: str):
@@ -66,7 +67,7 @@ def load(tmp_path: Path, text: str):
 
 
 def test_every_adapter_becomes_a_printer_section_the_bridge_loads(tmp_path):
-    printers = [MOONRAKER, BAMBU, PRUSALINK, OCTOPRINT, SDCP]
+    printers = [MOONRAKER, BAMBU, PRUSALINK, OCTOPRINT, SDCP, DUET]
     config = load(tmp_path, render_config({"printers": printers}))
 
     assert [(p.name, p.adapter.name, p.printer_id) for p in config.printers] == [
@@ -75,6 +76,7 @@ def test_every_adapter_becomes_a_printer_section_the_bridge_loads(tmp_path):
         ("mk4s", "prusalink", 45),
         ("ender", "octoprint", 46),
         ("cc", "sdcp", 47),
+        ("railcore", "duet", 48),
     ]
     assert config.printers[3].adapter.api_key == "octo-key"
     assert config.update_check is False  # Home Assistant shows the app's updates itself

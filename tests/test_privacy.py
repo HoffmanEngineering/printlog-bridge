@@ -627,8 +627,8 @@ class TestOnlyOutboundConnections:
         the Moonraker session, discovery (finding Moonraker on the local network), a Bambu
         printer's MQTT and FTPS clients and its discovery (`discover` only), PrusaLink's
         HTTP client, OctoPrint's HTTP client and socket, an SDCP printer's websocket, its
-        file download and its discovery (`M99999`, from an ephemeral port), and pairing (3D
-        Print Log's sign-in service, Auth0).
+        file download and its discovery (`M99999`, from an ephemeral port), a Duet's HTTP
+        client, and pairing (3D Print Log's sign-in service, Auth0).
         docs/privacy.md lists what each connects to."""
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
@@ -656,6 +656,7 @@ class TestOnlyOutboundConnections:
             "adapters/sdcp/adapter.py",
             "adapters/sdcp/discovery.py",
             "adapters/sdcp/files.py",
+            "adapters/duet/client.py",
             # `printlog-bridge probe` only (docs/privacy.md, "The probe").
             "probe/services.py",
             "probe/discovery.py",
@@ -1145,3 +1146,51 @@ class TestSealedCredentials:
 
         text = "".join(p.read_text(encoding="utf-8") for p in trace_files(tmp_path))
         assert "PLAINTEXT-CANARY" not in text
+
+
+class TestDuet:
+    """A Duet (`adapter = duet`): the board gets only GETs, and its password reaches no log,
+    trace, state file or status (docs/privacy.md, "Duet")."""
+
+    def test_the_password_stays_between_the_bridge_and_the_board(self, tmp_path, caplog):
+        from fake_duet import PASSWORD, FakeDuet
+
+        async def scenario():
+            api, fake = FakePrintLogApi(), FakeDuet()
+            api_url = await api.start()
+            await fake.start()
+            try:
+                config = tmp_path / "printlog-bridge.cfg"
+                config.write_text(
+                    f"[bridge]\napi_url = {api_url}\napi_key = key-123\n"
+                    f"state_dir = {tmp_path / 'state'}\ntrace = true\n"
+                    f"[printer railcore]\nadapter = duet\nprinter_id = 42\nhost = 127.0.0.1\n"
+                    f"port = {fake.port}\npassword = {PASSWORD}\npoll_interval = 1\n"
+                    "idle_poll_interval = 1\n",
+                    encoding="utf-8",
+                )
+                async with helpers.bridge(
+                    config, connected=lambda: fake.requests_of("/rr_model"),
+                    disconnected=lambda: True,
+                ):  # fmt: skip
+                    fake.print_file("Benchy.gcode")
+                    await eventually(lambda: api.prints, timeout=10)
+                    fake.end()
+                    await eventually(lambda: api.prints[1]["status"] != 2, timeout=10)
+                return fake
+            finally:
+                await fake.close()
+                await api.close()
+
+        with caplog.at_level(logging.DEBUG):
+            fake = asyncio.run(scenario())
+
+        assert fake.methods == {"GET"}
+        # The fake board's own access log (aiohttp.access, the server side) shows the query.
+        bridge_log = [r.getMessage() for r in caplog.records if r.name != "aiohttp.access"]
+        assert bridge_log and not any(PASSWORD in line for line in bridge_log)
+        for path in (tmp_path / "state").rglob("*"):
+            if path.is_file():
+                assert PASSWORD.encode() not in path.read_bytes(), path
+        connect = [q for q in fake.queries if q.startswith("/rr_connect")]
+        assert connect and all("time=" not in q for q in connect)  # never sets the clock
