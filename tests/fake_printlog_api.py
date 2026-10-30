@@ -98,6 +98,11 @@ Device pairing and device tokens (api#148, PR 286, the "Contract for the bridge"
   holds: 401 `invalid_device_token` for a token no grant has (revoked or rotated), 403
   `insufficient_scope` or `device_endpoint_not_allowed`, 400 `multiple_credentials` with an
   `X-Api-Key` too, and 429 `device_token_throttled` (`Retry-After: 60`) while `throttled`.
+- A re-pair (pairing again with the same `deviceId`, or `supersede`) keeps the replaced token as
+  the grant's `previousTokenHash` (api#299) until the new token's first use or `end_grace` (the
+  API's 10 minutes). Meanwhile the old token works only on `GRACE_SCOPES` endpoints (prints and
+  heartbeats); every other one answers 403 `device_token_superseded`. A re-pair during a grace
+  keeps the older token. After the grace the old token gets 401 `invalid_device_token`.
 - `GET /api/Printers/summary` pages the user's printers (`pageNumber`, `pageSize`), and
   `POST /api/Printers` (`AddPrinterDTO`: `make`, `model`, `name` required) adds one: 201.
 
@@ -220,6 +225,8 @@ DEVICE_SCOPES = {
 _GRANT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("grant")
 """The grant of the device token the request being handled came with."""
 ALL_DEVICE_SCOPES = frozenset(s for s in DEVICE_SCOPES.values() if s)
+GRACE_SCOPES = frozenset({"prints:write", "connections:write"})
+"""What a superseded token still reaches during a re-pair's grace (`DuringRepairGrace`)."""
 MAX_PAIRING_TOKEN_AGE_S = 10 * 60
 UUID = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
 
@@ -418,17 +425,25 @@ class FakePrintLogApi:
         if self.throttled:
             return _coded(429, "device_token_throttled", headers={"Retry-After": "60"})
         grant = self.grant_for(token)
+        superseded = None
         if grant is None:
-            return _coded(
-                401,
-                "invalid_device_token",
-                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
-            )
+            superseded = self.superseded_grant_for(token)
+            if superseded is None:
+                return _coded(
+                    401,
+                    "invalid_device_token",
+                    headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+                )
+            grant = superseded
+        elif grant.get("previousTokenHash"):
+            grant["previousTokenHash"] = None  # the new token's first use ends the grace
         route = request.match_info.route.resource
         key = (request.method, route.canonical if route is not None else request.path)
         if key not in DEVICE_SCOPES:
             return _coded(403, "device_endpoint_not_allowed")
         scope = DEVICE_SCOPES[key]
+        if superseded is not None and scope not in GRACE_SCOPES:
+            return _coded(403, "device_token_superseded")
         if scope is not None and scope not in grant["scopes"]:
             return _coded(
                 403,
@@ -442,6 +457,26 @@ class FakePrintLogApi:
     def grant_for(self, token: str) -> dict[str, Any] | None:
         hashed = hashlib.sha256(token.encode()).hexdigest()
         return next((g for g in self.grants.values() if g["tokenHash"] == hashed), None)
+
+    def superseded_grant_for(self, token: str) -> dict[str, Any] | None:
+        """The grant whose re-pair replaced `token`, while its grace lasts."""
+        hashed = hashlib.sha256(token.encode()).hexdigest()
+        return next((g for g in self.grants.values() if g.get("previousTokenHash") == hashed), None)
+
+    def supersede(self, token: str) -> str:
+        """Another install pairs this device again: a new token for `token`'s grant, which keeps
+        the old one for the grace (api#299)."""
+        grant = self.grant_for(token)
+        assert grant is not None, "no grant has this token"
+        new_token = "pld_" + secrets.token_urlsafe(32)
+        _rotate(grant, hashlib.sha256(new_token.encode()).hexdigest())
+        return new_token
+
+    def end_grace(self, grant_id: int | None = None) -> None:
+        """The grace ends (the API's 10 minutes): superseded tokens get 401 from now on."""
+        for grant in self.grants.values():
+            if grant_id is None or grant["id"] == grant_id:
+                grant["previousTokenHash"] = None
 
     def revoke(self, grant_id: int) -> None:
         """The user removes the bridge in the app: its token stops working at once."""
@@ -837,7 +872,8 @@ class FakePrintLogApi:
             status = 201
         else:
             status = 200
-        grant.update(name=name, scopes=device_scopes, tokenHash=hashed)
+        grant.update(name=name, scopes=device_scopes)
+        _rotate(grant, hashed)
         self._spent_pairing_tokens.add(claims["jti"])
         return web.json_response(
             {
@@ -1647,6 +1683,15 @@ def _identity(printer: dict[str, Any]) -> str:
     if macs:
         return f"{kind}:mac:{macs[0]}:{port}"
     return f"{kind}:ip:{printer['address']}:{port}"
+
+
+def _rotate(grant: dict[str, Any], new_hash: str) -> None:
+    """Gives the grant a new token. The replaced one becomes the previous token, unless a grace
+    is already running: then the older one stays (re-pairing again can't stretch it)."""
+    old = grant.get("tokenHash")
+    if old and not grant.get("previousTokenHash"):
+        grant["previousTokenHash"] = old
+    grant["tokenHash"] = new_hash
 
 
 def _coded(status: int, code: str, headers: dict[str, str] | None = None) -> web.Response:

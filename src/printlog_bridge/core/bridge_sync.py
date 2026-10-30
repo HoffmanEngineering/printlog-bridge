@@ -16,6 +16,11 @@
   The bridge pairs again once (the code is in the log), only when 3D Print Log offers the scope;
   if the scope is still missing, it says so and stops syncing. It never loops re-pairing, also
   across restarts: `bridge.json` records the token that was refused.
+- **Superseded** (api#299): 403 `device_token_superseded` with no newer token stored (the API
+  client already tried one) means another install of this device paired again. Check-ins and
+  polls stop, said once in the log, `status` and `doctor`; prints and heartbeats go on during
+  the grace. Every `desiredPollSeconds` the state folder is looked at again: a newer token there
+  resumes the sync, and the 401 after the grace hands over to the re-pair path. It never pairs.
 
 - **Sealed credentials** (story 14b; 3d-print-log-api `docs/bridge-credential-sealing.md`):
   every check-in sends the bridge's public key and its fingerprint (core/credentials.py), and,
@@ -48,10 +53,12 @@ from typing import Any, Optional
 
 from printlog_bridge import __version__
 from printlog_bridge.core.api_client import (
+    SUPERSEDED,
     ApiClient,
     ApiRejected,
     ApiUnavailable,
     AuthRejected,
+    TokenSuperseded,
 )
 from printlog_bridge.core.app_printers import DesiredPrinter
 from printlog_bridge.core.credentials import KeyStore, Opener, short_fingerprint
@@ -159,6 +166,8 @@ class BridgeSync:
         self._discovering: asyncio.Task | None = None
         self.stopped: str | None = None
         """Why syncing stopped for good (a missing scope), or None."""
+        self.held: str | None = None
+        """Why check-ins and polls wait (another pairing replaced the token), or None."""
         self._wake: asyncio.Event | None = None
         self._registered = False
         """Whether a check-in got through in this run."""
@@ -210,7 +219,10 @@ class BridgeSync:
             while self.stopped is None:
                 self._issues_changed()
                 now = self.clock()
-                if now >= self._next_check_in:
+                if self.held is not None:
+                    if now >= self._next_poll:
+                        self._check_hold()
+                elif now >= self._next_check_in:
                     await self.check_in()
                 elif now >= self._next_poll:
                     await self.poll()
@@ -218,7 +230,11 @@ class BridgeSync:
                     break
                 if self._scan is not None and self.discovery is not None:
                     await self._sweep()
-                wake = min(self._next_check_in, self._next_poll)
+                wake = (
+                    self._next_poll
+                    if self.held is not None
+                    else min(self._next_check_in, self._next_poll)
+                )
                 if self._scan is not None:
                     wake = min(wake, self.clock() + 5)
                 self._wake.clear()
@@ -320,6 +336,9 @@ class BridgeSync:
         self._last_check_in = now
         try:
             answer = await self.api.check_in(body)
+        except TokenSuperseded:
+            self._hold()
+            return
         except ApiRejected as e:
             await self._refused(e)
             return
@@ -470,6 +489,25 @@ class BridgeSync:
         self._save()
         self._next_check_in = 0.0
 
+    def _hold(self) -> None:
+        """Another pairing replaced the token: no check-ins or polls until that changes."""
+        self._next_poll = self.clock() + self.poll_s
+        if self.held is not None:
+            return
+        self.held = SUPERSEDED
+        log.warning("%s.", SUPERSEDED)
+        self._problem(SUPERSEDED)
+
+    def _check_hold(self) -> None:
+        """Ends the hold once the token isn't superseded any more: a newer one was stored here,
+        or the grace ended (then the check-in says a re-pair is needed)."""
+        self._next_poll = self.clock() + self.poll_s
+        if self.api.still_superseded():
+            return
+        self.held = None
+        self.device = self.api.device or self.device
+        self._next_check_in = 0.0
+
     def _stop(self, why: str) -> None:
         if self.stopped is None:
             log.error("%s.", why)
@@ -485,6 +523,9 @@ class BridgeSync:
         self._next_poll = self.clock() + self.poll_s
         try:
             status, desired, etag = await self.api.desired(self.state.get("etag"))
+        except TokenSuperseded:
+            self._hold()
+            return
         except ApiRejected as e:
             if e.code == INSUFFICIENT_SCOPE:
                 await self._scope_missing()

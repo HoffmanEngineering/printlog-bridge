@@ -38,7 +38,10 @@ skipped by default.
 - One credential per request (api#286): the device token from `pair` when there is one, else the
   API key; the API answers 400 `multiple_credentials` to both. Only 401 `invalid_device_token`
   means re-pair; 429 `device_token_throttled` is waited out. The pairing contract is
-  3d-print-log-api PR #286's "Contract for the bridge".
+  3d-print-log-api PR #286's "Contract for the bridge". After a re-pair (api#299) the old token
+  still logs prints and heartbeats until the new one's first use (10 minutes at most); everything
+  else answers it 403 `device_token_superseded`. `core/api_client.py` then uses a newer stored token
+  and retries once; with none, `core/bridge_sync.py` holds check-ins and polls. Never pair on it.
 - Bridges (#100): the check-in, desired list and scan contract is 3d-print-log-api PR #288's
   "Contract for story 12" (`core/bridge_sync.py`). Discovery only reports; nothing is watched
   unless a `[printer]` or the desired list names it, and the config file wins. Printers
