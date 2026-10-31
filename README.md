@@ -540,7 +540,9 @@ url = http://192.168.1.70:7125
 
 Give the printer a fixed address (a DHCP reservation in your router). Its Moonraker needs no API key from the network. Creality Print and the printer's screen keep working as before: the bridge only reads.
 
-Not yet checked: that the K3's four nozzles split the filament per tool (it should, as a Klipper toolchanger), and that Moonraker is up straight after a cold boot (in our first probe, just after unboxing, only Creality's own websocket on port 9999 answered). Firmware checked: DWIN 4.0.3.1.25 (Klipper `09faed31`). Other Creality printers on stock firmware (K1, K2, Hi, Ender-3 V3) are unconfirmed: `printlog-bridge probe` ([Probing an unsupported printer](#probing-an-unsupported-printer)) shows whether yours answers on 7125.
+The filament is split per nozzle, by the nozzle that printed it: the K3 keeps Klipper's active extruder on T0 through every tool change and names the printing nozzle in its own `nozzle_manager`, which the bridge follows. Nozzle 1 is slot 0 (CFS slot A), nozzle 4 slot 3 (slot D), so load each spool in 3D Print Log in the slot of the nozzle it feeds. The colors you map in Creality Print when you send a print don't matter: the nozzle that prints is the one counted. A print that ended while the bridge was away is split by the slicer's grams per filament, read from the file's settings (Moonraker doesn't read them from Creality Print's files); those follow the slicer's filament order, so they're right only when the slicer's filament 1 printed from slot A, filament 2 from slot B, and so on.
+
+Not yet checked: that `nozzle_manager` follows the nozzle mid-print as Creality's own websocket does (no trace of a print with the bridge subscribed to it yet), and that Moonraker is up straight after a cold boot (in our first probe, just after unboxing, only Creality's own websocket on port 9999 answered). Firmware checked: DWIN 4.0.3.1.25 (Klipper `09faed31`). Other Creality printers on stock firmware (K1, K2, Hi, Ender-3 V3) are unconfirmed: `printlog-bridge probe` ([Probing an unsupported printer](#probing-an-unsupported-printer)) shows whether yours answers on 7125.
 
 ### Timelapse videos (Pro)
 

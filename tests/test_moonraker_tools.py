@@ -14,17 +14,53 @@ import pytest
 
 from printlog_bridge.adapters.moonraker.tools import (
     ToolUsage,
+    active_slot,
     estimated_grams_by_slot,
+    grams_by_slot_from_file,
     per_slot,
     slot_of,
 )
 
 
-def status(state="printing", used=None, tool="extruder", filename="cube.gcode"):
+def status(state="printing", used=None, tool="extruder", filename="cube.gcode", nozzle=None):
     stats = {"state": state, "filename": filename}
     if used is not None:
         stats["filament_used"] = used
-    return {"print_stats": stats, "toolhead": {"extruder": tool}}
+    result = {"print_stats": stats, "toolhead": {"extruder": tool}}
+    if nozzle is not None:
+        result["nozzle_manager"] = {"selected": nozzle}
+    return result
+
+
+class TestActiveSlot:
+    def test_is_the_active_extruder(self):
+        assert active_slot({"toolhead": {"extruder": "extruder2"}}) == 2
+
+    def test_a_creality_k3_names_its_nozzle_while_toolhead_stays_on_extruder(self):
+        """The K3's stock firmware prints T1-T3 without switching Klipper's active extruder
+        (seen in a trace of a four-color print: `toolhead.extruder` was `extruder` throughout),
+        and keeps the printing nozzle, 0-3, in `nozzle_manager.selected`."""
+        status = {"toolhead": {"extruder": "extruder"}, "nozzle_manager": {"selected": 3}}
+
+        assert active_slot(status) == 3
+
+    @pytest.mark.parametrize("selected", [-1, None, "1", True, 1.5])
+    def test_no_nozzle_selected_is_no_slot_not_the_extruder(self, selected):
+        """-1 is the K3's idle answer, and what a swap between nozzles may pass through; its
+        `toolhead.extruder` is always `extruder`, so falling back to it would give slot 0
+        whatever was purged between nozzles. No slot keeps the last one."""
+        status = {"toolhead": {"extruder": "extruder"}, "nozzle_manager": {"selected": selected}}
+
+        assert active_slot(status) is None
+
+    def test_a_nozzle_manager_without_selected_leaves_it_to_the_extruder(self):
+        status = {"toolhead": {"extruder": "extruder1"}, "nozzle_manager": {"nozzles": []}}
+
+        assert active_slot(status) == 1
+
+    def test_is_none_when_nothing_says(self):
+        assert active_slot({}) is None
+        assert active_slot({"toolhead": {"extruder": "my_tool"}}) is None
 
 
 class TestSlotOf:
@@ -135,6 +171,18 @@ class TestToolUsage:
 
         assert usage.take("cube.gcode") == {1: 10.0}
 
+    def test_a_creality_k3_follows_the_selected_nozzle(self):
+        """Whatever slot a G-code tool was mapped to when the print was sent, the nozzle that
+        prints is the one fed, so its slot is the one used."""
+        usage = ToolUsage()
+        usage.update(status("printing", 0.0, nozzle=-1))
+        usage.update(status(used=100.0, nozzle=3))
+        usage.update(status(used=101.0, nozzle=-1))  # between nozzles: stays on the last one
+        usage.update(status(used=150.0, nozzle=0))
+        usage.update(status(used=170.0, nozzle=2))
+
+        assert usage.take("cube.gcode") == {3: 101.0, 0: 49.0, 2: 20.0}
+
 
 class TestPerSlot:
     def test_scales_what_was_tracked_to_moonrakers_total(self):
@@ -187,3 +235,44 @@ class TestEstimatedGramsBySlot:
     )
     def test_is_empty_without_a_weight_per_tool(self, metadata):
         assert estimated_grams_by_slot(metadata) == {}
+
+
+class TestGramsBySlotFromFile:
+    # The end of a real Creality Print 7.3 file for a Creality K3, whose metadata Moonraker
+    # leaves without weights (`slicer: Unknown`).
+    K3_TAIL = (
+        "; filament used [mm] = 7295.43, 3462.26, 1318.99, 1870.45\n"
+        "; filament used [cm3] = 17.55, 8.33, 3.17, 4.50\n"
+        "; filament used [g] = 21.76, 10.33, 3.93, 5.58\n"
+        "; filament cost = 0.44, 0.21, 0.08, 0.11\n"
+        "; total filament used [g] = 41.60\n"
+        "; total filament change = 410\n"
+    )
+
+    def test_reads_the_slicers_grams_per_filament(self):
+        assert grams_by_slot_from_file(self.K3_TAIL) == {0: 21.76, 1: 10.33, 2: 3.93, 3: 5.58}
+
+    def test_prusaslicer_and_orca_spacing_and_crlf(self):
+        text = ";filament used [g]=12.31,0.00,4.52\r\n; total filament used [g] = 16.83\r\n"
+
+        assert grams_by_slot_from_file(text) == {0: 12.31, 2: 4.52}
+
+    def test_the_last_such_line_wins(self):
+        """A slicer's line in the G-code is followed by its settings block's; keep the last."""
+        text = "; filament used [g] = 1, 2\n; filament used [g] = 3, 4\n"
+
+        assert grams_by_slot_from_file(text) == {0: 3.0, 1: 4.0}
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "; filament used [g] = 13.27\n",  # one filament: the single row stays as it was
+            "; total filament used [g] = 41.60\n",
+            "; filament used [mm] = 7295.43, 3462.26\n",
+            "; filament used [g] = 12, abc\n",
+            "G1 X10 ; filament used [g] = 1, 2\n",  # not a comment line of its own
+        ],
+    )
+    def test_is_empty_without_a_weight_per_tool(self, text):
+        assert grams_by_slot_from_file(text) == {}

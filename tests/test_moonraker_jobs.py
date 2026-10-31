@@ -4,11 +4,13 @@ import asyncio
 import contextlib
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
-from fake_moonraker import FakeMoonraker, eventually
+from fake_moonraker import FakeMoonraker, eventually, gcode_metadata
 from session_helpers import ReportRecorder, running
 
+from printlog_bridge.adapters.moonraker.images import MoonrakerImages
 from printlog_bridge.adapters.moonraker.jobs import JobTracker
 from printlog_bridge.adapters.moonraker.session import Backoff, MoonrakerSession
 from printlog_bridge.core.events import JobFinished, JobOutcome, JobSlicerSettings, JobStarted
@@ -601,3 +603,148 @@ class TestCancelledObjects:
 
         assert first.note == "1 of 6 objects was cancelled: PART_4"
         assert second.note is None
+
+
+# A Creality K3 on its stock firmware: four nozzles, each fed by one slot of its CFS. Klipper's
+# `toolhead.extruder` stays `extruder` through every tool change (seen in a trace of a real
+# four-color print), and `nozzle_manager.selected` names the nozzle printing, -1 for none.
+K3_GCODE = Path(__file__).parent / "fixtures" / "gcode" / "creality-print-7.3-k3-four-color.gcode"
+K3_NAME = "Fuecoco.stl 2_PLA_2h39m57s.gcode"
+K3_OBJECTS = (*FakeMoonraker().objects, "nozzle_manager", "extruder1", "extruder2", "extruder3")
+K3_GRAMS = (21.76, 10.33, 3.93, 5.58)
+"""`; filament used [g] = 21.76, 10.33, 3.93, 5.58`, in the file's settings block."""
+
+
+class SettingsSink(RecordingSink):
+    """Reads each job's slicer settings as the lifecycle does, unless `slicer_settings` is off:
+    while the event is emitted, before the job's end is reported."""
+
+    def __init__(self, resume: datetime | None = None, slicer_settings: bool = True) -> None:
+        super().__init__(resume)
+        self.slicer_settings = slicer_settings
+
+    async def emit(self, event) -> None:
+        if isinstance(event, JobSlicerSettings) and self.slicer_settings and event.read:
+            await event.read()
+        await super().emit(event)
+
+
+@contextlib.asynccontextmanager
+async def tracking_k3(
+    sink: RecordingSink, fake: FakeMoonraker | None = None, with_file: bool = True
+):
+    """A K3 with the job's file on it (unless not `with_file`), tracked by a remote bridge
+    that reads files."""
+    fake = fake or FakeMoonraker(objects=K3_OBJECTS)
+    fake.status["nozzle_manager"] = {"selected": -1}
+    if with_file:
+        fake.files[K3_NAME] = K3_GCODE.read_bytes()
+    base = await fake.start()
+    images = MoonrakerImages("k3", url=base, socket=None)
+    tracker = JobTracker("k3", sink, images=images)
+    session = MoonrakerSession("k3", url=base, listener=tracker, backoff=FAST)
+    try:
+        async with running(session):
+            await eventually(lambda: fake.subscriptions)
+            yield fake
+    finally:
+        await fake.close()
+
+
+def k3_metadata() -> dict:
+    """What Moonraker keeps for a Creality Print file: no slicer, no weights."""
+    return {**gcode_metadata(K3_GCODE.read_bytes()), "slicer": "Unknown"}
+
+
+async def feed_k3(fake: FakeMoonraker, steps) -> None:
+    """The K3 printing: (selected nozzle, filament_used so far) at each update."""
+    await fake.set_status(
+        print_stats={"state": "standby", "filename": K3_NAME, "filament_used": 0.0}
+    )
+    await fake.set_status(print_stats={"state": "printing"})
+    for nozzle, used in steps:
+        await fake.set_status(
+            toolhead={"extruder": "extruder"},
+            nozzle_manager={"selected": nozzle},
+            print_stats={"filament_used": used},
+        )
+    last = steps[-1][1]
+    await eventually(lambda: fake.status["print_stats"]["filament_used"] == last)
+    await asyncio.sleep(0.05)
+
+
+def ended_while_away(filament_used: float, sink: SettingsSink):
+    async def scenario():
+        fake = FakeMoonraker(objects=K3_OBJECTS)
+        job = await fake.start_job(K3_NAME, k3_metadata(), notify=False, start_time=T0)
+        await fake.finish_job(job, filament_used=filament_used, notify=False)
+        async with tracking_k3(sink, fake):
+            await eventually(lambda: sink.of(JobFinished))
+            return list(fake.ranges)
+
+    ranges = asyncio.run(scenario())
+    [event] = sink.of(JobFinished)
+    return event, ranges
+
+
+class TestCrealityK3:
+    def test_subscribes_to_the_selected_nozzle_when_the_printer_has_one(self):
+        async def scenario():
+            async with tracking_k3(RecordingSink()) as fake:
+                return fake.subscriptions[0]
+
+        assert asyncio.run(scenario())["nozzle_manager"] == ["selected"]
+
+    def test_a_printer_without_one_isnt_asked_for_it(self):
+        async def scenario():
+            async with tracking(RecordingSink()) as fake:
+                return fake.subscriptions[0]
+
+        assert "nozzle_manager" not in asyncio.run(scenario())
+
+    def test_a_four_color_print_is_split_by_the_nozzle_that_fed(self):
+        """Mapped when it was sent, the G-code's T0 (red) printed from nozzle 4, slot 3: what
+        the bridge saw wins over the file's grams, which are in the slicer's tool order."""
+
+        async def scenario():
+            sink = SettingsSink()
+            async with tracking_k3(sink) as fake:
+                job = await fake.start_job(K3_NAME, k3_metadata(), start_time=T0)
+                await feed_k3(fake, [(3, 4000.0), (-1, 4010.0), (0, 6000.0), (2, 7000.0),
+                                     (1, 8000.0), (3, 11000.0)])  # fmt: skip
+                await fake.finish_job(job, filament_used=11000.0)
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert event.filament_mm == pytest.approx({0: 1990.0, 1: 1000.0, 2: 1000.0, 3: 7010.0})
+
+    def test_a_print_that_ended_while_away_is_split_by_the_files_grams_per_tool(self):
+        """Moonraker reads no weights from Creality Print's files; its settings block has them."""
+        event, _ = ended_while_away(14107.8, SettingsSink(resume=at(T0)))
+
+        total = sum(K3_GRAMS)
+        assert event.filament_mm == pytest.approx(
+            {slot: 14107.8 * grams / total for slot, grams in enumerate(K3_GRAMS)}
+        )
+
+    def test_with_slicer_settings_off_the_file_is_never_read_and_its_all_slot_0(self):
+        event, ranges = ended_while_away(500.0, SettingsSink(resume=at(T0), slicer_settings=False))
+
+        assert event.filament_mm == {0: 500.0}
+        assert ranges == []
+
+    def test_a_file_that_cant_be_read_leaves_it_all_to_slot_0(self):
+        sink = SettingsSink(resume=at(T0))
+
+        async def scenario():
+            fake = FakeMoonraker(objects=K3_OBJECTS)
+            job = await fake.start_job(K3_NAME, k3_metadata(), notify=False, start_time=T0)
+            await fake.finish_job(job, filament_used=500.0, notify=False)
+            async with tracking_k3(sink, fake, with_file=False):
+                await eventually(lambda: sink.of(JobFinished))
+
+        asyncio.run(scenario())
+
+        assert sink.of(JobFinished)[0].filament_mm == {0: 500.0}
