@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 EXTRUDER = re.compile(r"extruder(\d*)")
 TOOL_MACRO = re.compile(r"gcode_macro t(\d+)", re.IGNORECASE)
@@ -193,8 +193,8 @@ class SlicedFilament(NamedTuple):
     its type, as the file's settings give them."""
 
     grams: float
-    color: Optional[str]
-    material: Optional[str]
+    color: str | None
+    material: str | None
 
 
 def sliced_filaments_from_file(text: str) -> list[SlicedFilament]:
