@@ -381,6 +381,29 @@ class TestBodiesAreCapped:
             rec.receive("ws:1/", message={})
         assert len(rec.events) == 2 and rec.dropped["ws:1/"] == 3 and rec.received("ws:1/") == 5
 
+    def test_the_longest_probe_of_a_chatty_printer_fits(self):
+        # A Creality K3 pushes 5 to 6 websocket messages a second while it prints; the old cap
+        # of 300 kept its first two minutes and dropped the rest.
+        assert record.MAX_PER_CHANNEL >= 20 * probe_run.MAX_SECONDS
+        assert record.MAX_EVENTS >= record.MAX_PER_CHANNEL + 1000
+
+    def test_kept_bytes_are_capped_too(self, monkeypatch):
+        monkeypatch.setattr(record, "MAX_KEPT_BYTES", 1000)
+        rec = record.Recorder()
+        for _ in range(5):
+            rec.receive("ws:1/", message=record.payload("x" * 400))
+        assert len(rec.events) == 2 and rec.dropped["ws:1/"] == 3
+        rec.send("tcp-connect", "tcp:80", None)  # sends are always kept
+        assert rec.events[-1]["kind"] == "send"
+
+    def test_the_summary_says_what_was_dropped(self, probed):
+        trace, _ = probed
+        trace = probe_run.finish(json.loads(json.dumps(trace)), False)
+        assert "not kept" not in probe_run.summarize(trace, None)
+        trace["notCounted"] = {"ws:9999/": 1764}
+        summary = probe_run.summarize(trace, None)
+        assert "1764 message(s) on ws:9999/ were not kept" in summary
+
 
 # -- redaction ---------------------------------------------------------------------------------
 
