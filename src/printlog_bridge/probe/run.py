@@ -22,6 +22,7 @@ from printlog_bridge.probe.discovery import Discovery, Network
 from printlog_bridge.probe.record import (
     MAX_BODY,
     MAX_EVENTS,
+    MAX_KEPT_BYTES,
     MAX_MESSAGE,
     MAX_PER_CHANNEL,
     Recorder,
@@ -208,6 +209,7 @@ class Probe:
                 "messageBytes": MAX_MESSAGE,
                 "messagesPerChannel": MAX_PER_CHANNEL,
                 "events": MAX_EVENTS,
+                "keptBytes": MAX_KEPT_BYTES,
             },
             "ports": self.port_rows,
             "events": rec.events,
@@ -353,6 +355,10 @@ def summarize(trace: dict[str, Any], out: Path | None) -> str:
         lines += _port_lines(port, by_channel)
     if closed:
         lines.append(f"Closed or filtered: {', '.join(closed)}")
+    if trace.get("notCounted"):
+        lines += ["", "Past the trace's caps (see 'limits'):"]
+        for channel, count in sorted(trace["notCounted"].items()):
+            lines.append(f"  {count} message(s) on {channel} were not kept")
     if trace["notes"]:
         lines += ["", "Notes:"] + [f"  - {note}" for note in trace["notes"]]
     by_rule: dict[str, int] = {}

@@ -4,6 +4,7 @@ passive message, with timestamps and size caps."""
 from __future__ import annotations
 
 import base64
+import json
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -15,9 +16,13 @@ MAX_BODY = 64 * 1024
 """An HTTP body is kept up to this many bytes."""
 MAX_MESSAGE = 16 * 1024
 """A websocket, MQTT or UDP message is kept up to this many bytes."""
-MAX_PER_CHANNEL = 300
-"""Messages kept per channel (one port's websocket, the MQTT broker...); later ones are counted."""
-MAX_EVENTS = 5000
+MAX_PER_CHANNEL = 12_000
+"""Messages kept per channel (one port's websocket, the MQTT broker...); later ones are counted.
+Enough for 20 a second through the longest probe: a Creality K3 pushes 5 to 6 while printing."""
+MAX_EVENTS = 13_000
+MAX_KEPT_BYTES = 64 * 1024 * 1024
+"""Received messages stop being kept past this many bytes in all, so a printer that sends large
+messages often can't make a trace too big to open; later ones are counted."""
 
 
 def payload(data: bytes | str, cap: int = MAX_MESSAGE) -> dict[str, Any]:
@@ -61,6 +66,7 @@ class Recorder:
         """Every send the allow-list stopped, as (rule, why)."""
         self._per_channel: Counter[str] = Counter()
         self.dropped: Counter[str] = Counter()
+        self._kept_bytes = 0
 
     def _add(self, channel: str, kind: str, data: dict[str, Any]) -> None:
         if kind == "receive":
@@ -68,6 +74,11 @@ class Recorder:
             if self._per_channel[channel] > MAX_PER_CHANNEL:
                 self.dropped[channel] += 1
                 return
+            size = len(json.dumps(data, default=str))
+            if self._kept_bytes + size > MAX_KEPT_BYTES:
+                self.dropped[channel] += 1
+                return
+            self._kept_bytes += size
         if len(self.events) >= MAX_EVENTS:
             self.dropped[channel] += 1
             return
