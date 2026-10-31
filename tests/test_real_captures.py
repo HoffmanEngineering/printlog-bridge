@@ -87,6 +87,8 @@ class TestObjects:
         assert set(objects) == {
             "print_stats", "toolhead", "virtual_sdcard", "webhooks", "filament_detect",
             "exclude_object",
+            # Where the screen sent each of the slicer's filaments, and what each head has.
+            "print_task_config",
             # A runout sensor per tool (#44).
             *(f"filament_motion_sensor e{n}_filament" for n in range(4)),
         }  # fmt: skip

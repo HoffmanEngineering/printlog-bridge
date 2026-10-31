@@ -334,6 +334,12 @@ class JobLogger:
                 }  # as JSON keeps it
                 if start["estimated_volume_ml"] is None:
                     del start["estimated_volume_ml"]  # a filament job's, as before #97
+                if event.slot_notes:
+                    start["slot_notes"] = {
+                        str(slot): note for slot, note in event.slot_notes.items()
+                    }
+                else:
+                    del start["slot_notes"]  # as a start without them was kept before
                 job = state.jobs[event.job_id] = JobRecord(
                     started_at=start["started_at"], start=start
                 )
@@ -1447,8 +1453,19 @@ def _estimate_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
 
     A file with a weight per tool gets a row for each tool it uses, by weight. Otherwise (one
     filament, or one tool used) the totals are one row, by length when the slicer gave one,
-    or by volume for resin (#97).
+    or by volume for resin (#97). Each row carries the note on what its slot had loaded, when
+    the adapter reported one (`JobStarted.slot_notes`); completing keeps it.
     """
+    rows = _estimate_rows_bare(start)
+    notes = {int(slot): note for slot, note in (start.get("slot_notes") or {}).items()}
+    for row in rows:
+        note = notes.get(row["slot"])
+        if isinstance(note, str) and note:
+            row["notes"] = note
+    return rows
+
+
+def _estimate_rows_bare(start: Mapping[str, Any]) -> list[dict[str, Any]]:
     estimated = start.get("estimated_filament_g_by_slot") or {}
     by_slot = {int(slot): grams for slot, grams in estimated.items()}
     if len(by_slot) > 1:

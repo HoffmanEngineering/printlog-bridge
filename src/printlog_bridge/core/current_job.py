@@ -163,6 +163,8 @@ def _start_payload(event: JobStarted) -> dict[str, Any]:
     }
     if event.estimated_volume_ml is not None:  # only then: a filament job's is as before #97
         payload["estimated_volume_ml"] = event.estimated_volume_ml
+    if event.slot_notes:
+        payload["slot_notes"] = {str(slot): note for slot, note in event.slot_notes.items()}
     return payload
 
 
@@ -183,4 +185,9 @@ def _start_event(payload: Mapping[str, Any]) -> JobStarted:
             for slot, grams in (payload.get("estimated_filament_g_by_slot") or {}).items()
         },
         estimated_volume_ml=payload.get("estimated_volume_ml"),
+        slot_notes={
+            int(slot): note
+            for slot, note in (payload.get("slot_notes") or {}).items()
+            if isinstance(note, str)
+        },
     )

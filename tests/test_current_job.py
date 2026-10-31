@@ -47,6 +47,13 @@ def test_the_job_is_remembered_across_a_restart(tmp_path):
     assert current(tmp_path).job == start(estimated_filament_g_by_slot={0: 10.0, 2: 3.1})
 
 
+def test_its_slot_notes_are_remembered_too(tmp_path):
+    notes = {2: "Slot 3 · Blue (#1E88E5) · PLA"}
+    current(tmp_path).started(start(slot_notes=notes))
+
+    assert current(tmp_path).job.slot_notes == notes
+
+
 def test_the_same_job_still_running_replays_its_start(tmp_path):
     current(tmp_path).started(start())
 
