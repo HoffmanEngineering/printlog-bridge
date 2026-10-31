@@ -120,9 +120,9 @@ class JobTracker:
         self._file_grams: dict[str, dict[int, float]] = {}
         """The slicer's grams per tool found in a job's settings block, by job id, kept for its
         end when Moonraker's metadata has none (Creality Print's files)."""
-        self._files: dict[str, SlicerFile | None] = {}
-        """What was read of each job's file, by job id, so its estimate and its slicer settings
-        read it once between them (the last `MAX_FILE_GRAMS` jobs)."""
+        self._files: dict[str, SlicerFile] = {}
+        """What was read of each job's file, by job id and file name, so its estimate and its
+        slicer settings read it once between them (the last `MAX_FILE_GRAMS` jobs)."""
         self._replay_status: Mapping[str, Any] = {}
         """Klipper's status as asked for on connecting, for the jobs replayed then."""
         self._can_respond: bool | None = None
@@ -228,12 +228,15 @@ class JobTracker:
         the settings after it get the same read."""
         assert self.slicer is not None
         job_id = str(job["job_id"])
-        if job_id in self._files:
-            return self._files[job_id]
+        # By file as well: Moonraker numbers jobs again after its history is cleared.
+        key = f"{job_id}:{job.get('filename') or ''}"
+        if key in self._files:
+            return self._files[key]
         file = await self.slicer.read(call, job)
-        self._files[job_id] = file
-        while len(self._files) > MAX_FILE_GRAMS:
-            del self._files[next(iter(self._files))]
+        if file is not None:  # nothing read can be tried again by the settings
+            self._files[key] = file
+            while len(self._files) > MAX_FILE_GRAMS:
+                del self._files[next(iter(self._files))]
         grams = grams_by_slot_from_file(file.config_block or "") if file is not None else {}
         if grams:
             self._file_grams[job_id] = grams
@@ -258,9 +261,12 @@ class JobTracker:
         table = tool_map(here) if here is not None else None
         slots = loaded(here) if here is not None else {}
         unplaced: list[UnplacedFilament] = []
-        if table or not slots:
+        if table or (here is not None and "box" not in here):
+            # The U1's map, or a printer with no CFS: the slicer's tools are its slots.
             by_slot = placed(grams, table)
         else:
+            # A K3, or a job whose printer state is long gone (`_here`): by color, and with
+            # nothing loaded to go by, nothing is placed rather than guessed.
             by_slot, missing = placed_by_color(filaments, slots)
             unplaced = [
                 UnplacedFilament(

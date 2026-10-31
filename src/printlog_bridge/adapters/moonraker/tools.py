@@ -199,11 +199,18 @@ class SlicedFilament(NamedTuple):
 
 def sliced_filaments_from_file(text: str) -> list[SlicedFilament]:
     """Each sliced filament's grams, color and type, from the end of a G-code file (Creality
-    Print, OrcaSlicer, PrusaSlicer), for a file with a weight per filament. Empty otherwise, as
-    `grams_by_slot_from_file`. The last line of each kind wins."""
+    Print, OrcaSlicer, PrusaSlicer), a one-filament file's one included. Empty without a weight,
+    or with one that isn't a number. The last line of each kind wins."""
     grams = grams_by_slot_from_file(text)
     if not grams:
-        return []
+        lines = FILE_GRAMS.findall(text)
+        try:
+            single = float(lines[-1]) if lines else 0.0
+        except ValueError:
+            return []
+        if single <= 0:
+            return []
+        grams = {0: single}
     count = max(grams) + 1
     colors = _listed(FILE_COLORS, text)
     types = _listed(FILE_TYPES, text)

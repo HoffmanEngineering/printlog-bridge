@@ -754,6 +754,36 @@ class TestCrealityK3Estimate:
         assert (red.index, red.grams, red.color) == (0, 21.76, "#FF0000")
         assert red.note == "Sliced filament 1 · Red (#FF0000) · PLA: printer slot not known"
 
+    def test_an_empty_cfs_leaves_every_filament_unplaced(self):
+        sink = SettingsSink()
+        k3_start(sink, {**K3_BOX, "same_material": []})
+
+        [estimate] = sink.estimates
+        assert estimate.by_slot == {}
+        assert [f.index for f in estimate.unplaced] == [0, 1, 2, 3]
+
+    def test_a_one_color_file_is_placed_on_its_slot(self):
+        """The most common print: one filament, its estimate on the slot loaded in its color."""
+        sink = SettingsSink()
+        box = {**K3_BOX, "same_material": [["000001", "0ff1e1e", ["T1D"], "PLA"]]}
+
+        async def scenario():
+            fake = FakeMoonraker(objects=(*K3_OBJECTS, "box"))
+            fake.status["box"] = box
+            one = K3_GCODE.read_bytes().replace(b"21.76, 10.33, 3.93, 5.58", b"21.76")
+            one = one.replace(b"#FF0000;#FFFFFF;#FFFF00;#000000", b"#FF0000")
+            fake.files[K3_NAME] = one
+            metadata = {**gcode_metadata(one), "slicer": "Unknown"}
+            async with tracking_k3(sink, fake, with_file=False) as fake:
+                await fake.start_job(K3_NAME, metadata, start_time=T0)
+                await eventually(lambda: sink.of(JobStarted))
+
+        asyncio.run(scenario())
+
+        [estimate] = sink.estimates
+        assert estimate.by_slot == {3: 21.76}
+        assert estimate.filament_g == 21.76
+
     def test_with_slicer_settings_off_nothing_is_read(self):
         sink = SettingsSink(slicer_settings=False)
 

@@ -2091,7 +2091,9 @@ class TestPlaceholdersAtTheEnd:
             "looks high, delete its row."
         ) in api.prints[1]["notes"]
 
-    def test_a_placeholder_the_user_linked_is_left_alone(self, tmp_path):
+    def test_a_placeholder_the_user_linked_is_filled_and_keeps_the_spool(self, tmp_path):
+        """Picking the spool for the "Other" row on the print (printlog-bridge#128): the slot
+        that fed still fills that row, and the user's spool stays on it."""
         api = FakePrintLogApi()
 
         def link(api):
@@ -2106,11 +2108,11 @@ class TestPlaceholdersAtTheEnd:
             finished(filament_mm=FED),
         )
 
-        [completion] = api.completions
-        assert not any(u.get("rowId") for u in completion["filamentUsage"])
-        assert any(
-            (r["filament"] or {}).get("id") == "spool-red" for r in api.prints[1]["filamentUsage"]
-        )
+        rows = api.prints[1]["filamentUsage"]
+        assert len(rows) == 4
+        red = next(r for r in rows if (r["filament"] or {}).get("id") == "spool-red")
+        assert red["slot"] == 3
+        assert red["lengthInM"] == 7.295
 
     def test_a_start_with_nothing_unplaced_sends_no_row_ids(self, tmp_path):
         api = FakePrintLogApi()

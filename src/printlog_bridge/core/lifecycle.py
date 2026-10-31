@@ -1313,14 +1313,17 @@ class JobLogger:
             rows_now = print_.get("filamentUsage") or []
             conflicts: list[str] = []
             usage = _usage_rows(event, rows_now, loaded, single_tool, swaps, conflicts)
-            conflicts.extend(_pair_placeholders(usage, rows_now, job.start))
             noted = "\n".join([*swap_notes(swaps, fed), *conflicts])
             hints = change_hints(job.filament_changes, swaps)
             completion = {"usage": usage, "notes": [n for n in (event.note, noted, *hints) if n]}
             if swaps:
                 job.completion = completion
                 state.save()
-        rows = completion["usage"]
+        # Paired on every attempt, from the print as read now: an edit since gives every row a
+        # new id, so a `rowId` kept with a stored completion could be stale (#128).
+        rows = [{k: v for k, v in row.items() if k != "rowId"} for row in completion["usage"]]
+        unpaired = _pair_placeholders(rows, print_.get("filamentUsage") or [], job.start)
+        completion = {**completion, "notes": [*completion["notes"], *unpaired]}
         if rows:
             body["filamentUsage"] = rows
 
@@ -1531,7 +1534,8 @@ def _pair_placeholders(
     """Names, by `rowId`, the row with no slot each unplaced sliced filament got
     (`_unplaced_rows`) on the measured slot that fed it, so completing fills that row instead of
     adding one beside it and counting its estimate twice (printlog-bridge#128). Ids come from
-    the print as read now: an edit gives every row a new one. A slot is paired only when it has
+    the print as read now: an edit gives every row a new one. A placeholder the user picked a
+    spool for is still one (the API keeps the spool on it). A slot is paired only when it has
     no row of its own; with several, the nearest in color first. Returns a note for each
     placeholder left unpaired."""
     unplaced = list(start.get("unplaced") or [])
@@ -1541,7 +1545,6 @@ def _pair_placeholders(
         row
         for row in rows_now
         if row.get("slot") is None
-        and not row.get("filament")
         and not any(row.get(k) for k in ("amountMg", "lengthInM", "volumeMl"))
         and row.get("id")
     ]

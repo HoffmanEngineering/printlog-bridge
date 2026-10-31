@@ -305,10 +305,15 @@ class TestSlicedFilamentsFromFile:
             SlicedFilament(2.0, None, None),
         ]
 
+    def test_a_one_filament_file_gives_its_one_filament(self):
+        text = "; filament used [g] = 13.27\n; filament_colour = #FF0000\n; filament_type = PLA\n"
+
+        assert sliced_filaments_from_file(text) == [SlicedFilament(13.27, "#FF0000", "PLA")]
+
     @pytest.mark.parametrize(
-        "text", ["", "; filament used [g] = 13.27\n; filament_colour = #FF0000\n"]
+        "text", ["", "; filament used [g] = abc\n", "; filament used [g] = 0\n"]
     )
-    def test_is_empty_without_a_weight_per_filament(self, text):
+    def test_is_empty_without_a_weight(self, text):
         assert sliced_filaments_from_file(text) == []
 
 
