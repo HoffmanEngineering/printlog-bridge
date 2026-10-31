@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NamedTuple, Optional
 
 EXTRUDER = re.compile(r"extruder(\d*)")
 TOOL_MACRO = re.compile(r"gcode_macro t(\d+)", re.IGNORECASE)
@@ -177,3 +177,62 @@ def grams_by_slot_from_file(text: str) -> dict[int, float]:
     if len(weights) < 2:
         return {}
     return {slot: grams for slot, grams in enumerate(weights) if grams > 0}
+
+
+FILE_COLORS = re.compile(r"^;\s*filament_colour\s*=\s*(.+?)\s*$", re.MULTILINE)
+FILE_TYPES = re.compile(r"^;\s*filament_type\s*=\s*(.+?)\s*$", re.MULTILINE)
+FILE_DURATION = re.compile(
+    r"^;\s*estimated printing time \(normal mode\)\s*=\s*(.+?)\s*$", re.MULTILINE
+)
+DURATION_PART = re.compile(r"(\d+)\s*([dhms])")
+DURATION_UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+
+
+class SlicedFilament(NamedTuple):
+    """One of the slicer's filaments, in its order (T0 first): its grams, its `#RRGGBB` color and
+    its type, as the file's settings give them."""
+
+    grams: float
+    color: Optional[str]
+    material: Optional[str]
+
+
+def sliced_filaments_from_file(text: str) -> list[SlicedFilament]:
+    """Each sliced filament's grams, color and type, from the end of a G-code file (Creality
+    Print, OrcaSlicer, PrusaSlicer), for a file with a weight per filament. Empty otherwise, as
+    `grams_by_slot_from_file`. The last line of each kind wins."""
+    grams = grams_by_slot_from_file(text)
+    if not grams:
+        return []
+    count = max(grams) + 1
+    colors = _listed(FILE_COLORS, text)
+    types = _listed(FILE_TYPES, text)
+    return [
+        SlicedFilament(
+            grams.get(index, 0.0),
+            colors[index] if index < len(colors) else None,
+            types[index] if index < len(types) else None,
+        )
+        for index in range(count)
+    ]
+
+
+def duration_from_file(text: str) -> float | None:
+    """The slicer's estimated print time, in seconds, from the end of a G-code file
+    (`; estimated printing time (normal mode) = 2h 39m 57s`); None when there's none."""
+    lines = FILE_DURATION.findall(text)
+    if not lines:
+        return None
+    value = lines[-1]
+    parts = DURATION_PART.findall(value)
+    if not parts or DURATION_PART.sub("", value).strip():
+        return None
+    seconds = float(sum(int(n) * DURATION_UNITS[unit] for n, unit in parts))
+    return seconds if seconds > 0 else None
+
+
+def _listed(pattern: re.Pattern[str], text: str) -> list[str | None]:
+    lines = pattern.findall(text)
+    if not lines:
+        return []
+    return [part.strip() or None for part in lines[-1].split(";")]
