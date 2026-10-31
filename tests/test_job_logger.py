@@ -1507,6 +1507,25 @@ class TestPerToolUsage:
         assert row["estimatedLengthInM"] == 2.7
         assert row["estimatedAmountMg"] == 8200
 
+    def test_each_row_carries_the_note_on_what_its_slot_had_loaded(self, tmp_path):
+        """As the Slic3r uploader writes it, so each spool's row can be told apart; a slot the
+        printer said nothing about has no note, and completing keeps them."""
+        api = FakePrintLogApi()
+        notes = {0: "Slot 1 · White (#E2DEDB) · PLA SnapSpeed", 3: "Slot 4 · Pink (#D81B60) · PLA"}
+
+        run(api, tmp_path, four_tool_start(slot_notes=notes), finished(filament_mm=FOUR_TOOL_USAGE))
+
+        [created] = api.created
+        assert [row.get("notes") for row in created["filamentUsage"]] == [
+            notes[0],
+            None,
+            None,
+            notes[3],
+        ]
+        rows = by_slot(api.prints[1])
+        assert rows[0]["notes"] == notes[0]
+        assert rows[3]["notes"] == notes[3]
+
     def test_each_tool_gets_its_own_row_and_they_add_up_to_the_total(self, tmp_path):
         api = FakePrintLogApi()
 

@@ -38,6 +38,11 @@ class JobStarted:
     estimated_volume_ml: float | None = None
     """The slicer's estimate of resin, in milliliters (#97), for a resin printer: its vat is
     slot 0. From the sliced file's header (`adapters/common/resin_files.py`)."""
+    slot_notes: Mapping[int, str] = field(default_factory=dict)
+    """A note per slot on what the printer had loaded there ("Slot 1 · Red (#E72F1D) · PLA",
+    `core.colors.slot_note`), put on that slot's usage row when the print is created. Only from
+    what the printer reports, never the slicer's filament order, which a mapping at print time
+    can change."""
 
 
 @dataclass(frozen=True)

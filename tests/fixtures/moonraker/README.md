@@ -8,6 +8,7 @@ where noted.
 | --- | --- | --- |
 | `u1/` | Snapmaker U1 | Klipper `2.0.0.205_20260914173503`, Moonraker `2.0.0` (Snapmaker's forks) |
 | `infimech/` | Infimech EX | the vendor's Klipper and Moonraker, both reporting version `9.9.9` |
+| `k3/` | Creality K3 (CFS-Nano) | DWIN 4.0.3.1.25, Klipper `09faed31` |
 
 Each file is one call's JSON-RPC answer (`{"result": ...}`):
 
@@ -20,6 +21,13 @@ Each file is one call's JSON-RPC answer (`{"result": ...}`):
 | `history.json` | `server.history.list` (the last 5 jobs) |
 | `webcams.json` | `server.webcams.list` |
 | `server_config.json` | `server.config` |
+
+Added 2026-10-31, idle after a print, one HTTP `GET /printer/objects/query` each:
+
+| File | Query |
+| --- | --- |
+| `u1/print_task_config.json` | `print_task_config`, whole: where the screen sent each G-code tool (`extruder_map_table`) and what each head has loaded |
+| `k3/box.json` | `box=same_material,T1` and `nozzle_manager=selected`: the CFS's loaded slots (its `sn` is all `0xFF`, no serial) |
 
 Scrubbed before committing:
 

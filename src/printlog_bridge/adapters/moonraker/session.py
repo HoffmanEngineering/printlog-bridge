@@ -28,6 +28,7 @@ from printlog_bridge.core.status import NullReport, PrinterReport
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 from .changes import SENSOR_FIELDS, is_sensor
+from .task_config import K3_FIELDS, U1_FIELDS
 from .tools import macro_slot, slot_of
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "exclude_object": ["objects", "excluded_objects"],  # objects cancelled mid-print
     "save_variables": ["variables"],  # each tool's spool in the user's own Spoolman (#38)
     "nozzle_manager": ["selected"],  # a Creality K3's printing nozzle (`tools.active_slot`)
+    # Where each slicer filament printed, and what each slot has loaded (`task_config.py`)
+    "print_task_config": U1_FIELDS,  # Snapmaker U1
+    "box": K3_FIELDS,  # a Creality K3's CFS
 }
 
 RemoteMethod = Callable[[Mapping[str, Any]], Awaitable[None]]

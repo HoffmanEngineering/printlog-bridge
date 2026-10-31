@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -748,3 +750,135 @@ class TestCrealityK3:
         asyncio.run(scenario())
 
         assert sink.of(JobFinished)[0].filament_mm == {0: 500.0}
+
+
+# A Snapmaker U1 lets the screen send each of the slicer's filaments to any head. Its
+# `print_task_config` says where (`extruder_map_table`) and what each head has loaded: a real
+# answer, with the first tools remapped as the screen does it.
+U1_CONFIG = json.loads(
+    (Path(__file__).parent / "fixtures" / "moonraker" / "u1" / "print_task_config.json").read_text(
+        encoding="utf-8"
+    )
+)["result"]["status"]["print_task_config"]
+U1_OBJECTS = (*FakeMoonraker().objects, "print_task_config")
+
+
+def u1_config(*table_start: int) -> dict:
+    config = copy.deepcopy(U1_CONFIG)
+    config["extruder_map_table"][: len(table_start)] = list(table_start)
+    return config
+
+
+@contextlib.asynccontextmanager
+async def tracking_u1(sink: RecordingSink, *table_start: int, fake: FakeMoonraker | None = None):
+    fake = fake or FakeMoonraker(objects=U1_OBJECTS)
+    fake.status["print_task_config"] = u1_config(*table_start)
+    async with tracking(sink, fake):
+        yield fake
+
+
+U1_NOTES = {
+    0: "Slot 1 · White (#E2DEDB) · PLA SnapSpeed",
+    1: "Slot 2 · Black (#000000) · PLA Basic",
+    2: "Slot 3 · Blue (#1E88E5) · PLA Basic",
+    3: "Slot 4 · Pink (#D81B60) · PLA Basic",
+}
+
+
+class TestSnapmakerU1Mapping:
+    def test_subscribes_to_the_map_and_whats_loaded_not_the_rest(self):
+        async def scenario():
+            async with tracking_u1(RecordingSink()) as fake:
+                return fake.subscriptions[0]
+
+        assert asyncio.run(scenario())["print_task_config"] == [
+            "extruder_map_table",
+            "filament_color_rgba",
+            "filament_type",
+            "filament_sub_type",
+            "filament_exist",
+        ]
+
+    def test_the_start_puts_the_slicers_grams_on_the_heads_they_were_sent_to(self):
+        """T0 (30.2 g) printed on head 3 and T1 (9.8 g) on head 0, as the screen mapped them."""
+
+        async def run():
+            sink = RecordingSink()
+            async with tracking_u1(sink, 3, 0, 2, 1) as fake:
+                await fake.start_job("u1/dragon.gcode", U1_METADATA, start_time=T0)
+                await eventually(lambda: sink.of(JobStarted))
+            return sink
+
+        [event] = asyncio.run(run()).of(JobStarted)
+
+        assert event.estimated_filament_g_by_slot == {3: 30.2, 0: 9.8, 2: 3.6, 1: 1.5}
+        assert event.slot_notes == U1_NOTES
+
+    def test_a_one_color_print_sent_to_another_head_is_estimated_on_it(self):
+        async def run():
+            sink = RecordingSink()
+            async with tracking_u1(sink, 2) as fake:
+                metadata = {"filament_weights": [13.27], "filament_weight_total": 13.27}
+                await fake.start_job("benchy.gcode", metadata, start_time=T0)
+                await eventually(lambda: sink.of(JobStarted))
+            return sink
+
+        [event] = asyncio.run(run()).of(JobStarted)
+
+        assert event.estimated_filament_g_by_slot == {2: 13.27}
+
+    def test_a_print_it_didnt_see_is_split_on_the_mapped_heads_when_it_was_the_last(self):
+        async def run():
+            fake = FakeMoonraker(objects=U1_OBJECTS)
+            job = await fake.start_job("u1/dragon.gcode", U1_METADATA, notify=False, start_time=T0)
+            await fake.finish_job(job, filament_used=15060.0, notify=False)
+            fake.status["print_stats"] = {"state": "complete", "filename": "u1/dragon.gcode"}
+            sink = RecordingSink(resume=at(T0))
+            async with tracking_u1(sink, 3, 0, 2, 1, fake=fake):
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        sink = asyncio.run(run())
+        [start] = sink.of(JobStarted)
+        [event] = sink.of(JobFinished)
+
+        assert start.slot_notes == U1_NOTES
+        assert sorted(event.filament_mm) == [0, 1, 2, 3]
+        assert event.filament_mm[3] == pytest.approx(15060.0 * 30.2 / 45.1)
+        assert event.filament_mm[0] == pytest.approx(15060.0 * 9.8 / 45.1)
+
+    def test_an_older_job_isnt_given_todays_map_or_spools(self):
+        """Klipper has run another file since: the map and the loaded heads are that one's."""
+
+        async def run():
+            fake = FakeMoonraker(objects=U1_OBJECTS)
+            job = await fake.start_job("u1/dragon.gcode", U1_METADATA, notify=False, start_time=T0)
+            await fake.finish_job(job, filament_used=15060.0, notify=False)
+            fake.status["print_stats"] = {"state": "complete", "filename": "later.gcode"}
+            sink = RecordingSink(resume=at(T0))
+            async with tracking_u1(sink, 3, 0, 2, 1, fake=fake):
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        sink = asyncio.run(run())
+        [start] = sink.of(JobStarted)
+        [event] = sink.of(JobFinished)
+
+        assert start.slot_notes == {}
+        assert start.estimated_filament_g_by_slot == {0: 30.2, 1: 9.8, 2: 3.6, 3: 1.5}
+        assert event.filament_mm[0] == pytest.approx(15060.0 * 30.2 / 45.1)
+
+    def test_what_it_saw_each_head_feed_still_wins(self):
+        async def run():
+            sink = RecordingSink()
+            async with tracking_u1(sink, 3, 0, 2, 1) as fake:
+                job = await fake.start_job("u1/dragon.gcode", U1_METADATA, start_time=T0)
+                await feed(fake, "u1/dragon.gcode", U1_STEPS)
+                await fake.finish_job(job, filament_used=15060.0)
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(run()).of(JobFinished)
+
+        assert event.filament_mm[0] == pytest.approx(11000.0, rel=0.01)
+        assert event.filament_mm[3] == pytest.approx(500.0, rel=0.01)

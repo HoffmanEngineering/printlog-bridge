@@ -46,6 +46,7 @@ from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
 from .slicer import MoonrakerSlicerFiles, slicer_metadata
 from .spools import RESPOND_MACRO, answer_script
+from .task_config import K3_FIELDS, U1_FIELDS, placed, slot_notes, tool_map
 from .timelapse import TimelapseWatcher
 from .tools import (
     PRINTING,
@@ -104,6 +105,8 @@ class JobTracker:
         self._file_grams: dict[str, dict[int, float]] = {}
         """The slicer's grams per tool found in a job's settings block, by job id, kept for its
         end when Moonraker's metadata has none (Creality Print's files)."""
+        self._replay_status: Mapping[str, Any] = {}
+        """Klipper's status as asked for on connecting, for the jobs replayed then."""
         self._can_respond: bool | None = None
         self._tasks: set[asyncio.Future] = set()
 
@@ -125,9 +128,15 @@ class JobTracker:
             self.report.warn(HISTORY_TOPIC, problem)
             return
         self.report.warn(HISTORY_TOPIC, None)
-        for n, job in enumerate(jobs, 1):
-            # Only the newest job can be the print Klipper ran last, whose usage was tracked.
-            await self._report(job, latest=n == len(jobs))
+        # Replayed before the subscription answers: what Klipper ran last, and its tool map and
+        # loaded slots, are asked for once, so the job they describe gets them (`_here`).
+        self._replay_status = await _replay_status(call) if jobs else {}
+        try:
+            for n, job in enumerate(jobs, 1):
+                # Only the newest job can be the print Klipper ran last, whose usage was tracked.
+                await self._report(job, latest=n == len(jobs))
+        finally:
+            self._replay_status = {}
 
     async def on_klippy_state(self, state: str) -> None:
         if state == "ready":
@@ -206,6 +215,16 @@ class JobTracker:
                 del self._file_grams[next(iter(self._file_grams))]
         return file
 
+    def _here(self, job: Mapping[str, Any], live: bool) -> Mapping[str, Any] | None:
+        """Klipper's status, when it describes `job`: a job announced as it happens, or the
+        file Klipper ran last. Only then are its tool map and loaded filaments the job's
+        (`task_config.py`); an older job's are long gone."""
+        if live:
+            return self._status
+        status = self._replay_status or self._status
+        filename = (status.get("print_stats") or {}).get("filename")
+        return status if filename and filename == job.get("filename") else None
+
     def _spawn(self, work) -> None:
         task = asyncio.ensure_future(work)
         self._tasks.add(task)
@@ -249,7 +268,8 @@ class JobTracker:
     async def _report(
         self, job: Mapping[str, Any], live: bool = False, latest: bool = False
     ) -> None:
-        start = started(self.printer, job)
+        here = self._here(job, live)
+        start = started(self.printer, job, here)
         model = (job.get("metadata") or {}).get("printer_model")
         if isinstance(model, str) and model.strip():
             self.report.printer_model(model.strip())
@@ -285,7 +305,10 @@ class JobTracker:
             tracked = self._usage.take(filename) if latest else {}
             excluded = self._excluded.take(filename) if latest else None
             from_file = self._file_grams.pop(start.job_id, {})
-            await self.sink.emit(finished(self.printer, job, message, tracked, excluded, from_file))
+            table = tool_map(here) if here is not None else None
+            await self.sink.emit(
+                finished(self.printer, job, message, tracked, excluded, from_file, table)
+            )
             if live and self.timelapse is not None:
                 self.timelapse.job_ended(start.job_id, start.file_name)
             if live and images is not None and images.snapshots and call is not None:
@@ -299,8 +322,28 @@ class JobTracker:
                 )
 
 
-def started(printer: str, job: Mapping[str, Any]) -> JobStarted:
+async def _replay_status(call: Call) -> Mapping[str, Any]:
+    """The file Klipper ran last, and where it sent each tool and what each slot has loaded;
+    empty when Klipper can't say (not ready yet, or an object it doesn't have)."""
+    objects = {"print_stats": ["filename"], "print_task_config": U1_FIELDS, "box": K3_FIELDS}
+    try:
+        result = await call("printer.objects.query", {"objects": objects})
+    except Exception as e:
+        log.debug("couldn't ask Klipper what it ran last: %s", e)
+        return {}
+    status = (result or {}).get("status") if isinstance(result, Mapping) else None
+    return status if isinstance(status, Mapping) else {}
+
+
+def started(
+    printer: str, job: Mapping[str, Any], here: Mapping[str, Any] | None = None
+) -> JobStarted:
+    """The job's start. `here` is Klipper's status when it describes this job (`_here`): the
+    slicer's grams per tool then go to the slots the printer sent each tool to, and each slot's
+    usage row is noted with what it has loaded."""
     metadata = job.get("metadata") or {}
+    table = tool_map(here) if here is not None else None
+    total_g = _positive(metadata.get("filament_weight_total"))
     return JobStarted(
         printer=printer,
         job_id=str(job["job_id"]),
@@ -309,7 +352,8 @@ def started(printer: str, job: Mapping[str, Any]) -> JobStarted:
         estimated_duration_s=_positive(metadata.get("estimated_time")),
         estimated_filament_mm=_positive(metadata.get("filament_total")),
         estimated_filament_g=_positive(metadata.get("filament_weight_total")),
-        estimated_filament_g_by_slot=estimated_grams_by_slot(metadata),
+        estimated_filament_g_by_slot=placed(estimated_grams_by_slot(metadata), table, total_g),
+        slot_notes=slot_notes(here) if here is not None else {},
     )
 
 
@@ -320,10 +364,13 @@ def finished(
     tracked: Mapping[int, float] | None = None,
     excluded: str | None = None,
     from_file: Mapping[int, float] | None = None,
+    table: list[int] | None = None,
 ) -> JobFinished:
     """The job's end. `tracked` is what the bridge saw each slot feed (`tools.ToolUsage`),
     `excluded` its note on the objects cancelled mid-print (`excluded.ExcludedObjects`), and
-    `from_file` the slicer's grams per tool read from the file, for when the metadata has none."""
+    `from_file` the slicer's grams per tool read from the file, for when the metadata has none.
+    `table` is where the printer sent each of the slicer's tools (`task_config.tool_map`), which
+    places those estimates when the bridge saw no tool feed."""
     status = str(job.get("status"))
     outcome, note = OUTCOMES.get(
         status, (JobOutcome.FAILED, f"Moonraker ended the job as {status}")
@@ -335,7 +382,9 @@ def finished(
     filament_mm = per_slot(
         job.get("filament_used") or 0,
         tracked or {},
-        estimated_grams_by_slot(job.get("metadata") or {}) or dict(from_file or {}),
+        placed(
+            estimated_grams_by_slot(job.get("metadata") or {}) or dict(from_file or {}), table, 1.0
+        ),
     )
     return JobFinished(
         printer=printer,

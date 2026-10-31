@@ -30,8 +30,8 @@ skipped by default.
   are in `scripts/install_helper.py`.
 - Secrets (API keys, store keys) never reach logs, traces or support bundles: `core/secrets.py`
   scrubs them, and new output paths go through it.
-- `tests/fixtures/moonraker/` holds real answers from a Snapmaker U1 and an Infimech EX. Don't edit
-  them to make a test pass; record a new trace (`trace = true`) instead.
+- `tests/fixtures/moonraker/` holds real answers from a Snapmaker U1, an Infimech EX and a
+  Creality K3. Don't edit them to make a test pass; record a new trace (`trace = true`) instead.
 - Tests never call the real 3D Print Log API or Auth0: use `tests/fake_printlog_api.py`,
   `tests/fake_auth0.py` and `tests/fake_moonraker.py`. A test of `run` without credentials
   pairs first, so point its `api_url` at a fake (or at `http://127.0.0.1:9`), never the default.
