@@ -2,7 +2,7 @@
 
 An open-source bridge agent that watches Klipper/Moonraker printers and logs every print to [3D Print Log](https://www.3dprintlog.com) automatically: real outcome, duration, per-spool filament usage and a picture, with no manual entry and no printer config edits.
 
-It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1.
+It runs in **local mode** on the printer's own host (Moonraker Unix socket) or in **remote mode** on any LAN host (Pi, Docker, NAS) over Moonraker's WebSocket, which covers locked-down printers such as the Snapmaker U1 and the [Creality K3](#creality-k3) on stock firmware.
 
 It also watches **Bambu Lab printers** (X1, P1, A1, H2) over their LAN connection, **Prusa printers with PrusaLink** (MK4/MK4S, MK3.5/3.9, Core One, MINI, XL) over its local API, **printers run by OctoPrint** over OctoPrint's API, the **Elegoo Centauri Carbon** over its local protocol (SDCP), **Duet boards with RepRapFirmware** over their HTTP API, the **FlashForge Adventurer 5M, 5M Pro and AD5X** over their LAN API (SDCP, Duet and FlashForge not yet checked on a real printer), and **Anycubic printers in LAN mode** (Kobra S1, Kobra 3, Photon P1) over their own MQTT broker, from any host on the same network: see [Bambu Lab printers](#bambu-lab-printers), [Prusa printers (PrusaLink)](#prusa-printers-prusalink), [OctoPrint](#octoprint), [Elegoo Centauri Carbon (SDCP)](#elegoo-centauri-carbon-sdcp), [Duet / RepRapFirmware](#duet--reprapfirmware), [FlashForge (Adventurer 5M series, AD5X)](#flashforge-adventurer-5m-series-ad5x) and [Anycubic (LAN mode)](#anycubic-lan-mode).
 
@@ -527,6 +527,20 @@ The bridge asks the printer for its status (`/detail`) every 5 seconds while pri
 The printer keeps no job history the bridge can read, so **a print that starts and ends while the bridge is down isn't logged**. One that ends while the bridge is down is logged when it's back: with how it ended while the printer still shows it, otherwise by how far it got (99% or more: completed), with a note.
 
 Not yet: the camera (an MJPEG stream on port 8080), the Adventurer 3 and 4 (only the old TCP protocol), and the Creator 5 series. Firmware versions checked: none yet.
+
+### Creality K3
+
+The Creality K3 runs Moonraker on port 7125 on its stock firmware, so the bridge watches it with the Moonraker adapter in remote mode, with no rooting and no changes to the printer. Checked on a real K3 logging a two-color print from its CFS ([#87](https://github.com/HoffmanEngineering/printlog-bridge/issues/87)).
+
+```ini
+[printer k3]
+printer_id = 51
+url = http://192.168.1.70:7125
+```
+
+Give the printer a fixed address (a DHCP reservation in your router). Its Moonraker needs no API key from the network. Creality Print and the printer's screen keep working as before: the bridge only reads.
+
+Not yet checked: that the K3's four nozzles split the filament per tool (it should, as a Klipper toolchanger), and that Moonraker is up straight after a cold boot (in our first probe, just after unboxing, only Creality's own websocket on port 9999 answered). Firmware checked: DWIN 4.0.3.1.25 (Klipper `09faed31`). Other Creality printers on stock firmware (K1, K2, Hi, Ender-3 V3) are unconfirmed: `printlog-bridge probe` ([Probing an unsupported printer](#probing-an-unsupported-printer)) shows whether yours answers on 7125.
 
 ### Timelapse videos (Pro)
 
