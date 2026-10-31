@@ -61,6 +61,7 @@ from printlog_bridge.core.api_client import (
     ClaimConflict,
     RepairNeeded,
 )
+from printlog_bridge.core.colors import normalized
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
     AttachmentKind,
@@ -1312,6 +1313,7 @@ class JobLogger:
             rows_now = print_.get("filamentUsage") or []
             conflicts: list[str] = []
             usage = _usage_rows(event, rows_now, loaded, single_tool, swaps, conflicts)
+            conflicts.extend(_pair_placeholders(usage, rows_now, job.start))
             noted = "\n".join([*swap_notes(swaps, fed), *conflicts])
             hints = change_hints(job.filament_changes, swaps)
             completion = {"usage": usage, "notes": [n for n in (event.note, noted, *hints) if n]}
@@ -1515,6 +1517,98 @@ def _unplaced_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
         for f in start.get("unplaced") or []
         if f.get("grams")
     ]
+
+
+UNPAIRED_NOTE = (
+    "Sliced filament {n}'s estimate wasn't matched to a measured slot. If the print's total "
+    "looks high, delete its row."
+)
+
+
+def _pair_placeholders(
+    usage: list[dict[str, Any]], rows_now: Sequence[Mapping[str, Any]], start: Mapping[str, Any]
+) -> list[str]:
+    """Names, by `rowId`, the row with no slot each unplaced sliced filament got
+    (`_unplaced_rows`) on the measured slot that fed it, so completing fills that row instead of
+    adding one beside it and counting its estimate twice (printlog-bridge#128). Ids come from
+    the print as read now: an edit gives every row a new one. A slot is paired only when it has
+    no row of its own; with several, the nearest in color first. Returns a note for each
+    placeholder left unpaired."""
+    unplaced = list(start.get("unplaced") or [])
+    if not unplaced:
+        return []
+    placeholders = [
+        row
+        for row in rows_now
+        if row.get("slot") is None
+        and not row.get("filament")
+        and not any(row.get(k) for k in ("amountMg", "lengthInM", "volumeMl"))
+        and row.get("id")
+    ]
+    if not placeholders:
+        return []
+    slots_with_rows = {row.get("slot") for row in rows_now if row.get("slot") is not None}
+    spools = {(row.get("filament") or {}).get("id") for row in rows_now if row.get("filament")}
+    open_rows = [
+        row
+        for row in usage
+        if row.get("slot") is not None
+        and row["slot"] not in slots_with_rows
+        and (row.get("filamentId") is None or row["filamentId"] not in spools)
+    ]
+    sliced = {id(row): _sliced_for(row, unplaced) for row in placeholders}
+    slot_colors = {int(slot): color for slot, color in (start.get("slot_colors") or {}).items()}
+
+    def distance(row: Mapping[str, Any], placeholder: Mapping[str, Any]) -> float:
+        a = _rgb(slot_colors.get(row["slot"]))
+        filament = sliced[id(placeholder)]
+        b = _rgb(filament.get("color") if filament else None)
+        if a is None or b is None:
+            return float("inf")
+        return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+    pairs = sorted(
+        (
+            (distance(row, p), n, m)
+            for n, row in enumerate(open_rows)
+            for m, p in enumerate(placeholders)
+        ),
+        key=lambda pair: pair[0],
+    )
+    taken_rows: set[int] = set()
+    taken_placeholders: set[int] = set()
+    for _, n, m in pairs:
+        if n in taken_rows or m in taken_placeholders:
+            continue
+        open_rows[n]["rowId"] = placeholders[m]["id"]
+        taken_rows.add(n)
+        taken_placeholders.add(m)
+    return [
+        UNPAIRED_NOTE.format(n=(sliced[id(p)] or {}).get("index", m) + 1)
+        for m, p in enumerate(placeholders)
+        if m not in taken_placeholders
+    ]
+
+
+def _sliced_for(
+    row: Mapping[str, Any], unplaced: Sequence[Mapping[str, Any]]
+) -> Mapping[str, Any] | None:
+    """The unplaced sliced filament a placeholder row was created for: by its note, else by its
+    estimate (the user may have edited the note)."""
+    for filament in unplaced:
+        if row.get("notes") and row.get("notes") == filament.get("note"):
+            return filament
+    for filament in unplaced:
+        if row.get("estimatedAmountMg") == round((filament.get("grams") or 0) * 1000):
+            return filament
+    return None
+
+
+def _rgb(color: Any) -> tuple[int, int, int] | None:
+    value = normalized(color) if isinstance(color, str) else None
+    if value is None:
+        return None
+    return int(value[1:3], 16), int(value[3:5], 16), int(value[5:7], 16)
 
 
 def _estimate_rows_bare(start: Mapping[str, Any]) -> list[dict[str, Any]]:
