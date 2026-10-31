@@ -1511,19 +1511,61 @@ def _merge_actual_usage(
                 row["slot"] = 0
         return row
 
+    # A row named by `rowId` first (api#303, printlog-bridge#128): it keeps a spool linked to
+    # it, takes the slot when it had none, and an id not on the print is ignored.
+    named: dict[int, dict[str, Any]] = {}
+    for n, incoming in enumerate(usage):
+        row = next((r for r in rows if r["id"] == incoming.get("rowId")), None)
+        if row is None or any(row is r for r in named.values()):
+            continue
+        named[n] = row
+        if row in unlinked:
+            unlinked.remove(row)
+        if row["filament"] is None and incoming.get("filamentId"):
+            row["filament"] = {"id": incoming["filamentId"]}
+        if row["slot"] is None:
+            row["slot"] = incoming.get("slot")
+
+    spools = {u["filamentId"] for u in usage if u.get("filamentId")}
+    claimed = [*named.values()]
     matches: dict[int, dict[str, Any] | None] = {}
     for n, incoming in enumerate(usage):
+        if n in named:
+            continue
         if not incoming.get("filamentId") and incoming.get("slot") is not None:
-            matches[n] = take_on_slot(incoming["slot"])
+            # Else the slot's row whose spool no measurement names (a spool loaded since).
+            row = take_on_slot(incoming["slot"]) or next(
+                (
+                    r
+                    for r in rows
+                    if r["slot"] == incoming["slot"]
+                    and r["filament"]
+                    and r["filament"]["id"] not in spools
+                    and not any(r is c for c in claimed)
+                ),
+                None,
+            )
+            if row is not None:
+                claimed.append(row)
+            matches[n] = row
     for n, incoming in enumerate(usage):
+        if n in named:
+            continue
         if incoming.get("filamentId") and incoming.get("slot") is not None:
             if any((r["filament"] or {}).get("id") == incoming["filamentId"] for r in rows):
                 continue
             matches[n] = take_on_slot(incoming["slot"])
     for n, incoming in enumerate(usage):
-        if incoming.get("filamentId"):
+        if n in named:
+            match = named[n]
+        elif incoming.get("filamentId"):
             match = next(
-                (r for r in rows if (r["filament"] or {}).get("id") == incoming["filamentId"]),
+                (
+                    r
+                    for r in rows
+                    if (r["filament"] or {}).get("id") == incoming["filamentId"]
+                    and not any(r is v for v in named.values())
+                ),
                 None,
             ) or matches.get(n)
             if match is not None:

@@ -24,6 +24,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from printlog_bridge.adapters.moonraker.tools import SlicedFilament
 from printlog_bridge.core.colors import normalized, slot_note
 
 U1_FIELDS = [
@@ -141,3 +142,77 @@ def placed(
     if table and table[0] != 0 and single:
         return {table[0]: single}
     return {}
+
+
+NEAR = 80.0
+"""How far apart in RGB (0-255 per channel) a sliced filament's color and a slot's may be for
+the filament to be placed there: #FF0000 to the K3's #FF1E1E red is 42."""
+TIE = 10.0
+"""How much nearer the nearest slot must be than the next: two slots of one color are a tie,
+and the filament is left unplaced rather than guessed."""
+
+
+def placed_by_color(
+    filaments: Sequence[SlicedFilament],
+    slots: Mapping[int, tuple[str | None, str | None]],
+) -> tuple[dict[int, float], list[int]]:
+    """The slicer's grams per filament, in the slots nearest in color, for a printer that
+    doesn't say where it sent each tool (a K3). `slots` is `loaded()`'s. A filament goes to the
+    nearest slot of the same material (by its first word, when both are known) within `NEAR`,
+    unless another is within `TIE` of it; several may go to one slot, and add up. Returns the
+    grams by slot and the indexes of the filaments not placed (a filament with no grams is
+    neither)."""
+    by_slot: dict[int, float] = {}
+    unplaced: list[int] = []
+    for index, filament in enumerate(filaments):
+        if filament.grams <= 0:
+            continue
+        slot = _nearest(filament, slots)
+        if slot is None:
+            unplaced.append(index)
+        else:
+            by_slot[slot] = round(by_slot.get(slot, 0.0) + filament.grams, 4)
+    return by_slot, unplaced
+
+
+def _nearest(
+    filament: SlicedFilament, slots: Mapping[int, tuple[str | None, str | None]]
+) -> int | None:
+    rgb = _rgb(filament.color)
+    if rgb is None:
+        return None
+    distances = sorted(
+        (_distance(rgb, slot_rgb), slot)
+        for slot, (color, material) in slots.items()
+        for slot_rgb in [_rgb(color)]
+        if slot_rgb is not None and _same_material(filament.material, material)
+    )
+    if not distances or distances[0][0] > NEAR:
+        return None
+    if len(distances) > 1 and distances[1][0] - distances[0][0] <= TIE:
+        return None
+    return distances[0][1]
+
+
+def _rgb(color: str | None) -> tuple[int, int, int] | None:
+    value = normalized(color) if color else None
+    if value is None:
+        return None
+    return int(value[1:3], 16), int(value[3:5], 16), int(value[5:7], 16)
+
+
+def _distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+def _same_material(sliced: str | None, slot: str | None) -> bool:
+    if not sliced or not slot or not sliced.split() or not slot.split():
+        return True
+    return sliced.split()[0].lower() == slot.split()[0].lower()
+
+
+def unplaced_note(index: int, color: str | None, material: str | None) -> str:
+    """The note on the row of a sliced filament not placed on a slot: "Sliced filament 1 · Red
+    (#FF0000) · PLA: printer slot not known" for T0, worded as `slot_note`."""
+    note = slot_note(index, color, material)
+    return "Sliced filament" + note[len("Slot") :] + ": printer slot not known"

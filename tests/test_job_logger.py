@@ -18,6 +18,7 @@ from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import (
     AttachmentKind,
+    FileEstimate,
     ImageKind,
     JobAttachment,
     JobFinished,
@@ -25,6 +26,7 @@ from printlog_bridge.core.events import (
     JobOutcome,
     JobStarted,
     SpoolReading,
+    UnplacedFilament,
 )
 from printlog_bridge.core.images import FileUnavailable
 from printlog_bridge.core.lifecycle import (
@@ -1905,3 +1907,217 @@ class TestLoadedSpools:
         assert "PETG" in print_["notes"]
         assert "Basic PLA" in print_["notes"]
         assert print_["status"] == 3  # logged all the same
+
+
+FUECOCO_ESTIMATE = FileEstimate(
+    duration_s=9597.0,
+    filament_g=41.6,
+    by_slot={0: 10.33, 1: 5.58, 2: 3.93},
+    unplaced=[
+        UnplacedFilament(
+            0, 21.76, "#FF0000", "Sliced filament 1 · Red (#FF0000) · PLA: printer slot not known"
+        )
+    ],
+    slot_colors={0: "#FFFFFF", 1: "#000000", 2: "#FFF014", 3: "#FF1E1E"},
+)
+
+
+def reading(estimate, calls: list):
+    async def read():
+        calls.append(1)
+        if isinstance(estimate, Exception):
+            raise estimate
+        return estimate
+
+    return read
+
+
+class TestEstimateFromTheFile:
+    """A job whose metadata has no estimate (a Creality Print file on a K3) gets one from its
+    file before the print is created (printlog-bridge#128)."""
+
+    def test_the_print_starts_with_the_files_duration_rows_and_notes(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+        notes = {0: "Slot 1 · White (#FFFFFF) · PLA"}
+
+        run(
+            api, tmp_path, started(slot_notes=notes, read_estimate=reading(FUECOCO_ESTIMATE, calls))
+        )
+
+        [created] = api.created
+        assert calls == [1]
+        assert created["estimatedPrintTimeInSeconds"] == 9597
+        assert created["estimatedFilamentUsageMg"] == 41600
+        rows = created["filamentUsage"]
+        assert [(r.get("slot"), r["estimatedAmountMg"]) for r in rows] == [
+            (0, 10330),
+            (1, 5580),
+            (2, 3930),
+            (None, 21760),
+        ]
+        assert rows[0]["notes"] == notes[0]
+        assert rows[3]["notes"] == "Sliced filament 1 · Red (#FF0000) · PLA: printer slot not known"
+        assert rows[3]["estimatedSource"] == 1  # Weight
+        assert "slot" not in rows[3]
+
+    def test_with_slicer_settings_off_the_file_is_never_read(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+
+        run(
+            api,
+            tmp_path,
+            started(read_estimate=reading(FUECOCO_ESTIMATE, calls)),
+            slicer_settings=False,
+        )
+
+        assert calls == []
+        [created] = api.created
+        assert "estimatedPrintTimeInSeconds" not in created
+        assert "filamentUsage" not in created
+
+    def test_the_metadatas_estimate_wins(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+
+        run(
+            api,
+            tmp_path,
+            started(
+                estimated_duration_s=600.0,
+                estimated_filament_g=3.0,
+                estimated_filament_g_by_slot={0: 1.0, 1: 2.0},
+                read_estimate=reading(FUECOCO_ESTIMATE, calls),
+            ),
+        )
+
+        [created] = api.created
+        assert created["estimatedPrintTimeInSeconds"] == 600
+        assert [r["estimatedAmountMg"] for r in created["filamentUsage"]] == [1000, 2000]
+
+    def test_a_start_seen_before_reads_nothing(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+
+        run(api, tmp_path, started())
+        run(api, tmp_path, started(read_estimate=reading(FUECOCO_ESTIMATE, calls)))
+
+        assert calls == []
+
+    @pytest.mark.parametrize("answer", [None, OSError("gone")])
+    def test_nothing_read_creates_the_print_as_before(self, tmp_path, answer):
+        api, calls = FakePrintLogApi(), []
+
+        run(api, tmp_path, started(read_estimate=reading(answer, calls)))
+
+        [created] = api.created
+        assert calls == [1]
+        assert "filamentUsage" not in created
+
+
+TWO_UNPLACED = FileEstimate(
+    duration_s=9597.0,
+    filament_g=41.6,
+    by_slot={0: 10.33, 1: 5.58},
+    unplaced=[
+        UnplacedFilament(
+            0, 21.76, "#FF0000", "Sliced filament 1 · Red (#FF0000) · PLA: printer slot not known"
+        ),
+        UnplacedFilament(
+            2, 3.93, "#FFFF00", "Sliced filament 3 · Yellow (#FFFF00) · PLA: printer slot not known"
+        ),
+    ],
+    slot_colors={0: "#FFFFFF", 1: "#000000", 2: "#FFF014", 3: "#FF1E1E"},
+)
+FED = {0: 3462.0, 1: 1870.0, 2: 1319.0, 3: 7295.0}
+
+
+class TestPlaceholdersAtTheEnd:
+    """An unplaced filament's row (no slot) is filled by the measured slot that fed it, named by
+    `rowId`, so its estimate isn't counted again beside a new row (printlog-bridge#128)."""
+
+    def test_one_placeholder_is_filled_by_the_one_slot_with_no_row(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(
+            api,
+            tmp_path,
+            started(read_estimate=reading(FUECOCO_ESTIMATE, [])),
+            finished(filament_mm=FED),
+        )
+
+        rows = api.prints[1]["filamentUsage"]
+        assert len(rows) == 4
+        red = next(r for r in rows if r["slot"] == 3)
+        assert red["estimatedAmountMg"] == 21760
+        assert red["lengthInM"] == 7.295
+        assert red["notes"].startswith("Sliced filament 1 · Red")
+        [completion] = api.completions
+        assert [u.get("rowId") is not None for u in completion["filamentUsage"]] == [
+            False,
+            False,
+            False,
+            True,
+        ]
+
+    def test_several_are_paired_by_color(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(
+            api,
+            tmp_path,
+            started(read_estimate=reading(TWO_UNPLACED, [])),
+            finished(filament_mm=FED),
+        )
+
+        rows = {r["slot"]: r for r in api.prints[1]["filamentUsage"]}
+        assert sorted(rows) == [0, 1, 2, 3]
+        assert rows[3]["notes"].startswith("Sliced filament 1 · Red")
+        assert rows[2]["notes"].startswith("Sliced filament 3 · Yellow")
+
+    def test_a_placeholder_no_slot_is_left_for_gets_a_note(self, tmp_path):
+        api = FakePrintLogApi()
+        fed = {0: 3462.0, 1: 1870.0, 3: 8614.0}  # both sliced to the red slot
+
+        run(
+            api,
+            tmp_path,
+            started(read_estimate=reading(TWO_UNPLACED, [])),
+            finished(filament_mm=fed),
+        )
+
+        rows = api.prints[1]["filamentUsage"]
+        assert len(rows) == 4
+        assert [r for r in rows if r["slot"] is None][0]["notes"].startswith("Sliced filament 3")
+        assert (
+            "Sliced filament 3's estimate wasn't matched to a measured slot. If the print's total "
+            "looks high, delete its row."
+        ) in api.prints[1]["notes"]
+
+    def test_a_placeholder_the_user_linked_is_filled_and_keeps_the_spool(self, tmp_path):
+        """Picking the spool for the "Other" row on the print (printlog-bridge#128): the slot
+        that fed still fills that row, and the user's spool stays on it."""
+        api = FakePrintLogApi()
+
+        def link(api):
+            row = next(r for r in api.prints[1]["filamentUsage"] if r["slot"] is None)
+            row["filament"] = {"id": "spool-red"}
+
+        run(
+            api,
+            tmp_path,
+            started(read_estimate=reading(FUECOCO_ESTIMATE, [])),
+            link,
+            finished(filament_mm=FED),
+        )
+
+        rows = api.prints[1]["filamentUsage"]
+        assert len(rows) == 4
+        red = next(r for r in rows if (r["filament"] or {}).get("id") == "spool-red")
+        assert red["slot"] == 3
+        assert red["lengthInM"] == 7.295
+
+    def test_a_start_with_nothing_unplaced_sends_no_row_ids(self, tmp_path):
+        api = FakePrintLogApi()
+
+        run(api, tmp_path, four_tool_start(), finished(filament_mm=FOUR_TOOL_USAGE))
+
+        [completion] = api.completions
+        assert not any("rowId" in u for u in completion["filamentUsage"])

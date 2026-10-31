@@ -10,14 +10,19 @@ the state goes to `printing`.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from printlog_bridge.adapters.moonraker.tools import (
+    SlicedFilament,
     ToolUsage,
     active_slot,
+    duration_from_file,
     estimated_grams_by_slot,
     grams_by_slot_from_file,
     per_slot,
+    sliced_filaments_from_file,
     slot_of,
 )
 
@@ -276,3 +281,60 @@ class TestGramsBySlotFromFile:
     )
     def test_is_empty_without_a_weight_per_tool(self, text):
         assert grams_by_slot_from_file(text) == {}
+
+
+K3_FILE = Path(__file__).parent / "fixtures" / "gcode" / "creality-print-7.3-k3-four-color.gcode"
+
+
+class TestSlicedFilamentsFromFile:
+    def test_reads_each_filaments_grams_color_and_type(self):
+        text = K3_FILE.read_text(encoding="utf-8")
+
+        assert sliced_filaments_from_file(text) == [
+            SlicedFilament(21.76, "#FF0000", "PLA"),
+            SlicedFilament(10.33, "#FFFFFF", "PLA"),
+            SlicedFilament(3.93, "#FFFF00", "PLA"),
+            SlicedFilament(5.58, "#000000", "PLA"),
+        ]
+
+    def test_a_color_or_type_missing_is_none(self):
+        text = "; filament used [g] = 1, 2\n; filament_colour = #FF0000\n"
+
+        assert sliced_filaments_from_file(text) == [
+            SlicedFilament(1.0, "#FF0000", None),
+            SlicedFilament(2.0, None, None),
+        ]
+
+    def test_a_one_filament_file_gives_its_one_filament(self):
+        text = "; filament used [g] = 13.27\n; filament_colour = #FF0000\n; filament_type = PLA\n"
+
+        assert sliced_filaments_from_file(text) == [SlicedFilament(13.27, "#FF0000", "PLA")]
+
+    @pytest.mark.parametrize(
+        "text", ["", "; filament used [g] = abc\n", "; filament used [g] = 0\n"]
+    )
+    def test_is_empty_without_a_weight(self, text):
+        assert sliced_filaments_from_file(text) == []
+
+
+class TestDurationFromFile:
+    def test_reads_creality_prints_estimate(self):
+        assert duration_from_file(K3_FILE.read_text(encoding="utf-8")) == 9597.0
+
+    @pytest.mark.parametrize(
+        "value, seconds",
+        [("1d 2h", 93600.0), ("57s", 57.0), ("39m 57s", 2397.0), ("1d 2h 3m 4s", 93784.0)],
+    )
+    def test_each_form(self, value, seconds):
+        assert duration_from_file(f"; estimated printing time (normal mode) = {value}\n") == seconds
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "; estimated printing time (normal mode) = soon\n",
+            "; estimated printing time (normal mode) = 0s\n",
+        ],
+    )
+    def test_nothing_usable_is_none(self, text):
+        assert duration_from_file(text) is None

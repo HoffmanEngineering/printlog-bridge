@@ -21,14 +21,17 @@ it wants them.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+from printlog_bridge.core.colors import normalized
 from printlog_bridge.core.events import (
     EventSink,
+    FileEstimate,
     ImageKind,
     JobFinished,
     JobImage,
@@ -37,6 +40,7 @@ from printlog_bridge.core.events import (
     JobSlicerSettings,
     JobStarted,
     SlicerFile,
+    UnplacedFilament,
 )
 from printlog_bridge.core.status import NullReport, PrinterReport
 
@@ -46,15 +50,26 @@ from .images import MoonrakerImages
 from .session import Call, MoonrakerRpcError
 from .slicer import MoonrakerSlicerFiles, slicer_metadata
 from .spools import RESPOND_MACRO, answer_script
-from .task_config import K3_FIELDS, U1_FIELDS, placed, slot_notes, tool_map
+from .task_config import (
+    K3_FIELDS,
+    U1_FIELDS,
+    loaded,
+    placed,
+    placed_by_color,
+    slot_notes,
+    tool_map,
+    unplaced_note,
+)
 from .timelapse import TimelapseWatcher
 from .tools import (
     PRINTING,
     ToolUsage,
     active_slot,
+    duration_from_file,
     estimated_grams_by_slot,
     grams_by_slot_from_file,
     per_slot,
+    sliced_filaments_from_file,
 )
 
 log = logging.getLogger(__name__)
@@ -105,6 +120,9 @@ class JobTracker:
         self._file_grams: dict[str, dict[int, float]] = {}
         """The slicer's grams per tool found in a job's settings block, by job id, kept for its
         end when Moonraker's metadata has none (Creality Print's files)."""
+        self._files: dict[str, SlicerFile] = {}
+        """What was read of each job's file, by job id and file name, so its estimate and its
+        slicer settings read it once between them (the last `MAX_FILE_GRAMS` jobs)."""
         self._replay_status: Mapping[str, Any] = {}
         """Klipper's status as asked for on connecting, for the jobs replayed then."""
         self._can_respond: bool | None = None
@@ -205,15 +223,67 @@ class JobTracker:
     async def _read_file(self, call: Call, job: Mapping[str, Any]) -> SlicerFile | None:
         """The job's slicer settings, as the sink asks for them (`JobSlicerSettings.read`, only
         with `slicer_settings` on). The settings block holds the slicer's grams per tool too,
-        kept for the job's end, so the file is read for them no more than for its settings."""
+        kept for the job's end, so the file is read for them no more than for its settings.
+        Read once per job: the estimate before the print is created (`_estimate_from_file`) and
+        the settings after it get the same read."""
         assert self.slicer is not None
+        job_id = str(job["job_id"])
+        # By file as well: Moonraker numbers jobs again after its history is cleared.
+        key = f"{job_id}:{job.get('filename') or ''}"
+        if key in self._files:
+            return self._files[key]
         file = await self.slicer.read(call, job)
+        if file is not None:  # nothing read can be tried again by the settings
+            self._files[key] = file
+            while len(self._files) > MAX_FILE_GRAMS:
+                del self._files[next(iter(self._files))]
         grams = grams_by_slot_from_file(file.config_block or "") if file is not None else {}
         if grams:
-            self._file_grams[str(job["job_id"])] = grams
+            self._file_grams[job_id] = grams
             while len(self._file_grams) > MAX_FILE_GRAMS:
                 del self._file_grams[next(iter(self._file_grams))]
         return file
+
+    async def _estimate_from_file(
+        self, call: Call, job: Mapping[str, Any], here: Mapping[str, Any] | None
+    ) -> FileEstimate | None:
+        """The slicer's estimate from the end of the job's file, for a job whose metadata has
+        none (`JobStarted.read_estimate`, printlog-bridge#128). Each sliced filament goes to the
+        slot the printer sent it to (the U1's tool map), else to the slot nearest in color (the
+        K3's CFS), else to its own number; one that can't be placed is `unplaced`."""
+        file = await self._read_file(call, job)
+        text = (file.config_block or "") if file is not None else ""
+        duration = duration_from_file(text)
+        filaments = sliced_filaments_from_file(text)
+        if not filaments:
+            return FileEstimate(duration_s=duration) if duration else None
+        grams = {index: f.grams for index, f in enumerate(filaments) if f.grams > 0}
+        table = tool_map(here) if here is not None else None
+        slots = loaded(here) if here is not None else {}
+        unplaced: list[UnplacedFilament] = []
+        if table or (here is not None and "box" not in here):
+            # The U1's map, or a printer with no CFS: the slicer's tools are its slots.
+            by_slot = placed(grams, table)
+        else:
+            # A K3, or a job whose printer state is long gone (`_here`): by color, and with
+            # nothing loaded to go by, nothing is placed rather than guessed.
+            by_slot, missing = placed_by_color(filaments, slots)
+            unplaced = [
+                UnplacedFilament(
+                    index,
+                    filaments[index].grams,
+                    normalized(filaments[index].color),
+                    unplaced_note(index, filaments[index].color, filaments[index].material),
+                )
+                for index in missing
+            ]
+        return FileEstimate(
+            duration_s=duration,
+            filament_g=round(sum(grams.values()), 4),
+            by_slot=by_slot,
+            unplaced=unplaced,
+            slot_colors={slot: color for slot, (color, _) in slots.items() if color},
+        )
 
     def _here(self, job: Mapping[str, Any], live: bool) -> Mapping[str, Any] | None:
         """Klipper's status, when it describes `job`: a job announced as it happens, or the
@@ -270,6 +340,11 @@ class JobTracker:
     ) -> None:
         here = self._here(job, live)
         start = started(self.printer, job, here)
+        if self.slicer is not None and self._call is not None and _no_estimate(job):
+            start = dataclasses.replace(
+                start,
+                read_estimate=functools.partial(self._estimate_from_file, self._call, job, here),
+            )
         model = (job.get("metadata") or {}).get("printer_model")
         if isinstance(model, str) and model.strip():
             self.report.printer_model(model.strip())
@@ -395,6 +470,14 @@ def finished(
         filament_mm=filament_mm,
         note=note,
     )
+
+
+def _no_estimate(job: Mapping[str, Any]) -> bool:
+    """Whether Moonraker's metadata for the job has no estimate at all (no time, no filament):
+    a Creality Print file, whose estimate is then read from the file's end."""
+    metadata = job.get("metadata") or {}
+    keys = ("estimated_time", "filament_total", "filament_weight_total", "filament_weights")
+    return not any(_positive(metadata.get(key)) or metadata.get(key) for key in keys)
 
 
 def _time(timestamp: float) -> datetime:
