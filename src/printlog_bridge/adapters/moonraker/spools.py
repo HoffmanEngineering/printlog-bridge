@@ -28,7 +28,7 @@ from typing import Any
 from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolSink
 
 from .session import Call
-from .tools import EXTRUDER, slot_of
+from .tools import EXTRUDER, active_slot
 from .u1_rfid import U1RfidReader
 
 log = logging.getLogger(__name__)
@@ -115,7 +115,7 @@ class SpoolWatcher:
             self._tools = None  # a config change may have added a tool
 
     async def on_status(self, status: Mapping[str, Any], changed: Mapping[str, Any]) -> None:
-        slot = slot_of((status.get("toolhead") or {}).get("extruder"))
+        slot = active_slot(status)
         if slot is not None:
             self._active = slot
         if self.reader is not None and "filament_detect" in changed:

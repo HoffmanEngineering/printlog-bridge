@@ -51,6 +51,7 @@ OPTIONAL_SUBSCRIPTION: Mapping[str, list[str] | None] = {
     "filament_detect": None,  # Snapmaker U1's RFID reader
     "exclude_object": ["objects", "excluded_objects"],  # objects cancelled mid-print
     "save_variables": ["variables"],  # each tool's spool in the user's own Spoolman (#38)
+    "nozzle_manager": ["selected"],  # a Creality K3's printing nozzle (`tools.active_slot`)
 }
 
 RemoteMethod = Callable[[Mapping[str, Any]], Awaitable[None]]

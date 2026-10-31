@@ -8,10 +8,19 @@ extruder named in `toolhead.extruder` at that update: `extruder` is slot 0, `ext
 and so on. That covers toolchangers (klipper-toolchanger), IDEX in its normal mode, and the
 Snapmaker U1's four heads (T0-T3).
 
+The Creality K3 on its stock firmware is different: it prints T1-T3 without switching Klipper's
+active extruder (`toolhead.extruder` stays `extruder`), and keeps the nozzle that prints, 0-3,
+in its own `nozzle_manager.selected` (-1 when none is). Each nozzle is fed by one slot of the
+CFS (nozzle 1 from slot A, and so on, in Creality's own websocket), and the slicer's colors are
+mapped to slots when the print is sent, so the nozzle, not the G-code's tool, is the slot used.
+So a nozzle named there is the active slot; elsewhere it's the active extruder (`active_slot`).
+
 What the bridge saw is then scaled to Moonraker's total for the job, which stays the source of
 truth. When it saw nothing (the job ran while the bridge was away), the slicer's estimate per
-tool decides the split; with no estimate per tool either, it all goes to slot 0, as on a
-single-tool printer.
+tool decides the split: Moonraker's `filament_weights`, or the file's own `; filament used [g]`
+line when Moonraker doesn't read the slicer's files (Creality Print). That estimate is by the
+slicer's tool order, which a K3's mapping at print time can change. With no estimate per tool
+either, it all goes to slot 0, as on a single-tool printer.
 
 Not covered: an MMU on one extruder (ERCF, Happy Hare, AFC), where every gate feeds `extruder`,
 and IDEX copy or mirror mode, where two heads print what Klipper counts once.
@@ -28,6 +37,8 @@ TOOL_MACRO = re.compile(r"gcode_macro t(\d+)", re.IGNORECASE)
 """A toolchanger's tool macro (`gcode_macro T1`). Fluidd and Mainsail keep each tool's spool
 in the user's own Spoolman as its `spool_id` variable."""
 PRINTING = ("printing", "paused")
+FILE_GRAMS = re.compile(r"^;\s*filament used \[g\]\s*=\s*(.+?)\s*$", re.MULTILINE)
+"""The slicer's grams per filament, in tool order (PrusaSlicer, OrcaSlicer, Creality Print)."""
 
 
 def macro_slot(name: str) -> int | None:
@@ -44,6 +55,19 @@ def slot_of(extruder: str | None) -> int | None:
     return int(match.group(1) or 0)
 
 
+def active_slot(status: Mapping[str, Any]) -> int | None:
+    """The slot of the tool printing: on a Creality K3, its selected nozzle, else the active
+    extruder; None when that doesn't say. A K3 with no nozzle selected (-1, idle or between
+    nozzles) gives None, so the last slot is kept: its `toolhead.extruder` is always slot 0."""
+    nozzles = status.get("nozzle_manager") or {}
+    if "selected" in nozzles:
+        selected = nozzles["selected"]
+        if isinstance(selected, int) and not isinstance(selected, bool) and selected >= 0:
+            return selected
+        return None
+    return slot_of((status.get("toolhead") or {}).get("extruder"))
+
+
 class ToolUsage:
     """Millimetres fed per slot for the print Klipper is running, or ran last."""
 
@@ -57,7 +81,7 @@ class ToolUsage:
 
     def update(self, status: Mapping[str, Any]) -> None:
         """Takes the subscribed objects' latest fields, after each status update."""
-        slot = slot_of((status.get("toolhead") or {}).get("extruder"))
+        slot = active_slot(status)
         if slot is not None:
             self._slot = slot
 
@@ -137,3 +161,19 @@ def estimated_grams_by_slot(metadata: Mapping[str, Any]) -> dict[int, float]:
         if isinstance(grams, (int, float)) and grams > 0:
             by_slot[slot] = float(grams)
     return by_slot
+
+
+def grams_by_slot_from_file(text: str) -> dict[int, float]:
+    """The slicer's grams per tool from the end of a G-code file, for when Moonraker's metadata
+    has none (it reads no weights from Creality Print's files). The last `; filament used [g]`
+    line wins; one with a single filament, or a value that isn't a number, gives nothing."""
+    lines = FILE_GRAMS.findall(text)
+    if not lines:
+        return {}
+    try:
+        weights = [float(value) for value in lines[-1].split(",")]
+    except ValueError:
+        return {}
+    if len(weights) < 2:
+        return {}
+    return {slot: grams for slot, grams in enumerate(weights) if grams > 0}

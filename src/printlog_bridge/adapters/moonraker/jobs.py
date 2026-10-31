@@ -36,6 +36,7 @@ from printlog_bridge.core.events import (
     JobPoint,
     JobSlicerSettings,
     JobStarted,
+    SlicerFile,
 )
 from printlog_bridge.core.status import NullReport, PrinterReport
 
@@ -46,12 +47,21 @@ from .session import Call, MoonrakerRpcError
 from .slicer import MoonrakerSlicerFiles, slicer_metadata
 from .spools import RESPOND_MACRO, answer_script
 from .timelapse import TimelapseWatcher
-from .tools import PRINTING, ToolUsage, estimated_grams_by_slot, per_slot, slot_of
+from .tools import (
+    PRINTING,
+    ToolUsage,
+    active_slot,
+    estimated_grams_by_slot,
+    grams_by_slot_from_file,
+    per_slot,
+)
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 50
 HISTORY_TOPIC = "history"
+MAX_FILE_GRAMS = 8
+"""Jobs whose grams per tool from the file are kept until they end: one runs at a time."""
 
 STOPPED = "Moonraker stopped during the print"
 OUTCOMES: Mapping[str, tuple[JobOutcome, str | None]] = {
@@ -91,6 +101,9 @@ class JobTracker:
         self._active = 0
         self._job: tuple[str, str, dict[int, float]] | None = None
         """The job in progress: its id, its file, and the slicer's grams per tool."""
+        self._file_grams: dict[str, dict[int, float]] = {}
+        """The slicer's grams per tool found in a job's settings block, by job id, kept for its
+        end when Moonraker's metadata has none (Creality Print's files)."""
         self._can_respond: bool | None = None
         self._tasks: set[asyncio.Future] = set()
 
@@ -122,7 +135,7 @@ class JobTracker:
 
     async def on_status(self, status: Mapping[str, Any], changed: Mapping[str, Any]) -> None:
         self._status = status
-        slot = slot_of((status.get("toolhead") or {}).get("extruder"))
+        slot = active_slot(status)
         if slot is not None:
             self._active = slot
         self._usage.update(status)
@@ -179,6 +192,19 @@ class JobTracker:
                 await call("printer.gcode.script", {"script": answer_script(text)})
         except Exception as e:
             log.debug("[printer %s] couldn't show it on the console: %s", self.printer, e)
+
+    async def _read_file(self, call: Call, job: Mapping[str, Any]) -> SlicerFile | None:
+        """The job's slicer settings, as the sink asks for them (`JobSlicerSettings.read`, only
+        with `slicer_settings` on). The settings block holds the slicer's grams per tool too,
+        kept for the job's end, so the file is read for them no more than for its settings."""
+        assert self.slicer is not None
+        file = await self.slicer.read(call, job)
+        grams = grams_by_slot_from_file(file.config_block or "") if file is not None else {}
+        if grams:
+            self._file_grams[str(job["job_id"])] = grams
+            while len(self._file_grams) > MAX_FILE_GRAMS:
+                del self._file_grams[next(iter(self._file_grams))]
+        return file
 
     def _spawn(self, work) -> None:
         task = asyncio.ensure_future(work)
@@ -243,7 +269,7 @@ class JobTracker:
                 )
             )
         if call is not None:
-            read = functools.partial(self.slicer.read, call, job) if self.slicer else None
+            read = functools.partial(self._read_file, call, job) if self.slicer else None
             metadata = job.get("metadata")
             await self.sink.emit(
                 JobSlicerSettings(
@@ -258,7 +284,8 @@ class JobTracker:
             filename = str(job.get("filename") or "")
             tracked = self._usage.take(filename) if latest else {}
             excluded = self._excluded.take(filename) if latest else None
-            await self.sink.emit(finished(self.printer, job, message, tracked, excluded))
+            from_file = self._file_grams.pop(start.job_id, {})
+            await self.sink.emit(finished(self.printer, job, message, tracked, excluded, from_file))
             if live and self.timelapse is not None:
                 self.timelapse.job_ended(start.job_id, start.file_name)
             if live and images is not None and images.snapshots and call is not None:
@@ -292,9 +319,11 @@ def finished(
     error_message: str | None = None,
     tracked: Mapping[int, float] | None = None,
     excluded: str | None = None,
+    from_file: Mapping[int, float] | None = None,
 ) -> JobFinished:
-    """The job's end. `tracked` is what the bridge saw each slot feed (`tools.ToolUsage`), and
-    `excluded` its note on the objects cancelled mid-print (`excluded.ExcludedObjects`)."""
+    """The job's end. `tracked` is what the bridge saw each slot feed (`tools.ToolUsage`),
+    `excluded` its note on the objects cancelled mid-print (`excluded.ExcludedObjects`), and
+    `from_file` the slicer's grams per tool read from the file, for when the metadata has none."""
     status = str(job.get("status"))
     outcome, note = OUTCOMES.get(
         status, (JobOutcome.FAILED, f"Moonraker ended the job as {status}")
@@ -306,7 +335,7 @@ def finished(
     filament_mm = per_slot(
         job.get("filament_used") or 0,
         tracked or {},
-        estimated_grams_by_slot(job.get("metadata") or {}),
+        estimated_grams_by_slot(job.get("metadata") or {}) or dict(from_file or {}),
     )
     return JobFinished(
         printer=printer,

@@ -68,7 +68,7 @@ from printlog_bridge.core.events import JobPoint, SpoolCommand, SpoolmanSpool, S
 
 from .session import Call, ConnectionLost, MoonrakerListener, MoonrakerRpcError
 from .spools import tool_count
-from .tools import macro_slot, slot_of
+from .tools import active_slot, macro_slot
 
 log = logging.getLogger(__name__)
 
@@ -253,7 +253,7 @@ class SpoolmanSync(MoonrakerListener):
         state = (status.get("print_stats") or {}).get("state")
         if isinstance(state, str):
             self._busy = state in BUSY
-        slot = slot_of((status.get("toolhead") or {}).get("extruder"))
+        slot = active_slot(status)
         tool_changed = slot is not None and slot != self.active_slot
         if slot is not None:
             self.active_slot = slot
