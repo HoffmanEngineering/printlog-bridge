@@ -6,7 +6,7 @@ Adapters translate their printer's own vocabulary into these events, and everyth
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -43,6 +43,43 @@ class JobStarted:
     `core.colors.slot_note`), put on that slot's usage row when the print is created. Only from
     what the printer reports, never the slicer's filament order, which a mapping at print time
     can change."""
+    read_estimate: Callable[[], Awaitable[FileEstimate | None]] | None = field(
+        default=None, compare=False, repr=False
+    )
+    """Reads the slicer's estimate from the job's file, for a job whose metadata has none (a
+    Creality Print file on a K3, printlog-bridge#128). The sink calls it once, before the print
+    is created, and only with `slicer_settings` on, so an adapter must not read the file before
+    then; it is the same read `JobSlicerSettings.read` makes, which then reads nothing again.
+    Never stored. Errors and a slow read (about 10 s) count as nothing read."""
+
+
+@dataclass(frozen=True)
+class UnplacedFilament:
+    """A sliced filament the adapter couldn't place on a printer slot: it gets a usage row with
+    no slot, which completing fills by `rowId` (printlog-bridge#128)."""
+
+    index: int
+    """Its place in the slicer's filaments, 0 for T0."""
+    grams: float
+    color: str | None
+    """`#RRGGBB`, from the file."""
+    note: str
+    """The row's note: "Sliced filament 2 · Red (#FF0000) · PLA: printer slot not known"."""
+
+
+@dataclass(frozen=True)
+class FileEstimate:
+    """The slicer's estimate as read from a job's file (`JobStarted.read_estimate`). The sink
+    uses what the start's metadata lacks."""
+
+    duration_s: float | None = None
+    filament_g: float | None = None
+    by_slot: Mapping[int, float] = field(default_factory=dict)
+    """Grams per printer slot, for the filaments placed on one."""
+    unplaced: Sequence[UnplacedFilament] = ()
+    slot_colors: Mapping[int, str] = field(default_factory=dict)
+    """The `#RRGGBB` the printer reported in each slot, for pairing a measured slot with an
+    unplaced filament's row when the job ends."""
 
 
 @dataclass(frozen=True)

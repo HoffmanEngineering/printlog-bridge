@@ -47,7 +47,7 @@ import os
 import shutil
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
@@ -64,6 +64,7 @@ from printlog_bridge.core.api_client import (
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
     AttachmentKind,
+    FileEstimate,
     FilamentChange,
     ImageKind,
     JobAttachment,
@@ -327,7 +328,9 @@ class JobLogger:
         elif isinstance(event, JobStarted):
             job = state.jobs.get(event.job_id)
             if job is None:
-                start = asdict(event)
+                estimate = await self._file_estimate(event)
+                start = asdict(replace(event, read_estimate=None))
+                del start["read_estimate"]  # the adapter's callable, never stored
                 start["started_at"] = event.started_at.isoformat()
                 start["estimated_filament_g_by_slot"] = {
                     str(slot): grams for slot, grams in event.estimated_filament_g_by_slot.items()
@@ -340,6 +343,8 @@ class JobLogger:
                     }
                 else:
                     del start["slot_notes"]  # as a start without them was kept before
+                if estimate is not None:
+                    _add_file_estimate(start, estimate)
                 job = state.jobs[event.job_id] = JobRecord(
                     started_at=start["started_at"], start=start
                 )
@@ -466,6 +471,15 @@ class JobLogger:
         # outbox holds one entry per job and kind, and nothing is sent before this save.
         job.images[kind] = True
         state.save()
+
+    async def _file_estimate(self, event: JobStarted) -> FileEstimate | None:
+        """The slicer's estimate from the job's file, when the adapter offers one and slicer
+        settings are on (with them off the file is never read, `docs/privacy.md`)."""
+        if event.read_estimate is None or not self.printers[event.printer].slicer_settings:
+            return None
+        where = f"[printer {event.printer}] job {event.job_id}'s estimate from its file"
+        estimate = await self._wait_for(event.read_estimate, where)
+        return estimate if isinstance(estimate, FileEstimate) else None
 
     async def _emit_slicer_settings(self, state: PrinterState, event: JobSlicerSettings) -> None:
         if not self.printers[event.printer].slicer_settings:
@@ -1054,6 +1068,7 @@ class JobLogger:
                 notes.append(EARLIER_READ_NOTE)
             if notes:
                 body["notes"] = "\n\n".join(notes)
+        rows.extend(_unplaced_rows(start))
         if rows:
             body["filamentUsage"] = rows
 
@@ -1465,9 +1480,52 @@ def _estimate_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _add_file_estimate(start: dict[str, Any], estimate: FileEstimate) -> None:
+    """Fills in what the start's metadata lacked from the file's estimate (`read_estimate`),
+    and keeps the filaments it couldn't place, with the slots' colors, for the job's end."""
+    if not start.get("estimated_duration_s") and estimate.duration_s:
+        start["estimated_duration_s"] = estimate.duration_s
+    if not start.get("estimated_filament_g") and estimate.filament_g:
+        start["estimated_filament_g"] = estimate.filament_g
+    if not start.get("estimated_filament_g_by_slot") and (estimate.by_slot or estimate.unplaced):
+        start["estimated_filament_g_by_slot"] = {
+            str(slot): grams for slot, grams in estimate.by_slot.items()
+        }
+        if estimate.unplaced:
+            start["unplaced"] = [
+                {"index": f.index, "grams": f.grams, "color": f.color, "note": f.note}
+                for f in estimate.unplaced
+            ]
+        if estimate.slot_colors:
+            start["slot_colors"] = {
+                str(slot): color for slot, color in estimate.slot_colors.items()
+            }
+
+
+def _unplaced_rows(start: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """A usage row with no slot for each sliced filament the adapter couldn't place on a slot
+    (printlog-bridge#128), with its estimate and note. It shows as "Other" until the user picks
+    its spool; completing fills it by `rowId` (`_pair_placeholders`)."""
+    return [
+        {
+            "estimatedAmountMg": round(f["grams"] * 1000),
+            "estimatedSource": WEIGHT,
+            "notes": f["note"],
+        }
+        for f in start.get("unplaced") or []
+        if f.get("grams")
+    ]
+
+
 def _estimate_rows_bare(start: Mapping[str, Any]) -> list[dict[str, Any]]:
     estimated = start.get("estimated_filament_g_by_slot") or {}
     by_slot = {int(slot): grams for slot, grams in estimated.items()}
+    if start.get("unplaced"):
+        # The totals count the unplaced filaments too, which get rows of their own.
+        return [
+            {"slot": slot, "estimatedAmountMg": round(grams * 1000), "estimatedSource": WEIGHT}
+            for slot, grams in sorted(by_slot.items())
+        ]
     if len(by_slot) > 1:
         return [
             {"slot": slot, "estimatedAmountMg": round(grams * 1000), "estimatedSource": WEIGHT}

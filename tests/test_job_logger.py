@@ -18,6 +18,7 @@ from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.connections import Connection, Heartbeat
 from printlog_bridge.core.events import (
     AttachmentKind,
+    FileEstimate,
     ImageKind,
     JobAttachment,
     JobFinished,
@@ -25,6 +26,7 @@ from printlog_bridge.core.events import (
     JobOutcome,
     JobStarted,
     SpoolReading,
+    UnplacedFilament,
 )
 from printlog_bridge.core.images import FileUnavailable
 from printlog_bridge.core.lifecycle import (
@@ -1905,3 +1907,106 @@ class TestLoadedSpools:
         assert "PETG" in print_["notes"]
         assert "Basic PLA" in print_["notes"]
         assert print_["status"] == 3  # logged all the same
+
+
+FUECOCO_ESTIMATE = FileEstimate(
+    duration_s=9597.0,
+    filament_g=41.6,
+    by_slot={0: 10.33, 1: 5.58, 2: 3.93},
+    unplaced=[
+        UnplacedFilament(
+            0, 21.76, "#FF0000", "Sliced filament 1 · Red (#FF0000) · PLA: printer slot not known"
+        )
+    ],
+    slot_colors={0: "#FFFFFF", 1: "#000000", 2: "#FFF014", 3: "#FF1E1E"},
+)
+
+
+def reading(estimate, calls: list):
+    async def read():
+        calls.append(1)
+        if isinstance(estimate, Exception):
+            raise estimate
+        return estimate
+
+    return read
+
+
+class TestEstimateFromTheFile:
+    """A job whose metadata has no estimate (a Creality Print file on a K3) gets one from its
+    file before the print is created (printlog-bridge#128)."""
+
+    def test_the_print_starts_with_the_files_duration_rows_and_notes(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+        notes = {0: "Slot 1 · White (#FFFFFF) · PLA"}
+
+        run(
+            api, tmp_path, started(slot_notes=notes, read_estimate=reading(FUECOCO_ESTIMATE, calls))
+        )
+
+        [created] = api.created
+        assert calls == [1]
+        assert created["estimatedPrintTimeInSeconds"] == 9597
+        assert created["estimatedFilamentUsageMg"] == 41600
+        rows = created["filamentUsage"]
+        assert [(r.get("slot"), r["estimatedAmountMg"]) for r in rows] == [
+            (0, 10330),
+            (1, 5580),
+            (2, 3930),
+            (None, 21760),
+        ]
+        assert rows[0]["notes"] == notes[0]
+        assert rows[3]["notes"] == "Sliced filament 1 · Red (#FF0000) · PLA: printer slot not known"
+        assert rows[3]["estimatedSource"] == 1  # Weight
+        assert "slot" not in rows[3]
+
+    def test_with_slicer_settings_off_the_file_is_never_read(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+
+        run(
+            api,
+            tmp_path,
+            started(read_estimate=reading(FUECOCO_ESTIMATE, calls)),
+            slicer_settings=False,
+        )
+
+        assert calls == []
+        [created] = api.created
+        assert "estimatedPrintTimeInSeconds" not in created
+        assert "filamentUsage" not in created
+
+    def test_the_metadatas_estimate_wins(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+
+        run(
+            api,
+            tmp_path,
+            started(
+                estimated_duration_s=600.0,
+                estimated_filament_g=3.0,
+                estimated_filament_g_by_slot={0: 1.0, 1: 2.0},
+                read_estimate=reading(FUECOCO_ESTIMATE, calls),
+            ),
+        )
+
+        [created] = api.created
+        assert created["estimatedPrintTimeInSeconds"] == 600
+        assert [r["estimatedAmountMg"] for r in created["filamentUsage"]] == [1000, 2000]
+
+    def test_a_start_seen_before_reads_nothing(self, tmp_path):
+        api, calls = FakePrintLogApi(), []
+
+        run(api, tmp_path, started())
+        run(api, tmp_path, started(read_estimate=reading(FUECOCO_ESTIMATE, calls)))
+
+        assert calls == []
+
+    @pytest.mark.parametrize("answer", [None, OSError("gone")])
+    def test_nothing_read_creates_the_print_as_before(self, tmp_path, answer):
+        api, calls = FakePrintLogApi(), []
+
+        run(api, tmp_path, started(read_estimate=reading(answer, calls)))
+
+        [created] = api.created
+        assert calls == [1]
+        assert "filamentUsage" not in created
