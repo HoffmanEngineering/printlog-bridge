@@ -13,10 +13,12 @@ import pytest
 from printlog_bridge.adapters.moonraker.task_config import (
     loaded,
     placed,
+    placed_by_color,
     remapped,
     slot_notes,
     tool_map,
 )
+from printlog_bridge.adapters.moonraker.tools import SlicedFilament
 
 FIXTURES = Path(__file__).parent / "fixtures" / "moonraker"
 
@@ -141,3 +143,62 @@ class TestSlotNotes:
             2: "Slot 3 · Yellow (#FFF014) · PLA",
             3: "Slot 4 · Red (#FF1E1E) · PLA",
         }
+
+
+FUECOCO = [
+    SlicedFilament(21.76, "#FF0000", "PLA"),
+    SlicedFilament(10.33, "#FFFFFF", "PLA"),
+    SlicedFilament(3.93, "#FFFF00", "PLA"),
+    SlicedFilament(5.58, "#000000", "PLA"),
+]
+
+
+class TestPlacedByColor:
+    """A K3 has no map of the G-code's tools, so each sliced filament goes to the CFS slot
+    nearest in color: slot 0 white, 1 black, 2 yellow (#FFF014), 3 red (#FF1E1E)."""
+
+    def test_places_each_filament_on_its_color(self):
+        assert placed_by_color(FUECOCO, loaded(K3)) == ({0: 10.33, 1: 5.58, 2: 3.93, 3: 21.76}, [])
+
+    def test_two_slots_of_one_color_are_a_tie(self):
+        slots = {**loaded(K3), 4: ("#FFFFFF", "PLA")}
+
+        by_slot, unplaced = placed_by_color(FUECOCO, slots)
+
+        assert unplaced == [1]
+        assert 0 not in by_slot and 4 not in by_slot
+
+    def test_a_color_nothing_is_near_is_unplaced(self):
+        blue = [SlicedFilament(4.0, "#1E88E5", "PLA"), *FUECOCO[1:]]
+
+        assert placed_by_color(blue, loaded(K3)) == ({0: 10.33, 1: 5.58, 2: 3.93}, [0])
+
+    def test_another_material_is_unplaced(self):
+        petg = [SlicedFilament(21.76, "#FF0000", "PETG"), *FUECOCO[1:]]
+
+        assert placed_by_color(petg, loaded(K3))[1] == [0]
+
+    def test_the_materials_first_word_matches(self):
+        slots = {3: ("#FF1E1E", "PLA Basic")}
+
+        assert placed_by_color([FUECOCO[0], FUECOCO[0]], slots) == ({3: 43.52}, [])
+
+    def test_two_filaments_of_one_color_add_up(self):
+        reds = [FUECOCO[0], SlicedFilament(1.0, "#FE0101", "PLA")]
+
+        assert placed_by_color(reds, loaded(K3)) == ({3: 22.76}, [])
+
+    def test_nothing_loaded_leaves_them_all_unplaced(self):
+        assert placed_by_color(FUECOCO, {}) == ({}, [0, 1, 2, 3])
+
+    def test_a_filament_with_no_color_is_unplaced(self):
+        assert placed_by_color([SlicedFilament(2.0, None, "PLA"), FUECOCO[1]], loaded(K3)) == (
+            {0: 10.33},
+            [0],
+        )
+
+    def test_a_filament_with_no_grams_is_left_out(self):
+        assert placed_by_color([SlicedFilament(0.0, "#123456", "PLA"), FUECOCO[1]], loaded(K3)) == (
+            {0: 10.33},
+            [],
+        )
