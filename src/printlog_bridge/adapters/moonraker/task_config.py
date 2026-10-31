@@ -209,3 +209,10 @@ def _same_material(sliced: str | None, slot: str | None) -> bool:
     if not sliced or not slot or not sliced.split() or not slot.split():
         return True
     return sliced.split()[0].lower() == slot.split()[0].lower()
+
+
+def unplaced_note(index: int, color: str | None, material: str | None) -> str:
+    """The note on the row of a sliced filament not placed on a slot: "Sliced filament 1 · Red
+    (#FF0000) · PLA: printer slot not known" for T0, worded as `slot_note`."""
+    note = slot_note(index, color, material)
+    return "Sliced filament" + note[len("Slot") :] + ": printer slot not known"

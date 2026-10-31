@@ -64,8 +64,8 @@ from printlog_bridge.core.api_client import (
 from printlog_bridge.core.config import Adoption
 from printlog_bridge.core.events import (
     AttachmentKind,
-    FileEstimate,
     FilamentChange,
+    FileEstimate,
     ImageKind,
     JobAttachment,
     JobEvent,
