@@ -1046,7 +1046,9 @@ class TestBridgeCheckIn:
                     sync = BridgeSync(
                         client, tmp_path, board, apply, device=device, discovery=found,
                         networks=lambda: ["192.168.1.0/24"],
-                        configured=lambda: [Found("moonraker", "192.168.1.50", 7125)],
+                        configured=lambda: [
+                            Found("moonraker", "192.168.1.50", 7125, name="voron", printer_id=42)
+                        ],
                     )  # fmt: skip
                     await sync.check_in()
             finally:
@@ -1055,7 +1057,8 @@ class TestBridgeCheckIn:
 
         [body], token, state = asyncio.run(scenario())
         assert set(body) <= CHECK_IN_FIELDS
-        assert all(set(d) == DISCOVERED_FIELDS for d in body["discovered"])
+        for d in body["discovered"]:  # a config-file printer's printer_id, and only its
+            assert set(d) == DISCOVERED_FIELDS | ({"printerId"} if d["configured"] else set())
         assert {d["address"] for d in body["discovered"]} == {"192.168.1.60", "192.168.1.50"}
         assert token not in json.dumps(body) and token not in state
 

@@ -80,6 +80,10 @@ def clean_mac(text: str) -> str | None:
     return ":".join(digits[i : i + 2] for i in range(0, 12, 2))
 
 
+def _printer_id(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def _text(value: Any) -> str | None:
     if value is None:
         return None
@@ -99,6 +103,9 @@ class Found:
     serial: str | None = None
     mainboard_id: str | None = None
     macs: tuple[str, ...] = ()
+    printer_id: int | None = None
+    """A config-file printer's `printer_id` (its id in 3D Print Log). Discovery never sets it;
+    sent as `printerId`, and only for a configured printer."""
 
     @property
     def identity(self) -> str:
@@ -133,10 +140,11 @@ class Found:
             serial=serial,
             mainboard_id=board,
             macs=tuple(macs),
+            printer_id=_printer_id(self.printer_id),
         )
 
     def to_json(self, configured: bool = False) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "kind": self.kind,
             "address": self.address,
             "port": self.port,
@@ -147,6 +155,9 @@ class Found:
             "macs": list(self.macs),
             "configured": configured,
         }
+        if configured and self.printer_id is not None:
+            out["printerId"] = self.printer_id
+        return out
 
     def same_printer(self, other: Found) -> bool:
         """Whether `other` is this printer: the same serial or mainboard id, a MAC in common
@@ -288,8 +299,8 @@ class DiscoveryService:
             )  # fmt: skip
             changed = True
         else:
-            changed = entry.found != _merge(entry.found, cleaned)
-            entry.found = _merge(entry.found, cleaned)
+            changed = entry.found != merge(entry.found, cleaned)
+            entry.found = merge(entry.found, cleaned)
             entry.seen = now
             entry.expires = max(entry.expires, now + life)
         entry.sources.add(source)
@@ -426,7 +437,7 @@ class DiscoveryService:
         }
 
 
-def _merge(old: Found, new: Found) -> Found:
+def merge(old: Found, new: Found) -> Found:
     """What is known of a printer: the newest answer, keeping what it left out."""
     return replace(
         new,

@@ -4,7 +4,8 @@
 - **Check-in**, `PUT /api/bridges/me`, at start, every `checkInSeconds` and right after a sweep:
   the bridge's version, mode and host name, the private networks it sees, when it last swept,
   and (with discovery on) the printers it recognized, those in the config file as
-  `configured: true`. The answer carries the desired list.
+  `configured: true` with their section's name and, when it has one, `printerId` (even when
+  discovery found them under another name). The answer carries the desired list.
 - **Poll**, `GET /api/bridges/me/desired` every `desiredPollSeconds` with the last `ETag`: 304 is
   unchanged; 404 `bridge_not_registered` means check in first.
 - **Desired list**: when its `version` (opaque, compared for equality) changes, the printers it
@@ -47,6 +48,7 @@ import re
 import socket
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -63,7 +65,7 @@ from printlog_bridge.core.api_client import (
 from printlog_bridge.core.app_printers import DesiredPrinter
 from printlog_bridge.core.credentials import KeyStore, Opener, short_fingerprint
 from printlog_bridge.core.device import DeviceToken, write_private_file
-from printlog_bridge.core.discovery import MAX_FOUND, DiscoveryService, Found
+from printlog_bridge.core.discovery import MAX_FOUND, DiscoveryService, Found, merge
 from printlog_bridge.core.status import StatusBoard
 
 log = logging.getLogger(__name__)
@@ -313,7 +315,7 @@ class BridgeSync:
             match = next((c for c in configured if c.same_printer(f)), None)
             if match is not None:
                 configured.remove(match)
-                out.append((True, f))
+                out.append((True, _as_configured(match, f)))
             else:
                 out.append((self.is_configured(f), f))
         out.extend((True, c) for c in configured)
@@ -592,3 +594,9 @@ class BridgeSync:
             discovery=(self.discovery.status() if self.discovery is not None else None),
             last_sweep_at=self.state.get("last_sweep_at"),
         )
+
+
+def _as_configured(entry: Found, found: Found) -> Found:
+    """A config-file printer that discovery found: what discovery knows of it, but the name
+    and printer id of its `[printer <name>]` section."""
+    return replace(merge(entry, found), name=entry.name or found.name, printer_id=entry.printer_id)

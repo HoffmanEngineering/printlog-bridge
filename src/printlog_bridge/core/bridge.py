@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from printlog_bridge.core.config import (
     APP_PRINTER_PREFIX,
     BridgeConfig,
     ConfigError,
+    PrinterConfig,
 )
 from printlog_bridge.core.connections import HEARTBEAT_INTERVAL_S, Heartbeat
 from printlog_bridge.core.credentials import KeyStore, Opener
@@ -256,6 +258,17 @@ async def _sync_quietly(sync: BridgeSync) -> None:
     await asyncio.Event().wait()
 
 
+def configured_entries(printers: Sequence[PrinterConfig]) -> list[Found]:
+    """The config file's printers as a check-in reports them: where each one is, named after
+    its `[printer <name>]` section, with its `printer_id`."""
+    out = []
+    for printer in printers:
+        entry = printer.adapter.found_entry()
+        if entry is not None:
+            out.append(replace(entry, name=printer.name, printer_id=printer.printer_id))
+    return out
+
+
 def _bridge_sync(
     config: BridgeConfig,
     api: ApiClient,
@@ -272,7 +285,7 @@ def _bridge_sync(
         discovery = DiscoveryService(hooks, **options.pop("discovery_options", {}))
 
     def configured() -> list[Found]:
-        return [e for e in (p.adapter.found_entry() for p in config.printers) if e is not None]
+        return configured_entries(config.printers)
 
     def is_configured(found: Found) -> bool:
         return any(p.adapter.watches(found) for p in app.config.printers)

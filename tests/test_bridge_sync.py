@@ -10,8 +10,11 @@ import logging
 import pytest
 from fake_printlog_api import ALL_DEVICE_SCOPES, FakePrintLogApi
 
+from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.core.api_client import ApiClient
+from printlog_bridge.core.bridge import configured_entries
 from printlog_bridge.core.bridge_sync import STATE_FILE, BridgeSync
+from printlog_bridge.core.config import load_config
 from printlog_bridge.core.device import DeviceToken
 from printlog_bridge.core.discovery import Discovery, DiscoveryService, Found
 from printlog_bridge.core.status import StatusBoard, read_status
@@ -113,6 +116,110 @@ def test_a_config_printer_not_found_on_the_network_is_still_reported_as_configur
 
     [only] = run(scenario())
     assert only["kind"] == "prusalink" and only["configured"] is True
+
+
+U1_MAC = "2c:cf:67:00:00:07"
+
+
+def test_a_config_printer_found_on_the_network_keeps_its_section_name_and_printer_id(tmp_path):
+    async def scenario():
+        configured = [
+            Found("moonraker", "192.168.4.207", 7125, name="u1", printer_id=13056,
+                  macs=(U1_MAC,)),
+        ]  # fmt: skip
+        async with setup(tmp_path, configured=lambda: configured) as (api, sync, _):
+            sync.discovery.heard(
+                Found("moonraker", "192.168.4.207", 7125, model="Snapmaker U1", name="lava",
+                      serial="U1SN0001", macs=(U1_MAC,)), "mdns",
+            )  # fmt: skip
+            await sync.check_in()
+            return api.check_ins[-1]["discovered"]
+
+    assert run(scenario()) == [
+        {"kind": "moonraker", "address": "192.168.4.207", "port": 7125, "model": "Snapmaker U1",
+         "name": "u1", "serial": "U1SN0001", "mainboardId": None, "macs": [U1_MAC],
+         "configured": True, "printerId": 13056},
+    ]  # fmt: skip
+
+
+def test_a_config_printer_matched_by_discovery_keeps_what_discovery_left_out(tmp_path):
+    async def scenario():
+        configured = [
+            Found("moonraker", "192.168.4.207", 7125, name="u1", macs=(U1_MAC,)),
+        ]
+        async with setup(tmp_path, configured=lambda: configured) as (api, sync, _):
+            sync.discovery.heard(Found("moonraker", "192.168.4.207", 7125, name="lava"), "mdns")
+            await sync.check_in()
+            return api.check_ins[-1]["discovered"]
+
+    [only] = run(scenario())
+    assert only["name"] == "u1" and only["macs"] == [U1_MAC] and "printerId" not in only
+
+
+def test_an_offline_config_printer_has_its_section_name_and_printer_id(tmp_path):
+    async def scenario():
+        configured = [
+            Found("moonraker", "192.168.4.207", 7125, name="u1", printer_id=13056),
+            Found("moonraker", "192.168.4.208", 7125, name="u1 left"),
+        ]
+        async with setup(tmp_path, configured=lambda: configured) as (api, sync, _):
+            await sync.check_in()
+            return api.check_ins[-1]["discovered"]
+
+    first, second = run(scenario())
+    assert first["name"] == "u1" and first["printerId"] == 13056 and first["configured"] is True
+    assert second["name"] == "u1 left" and "printerId" not in second
+
+
+def test_printers_not_in_the_config_file_never_carry_a_printer_id(tmp_path):
+    async def scenario():
+        def in_the_app(found):
+            return found.address == "192.168.1.61"
+
+        async with setup(tmp_path, is_configured=in_the_app) as (api, sync, _):
+            sync.discovery.heard(Found("bambu", "192.168.1.60", 8883, serial="01P00A1"), "udp")
+            sync.discovery.heard(Found("moonraker", "192.168.1.61", 7125, name="app one"), "mdns")
+            await sync.check_in()
+            return api.check_ins[-1]["discovered"]
+
+    found = run(scenario())
+    assert {f["address"]: f["configured"] for f in found} == {
+        "192.168.1.61": True, "192.168.1.60": False,
+    }  # fmt: skip
+    assert all("printerId" not in f for f in found)
+    assert next(f for f in found if f["configured"])["name"] == "app one"
+
+
+def test_found_sends_printer_id_only_for_a_configured_printer():
+    found = Found("moonraker", "192.168.4.207", 7125, name="u1", printer_id=13056)
+    assert found.to_json(configured=True)["printerId"] == 13056
+    assert "printerId" not in found.to_json(configured=False)
+    assert "printerId" not in Found("moonraker", "192.168.4.207", 7125).to_json(True)
+
+
+def test_cleaning_keeps_a_valid_printer_id_and_trims_the_name():
+    found = Found("moonraker", "192.168.4.207", 7125, name=" u1\x00 " + "x" * 200, printer_id=7)
+    cleaned = found.cleaned()
+    assert cleaned is not None
+    assert cleaned.printer_id == 7 and cleaned.name is not None and len(cleaned.name) <= 100
+    assert cleaned.name.startswith("u1")
+    bad = Found("moonraker", "192.168.4.207", 7125, printer_id=0).cleaned()
+    assert bad is not None and bad.printer_id is None
+
+
+def test_config_printers_report_their_section_name_and_printer_id(tmp_path):
+    path = tmp_path / "printlog-bridge.cfg"
+    path.write_text(
+        f"[bridge]\napi_key = key-123\nstate_dir = {tmp_path / 'state'}\n"
+        "[printer u1]\nprinter_id = 13056\nurl = http://192.168.4.207:7125\n"
+        "[printer u1 left]\nurl = http://192.168.4.208:7125\n",
+        encoding="utf-8",
+    )
+    config = load_config(path, adapters=ADAPTERS, env={}, home=tmp_path)
+    entries = configured_entries(config.printers)
+    assert [(e.name, e.printer_id, e.address) for e in entries] == [
+        ("u1", 13056, "192.168.4.207"), ("u1 left", None, "192.168.4.208"),
+    ]  # fmt: skip
 
 
 def test_with_discovery_off_nothing_found_is_sent(tmp_path):
