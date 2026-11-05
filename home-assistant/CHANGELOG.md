@@ -2,6 +2,10 @@
 
 The app's version is printlog-bridge's. The bridge's own changes are in its [releases](https://github.com/HoffmanEngineering/printlog-bridge/releases).
 
+## 0.2.1
+
+- On the Bridges page, printers from your configuration keep their own names instead of the name the printer advertises on the network, and show which 3D Print Log printer they log to.
+
 ## 0.2.0
 
 - New printers in the app's options: OctoPrint, Elegoo (SDCP), Duet, FlashForge and Anycubic, beside Moonraker, Bambu Lab and PrusaLink.
