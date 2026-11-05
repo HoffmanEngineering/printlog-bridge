@@ -5,9 +5,9 @@
 # the Supervisor pulls image:version. A v* tag publishes that tag of the app image
 # (.github/workflows/docker.yml), so bump both in the release PR and tag right after merging it.
 name: 3D Print Log Bridge
-version: "0.1.1"
+version: "0.2.0"
 slug: printlog_bridge
-description: Logs every print from your Klipper, Bambu Lab and Prusa printers to 3D Print Log.
+description: Logs every print from your Klipper, Bambu Lab, Prusa, Elegoo, OctoPrint and other printers to 3D Print Log.
 url: "https://github.com/HoffmanEngineering/printlog-bridge/tree/main/home-assistant"
 # The image is also built for linux/arm/v7, but Home Assistant dropped 32-bit Arm in 2025.12.
 arch:
