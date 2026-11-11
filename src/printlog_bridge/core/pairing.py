@@ -329,6 +329,7 @@ async def exchange(
             url,
             json={"deviceId": device, "name": name},
             headers={"Authorization": f"Bearer {access_token}"},
+            allow_redirects=False,  # only the API sees the approval, and only it issues the token
         ) as response:
             status = response.status
             try:

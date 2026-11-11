@@ -643,11 +643,20 @@ class ApiClient:
                 data=data,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
+                # aiohttp keeps X-Api-Key on a redirect to another host; the API never redirects.
+                allow_redirects=False,
             ) as response:
                 self.server_time = _date(response.headers.get("Date")) or self.server_time
                 self.last_etag = response.headers.get("ETag")
                 if response.status == 304:
                     return 304, None
+                if 300 <= response.status < 400:
+                    raise ApiUnavailable(
+                        f"the API answered {response.status} for {path}, a redirect, which the "
+                        "bridge doesn't follow with its credentials",
+                        _retry_after(response.headers.get("Retry-After"), self.server_time),
+                        status=response.status,
+                    )
                 if response.status == 401:
                     code = await _code(response)
                     if sent is not None and code == INVALID_DEVICE_TOKEN:

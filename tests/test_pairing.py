@@ -414,3 +414,46 @@ def test_pairing_that_fails_forgets_its_code(tmp_path):
 
     run(scenario)
     assert pairing.pending.get() is None
+
+
+def test_the_exchange_never_follows_a_redirect(tmp_path):
+    """The Auth0 access token goes only to the API: a 3xx isn't followed, and the approval is
+    asked for again (it can be used only once)."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    seen = []
+
+    async def elsewhere(request):
+        seen.append(dict(request.headers))
+        return web.json_response({"token": "pld_elsewhere"}, status=201)
+
+    async def scenario():
+        other = web.Application()
+        other.router.add_route("*", "/{tail:.*}", elsewhere)
+        other_server = TestServer(other, host="127.0.0.1")
+        await other_server.start_server()
+        target = str(other_server.make_url(pairing.GRANTS_PATH))
+
+        async def redirect(_request):
+            return web.Response(status=307, headers={"Location": target})
+
+        api = web.Application()
+        api.router.add_route("*", "/{tail:.*}", redirect)
+        api_server = TestServer(api, host="127.0.0.1")
+        await api_server.start_server()
+        try:
+            api_url = str(api_server.make_url("")).rstrip("/")
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(ExchangeRefused) as refused:
+                    await pairing.exchange(session, api_url, "auth0-token", "device", "bridge")
+            return refused.value
+        finally:
+            await api_server.close()
+            await other_server.close()
+
+    refused = asyncio.run(scenario())
+
+    assert seen == []
+    assert refused.again
+    assert "307" in str(refused)

@@ -14,6 +14,7 @@ from printlog_bridge.core.api_client import (
     ApiUnavailable,
     AuthRejected,
 )
+from printlog_bridge.core.device import DeviceToken
 
 
 def with_api(handler, call):
@@ -98,6 +99,65 @@ def serve(routes, call):
             await server.close()
 
     return asyncio.run(scenario())
+
+
+class TestRedirects:
+    """aiohttp follows redirects by default and, on a redirect to another origin, drops only
+    `Authorization`: `X-Api-Key` went along (seen with aiohttp 3.8.6, 3.9.5 and 3.14.5). The
+    API never redirects, so a 3xx is answered as an API that isn't working right."""
+
+    @staticmethod
+    def redirected(status, *, api_key=None, device=None, call=None):
+        seen = []
+
+        async def elsewhere(request):
+            seen.append(dict(request.headers))
+            return web.json_response({"id": 1})
+
+        async def scenario():
+            other = web.Application()
+            other.router.add_route("*", "/{tail:.*}", elsewhere)
+            other_server = TestServer(other, host="127.0.0.1")
+            await other_server.start_server()
+            # localhost against 127.0.0.1: another host name, as well as another port
+            target = str(other_server.make_url("/api/Users/me")).replace("127.0.0.1", "localhost")
+
+            async def redirect(_request):
+                return web.Response(status=status, headers={"Location": target})
+
+            api = web.Application()
+            api.router.add_route("*", "/{tail:.*}", redirect)
+            api_server = TestServer(api, host="127.0.0.1")
+            await api_server.start_server()
+            try:
+                base = str(api_server.make_url("")).rstrip("/")
+                async with ApiClient(base, api_key=api_key, device=device) as client:
+                    await (call or (lambda c: c.current_user()))(client)
+            finally:
+                await api_server.close()
+                await other_server.close()
+
+        with pytest.raises(ApiUnavailable) as raised:
+            asyncio.run(scenario())
+        return raised.value, seen
+
+    @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+    def test_the_api_key_never_follows_a_redirect(self, status):
+        error, seen = self.redirected(
+            status, api_key="key-123", call=lambda c: c.create_print({"title": "Benchy"})
+        )
+
+        assert seen == []
+        assert error.status == status
+        assert str(status) in str(error)
+
+    def test_a_device_token_never_follows_a_redirect_either(self):
+        device = DeviceToken(token="pld_secret", api_url="http://127.0.0.1")
+
+        error, seen = self.redirected(302, device=device)
+
+        assert seen == []
+        assert error.status == 302
 
 
 class TestPrints:
