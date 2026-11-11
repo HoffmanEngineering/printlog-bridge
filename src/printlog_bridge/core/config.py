@@ -21,6 +21,13 @@ file `<state_dir>/api_key` (which `printlog-bridge store-key` and install.sh wri
 then `api_key` in `[bridge]`. In local mode the config sits in Klipper's config folder, which
 Moonraker serves to anyone who can open Mainsail or Fluidd, so the key file is the default.
 
+A key from the key file goes only to the API it was stored for: `store-key` records that API's
+origin in `<state_dir>/api_key_origin`, and a config whose `api_url` names another one is
+refused, so editing the config through Moonraker can't send the key elsewhere. A key file from
+before the record exists is used only with the default API or this computer itself. The
+environment variable and `api_key` in `[bridge]` aren't bound: whoever sets them sets the URL
+beside them.
+
 A device token from `printlog-bridge pair` (`<state_dir>/device_token`, core/device.py) wins
 over every API key: the bridge sends one credential, never both.
 """
@@ -61,6 +68,8 @@ CONFIG_FILE_NAME = "printlog-bridge.cfg"
 API_KEY_ENV = "PRINTLOG_API_KEY"
 API_KEY_FILE = "api_key"
 """The key file's name in the state directory."""
+API_KEY_ORIGIN_FILE = "api_key_origin"
+"""Next to the key file: the origin of the API the key was stored for (`write_key_file`)."""
 CONFIG_PATH_ENV = "PRINTLOG_BRIDGE_CONFIG"
 STATE_DIR_ENV = "PRINTLOG_BRIDGE_STATE_DIR"
 """The state directory when the config doesn't set `state_dir` (the Docker image sets it)."""
@@ -251,13 +260,18 @@ def load_config(
     *,
     missing_ok: bool = False,
     printers_required: bool = True,
+    key_origin_checked: bool = True,
 ) -> BridgeConfig:
     """`text` is the config's contents when the caller has already read them (store-key, which
     checks who owns the file it read); otherwise they are read from `path`.
 
     `missing_ok` loads a missing file as an empty one, and `printers_required=False` allows a
     config with no `[printer]` section: `run` in a new container pairs, then waits for printers
-    (core/first_run.py)."""
+    (core/first_run.py).
+
+    A key file stored for another API than `api_url` raises ConfigError, unless a device token
+    for `api_url` is stored (the key isn't sent then, so it is left out).
+    `key_origin_checked=False` is for store-key, which replaces the key and its record."""
     parser = _parse(path, text, missing_ok=missing_ok)
     bridge = parser["bridge"] if parser.has_section("bridge") else {}
 
@@ -274,6 +288,13 @@ def load_config(
         stored_device = read_device_token(state_dir)
     except DeviceFileError as e:
         raise ConfigError(str(e)) from None
+    if source is ApiKeySource.KEY_FILE and key_origin_checked:
+        refusal = _key_file_refusal(state_dir, api_url)
+        if refusal is not None:
+            if stored_device is not None and stored_device.api_url == api_url:
+                api_key, source = None, None  # the device token is sent, never the key
+            else:
+                raise ConfigError(refusal)
 
     adoption = _adoption("[bridge]", bridge, Adoption())
     slicer_settings = _slicer_settings("[bridge]", bridge, True)
@@ -526,10 +547,70 @@ def clean_key(text: str) -> str:
     return text.strip().removeprefix("﻿").strip()
 
 
-def write_key_file(path: Path, key: str) -> None:
+def write_key_file(path: Path, key: str, *, api_url: str) -> None:
     """Writes the key file so only this user can read it (mode 600), replacing any earlier key in
-    one step. A state directory it has to make is made mode 700."""
+    one step, and records `api_url`'s origin next to it (`API_KEY_ORIGIN_FILE`): the key is used
+    only with that API. A state directory it has to make is made mode 700."""
     write_private_file(path, clean_key(key))
+    write_private_file(path.parent / API_KEY_ORIGIN_FILE, api_origin(api_url))
+
+
+def api_origin(url: str) -> str:
+    """`scheme://host[:port]`, lowercased, without a default port, a user or a path: what two
+    URLs must share to be the same API."""
+    parts = urlparse(url.strip())
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if ":" in host:
+        host = f"[{host}]"  # IPv6
+    port = parts.port
+    if port is None or (scheme, port) in (("http", 80), ("https", 443)):
+        return f"{scheme}://{host}"
+    return f"{scheme}://{host}:{port}"
+
+
+def read_key_origin(state_dir: Path) -> str | None:
+    """The origin `write_key_file` recorded for the key file, or None when there is none (a key
+    file from before the bridge recorded it, or one written by hand)."""
+    path = state_dir / API_KEY_ORIGIN_FILE
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"can't read {path} ({API_KEY_ORIGIN_FILE}): {e}") from None
+    return text or None
+
+
+def _key_file_refusal(state_dir: Path, api_url: str) -> str | None:
+    """Why the key file's key must not go to `api_url`, or None when it may."""
+    key_file = state_dir / API_KEY_FILE
+    recorded = read_key_origin(state_dir)
+    store_again = (
+        "If you changed api_url yourself, store the key again for it: run "
+        "`printlog-bridge store-key`."
+    )
+    if recorded is not None:
+        try:
+            same = api_origin(recorded) == api_origin(api_url)
+        except ValueError:
+            same = False
+        if same:
+            return None
+        return (
+            f"the API key in {key_file} was stored for {mask_url(recorded)}, but api_url is "
+            f"{mask_url(api_url)}. A stored key is sent only to the API it was stored for, so a "
+            f"changed config can't send it anywhere else. {store_again}"
+        )
+    if api_origin(api_url) == api_origin(DEFAULT_API_URL):
+        return None
+    if _is_loopback(urlparse(api_url).hostname or ""):
+        return None  # a development API on this computer
+    return (
+        f"the API key in {key_file} was stored by an earlier printlog-bridge, which didn't record "
+        f"the API it was for, and api_url is {mask_url(api_url)}, not {DEFAULT_API_URL}. A stored "
+        f"key is sent only to the API it was stored for. {store_again}"
+    )
 
 
 def _load_printer(

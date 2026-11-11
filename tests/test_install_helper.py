@@ -17,7 +17,13 @@ from pathlib import Path
 import pytest
 
 from printlog_bridge.adapters import ADAPTERS
-from printlog_bridge.core.config import load_config
+from printlog_bridge.core.config import (
+    DEFAULT_API_URL,
+    ConfigError,
+    api_origin,
+    load_config,
+    read_key_origin,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
@@ -301,6 +307,34 @@ class TestConfig:
         self.write(tmp_path, env={"PRINTLOG_API_KEY": "second"})
 
         assert self.load(tmp_path).api_key == "first"
+
+    def test_the_key_is_bound_to_the_api_the_config_names(self, tmp_path):
+        # The config it writes has no api_url, so the key is for the default API, and a config
+        # later pointed elsewhere (through Moonraker) doesn't get it.
+        (tmp_path / "config").mkdir()
+
+        self.write(tmp_path, env={"PRINTLOG_API_KEY": "k-1"})
+
+        state = self.key_file(tmp_path).parent
+        assert read_key_origin(state) == api_origin(DEFAULT_API_URL)
+        assert helper.DEFAULT_API_URL == DEFAULT_API_URL
+        path = tmp_path / "config" / "printlog-bridge.cfg"
+        text = path.read_text(encoding="utf-8")
+        path.write_text(
+            text.replace("[bridge]\n", "[bridge]\napi_url = http://127.0.0.1:5000\n"),
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="store-key"):
+            self.load(tmp_path)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+    def test_the_record_is_this_users_alone_too(self, tmp_path):
+        (tmp_path / "config").mkdir()
+
+        self.write(tmp_path, env={"PRINTLOG_API_KEY": "k-1"})
+
+        record = self.key_file(tmp_path).parent / "api_key_origin"
+        assert record.stat().st_mode & 0o777 == 0o600
 
     def test_a_printer_name_from_any_host_name_is_a_valid_section(self):
         assert helper.printer_name("Voron 2.4 (garage)") == "voron-2-4-garage"
