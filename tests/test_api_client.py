@@ -488,3 +488,52 @@ class TestSlots:
 
         assert e.value.status == 403
         assert "does not have access" in str(e.value)
+
+
+class TestProblemCodes:
+    """The problem's `code` comes from the whole body; only the message is cut to 300 chars."""
+
+    @staticmethod
+    def problem(status, code, detail_length):
+        async def refuse(_request):
+            return web.json_response(
+                {
+                    "type": "https://tools.ietf.org/html/rfc9110#section-15.5.4",
+                    "title": "Forbidden",
+                    "status": status,
+                    "detail": "x" * detail_length,
+                    "code": code,
+                    "traceId": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-00",
+                },
+                status=status,
+            )
+
+        return refuse
+
+    def test_a_long_superseded_answer_is_still_superseded(self):
+        from printlog_bridge.core.api_client import TokenSuperseded
+
+        async def scenario():
+            app = web.Application()
+            app.router.add_post("/api/Prints", self.problem(403, "device_token_superseded", 400))
+            server = TestServer(app)
+            await server.start_server()
+            try:
+                base = str(server.make_url("")).rstrip("/")
+                device = DeviceToken(token="pld_old", api_url=base)
+                async with ApiClient(base, device=device) as client:
+                    await client.create_print({})
+            finally:
+                await server.close()
+
+        with pytest.raises(TokenSuperseded):
+            asyncio.run(scenario())
+
+    def test_a_long_refusal_keeps_its_code_and_a_short_message(self):
+        refuse = self.problem(400, "insufficient_scope", 400)
+
+        with pytest.raises(ApiRejected) as raised:
+            serve([("PUT", "/api/bridges/me", refuse)], lambda c: c.check_in({}))
+
+        assert raised.value.code == "insufficient_scope"
+        assert "x" * 400 not in str(raised.value)

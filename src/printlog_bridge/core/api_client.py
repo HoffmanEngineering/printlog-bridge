@@ -672,8 +672,9 @@ class ApiClient:
                     except ValueError:
                         return 409, None
                 if response.status in (400, 403, 413, 415):
-                    reason = (await response.text()).strip()[:300]
-                    code = _code_in(reason)
+                    text = (await response.text()).strip()
+                    code = _code_in(text)  # from the whole body: a cut one isn't JSON
+                    reason = text[:300]
                     if sent is not None and code == DEVICE_TOKEN_SUPERSEDED:
                         self._superseded_by_another(sent, newer_ok)
                     if sent is not None and code == INSUFFICIENT_SCOPE:
