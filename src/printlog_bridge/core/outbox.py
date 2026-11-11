@@ -7,7 +7,15 @@ with an external ID the API deduplicates on, and completing it sets the same val
 
 Entries are kept per print (printer and job) in the order they were queued, and a print's next
 entry is only offered once the one before it is gone, so a print is never completed before it
-is created. Entries older than `MAX_AGE` are dropped.
+is created. Entries that have waited `MAX_AGE` are dropped.
+
+How long an entry has waited (`waited_s`) is counted on the monotonic clock while the bridge
+runs, and kept in the file, not worked out from `queued_at` and the wall clock. A Raspberry Pi has
+no clock of its own: one that boots offline starts at the time it was shut down, so `queued_at`
+can be months behind until NTP steps the clock forward, just as the API becomes reachable. Time
+the bridge wasn't running doesn't count either: a bridge switched off for a while still sends
+what it had queued once it starts again. Schema 1 files have no `waited_s`; opening one adds it,
+with its entries starting from none, and the bridge that wrote it can still use it.
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -26,9 +35,11 @@ log = logging.getLogger(__name__)
 
 OUTBOX_FILE = "outbox.sqlite3"
 MAX_AGE = timedelta(days=30)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+"""1: the first. 2: `waited_s`, added by `ALTER TABLE`, so a schema 1 bridge still runs on it."""
 
-_SCHEMA = """
+_WAITED = "waited_s REAL NOT NULL DEFAULT 0"
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS entries (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     printer TEXT NOT NULL,
@@ -38,6 +49,7 @@ CREATE TABLE IF NOT EXISTS entries (
     queued_at TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    {_WAITED},
     UNIQUE (printer, job_id, kind)
 )
 """
@@ -75,16 +87,30 @@ class Waiting:
 
 
 class Outbox:
-    def __init__(self, connection: sqlite3.Connection, clock: Callable[[], datetime]) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        clock: Callable[[], datetime],
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._db = connection
         self.clock = clock
+        """Stamps `queued_at`, for `status` and the log. Never decides an entry's age."""
+        self.monotonic = monotonic
+        """Counts how long entries wait, while the bridge runs."""
+        self._counted_to = monotonic()
 
     @classmethod
-    def open(cls, state_dir: Path, clock: Callable[[], datetime] = utc_now) -> Outbox:
+    def open(
+        cls,
+        state_dir: Path,
+        clock: Callable[[], datetime] = utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> Outbox:
         state_dir.mkdir(parents=True, exist_ok=True)
         path = state_dir / OUTBOX_FILE
         try:
-            return cls(_connect(path), clock)
+            return cls(_connect(path), clock, monotonic)
         except sqlite3.DatabaseError as e:
             broken = path.with_name(OUTBOX_FILE + ".broken")
             os.replace(path, broken)
@@ -93,14 +119,29 @@ class Outbox:
                 "the bridge hasn't finished logging are replayed from the printer's history.",
                 path, e, broken,
             )  # fmt: skip
-            return cls(_connect(path), clock)
+            return cls(_connect(path), clock, monotonic)
 
     def close(self) -> None:
+        try:
+            with self._db:
+                self._count_waiting()
+        except sqlite3.Error as e:  # a full or read-only disk: at most this run's wait is lost
+            log.debug("couldn't write how long the outbox's entries have waited: %s", e)
         self._db.close()
+
+    def _count_waiting(self) -> None:
+        """Adds the time since it last counted to every entry's time waited. Call it inside a
+        transaction, before anything is queued, so a new entry starts from none."""
+        now = self.monotonic()
+        elapsed = now - self._counted_to
+        self._counted_to = now
+        if elapsed > 0:
+            self._db.execute("UPDATE entries SET waited_s = waited_s + ?", (elapsed,))
 
     def add(self, printer: str, job_id: str, kind: str, payload: dict[str, Any]) -> bool:
         """Queues an event, committed before it returns. False if it was already queued."""
         with self._db:
+            self._count_waiting()
             cursor = self._db.execute(
                 "INSERT OR IGNORE INTO entries (printer, job_id, kind, payload, queued_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -133,14 +174,15 @@ class Outbox:
             )
 
     def drop_expired(self) -> list[Entry]:
-        """Removes and returns the entries queued more than `MAX_AGE` ago."""
-        cutoff = self.clock() - MAX_AGE
-        expired = [e for e in self.entries() if e.queued_at < cutoff]
-        if expired:
-            with self._db:
-                self._db.executemany(
-                    "DELETE FROM entries WHERE seq = ?", [(e.seq,) for e in expired]
-                )
+        """Removes and returns the entries that have waited `MAX_AGE` while the bridge ran."""
+        with self._db:
+            self._count_waiting()
+            rows = self._db.execute(
+                f"SELECT {_COLUMNS} FROM entries WHERE waited_s >= ? ORDER BY seq",
+                (MAX_AGE.total_seconds(),),
+            ).fetchall()
+            expired = [_entry(row) for row in rows]
+            self._db.executemany("DELETE FROM entries WHERE seq = ?", [(e.seq,) for e in expired])
         return expired
 
 
@@ -197,6 +239,9 @@ def _connect(path: Path) -> sqlite3.Connection:
             )  # fmt: skip
         with db:
             db.execute(_SCHEMA)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(entries)")}
+            if "waited_s" not in columns:  # schema 1: its entries start from no time waited
+                db.execute(f"ALTER TABLE entries ADD COLUMN {_WAITED}")
             if version < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     except BaseException:

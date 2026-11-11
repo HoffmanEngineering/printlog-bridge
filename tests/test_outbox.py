@@ -95,18 +95,77 @@ def test_a_failed_attempt_is_counted_and_remembered(tmp_path):
     assert entry.last_error == "can't reach the API"
 
 
-def test_entries_older_than_30_days_are_dropped(tmp_path):
-    clock = Clock()
-    outbox = Outbox.open(tmp_path, clock=clock)
+class Monotonic:
+    """The bridge's running time, as `time.monotonic` counts it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, by: timedelta, clock: Clock | None = None) -> None:
+        self.now += by.total_seconds()
+        if clock is not None:
+            clock.now += by
+
+
+def test_entries_waiting_30_days_are_dropped(tmp_path):
+    clock, running = Clock(), Monotonic()
+    outbox = Outbox.open(tmp_path, clock=clock, monotonic=running)
     outbox.add("voron", "old", "start", {})
-    clock.now += timedelta(days=20)
+    running.advance(timedelta(days=20), clock)
     outbox.add("voron", "new", "start", {})
-    clock.now = NOW + MAX_AGE + timedelta(seconds=1)
+    running.advance(MAX_AGE - timedelta(days=20) - timedelta(seconds=1), clock)
+    assert outbox.drop_expired() == []
+    running.advance(timedelta(seconds=2), clock)
 
     dropped = outbox.drop_expired()
 
     assert [e.job_id for e in dropped] == ["old"]
     assert [e.job_id for e in outbox.heads()] == ["new"]
+
+
+def test_time_waited_adds_up_across_restarts(tmp_path):
+    clock = Clock()
+    running = Monotonic()
+    outbox = Outbox.open(tmp_path, clock=clock, monotonic=running)
+    outbox.add("voron", "A", "start", {})
+    running.advance(timedelta(days=20), clock)
+    outbox.close()  # the time waited so far is kept
+
+    running = Monotonic()  # a new process counts from its own start
+    outbox = Outbox.open(tmp_path, clock=clock, monotonic=running)
+    running.advance(timedelta(days=9), clock)
+    assert outbox.drop_expired() == []
+    running.advance(timedelta(days=1, seconds=1), clock)
+
+    assert [e.job_id for e in outbox.drop_expired()] == ["A"]
+
+
+def test_time_the_bridge_was_not_running_does_not_count(tmp_path):
+    """Powered off for two months, it still sends what it had queued when it starts again."""
+    clock = Clock()
+    outbox = Outbox.open(tmp_path, clock=clock, monotonic=Monotonic())
+    outbox.add("voron", "A", "start", {})
+    outbox.close()
+    clock.now += timedelta(days=60)
+
+    outbox = Outbox.open(tmp_path, clock=clock, monotonic=Monotonic())
+
+    assert outbox.drop_expired() == []
+    assert [e.job_id for e in outbox.heads()] == ["A"]
+
+
+def test_an_entry_queued_after_a_quiet_spell_starts_from_none(tmp_path):
+    clock, running = Clock(), Monotonic()
+    outbox = Outbox.open(tmp_path, clock=clock, monotonic=running)
+    outbox.drop_expired()
+    running.advance(timedelta(days=40), clock)  # nothing queued, nothing to send
+    outbox.add("voron", "A", "start", {})
+    running.advance(timedelta(minutes=1), clock)
+
+    assert outbox.drop_expired() == []
 
 
 def test_waiting_jobs_are_counted_per_printer_without_opening_for_writing(tmp_path):
@@ -155,3 +214,52 @@ def test_each_change_is_committed_before_it_returns(tmp_path):
     finally:
         other.close()
         outbox.close()
+
+
+def test_a_forward_clock_step_does_not_expire_entries(tmp_path):
+    """A Pi without a clock that boots offline queues with a stale time; when NTP steps the
+    clock forward, the entry hasn't waited 30 days, and is still sent."""
+    clock = Clock()
+    outbox = Outbox.open(tmp_path, clock=clock)
+    outbox.add("voron", "A", "start", {})
+    clock.now += timedelta(days=60)  # NTP
+
+    assert outbox.drop_expired() == []
+    assert [e.job_id for e in outbox.heads()] == ["A"]
+
+
+def test_an_entry_from_an_older_bridge_is_kept_and_upgraded(tmp_path):
+    """Schema 1 has no time waited: its entries start from none, rather than being judged by
+    the wall clock, and the file stays readable by the bridge that wrote it."""
+    db = sqlite3.connect(str(tmp_path / OUTBOX_FILE))
+    db.execute(
+        "CREATE TABLE entries (seq INTEGER PRIMARY KEY AUTOINCREMENT, printer TEXT NOT NULL, "
+        "job_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, queued_at TEXT NOT "
+        "NULL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, "
+        "UNIQUE (printer, job_id, kind))"
+    )
+    db.execute(
+        "INSERT INTO entries (printer, job_id, kind, payload, queued_at) VALUES (?, ?, ?, ?, ?)",
+        ("voron", "A", "start", "{}", (NOW - timedelta(days=60)).isoformat()),
+    )
+    db.execute("PRAGMA user_version = 1")
+    db.commit()
+    db.close()
+
+    outbox = Outbox.open(tmp_path, clock=Clock())
+    assert outbox.drop_expired() == []
+    [entry] = outbox.heads()
+    outbox.close()
+
+    assert (entry.job_id, entry.queued_at) == ("A", NOW - timedelta(days=60))
+    db = sqlite3.connect(str(tmp_path / OUTBOX_FILE))
+    try:
+        # What schema 1 runs still works: an older bridge started on this file again.
+        db.execute(
+            "INSERT INTO entries (printer, job_id, kind, payload, queued_at) "
+            "VALUES ('voron', 'B', 'start', '{}', ?)",
+            (NOW.isoformat(),),
+        )
+        assert db.execute("SELECT COUNT(*) FROM entries").fetchone() == (2,)
+    finally:
+        db.close()
