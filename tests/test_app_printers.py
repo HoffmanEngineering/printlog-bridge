@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from bridge_helpers import until
@@ -12,7 +13,8 @@ from fake_moonraker import FakeMoonraker
 from fake_printlog_api import FakePrintLogApi
 
 from printlog_bridge.adapters import ADAPTERS
-from printlog_bridge.core import bridge_sync
+from printlog_bridge.core import bridge_sync, watchers
+from printlog_bridge.core.adapter import Adapter
 from printlog_bridge.core.app_printers import Refused, resolve_private
 from printlog_bridge.core.bridge import run_bridge
 from printlog_bridge.core.config import ConfigError, load_config
@@ -47,7 +49,7 @@ def write(tmp_path: Path, api_url: str, printers: str = "") -> Path:
 
 
 @contextlib.asynccontextmanager
-async def running(tmp_path, printers="", resolve=as_is, before=None):
+async def running(tmp_path, printers="", resolve=as_is, before=None, adapters=ADAPTERS):
     api = FakePrintLogApi(printers=(42, 43))
     api.desired_poll_seconds = 0.05
     url = await api.start()
@@ -59,14 +61,14 @@ async def running(tmp_path, printers="", resolve=as_is, before=None):
     path = write(tmp_path, url, printers)
 
     def load():
-        return load_config(path, ADAPTERS, env={}, home=tmp_path, printers_required=False)
+        return load_config(path, adapters, env={}, home=tmp_path, printers_required=False)
 
     if before is not None:
         await before(api, url)
     task = asyncio.ensure_future(
         run_bridge(
             load(),
-            adapters=ADAPTERS,
+            adapters=adapters,
             reload=load,
             reload_poll=0.05,
             heartbeat_interval=0.1,
@@ -294,3 +296,136 @@ def test_pairing_asks_for_bridge_sync_only_when_offered():
 
     assert "bridge:sync" in scopes_to_request(["bridge:sync", "prints:write"], create=False)
     assert scopes_to_request(["prints:write"], create=False) == ["prints:write"]
+
+
+class Flaky(Adapter):
+    """An app printer whose `run` raises the next of `failures` (one per run), then watches
+    until cancelled. `runs` records when each run began, on the loop's clock."""
+
+    name = "flaky"
+    runs: ClassVar[list[float]] = []
+    failures: ClassVar[list[Exception]] = []
+
+    @classmethod
+    def app_options(cls, host, port, serial, secrets):
+        return {"host": host}
+
+    @classmethod
+    def from_config(cls, printer, options):
+        return cls()
+
+    def describe(self) -> str:
+        return "flaky"
+
+    async def check(self):
+        return []
+
+    async def run(self, sink, report) -> None:
+        Flaky.runs.append(asyncio.get_running_loop().time())
+        if Flaky.failures:
+            raise Flaky.failures.pop(0)
+        report.connected()
+        await asyncio.Event().wait()
+
+
+FLAKY = {**ADAPTERS, "flaky": Flaky}
+
+
+@pytest.fixture
+def flaky():
+    Flaky.runs.clear()
+    Flaky.failures.clear()
+    yield Flaky
+    Flaky.runs.clear()
+    Flaky.failures.clear()
+
+
+def printer_status(tmp_path: Path, name: str) -> dict:
+    return ((read_status(tmp_path / "state") or {}).get("printers") or {}).get(name) or {}
+
+
+def test_an_app_printer_whose_adapter_fails_is_watched_again(tmp_path, flaky, monkeypatch, caplog):
+    """An unexpected error in an adapter (a firmware message it can't read) stops only that
+    printer, and only for a while: it is watched again, not left alone until a restart."""
+    monkeypatch.setattr(watchers, "RESTART_MIN_S", 0.05)
+    flaky.failures.append(KeyError("print_stats"))
+
+    async def scenario():
+        async with running(tmp_path, adapters=FLAKY) as (api, _, task):
+            entry = api.connect("flaky", "127.0.0.1", 42, port=1)
+            await until(lambda: len(flaky.runs) >= 2, 5)
+            await until(
+                lambda: printer_status(tmp_path, f"app-{entry}").get("connection") == "connected"
+            )
+            assert not task.done()  # the bridge itself kept running
+            return entry
+
+    entry = asyncio.run(scenario())
+    assert len(flaky.runs) == 2
+    assert f"[printer app-{entry}]" in caplog.text and "KeyError" in caplog.text
+
+
+def test_status_says_when_a_failed_app_printer_is_tried_again(tmp_path, flaky, monkeypatch):
+    monkeypatch.setattr(watchers, "RESTART_MIN_S", 30)
+    flaky.failures.append(TypeError("'NoneType' object is not subscriptable"))
+
+    async def scenario():
+        async with running(tmp_path, adapters=FLAKY) as (api, _, _):
+            entry = api.connect("flaky", "127.0.0.1", 42, port=1)
+            name = f"app-{entry}"
+            await until(lambda: printer_status(tmp_path, name).get("connection_detail"), 5)
+            return printer_status(tmp_path, name)
+
+    printer = asyncio.run(scenario())
+    assert printer["connection"] == "disconnected"
+    assert "TypeError" in printer["connection_detail"]
+    assert "tries again in 30s" in printer["connection_detail"]
+
+
+def test_a_failed_app_printer_disconnected_in_the_app_is_not_watched_again(
+    tmp_path, flaky, monkeypatch
+):
+    monkeypatch.setattr(watchers, "RESTART_MIN_S", 0.3)
+    flaky.failures.append(KeyError("print_stats"))
+
+    async def scenario():
+        async with running(tmp_path, adapters=FLAKY) as (api, _, _):
+            entry = api.connect("flaky", "127.0.0.1", 42, port=1)
+            await until(lambda: len(flaky.runs) == 1, 5)
+            api.disconnect(entry)
+            await until(lambda: app_state(tmp_path) == {}, 5)
+            await asyncio.sleep(0.6)  # past when it would have been started again
+            return f"app-{entry}" in ((read_status(tmp_path / "state") or {}).get("printers"))
+
+    still_listed = asyncio.run(scenario())
+    assert len(flaky.runs) == 1
+    assert not still_listed
+
+
+def test_an_app_printer_that_fails_every_time_backs_off(tmp_path, flaky, monkeypatch):
+    """Tried again after a wait that doubles up to a cap, never in a tight loop."""
+    monkeypatch.setattr(watchers, "RESTART_MIN_S", 0.1)
+    monkeypatch.setattr(watchers, "RESTART_MAX_S", 0.4)
+    flaky.failures.extend(KeyError("print_stats") for _ in range(100))
+
+    async def scenario():
+        async with running(tmp_path, adapters=FLAKY) as (api, _, task):
+            api.connect("flaky", "127.0.0.1", 42, port=1)
+            await until(lambda: flaky.runs, 5)
+            await asyncio.sleep(2)
+            assert not task.done()
+
+    asyncio.run(scenario())
+    # Waits of 0.1, 0.2, then 0.4 s each time (timers on Windows tick every ~16 ms).
+    gaps = [b - a for a, b in zip(flaky.runs, flaky.runs[1:])]
+    assert 4 <= len(flaky.runs) <= 10, flaky.runs
+    assert gaps[2] > gaps[0] * 2.5  # growing
+    assert all(gap >= 0.08 for gap in gaps)
+    assert max(gaps) < 0.6  # capped
+
+
+def test_the_wait_before_watching_again_doubles_to_a_cap():
+    delays = [watchers.restart_delay(n) for n in range(1, 10)]
+    assert delays[0] == watchers.RESTART_MIN_S
+    assert delays == sorted(delays)
+    assert delays[-1] == watchers.RESTART_MAX_S
