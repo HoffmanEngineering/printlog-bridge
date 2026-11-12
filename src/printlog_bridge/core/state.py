@@ -8,6 +8,7 @@ printer again after an address change keeps what it needs for that in `discovery
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import os
@@ -132,7 +133,21 @@ class PrinterState:
             return None
 
     def resume_after(self) -> datetime | None:
-        unfinished = [j.started_at for j in self.jobs.values() if not j.finished]
+        """The `started_at` of the earliest job not yet logged as finished, or else of the
+        latest job (`EventSink.resume_after`).
+
+        An unfinished job that KEEP_FINISHED_JOBS later jobs have finished after no longer
+        counts: its start or end was refused for good, or it left the printer's history. Held
+        there, every reconnect would replay the jobs since, and those `save` has pruned would be
+        taken for new ones. Since it no longer counts, every finished job newer than the resume
+        point is among those kept, so a replay always recognizes them."""
+        starts = sorted(j.started_at for j in self.jobs.values() if j.finished)
+        unfinished = [
+            j.started_at
+            for j in self.jobs.values()
+            if not j.finished
+            and len(starts) - bisect.bisect_right(starts, j.started_at) < KEEP_FINISHED_JOBS
+        ]
         candidates = unfinished or [j.started_at for j in self.jobs.values()]
         if not candidates:
             return None
