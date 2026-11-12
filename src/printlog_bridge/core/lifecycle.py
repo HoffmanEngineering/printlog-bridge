@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -180,9 +181,16 @@ an uplink too slow for the file). A rate limited upload, or one made while the A
 reached at all, waits like any event: then nothing behind it could be sent either. Tries are
 counted for this run of the bridge; a restart starts the count over."""
 TOO_MANY_REQUESTS = 429
+SAME_START = timedelta(minutes=1)
+"""How far a print's start date may be from its job's start and still be that job's print.
+Generous: an ID used again comes at least a whole print later."""
 NO_LOOKUP = (400, 404, 405, 501)
 """What an API without the lookup for prints to adopt (api#165) answers it with: 400 when
 `/api/Prints/claimable` falls through to `/api/Prints/{id}`."""
+
+
+class ExternalIdTaken(ApiRejected):
+    """The job's external ID belongs to a finished print of another job (see `_create`)."""
 
 
 @dataclass(frozen=True)
@@ -1073,7 +1081,9 @@ class JobLogger:
         if rows:
             body["filamentUsage"] = rows
 
-        print_, _ = await self.api.create_print(body)
+        print_, created = await self.api.create_print(body)
+        if not created:
+            self._refuse_another_jobs_print(state, job, print_)
         job.print_id = int(print_["id"])
         state.save()
         if single_tool and job.swaps and not earlier:
@@ -1081,6 +1091,26 @@ class JobLogger:
             # was unloaded in the app since.
             await self._restore_loaded(target, printer, current)
         return print_
+
+    def _refuse_another_jobs_print(
+        self, state: PrinterState, job: JobRecord, print_: Mapping[str, Any]
+    ) -> None:
+        """Raises ExternalIdTaken when `print_`, which 3D Print Log already had for the job's
+        external ID, is a finished print of a job that started at another time: the printer
+        handed the id out again (Moonraker before job keys, `adapters/moonraker/job_ids.py`).
+        Completing this job onto it would overwrite it, and asking again can't change the
+        answer, so the job is given up on."""
+        started_at = job.start["started_at"]
+        if not _another_jobs_print(print_, started_at):
+            return
+        job.finished = True
+        state.save()
+        raise ExternalIdTaken(
+            f"3D Print Log already has print {print_.get('id')} ({print_.get('title')!r}), "
+            f"finished, for this job's ID, but it started at {print_.get('startDate')}, not "
+            f"{started_at}: the printer used the ID again. That print is left as it is, and "
+            "this job isn't logged"
+        )
 
     async def _spools_for_create(
         self, printer: str, queued_at: datetime
@@ -1228,6 +1258,7 @@ class JobLogger:
                 return None
             own = await self.api.get_print(e.print_id)
             if own is not None:
+                self._refuse_another_jobs_print(state, job, own)
                 job.print_id = int(own["id"])
                 job.claiming = None
                 state.save()
@@ -1401,6 +1432,31 @@ def _adoptable(print_: Mapping[str, Any], printer_id: int, since: datetime, file
     if created is not None and created < since:
         return False
     return same_file(print_.get("fileName") or print_.get("title") or "", file_name)
+
+
+def _another_jobs_print(print_: Mapping[str, Any], started_at: str) -> bool:
+    """Whether `print_`, which 3D Print Log returned for the job's external ID rather than
+    creating it, is a finished print of a job that started at another time. False when either
+    time can't be read: then it can't be told, and the print is taken as the job's, as before."""
+    if print_.get("status") not in FINISHED:
+        return False
+    theirs, ours = _api_time(print_.get("startDate")), _api_time(started_at)
+    return theirs is not None and ours is not None and abs(theirs - ours) > SAME_START
+
+
+def _api_time(value: Any) -> datetime | None:
+    """An ISO 8601 time as the API or the state file writes it. Python 3.9's `fromisoformat`
+    takes neither "Z" nor fractional seconds other than 3 or 6 digits (.NET writes up to 7)."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), value.strip(), count=1)
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
 
 
 def _created(print_: Mapping[str, Any]) -> datetime | None:
