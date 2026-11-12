@@ -42,11 +42,13 @@ from printlog_bridge.core.events import (
     SlicerFile,
     UnplacedFilament,
 )
+from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import NullReport, PrinterReport
 
 from .changes import FilamentChanges
 from .excluded import ExcludedObjects
 from .images import MoonrakerImages
+from .job_ids import JobIds
 from .session import Call, MoonrakerRpcError
 from .slicer import MoonrakerSlicerFiles, slicer_metadata
 from .spools import RESPOND_MACRO, answer_script
@@ -101,13 +103,17 @@ class JobTracker:
         report: PrinterReport | None = None,
         images: MoonrakerImages | None = None,
         timelapse: TimelapseWatcher | None = None,
+        state: PrinterState | None = None,
     ) -> None:
+        """`state` is the printer's state file, which the sink keeps its jobs in: a job's key
+        (`job_ids.py`) depends on what it holds."""
         self.printer = printer
         self.sink = sink
         self.report = report or NullReport()
         self.images = images
         self.slicer = MoonrakerSlicerFiles(printer, images) if images is not None else None
         self.timelapse = timelapse
+        self.ids = JobIds(state)
         self._error_message: str | None = None
         self._call: Call | None = None
         self._usage = ToolUsage()
@@ -116,12 +122,12 @@ class JobTracker:
         self._status: Mapping[str, Any] = {}
         self._active = 0
         self._job: tuple[str, str, dict[int, float]] | None = None
-        """The job in progress: its id, its file, and the slicer's grams per tool."""
+        """The job in progress: its key, its file, and the slicer's grams per tool."""
         self._file_grams: dict[str, dict[int, float]] = {}
-        """The slicer's grams per tool found in a job's settings block, by job id, kept for its
+        """The slicer's grams per tool found in a job's settings block, by job key, kept for its
         end when Moonraker's metadata has none (Creality Print's files)."""
         self._files: dict[str, SlicerFile] = {}
-        """What was read of each job's file, by job id and file name, so its estimate and its
+        """What was read of each job's file, by job key and file name, so its estimate and its
         slicer settings read it once between them (the last `MAX_FILE_GRAMS` jobs)."""
         self._replay_status: Mapping[str, Any] = {}
         """Klipper's status as asked for on connecting, for the jobs replayed then."""
@@ -227,8 +233,7 @@ class JobTracker:
         Read once per job: the estimate before the print is created (`_estimate_from_file`) and
         the settings after it get the same read."""
         assert self.slicer is not None
-        job_id = str(job["job_id"])
-        # By file as well: Moonraker numbers jobs again after its history is cleared.
+        job_id = self.ids.key(job)
         key = f"{job_id}:{job.get('filename') or ''}"
         if key in self._files:
             return self._files[key]
@@ -339,7 +344,7 @@ class JobTracker:
         self, job: Mapping[str, Any], live: bool = False, latest: bool = False
     ) -> None:
         here = self._here(job, live)
-        start = started(self.printer, job, here)
+        start = started(self.printer, job, here, job_id=self.ids.key(job))
         if self.slicer is not None and self._call is not None and _no_estimate(job):
             start = dataclasses.replace(
                 start,
@@ -382,7 +387,9 @@ class JobTracker:
             from_file = self._file_grams.pop(start.job_id, {})
             table = tool_map(here) if here is not None else None
             await self.sink.emit(
-                finished(self.printer, job, message, tracked, excluded, from_file, table)
+                finished(
+                    self.printer, job, message, tracked, excluded, from_file, table, start.job_id
+                )
             )
             if live and self.timelapse is not None:
                 self.timelapse.job_ended(start.job_id, start.file_name)
@@ -411,17 +418,21 @@ async def _replay_status(call: Call) -> Mapping[str, Any]:
 
 
 def started(
-    printer: str, job: Mapping[str, Any], here: Mapping[str, Any] | None = None
+    printer: str,
+    job: Mapping[str, Any],
+    here: Mapping[str, Any] | None = None,
+    job_id: str | None = None,
 ) -> JobStarted:
     """The job's start. `here` is Klipper's status when it describes this job (`_here`): the
     slicer's grams per tool then go to the slots the printer sent each tool to, and each slot's
-    usage row is noted with what it has loaded."""
+    usage row is noted with what it has loaded. `job_id` is the job's key (`JobIds.key`); the
+    bare history id without it."""
     metadata = job.get("metadata") or {}
     table = tool_map(here) if here is not None else None
     total_g = _positive(metadata.get("filament_weight_total"))
     return JobStarted(
         printer=printer,
-        job_id=str(job["job_id"]),
+        job_id=job_id if job_id is not None else str(job["job_id"]),
         file_name=str(job.get("filename") or ""),
         started_at=_time(job["start_time"]),
         estimated_duration_s=_positive(metadata.get("estimated_time")),
@@ -440,12 +451,14 @@ def finished(
     excluded: str | None = None,
     from_file: Mapping[int, float] | None = None,
     table: list[int] | None = None,
+    job_id: str | None = None,
 ) -> JobFinished:
     """The job's end. `tracked` is what the bridge saw each slot feed (`tools.ToolUsage`),
     `excluded` its note on the objects cancelled mid-print (`excluded.ExcludedObjects`), and
     `from_file` the slicer's grams per tool read from the file, for when the metadata has none.
     `table` is where the printer sent each of the slicer's tools (`task_config.tool_map`), which
-    places those estimates when the bridge saw no tool feed."""
+    places those estimates when the bridge saw no tool feed. `job_id` is the job's key, as for
+    `started`."""
     status = str(job.get("status"))
     outcome, note = OUTCOMES.get(
         status, (JobOutcome.FAILED, f"Moonraker ended the job as {status}")
@@ -463,7 +476,7 @@ def finished(
     )
     return JobFinished(
         printer=printer,
-        job_id=str(job["job_id"]),
+        job_id=job_id if job_id is not None else str(job["job_id"]),
         outcome=outcome,
         finished_at=_time(end_time),
         duration_s=job.get("print_duration"),

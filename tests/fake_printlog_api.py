@@ -271,6 +271,8 @@ class FakePrintLogApi:
         self.created: list[dict[str, Any]] = []
         """Every create body received, replays included."""
         self.completions: list[dict[str, Any]] = []
+        self.refused_completions: set[int] = set()
+        """Prints whose completion is answered 400, as one the API keeps refusing."""
         self.connections: dict[str, dict[str, Any]] = {}
         self.heartbeats: list[tuple[str, dict[str, Any]]] = []
         """Every PUT /api/Connections body received, by instance id."""
@@ -1472,6 +1474,8 @@ class FakePrintLogApi:
             return web.Response(status=404)
         body = await request.json()
         self.completions.append(body)
+        if found["id"] in self.refused_completions:
+            return web.Response(status=400, text="The completion is refused.")
         if body.get("status") not in FINISHED:
             return web.Response(status=400, text="status must be a finished status.")
 

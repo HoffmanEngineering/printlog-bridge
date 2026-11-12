@@ -33,6 +33,7 @@ from printlog_bridge.core.lifecycle import (
     SPOOL_READ_HOLD,
     JobLogger,
     LoggedPrinter,
+    _another_jobs_print,
     backoff_delay,
 )
 from printlog_bridge.core.outbox import MAX_AGE, OUTBOX_FILE, Outbox, read_entries, read_waiting
@@ -388,6 +389,90 @@ class TestJobEnd:
 
         assert api.requests == []
         assert "unknown" in caplog.text
+
+
+class TestExternalIdUsedAgain:
+    """A printer that hands a job id out again (Moonraker after its history is cleared, before
+    the bridge keyed jobs by their start too): 3D Print Log returns the old job's print for the
+    external ID. A finished one that started at another time is never completed again."""
+
+    def forget(self, tmp_path: Path, job_id: str = "00000A") -> None:
+        """The state file prunes the job, as it does past KEEP_FINISHED_JOBS."""
+        state = PrinterState.load(tmp_path, "voron")
+        del state.jobs[job_id]
+        state.save()
+
+    def test_a_finished_print_of_another_job_is_left_alone(self, tmp_path, caplog):
+        api = FakePrintLogApi()
+        run(api, tmp_path, started(), finished())
+        before = dict(api.prints[1])
+        self.forget(tmp_path)
+        later = STARTED_AT + timedelta(days=3)
+
+        with caplog.at_level(logging.ERROR, logger="printlog_bridge"):
+            run(
+                api,
+                tmp_path,
+                started(started_at=later),
+                finished(finished_at=later + timedelta(minutes=5), duration_s=300.0),
+            )
+        run(api, tmp_path, started(started_at=later), finished())  # the replay on a reconnect
+
+        assert api.prints == {1: before}
+        assert len(api.completions) == 1
+        assert len(api.created) == 2  # once, and never asked again
+        assert "used the ID again" in caplog.text
+        assert PrinterState.load(tmp_path, "voron").jobs["00000A"].finished
+
+    def test_nor_when_a_claim_answers_that_it_is_the_jobs_print(self, tmp_path, caplog):
+        """Adopting the user's print: the claim says the job is already logged as print 1."""
+        api = FakePrintLogApi()
+        run(api, tmp_path, started(), finished())
+        before = dict(api.prints[1])
+        self.forget(tmp_path)
+        later = STARTED_AT + timedelta(days=3)
+        mine = api.user_creates(
+            "Shelf Bracket",
+            file_name="shelf_bracket_0.2mm_PLA_MK4_1h2m.gcode",
+            created=(later - timedelta(minutes=10)).isoformat(),
+        )
+
+        with caplog.at_level(logging.ERROR, logger="printlog_bridge"):
+            run(api, tmp_path, started(started_at=later), finished())
+
+        assert [claimed for claimed, _ in api.claims] == [mine]
+        assert api.prints[1] == before
+        assert api.prints[mine]["status"] == 2
+        assert len(api.completions) == 1
+        assert "used the ID again" in caplog.text
+
+    def test_the_same_jobs_print_is_still_its_own(self, tmp_path, caplog):
+        """The state file lost a job that is replayed: same start, so the print is the job's."""
+        api = FakePrintLogApi()
+        run(api, tmp_path, started(), finished())
+        self.forget(tmp_path)
+
+        with caplog.at_level(logging.ERROR, logger="printlog_bridge"):
+            run(api, tmp_path, started(), finished())
+
+        assert len(api.prints) == 1
+        assert PrinterState.load(tmp_path, "voron").jobs["00000A"].print_id == 1
+        assert "used the ID again" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "start_date",
+        ["2026-10-10T09:30:00.1234567+00:00", "2026-10-10T09:30:00Z", "2026-10-10T11:30:00+02:00"],
+    )
+    def test_the_apis_date_formats_are_read(self, start_date):
+        print_ = {"id": 1, "status": 3, "startDate": start_date}
+
+        assert not _another_jobs_print(print_, STARTED_AT.isoformat())
+        assert _another_jobs_print(print_, (STARTED_AT + timedelta(hours=1)).isoformat())
+
+    def test_a_print_still_printing_is_not_judged(self):
+        print_ = {"id": 1, "status": 2, "startDate": "2026-10-01T00:00:00Z"}
+
+        assert not _another_jobs_print(print_, STARTED_AT.isoformat())
 
 
 class TestWhenTheApiIsDown:
