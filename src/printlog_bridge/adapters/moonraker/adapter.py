@@ -278,7 +278,7 @@ class MoonrakerAdapter(Adapter):
             if self.timelapse
             else None
         )
-        tracker = JobTracker(self.printer, sink, report, images, timelapse)
+        tracker = JobTracker(self.printer, sink, report, images, timelapse, self.state)
         listeners: list[MoonrakerListener] = [tracker]
         unwatch = None
         if self.spools is not None:

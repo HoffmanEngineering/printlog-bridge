@@ -73,7 +73,7 @@ class TestLiveJobs:
 
         assert event == JobStarted(
             printer="voron",
-            job_id="000001",
+            job_id=f"000001@{int(T0)}",
             file_name="parts/bracket.gcode",
             started_at=at(T0),
             estimated_duration_s=3900.5,
@@ -110,7 +110,7 @@ class TestLiveJobs:
 
         assert event == JobFinished(
             printer="voron",
-            job_id="000001",
+            job_id=f"000001@{int(T0)}",
             outcome=JobOutcome.COMPLETED,
             finished_at=at(T0 + 3900.0),
             duration_s=3725.4,
@@ -209,9 +209,9 @@ class TestCatchingUp:
         events = asyncio.run(scenario()).events
 
         assert [(type(e).__name__, e.job_id) for e in events] == [
-            ("JobStarted", "000002"),
-            ("JobFinished", "000002"),
-            ("JobStarted", "000003"),
+            ("JobStarted", f"000002@{int(T0)}"),
+            ("JobFinished", f"000002@{int(T0)}"),
+            ("JobStarted", f"000003@{int(T0 + 3600)}"),
         ]
         assert events[1].outcome is JobOutcome.CANCELLED
 
@@ -248,7 +248,7 @@ class TestCatchingUp:
 
         finished = asyncio.run(scenario()).of(JobFinished)
 
-        assert [e.job_id for e in finished] == [f"{n + 1:06X}" for n in range(120)]
+        assert [e.job_id for e in finished] == [f"{n + 1:06X}@{int(T0 + n)}" for n in range(120)]
 
     def test_on_its_first_run_picks_up_only_a_job_in_progress(self):
         """History from before the bridge was installed is for `backfill` (#8)."""
@@ -473,7 +473,7 @@ class TestPerToolUsage:
 
         last = asyncio.run(scenario()).of(JobFinished)[-1]
 
-        assert last.job_id == "000002"
+        assert last.job_id == f"000002@{int(T0 + 2000)}"
         assert last.filament_mm == pytest.approx({1: 300.0})
 
 
