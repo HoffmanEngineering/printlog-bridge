@@ -45,6 +45,7 @@ from printlog_bridge.core.config import (
     API_KEY_ENV,
     BridgeConfig,
     ConfigError,
+    api_origin,
     clean_key,
     clear_config_api_key,
     find_config,
@@ -537,7 +538,15 @@ def _store_key_in(
         print(f"printlog-bridge: {_not_as_root(None, command)}", file=sys.stderr)
         return 1
     try:
-        config = load_config(opened.path, adapters=ADAPTERS, env=env, home=home, text=opened.text)
+        # The key it replaces may be bound to another API: that's what storing it again fixes.
+        config = load_config(
+            opened.path,
+            adapters=ADAPTERS,
+            env=env,
+            home=home,
+            text=opened.text,
+            key_origin_checked=False,
+        )
     except ConfigError as e:
         print(f"printlog-bridge: {e}", file=sys.stderr)
         return 2
@@ -572,7 +581,7 @@ def _store_key_in(
         return 1
 
     try:
-        write_key_file(config.api_key_file, key)
+        write_key_file(config.api_key_file, key, api_url=config.api_url)
     except OSError as e:
         print(f"printlog-bridge: couldn't store the key: {e}", file=sys.stderr)
         return 1
@@ -600,6 +609,10 @@ def _store_key_in(
         print(f"Moved the API key from {config.path} to {config.api_key_file}.")
     else:
         print(f"Stored the API key in {config.api_key_file}.")
+    print(
+        f"It is sent only to {api_origin(config.api_url)} (api_url); for another API, run "
+        "store-key again after changing api_url."
+    )
     print("Only you can read it. Restart printlog-bridge to use it.")
     if env.get(API_KEY_ENV):
         print(f"Note: {API_KEY_ENV} is set here, and wins over the stored key while it is.")

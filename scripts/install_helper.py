@@ -46,6 +46,9 @@ SECTION_HEADER = f"[update_manager {SERVICE}]"
 BEGIN = f"# BEGIN {SERVICE}: added by its install.sh; its uninstall.sh removes this block"
 END = f"# END {SERVICE}"
 API_KEY_ENV = "PRINTLOG_API_KEY"
+API_KEY_ORIGIN_FILE = "api_key_origin"
+DEFAULT_API_URL = "https://api.3dprintlog.com"
+"""The bridge's `DEFAULT_API_URL` (an origin: no path), which tests check this matches."""
 
 Change = Optional[dict]
 """What an add changed: `added`, and `newline` when the file had no newline at its end."""
@@ -359,14 +362,21 @@ def macros_remove(args: argparse.Namespace) -> int:
 
 
 def write_key_file(path: Path, key: str) -> None:
-    """The bridge's key file: mode 600, in a folder made mode 700. As the bridge's own
-    `write_key_file`, which this can't import: it runs with the system's python3."""
+    """The bridge's key file: mode 600, in a folder made mode 700, and next to it the origin of
+    the API the key is for (the default one: the config written here names no other), which the
+    bridge checks before sending the key. As the bridge's own `write_key_file`, which this can't
+    import: it runs with the system's python3."""
+    _write_private(path, key)
+    _write_private(path.parent / API_KEY_ORIGIN_FILE, DEFAULT_API_URL)
+
+
+def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
     try:
         os.chmod(temporary, 0o600)  # mkstemp makes it 600 already; this says so
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(key + "\n")
+            f.write(text + "\n")
         os.replace(temporary, str(path))
     except BaseException:
         if os.path.exists(temporary):

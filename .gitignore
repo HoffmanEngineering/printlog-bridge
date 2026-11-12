@@ -10,3 +10,8 @@ dist/
 
 # Local uv lockfile; dependencies are pinned in requirements.txt
 uv.lock
+
+# `printlog-bridge probe` writes its captures to the current folder. Raw ones hold LAN
+# addresses, MAC addresses and serial numbers: attach a --redact one to an issue, never commit it
+/probe-*.json
+/probe-*/
