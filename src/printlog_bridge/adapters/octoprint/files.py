@@ -25,6 +25,7 @@ from typing import Any
 
 import aiohttp
 
+from printlog_bridge.adapters.common.http import inflated
 from printlog_bridge.adapters.common.slicer_meta import (
     JobFile,
     facts_from_meta,
@@ -159,7 +160,7 @@ class OctoPrintFiles:
             else:
                 raise ValueError(f"HTTP {response.status} for the job's file")
             data = bytearray()
-            async for chunk in response.content.iter_chunked(64 * 1024):
+            async for chunk in inflated(response):
                 data += chunk
                 if len(data) >= end - start:
                     break
@@ -179,7 +180,7 @@ class OctoPrintFiles:
             async with self.client.stream("/" + thumbnail.lstrip("/")) as response:
                 if response.status != 200:
                     return None
-                async for chunk in response.content.iter_chunked(64 * 1024):
+                async for chunk in inflated(response):
                     data += chunk
                     if len(data) > MAX_THUMBNAIL_BYTES:
                         return None

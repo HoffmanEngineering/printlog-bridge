@@ -8,6 +8,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import tracemalloc
 from pathlib import Path
 
 import aiohttp
@@ -16,7 +17,7 @@ import pytest
 from fake_moonraker import eventually
 from fake_octoprint import API_KEY, VERSION, FakeOctoPrint
 from fake_printlog_api import FakePrintLogApi
-from http_helpers import host_of, http_server
+from http_helpers import gzip_bomb, host_of, http_server
 from test_prusalink_adapter import Report, Sink, running
 
 from printlog_bridge.adapters import ADAPTERS
@@ -703,3 +704,20 @@ def test_the_client_requests_nothing_off_octoprint():
             return other.requests, [path for path, _ in server.requests]
 
     assert asyncio.run(scenario()) == ([], ["/octoprint/api/version"])
+
+
+def test_the_client_refuses_an_answer_inflating_past_its_cap():
+    async def scenario():
+        async with http_server() as server:
+            gzip_bomb(server)
+            client = OctoPrintClient(server.url, "TEST-ONLY-KEY")
+            tracemalloc.start()
+            try:
+                with pytest.raises(aiohttp.ClientPayloadError):
+                    await client.get_json("/api/settings")
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+                await client.close()
+
+    assert asyncio.run(scenario()) < 32 * 1024 * 1024

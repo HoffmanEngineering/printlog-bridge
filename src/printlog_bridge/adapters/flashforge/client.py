@@ -19,7 +19,7 @@ from typing import Any
 
 import aiohttp
 
-from printlog_bridge import __version__
+from printlog_bridge.adapters.common.http import TooLarge, read_capped, session
 from printlog_bridge.core.images import image_type
 from printlog_bridge.core.secrets import scrub
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
@@ -127,9 +127,7 @@ class FlashForgeClient:
         if self.closed:
             raise aiohttp.ClientConnectionError("the bridge stopped watching this printer")
         if self._http is None or self._http.closed:
-            self._http = aiohttp.ClientSession(
-                headers={"User-Agent": f"printlog-bridge/{__version__}"}
-            )
+            self._http = session()
         async with self._http.post(
             self.base_url + path,
             json=body,
@@ -137,9 +135,12 @@ class FlashForgeClient:
             allow_redirects=False,
         ) as response:
             status = response.status
-            raw = await response.content.read(MAX_ANSWER_BYTES + 1)
+            try:
+                raw = await read_capped(response, MAX_ANSWER_BYTES)
+            except TooLarge:
+                raw = b""  # not an answer the API gives
         answer: Any = None
-        if len(raw) <= MAX_ANSWER_BYTES and raw.strip():
+        if raw.strip():
             with contextlib.suppress(ValueError):
                 answer = json.loads(raw.decode("utf-8", errors="replace"))
         if self.trace is not None:

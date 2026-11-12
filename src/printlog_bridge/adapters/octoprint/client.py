@@ -20,8 +20,12 @@ from urllib.parse import quote
 
 import aiohttp
 
-from printlog_bridge import __version__
-from printlog_bridge.adapters.common.http import url_on
+from printlog_bridge.adapters.common.http import (
+    MAX_JSON_BYTES,
+    read_capped,
+    session,
+    url_on,
+)
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 from . import webhooks
@@ -58,9 +62,7 @@ class OctoPrintClient:
 
     def _session_for(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={"User-Agent": f"printlog-bridge/{__version__}"}
-            )
+            self._session = session()
         return self._session
 
     @property
@@ -96,7 +98,7 @@ class OctoPrintClient:
             allow_redirects=False,
         )
         async with request as response:
-            text = await response.text(errors="replace")
+            text = (await read_capped(response, MAX_JSON_BYTES)).decode("utf-8", errors="replace")
             answer: Any = None
             if text.strip():
                 with contextlib.suppress(ValueError):

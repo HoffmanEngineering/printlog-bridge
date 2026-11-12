@@ -5,6 +5,7 @@ between the fake and the fake API. Built from community sources, not a recorded 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import ipaddress
 import json
@@ -26,12 +27,13 @@ from fake_flashforge import (
 )
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
+from http_helpers import gzip_bomb, http_server
 from test_prusalink_adapter import Report, Sink, running
 
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.flashforge import FlashForgeAdapter
 from printlog_bridge.adapters.flashforge import discovery as ff_discovery
-from printlog_bridge.adapters.flashforge.client import FlashForgeClient
+from printlog_bridge.adapters.flashforge.client import FlashForgeClient, NotFlashForge
 from printlog_bridge.adapters.flashforge.discovery import (
     FlashForgeDiscovery,
     FoundFlashForge,
@@ -731,3 +733,34 @@ async def closed_udp_port() -> int:
 def _source(task: asyncio.Task) -> str:
     code = getattr(task.get_coro(), "cr_code", None)
     return code.co_filename.replace("\\", "/") if code is not None else ""
+
+
+class TestClientAnswers:
+    def test_an_answer_in_pieces_is_read_whole(self):
+        """A thumbnail's answer is hundreds of KB, which a real network delivers in pieces."""
+        picture = base64.b64encode(PNG + b"\0" * 300_000).decode()
+        answer = json.dumps({"code": 0, "message": "Success", "imageData": picture}).encode()
+
+        async def scenario():
+            async with http_server() as server:
+                server.pieces = [answer[n : n + 50_000] for n in range(0, len(answer), 50_000)]
+                client = FlashForgeClient(server.url, serial="SN-TEST", check_code="TEST-ONLY")
+                try:
+                    return await client.thumbnail("cube.gcode")
+                finally:
+                    await client.close()
+
+        assert asyncio.run(scenario()) == PNG + b"\0" * 300_000
+
+    def test_an_answer_inflating_past_the_cap_is_not_the_api(self):
+        async def scenario():
+            async with http_server() as server:
+                gzip_bomb(server)
+                client = FlashForgeClient(server.url, serial="SN-TEST", check_code="TEST-ONLY")
+                try:
+                    with pytest.raises(NotFlashForge):
+                        await client.detail()
+                finally:
+                    await client.close()
+
+        asyncio.run(scenario())

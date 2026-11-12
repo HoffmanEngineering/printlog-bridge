@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import tracemalloc
 
 import aiohttp
 import bridge_helpers as helpers
@@ -19,7 +20,7 @@ import pytest
 from fake_duet import BOARD, FIRMWARE, PASSWORD, PNG, FakeDuet
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
-from http_helpers import host_of, http_server
+from http_helpers import gzip_bomb, host_of, http_server
 
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.duet import DuetAdapter
@@ -725,3 +726,20 @@ def test_the_client_requests_nothing_off_the_board():
             return other.requests, board.requests
 
     assert asyncio.run(scenario()) == ([], [])
+
+
+def test_the_client_refuses_an_answer_inflating_past_its_cap():
+    async def scenario():
+        async with http_server() as board:
+            gzip_bomb(board)
+            client = DuetClient(board.url, password=PASSWORD)
+            tracemalloc.start()
+            try:
+                with pytest.raises(aiohttp.ClientPayloadError):
+                    await client._request("/rr_model", None, auth=False)
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+                await client.close()
+
+    assert asyncio.run(scenario()) < 32 * 1024 * 1024
