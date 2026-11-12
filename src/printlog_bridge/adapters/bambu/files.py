@@ -8,12 +8,13 @@ import contextlib
 import ftplib
 import logging
 import ssl
+import threading
 from collections.abc import Mapping
 from typing import Any, Protocol
 
 from printlog_bridge.core.status import PrinterReport
 
-from .ftps import BambuFtps, FilesRefused, FileTooLarge, candidates
+from .ftps import BambuFtps, FetchCanceled, FilesRefused, FileTooLarge, candidates
 from .threemf import ThreeMF
 from .tls import CertificateChanged
 
@@ -47,6 +48,8 @@ class BambuFiles:
         self.timeout = timeout
         self._key: tuple[str, ...] | None = None
         self._file: ThreeMF | None = None
+        self._fetching: asyncio.Future | None = None
+        """A fetch given up on that hasn't stopped yet: no other starts until it has."""
 
     async def open(self, status: Mapping[str, Any]) -> ThreeMF | None:
         subtask = str(status.get("subtask_name") or "")
@@ -58,11 +61,17 @@ class BambuFiles:
         paths = candidates(subtask, gcode_file)
         if not paths:
             return None
+        if self._fetching is not None and not self._fetching.done():
+            log.info(
+                "[printer %s] the job's file is still being fetched from an earlier try: not "
+                "fetching it again", self.printer,
+            )  # fmt: skip
+            return None
         loop = asyncio.get_running_loop()
+        cancel = threading.Event()
+        fetching = loop.run_in_executor(None, lambda: self.ftps.fetch(paths, cancel=cancel))
         try:
-            found = await asyncio.wait_for(
-                loop.run_in_executor(None, self.ftps.fetch, paths), self.timeout
-            )
+            found = await asyncio.wait_for(asyncio.shield(fetching), self.timeout)
         except FilesRefused:
             log.warning("[printer %s] %s", self.printer, REFUSED)
             self.report.warn(WARNING, REFUSED)
@@ -71,13 +80,18 @@ class BambuFiles:
             log.warning("[printer %s] can't read the job's file: %s", self.printer, e)
             self.report.warn(WARNING, str(e))
             return None
+        except asyncio.CancelledError:  # the adapter stopped
+            _give_up(fetching, cancel)
+            raise
         except asyncio.TimeoutError:
+            _give_up(fetching, cancel)
+            self._fetching = fetching
             log.warning(
                 "[printer %s] the job's file didn't arrive within %gs, so its usage is logged "
                 "without the slicer's grams", self.printer, self.timeout,
             )  # fmt: skip
             return None
-        except (OSError, EOFError, ftplib.Error, ssl.SSLError, FileTooLarge) as e:
+        except (OSError, EOFError, ftplib.Error, ssl.SSLError, FileTooLarge, FetchCanceled) as e:
             log.warning(
                 "[printer %s] can't read the job's file over FTPS (%s), so its usage is logged "
                 "without the slicer's grams", self.printer, e,
@@ -106,3 +120,20 @@ class BambuFiles:
                 self._file.close()
         self._file = None
         self._key = None
+
+
+def _give_up(fetching: asyncio.Future, cancel: threading.Event) -> None:
+    """Stops a fetch nobody waits for: its thread stops at its next block, and a file it still
+    returns is closed."""
+    cancel.set()
+    fetching.add_done_callback(_close_late_file)
+
+
+def _close_late_file(fetching: asyncio.Future) -> None:
+    """A fetch given up on that still returned a file: nobody will read it."""
+    if fetching.cancelled() or fetching.exception() is not None:
+        return
+    found = fetching.result()
+    if found is not None:
+        with contextlib.suppress(Exception):
+            found[1].close()

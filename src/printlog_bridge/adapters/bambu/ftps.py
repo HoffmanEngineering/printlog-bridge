@@ -21,6 +21,7 @@ import ftplib
 import posixpath
 import ssl
 import tempfile
+import threading
 from collections.abc import Callable
 from typing import IO, Any
 
@@ -40,6 +41,10 @@ class FilesRefused(Exception):
 
 class FileTooLarge(Exception):
     pass
+
+
+class FetchCanceled(Exception):
+    """The bridge stopped waiting for the file (`fetch`'s `cancel`)."""
 
 
 class ImplicitFTPS(ftplib.FTP_TLS):
@@ -130,26 +135,32 @@ class BambuFtps:
             _quit(ftp)
 
     def fetch(
-        self, paths: list[str], max_bytes: int = MAX_FILE_BYTES
+        self,
+        paths: list[str],
+        max_bytes: int = MAX_FILE_BYTES,
+        cancel: threading.Event | None = None,
     ) -> tuple[str, IO[bytes]] | None:
         """The first of `paths` that exists, as a temporary file (the caller closes it), or None
-        when none does."""
+        when none does. Raises `FetchCanceled` once `cancel` is set, at the next block read."""
+        cancel = cancel or threading.Event()
         ftp = self.login()
         try:
             for path in paths:
+                if cancel.is_set():
+                    raise FetchCanceled(posixpath.basename(path))
                 try:
                     size = ftp.size(path)
                 except ftplib.error_perm:
                     continue  # 550: not there
                 if size is not None and size > max_bytes:
                     raise FileTooLarge(f"{posixpath.basename(path)} is {size} bytes")
-                return path, self._retrieve(ftp, path, max_bytes)
+                return path, self._retrieve(ftp, path, max_bytes, cancel)
             return None
         finally:
             _quit(ftp)
 
     @staticmethod
-    def _retrieve(ftp: ftplib.FTP, path: str, max_bytes: int) -> IO[bytes]:
+    def _retrieve(ftp: ftplib.FTP, path: str, max_bytes: int, cancel: threading.Event) -> IO[bytes]:
         # On disk, unnamed, gone when closed. Not a SpooledTemporaryFile: before Python 3.11 it
         # isn't seekable() as zipfile needs.
         out = tempfile.TemporaryFile()  # noqa: SIM115
@@ -157,6 +168,8 @@ class BambuFtps:
 
         def write(block: bytes) -> None:
             nonlocal written
+            if cancel.is_set():
+                raise FetchCanceled(posixpath.basename(path))
             written += len(block)
             if written > max_bytes:
                 raise FileTooLarge(f"{posixpath.basename(path)} is over {max_bytes} bytes")
