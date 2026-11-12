@@ -116,8 +116,17 @@ THROTTLED_RETRY_S = 60.0
 """How long to wait on a `device_token_throttled` without a `Retry-After` (the API sends 60)."""
 
 
+RETRYABLE_4XX = frozenset({404, 405, 408, 409, 421, 425, 429})
+"""The 4xx answers that are ApiUnavailable, not ApiRejected (401 has its own handling). 408,
+421, 425 and 429 say to try again. 409 is also what the API answers when two requests race to
+finish a print (api#199). A 404 or 405 where the bridge expects an endpoint is far more often a
+misrouted request or an API being deployed than a permanent answer; callers that know better
+(`missing_ok`, `conflict_ok`, an older API's 405) handle them themselves."""
+
+
 class ApiRejected(ApiError):
-    """The API refused this request (400, 403, 413, 415). Sending it again won't change that."""
+    """The API refused this request (a 4xx not in RETRYABLE_4XX: 400, 403, 413, 415, 410,
+    422...). Sending it again won't change that."""
 
     def __init__(self, message: str, status: int | None = None, code: str | None = None) -> None:
         super().__init__(message)
@@ -643,11 +652,20 @@ class ApiClient:
                 data=data,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout),
+                # aiohttp keeps X-Api-Key on a redirect to another host; the API never redirects.
+                allow_redirects=False,
             ) as response:
                 self.server_time = _date(response.headers.get("Date")) or self.server_time
                 self.last_etag = response.headers.get("ETag")
                 if response.status == 304:
                     return 304, None
+                if 300 <= response.status < 400:
+                    raise ApiUnavailable(
+                        f"the API answered {response.status} for {path}, a redirect, which the "
+                        "bridge doesn't follow with its credentials",
+                        _retry_after(response.headers.get("Retry-After"), self.server_time),
+                        status=response.status,
+                    )
                 if response.status == 401:
                     code = await _code(response)
                     if sent is not None and code == INVALID_DEVICE_TOKEN:
@@ -662,9 +680,10 @@ class ApiClient:
                         return 409, await response.json(content_type=None)
                     except ValueError:
                         return 409, None
-                if response.status in (400, 403, 413, 415):
-                    reason = (await response.text()).strip()[:300]
-                    code = _code_in(reason)
+                if 400 <= response.status < 500 and response.status not in RETRYABLE_4XX:
+                    text = (await response.text()).strip()
+                    code = _code_in(text)  # from the whole body: a cut one isn't JSON
+                    reason = text[:300]
                     if sent is not None and code == DEVICE_TOKEN_SUPERSEDED:
                         self._superseded_by_another(sent, newer_ok)
                     if sent is not None and code == INSUFFICIENT_SCOPE:

@@ -30,6 +30,11 @@ skipped by default.
   are in `scripts/install_helper.py`.
 - Secrets (API keys, store keys) never reach logs, traces or support bundles: `core/secrets.py`
   scrubs them, and new output paths go through it.
+- The key file's key goes only to the API origin recorded beside it (`<state_dir>/api_key_origin`,
+  `core/config.py`), as the device token goes only to its `apiUrl`: anything new that writes the
+  key file records the origin too (`write_key_file`; `scripts/install_helper.py` has its own
+  copy). A key file with no record works only with the default API and loopback. The API client
+  never follows redirects (aiohttp keeps `X-Api-Key` on a cross-origin one).
 - `tests/fixtures/moonraker/` holds real answers from a Snapmaker U1, an Infimech EX and a
   Creality K3. Don't edit them to make a test pass; record a new trace (`trace = true`) instead.
 - Tests never call the real 3D Print Log API or Auth0: use `tests/fake_printlog_api.py`,
