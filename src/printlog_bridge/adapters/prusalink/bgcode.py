@@ -14,7 +14,9 @@ block may be stored as is, with Deflate, or with Heatshrink (window 11 or 12, lo
 PrusaSlicer 2.9 deflates the print and slicer metadata, stores the rest of the metadata and the
 thumbnails as is, and packs the G-code with Heatshrink 12/4 and MeatPack (its files in
 `tests/fixtures/gcode/`). A block in a compression or
-encoding the reader doesn't know is skipped, and said so in `problems`.
+encoding the reader doesn't know is skipped, and said so in `problems`, as is one bigger than a
+real file's (`MAX_METADATA_BYTES`, `MAX_THUMBNAIL_BYTES`). A block is never decoded past its
+declared size, so a small block can't inflate to gigabytes.
 """
 
 from __future__ import annotations
@@ -39,6 +41,14 @@ NONE, DEFLATE, HEATSHRINK_11_4, HEATSHRINK_12_4 = range(4)
 PNG, JPG, QOI = range(3)
 MAX_BLOCK_BYTES = 16 * 1024 * 1024
 """A metadata or thumbnail block bigger than this isn't read: no real one comes near it."""
+MAX_METADATA_BYTES = 1024 * 1024
+"""A metadata block's uncompressed size, at most. PrusaSlicer's slicer block, the largest, is
+some 10 KB, and a few hundred with long custom G-code."""
+MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
+"""A thumbnail's uncompressed size, at most. PrusaSlicer's are tens to hundreds of KB."""
+MAX_THUMBNAILS = 16
+MAX_THUMBNAILS_BYTES = 8 * 1024 * 1024
+"""All the thumbnails kept, together."""
 
 
 class NotBgcode(ValueError):
@@ -132,6 +142,17 @@ class BgcodeReader:
             self.info.problems.append(f"an unknown block type {kind} was skipped")
             return
         what = f"{name} metadata" if name else "a thumbnail"
+        limit = MAX_THUMBNAIL_BYTES if kind == THUMBNAIL else MAX_METADATA_BYTES
+        if size > limit:
+            self.info.problems.append(
+                f"{what} of {size} bytes was skipped: over the {limit} the bridge reads"
+            )
+            return
+        if kind == THUMBNAIL:
+            kept = sum(len(t.data) for t in self.info.thumbnails)
+            if len(self.info.thumbnails) >= MAX_THUMBNAILS or kept + size > MAX_THUMBNAILS_BYTES:
+                self.info.problems.append("a thumbnail was skipped: the file has more than enough")
+                return
         try:
             raw = decompress(compression, data, size)
         except ValueError as e:
@@ -149,17 +170,12 @@ class BgcodeReader:
 
 
 def decompress(compression: int, data: bytes, size: int) -> bytes:
-    """A block's data as stored, uncompressed. Raises ValueError for anything that isn't."""
+    """A block's data as stored, uncompressed: never more than `size` bytes of it, its declared
+    size. Raises ValueError for anything that isn't that."""
     if compression == NONE:
         out = data
     elif compression == DEFLATE:
-        try:
-            out = zlib.decompress(data)
-        except zlib.error:
-            try:
-                out = zlib.decompress(data, -15)  # a raw stream, without zlib's header
-            except zlib.error as e:
-                raise ValueError(f"broken Deflate data ({e})") from None
+        out = inflate(data, size)
     elif compression in (HEATSHRINK_11_4, HEATSHRINK_12_4):
         window = 11 if compression == HEATSHRINK_11_4 else 12
         out = heatshrink_decode(data, window, 4, size)
@@ -168,6 +184,23 @@ def decompress(compression: int, data: bytes, size: int) -> bytes:
     if len(out) != size:
         raise ValueError(f"{len(out)} bytes where the block says {size}")
     return out
+
+
+def inflate(data: bytes, size: int) -> bytes:
+    """A zlib stream, or a raw Deflate one without zlib's header, inflated to at most `size`
+    bytes. One that goes on past that is refused before its rest is inflated."""
+    error: zlib.error | None = None
+    for wbits in (15, -15):
+        inflater = zlib.decompressobj(wbits)
+        try:
+            out = inflater.decompress(data, size + 1)
+        except zlib.error as e:
+            error = e
+            continue
+        if len(out) > size or inflater.unconsumed_tail:
+            raise ValueError(f"more than the {size} bytes the block says")
+        return out
+    raise ValueError(f"broken Deflate data ({error})")
 
 
 def heatshrink_decode(data: bytes, window_bits: int, lookahead_bits: int, limit: int) -> bytes:

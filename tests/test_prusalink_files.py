@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
+import time
 from pathlib import Path
 
 import pytest
 from fake_prusalink import PASSWORD, PNG, FakePrusaLink, make_bgcode, make_gcode
 
+from printlog_bridge.adapters.prusalink import bgcode
+from printlog_bridge.adapters.prusalink.bgcode import BgcodeReader
 from printlog_bridge.adapters.prusalink.client import PrusaLinkClient
 from printlog_bridge.adapters.prusalink.files import (
     PrusaLinkFiles,
@@ -177,6 +181,65 @@ class TestRead:
 
         found = asyncio.run(scenario())
         assert found.grams == {} and found.settings is None
+
+    def test_a_bgcode_file_is_decoded_off_the_event_loop(self, monkeypatch):
+        on_loop_thread = []
+        real = bgcode.decompress
+
+        def spy(*args):
+            on_loop_thread.append(threading.current_thread() is threading.main_thread())
+            return real(*args)
+
+        monkeypatch.setattr(bgcode, "decompress", spy)
+
+        async def scenario():
+            async with files_on_a_printer() as (fake, files):
+                fake.print_file(7, "BENCHY.BGC", make_bgcode())
+                return await files.read(job_of(fake))
+
+        found = asyncio.run(scenario())
+
+        assert found.grams == {0: 12.34}
+        assert on_loop_thread and not any(on_loop_thread)
+
+    def test_a_slow_decode_gives_up_at_the_timeout(self, monkeypatch):
+        def slow(reader, data):
+            time.sleep(1.0)
+            return False
+
+        monkeypatch.setattr(BgcodeReader, "feed", slow)
+
+        async def scenario():
+            async with files_on_a_printer(timeout=0.2) as (fake, files):
+                fake.print_file(7, "BENCHY.BGC", make_bgcode())
+                started = time.monotonic()
+                found = await files.read(job_of(fake))
+                return found, time.monotonic() - started
+
+        found, took = asyncio.run(scenario())
+
+        assert found.grams == {}
+        assert took < 0.8
+
+    def test_running_out_of_memory_while_decoding_logs_the_print_without_estimates(
+        self, monkeypatch
+    ):
+        def out_of_memory(reader, data):
+            raise MemoryError
+
+        monkeypatch.setattr(BgcodeReader, "feed", out_of_memory)
+
+        async def scenario():
+            async with files_on_a_printer() as (fake, files):
+                fake.print_file(7, "BENCHY.BGC", make_bgcode())
+                first = await files.read(job_of(fake))
+                again = await files.read(job_of(fake))
+                return first, again, fake.downloads
+
+        first, again, downloads = asyncio.run(scenario())
+
+        assert first.grams == {} and again is first
+        assert downloads == ["BENCHY.BGC"]  # not read again for the same job
 
     def test_off_reads_nothing(self):
         async def scenario():
