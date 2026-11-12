@@ -199,7 +199,7 @@ Tests: `test_no_secret_reaches_the_log`, `..._the_state_directory` and `..._stat
 
 ## What it keeps on the printer
 
-In the state directory (`~/.local/share/printlog-bridge` by default): the key file, the device token and the bridge's id (`device_token`, `device_id`), which job it logged as which print, and each remote printer's identity and last found address (`printers/`), the outbox of events, pictures, slicer settings (scrubbed) and timelapse videos not yet sent (`outbox.sqlite3`, `images/`, `attachments/`; a sent entry is overwritten in the file, not just marked free, and a picture's or video's file is deleted once sent or given up on), `status.json` and `bridge.log`, and with `trace = true`, the traces (`traces/`). An event still unsent after 30 days is dropped. `uninstall.sh --purge` removes all of it.
+In the state directory (`~/.local/share/printlog-bridge` by default): the key file, the device token and the bridge's id (`device_token`, `device_id`), which job it logged as which print, and each remote printer's identity and last found address (`printers/`), the outbox of events, pictures, slicer settings (scrubbed) and timelapse videos not yet sent (`outbox.sqlite3`, `images/`, `attachments/`; a sent entry is overwritten in the file, not just marked free, and a picture's or video's file is deleted once sent or given up on), `status.json` and `bridge.log`, and with `trace = true`, the traces (`traces/`). An event still unsent after 30 days of the bridge running is dropped. `uninstall.sh --purge` removes all of it.
 
 ### Traces
 
