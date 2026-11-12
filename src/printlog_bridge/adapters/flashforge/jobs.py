@@ -267,6 +267,8 @@ class JobTracker:
         job.grams_estimate = Estimate(grams, 0.0, grams)
         job.mm_estimate = Estimate(mm, 0.0, mm)
         job.by_slot = dict(start.estimated_filament_g_by_slot)
+        if len(job.by_slot) == 1:  # a one-slot print's slot, from its start
+            job.slot = next(iter(job.by_slot))
         kept = self.current.state.discovery.get(KEY)
         if not isinstance(kept, Mapping) or kept.get("job_id") != start.job_id:
             return job
@@ -424,6 +426,11 @@ class JobTracker:
             duration = view.duration_s + view.remaining_s
         else:
             duration = view.remaining_s
+        slot = next(iter(by_slot)) if len(by_slot) == 1 else view.current_slot
+        if len(by_slot) > 1:
+            estimate_by_slot = dict(by_slot)
+        else:  # a one-slot print: all of it on its slot, when that is known
+            estimate_by_slot = {slot: round(grams, 3)} if slot is not None and grams else {}
         start = JobStarted(
             printer=self.printer,
             job_id=job_id,
@@ -432,17 +439,15 @@ class JobTracker:
             estimated_duration_s=duration,
             estimated_filament_mm=round(view.estimated_mm, 1) if view.estimated_mm else None,
             estimated_filament_g=round(grams, 3) if grams else None,
-            estimated_filament_g_by_slot=dict(by_slot) if len(by_slot) > 1 else {},
+            estimated_filament_g_by_slot=estimate_by_slot,
         )
         job = Job(job_id, view.path, start, view.progress or 0.0, view.duration_s or 0.0)
         done = job.progress / 100
         job.grams_estimate.see(grams, done)
         job.mm_estimate.see(view.estimated_mm, done)
         job.by_slot = by_slot
-        if len(by_slot) == 1:
-            job.slot = next(iter(by_slot))
-        elif view.current_slot is not None:
-            job.slot = view.current_slot
+        if slot is not None:
+            job.slot = slot
         self.job = job
         self._keep(job)
         await self.sink.emit(start)

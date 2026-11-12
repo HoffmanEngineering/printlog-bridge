@@ -12,10 +12,17 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fake_bambu import CANCELLED_ERROR, PNG, idle_status, make_3mf
+from fake_printlog_api import FakePrintLogApi
+from test_job_logger import run as log_run
 
 from printlog_bridge.adapters.bambu.jobs import IDLE_NOTE, JobTracker
 from printlog_bridge.adapters.bambu.threemf import ThreeMF
-from printlog_bridge.core.current_job import UNSEEN_END_NOTE, UNSEEN_TIME_NOTE, CurrentJob
+from printlog_bridge.core.current_job import (
+    UNSEEN_END_NOTE,
+    UNSEEN_PROGRESS_NOTE,
+    UNSEEN_TIME_NOTE,
+    CurrentJob,
+)
 from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
@@ -147,7 +154,7 @@ class TestLifecycle:
         assert start.estimated_duration_s == 3600
         assert start.estimated_filament_g == 12.34
         assert start.estimated_filament_mm == 4120
-        assert start.estimated_filament_g_by_slot == {}
+        assert start.estimated_filament_g_by_slot == {0: 12.34}
         assert thumbnail == PNG
         assert "; layer_height = 0.2" in settings.config_block
         finished = sink.of(JobFinished)
@@ -281,6 +288,72 @@ class TestAms:
         assert sink.of(JobFinished)[0].filament_g == {2: 9.0, 1: 3.0}
         assert sink.of(JobFinished)[0].filament_mm == {2: 3000.0, 1: 1000.0}
 
+    @pytest.mark.parametrize(
+        "where", [{"ams_mapping": [3]}, {"ams": {"tray_now": "3"}}], ids=["mapping", "tray_now"]
+    )
+    def test_a_one_filament_job_from_a_tray_has_its_estimate_on_that_tray(self, tmp_path, where):
+        sink = Sink()
+        t = tracker(tmp_path, sink)
+
+        run(feed(t, idle_status(), job(**where), {"gcode_state": "FINISH", "mc_percent": 100}))
+
+        assert sink.of(JobStarted)[0].estimated_filament_g_by_slot == {4: 12.34}
+        assert sink.of(JobFinished)[0].filament_g == {4: 12.34}
+        assert sink.of(JobFinished)[0].filament_mm == {4: 4120.0}
+
+    def test_a_one_filament_jobs_end_seen_after_a_reconnect_stays_on_its_tray(self, tmp_path):
+        sink = Sink()
+        t = tracker(tmp_path, sink)
+
+        async def scenario():
+            await feed(t, idle_status(), job(ams_mapping=[3], mc_percent=60))
+            t.connected()
+            await feed(t, idle_status(**job(ams_mapping=[3], gcode_state="FINISH")))
+
+        run(scenario())
+
+        assert sink.of(JobFinished)[0].filament_g == {4: 12.34}
+
+    def test_a_one_filament_jobs_end_seen_after_a_restart_stays_on_its_tray(self, tmp_path):
+        run(feed(tracker(tmp_path), idle_status(), job(ams_mapping=[3], mc_percent=60)))
+
+        sink = Sink()
+        run(
+            feed(
+                tracker(tmp_path, sink, files=Files(b"")),  # its file is gone by then
+                idle_status(**job(ams_mapping=[3], gcode_state="FINISH", mc_percent=100)),
+            )
+        )
+
+        assert sink.of(JobFinished)[0].filament_g == {4: 12.34}
+
+    def test_the_print_has_one_row_on_the_tray_linked_to_its_spool(self, tmp_path):
+        sink = Sink()
+        t = tracker(tmp_path / "bambu", sink)
+        run(
+            feed(
+                t,
+                idle_status(),
+                job(ams_mapping=[3]),
+                {"gcode_state": "FINISH", "mc_percent": 100},
+            )
+        )
+        api = FakePrintLogApi()
+        api.slot_counts[42] = 5  # the external holder and an AMS's four trays
+        external, a4 = api.add_spool("External"), api.add_spool("A4")
+        api.user_loads(42, 0, external)
+        api.user_loads(42, 4, a4)
+
+        log_run(
+            api, tmp_path / "log", *sink.of(JobStarted), *sink.of(JobFinished), spools=True, p1s=42
+        )
+
+        [row] = api.prints[1]["filamentUsage"]
+        assert row["slot"] == 4
+        assert row["filament"] == {"id": a4}
+        assert row["amountMg"] == 12340
+        assert row["estimatedAmountMg"] == 12340
+
     def test_each_trays_reading_is_sent_and_a_change_mid_job_says_where(self, tmp_path):
         sink, spools = Sink(), Spools()
         t = tracker(tmp_path, sink, spools=spools)
@@ -341,8 +414,14 @@ class TestReconnect:
         assert finished.note == UNSEEN_TIME_NOTE
         assert len(sink.of(JobFinished)) == 1
 
-    def test_a_job_replaced_by_another_while_away_is_guessed_complete(self, tmp_path):
-        run(feed(tracker(tmp_path), idle_status(), job()))
+    @pytest.mark.parametrize(
+        ("percent", "outcome", "grams"),
+        [(30, JobOutcome.CANCELLED, 3.702), (99, JobOutcome.COMPLETED, 12.34)],
+    )
+    def test_a_job_replaced_by_another_while_away_goes_by_its_progress(
+        self, tmp_path, percent, outcome, grams
+    ):
+        run(feed(tracker(tmp_path), idle_status(), job(mc_percent=percent)))
 
         sink = Sink()
         later = job(
@@ -354,9 +433,77 @@ class TestReconnect:
         assert [s.job_id for s in started] == [f"{START}-Benchy", f"{START + 7200}-Cube"]
         finished = sink.of(JobFinished)[0]
         assert finished.job_id == f"{START}-Benchy"
+        assert finished.outcome is outcome
+        assert finished.filament_g == {0: pytest.approx(grams, abs=0.01)}
+        assert finished.note == UNSEEN_PROGRESS_NOTE
+        assert finished.usage_estimated is True
+
+    def test_a_job_kept_without_its_progress_is_still_guessed_complete(self, tmp_path):
+        """A job an older bridge kept, with no progress beside it."""
+        run(feed(tracker(tmp_path), idle_status(), job()))
+        state = PrinterState.load(tmp_path, "p1s")
+        del state.discovery["current_job"]["progress"]
+        state.save()
+
+        sink = Sink()
+        later = job(gcode_start_time=str(START + 7200), subtask_name="Cube")
+        run(feed(tracker(tmp_path, sink), idle_status(**later)))
+
+        finished = sink.of(JobFinished)[0]
         assert finished.outcome is JobOutcome.COMPLETED
         assert finished.note == UNSEEN_END_NOTE
-        assert finished.usage_estimated is True
+
+    def test_a_cancel_while_disconnected_is_charged_for_how_far_it_got(self, tmp_path):
+        sink = Sink()
+        t = tracker(tmp_path, sink)
+
+        async def scenario():
+            await feed(t, idle_status(), job(mc_percent=40))
+            t.connected()  # MQTT dropped; the job was cancelled meanwhile
+            failed = job(gcode_state="FAILED", print_error=CANCELLED_ERROR, mc_percent=40)
+            await feed(t, idle_status(**failed))
+
+        run(scenario())
+
+        [finished] = sink.of(JobFinished)
+        assert finished.outcome is JobOutcome.CANCELLED
+        assert finished.filament_g == {0: pytest.approx(4.94)}
+        assert finished.filament_mm == {0: pytest.approx(1648.0)}
+        assert finished.note == UNSEEN_TIME_NOTE
+        assert finished.finished_at == STARTED_AT + timedelta(minutes=2)  # when last seen
+
+    @pytest.mark.parametrize(
+        ("percent", "outcome", "grams"),
+        [(30, JobOutcome.CANCELLED, 3.702), (99, JobOutcome.COMPLETED, 12.34)],
+    )
+    def test_another_job_after_a_reconnect_ends_the_first_by_its_progress(
+        self, tmp_path, percent, outcome, grams
+    ):
+        sink = Sink()
+        t = tracker(tmp_path, sink)
+        later = job(
+            gcode_start_time=str(START + 7200),
+            subtask_name="Other",
+            gcode_file="Other.gcode.3mf",
+            mc_percent=2,
+        )
+
+        async def scenario():
+            await feed(t, idle_status(), job(mc_percent=percent))
+            t.connected()
+            await feed(t, idle_status(**later))
+
+        run(scenario())
+
+        first = sink.of(JobFinished)[0]
+        assert first.job_id == f"{START}-Benchy"
+        assert first.outcome is outcome
+        assert first.filament_g == {0: pytest.approx(grams, abs=0.01)}
+        assert first.note == UNSEEN_PROGRESS_NOTE
+        assert [s.job_id for s in sink.of(JobStarted)] == [
+            f"{START}-Benchy",
+            f"{START + 7200}-Other",
+        ]
 
     def test_a_dropped_connection_carries_on_with_the_job(self, tmp_path):
         sink = Sink()

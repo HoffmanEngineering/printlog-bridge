@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from printlog_bridge.core.current_job import CurrentJob
+from printlog_bridge.core.current_job import (
+    UNSEEN_PROGRESS_NOTE,
+    UNSEEN_TIME_NOTE,
+    CurrentJob,
+)
 from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted
 from printlog_bridge.core.state import PrinterState
 
@@ -117,6 +121,15 @@ def test_grams_per_slot_are_the_estimate_of_a_multi_tool_job(tmp_path):
     assert finished.filament_mm == {}
 
 
+def test_a_one_slot_jobs_estimate_stays_on_its_slot(tmp_path):
+    current(tmp_path).started(start(estimated_filament_g_by_slot={3: 13.1}))
+
+    _, finished = current(tmp_path).reconcile(None)
+
+    assert finished.filament_g == {3: 13.1}
+    assert finished.filament_mm == {3: 4400.0}
+
+
 def test_never_seen_again_ends_when_it_was_remembered(tmp_path):
     clock = Clock()
     current(tmp_path, clock).started(start())
@@ -166,3 +179,48 @@ def test_a_broken_entry_is_treated_as_none(tmp_path):
 
     assert current(tmp_path).job is None
     assert current(tmp_path).reconcile(None) == []
+
+
+def test_a_job_gone_with_no_outcome_goes_by_its_kept_progress(tmp_path):
+    clock = Clock()
+    job = current(tmp_path, clock)
+    job.started(start(), progress=5.0)
+    clock.now = STARTED_AT + timedelta(minutes=50)
+    job.seen(progress=40.0)
+
+    _, finished = current(tmp_path, clock).reconcile(None)
+
+    assert finished.outcome is JobOutcome.CANCELLED
+    assert finished.filament_g == {0: 5.24}
+    assert finished.filament_mm == {0: 1760.0}
+    assert finished.note == UNSEEN_PROGRESS_NOTE
+
+
+def test_a_job_gone_at_99_percent_is_complete_with_its_whole_estimate(tmp_path):
+    current(tmp_path).started(start(), progress=99.0)
+
+    _, finished = current(tmp_path).reconcile("job-18")
+
+    assert finished.outcome is JobOutcome.COMPLETED
+    assert finished.filament_g == {0: 13.1}
+
+
+def test_the_printers_cancel_is_charged_by_the_kept_progress(tmp_path):
+    current(tmp_path).started(start(), progress=25.0)
+
+    _, finished = current(tmp_path).reconcile(None, outcome=JobOutcome.CANCELLED)
+
+    assert finished.outcome is JobOutcome.CANCELLED
+    assert finished.filament_g == {0: 3.275}
+    assert finished.note == UNSEEN_TIME_NOTE
+
+
+def test_progress_seen_within_the_minute_is_kept_in_memory(tmp_path):
+    clock = Clock()
+    job = current(tmp_path, clock)
+    job.started(start(), progress=10.0)
+    clock.now = STARTED_AT + timedelta(seconds=30)
+    job.seen(progress=20.0)
+
+    assert job.progress == 20.0
+    assert current(tmp_path).progress == 10.0  # written with the next save

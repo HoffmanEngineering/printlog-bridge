@@ -16,8 +16,11 @@ before it goes back to 0; 0x0500400E is taken as a cancel too.
 - It ends at `FINISH` (completed), `FAILED` (cancelled or failed, by `print_error`), or `IDLE`
   straight from a running state (cancelled, with a note). Its usage is the slicer's grams per
   filament, scaled by `mc_percent` for a job that didn't complete, marked estimated.
-- The local API keeps no history, so the running job is kept with `CurrentJob`, and after each
-  connect `reconcile` says what became of it.
+- The local API keeps no history, so the running job is kept with `CurrentJob`, with its
+  progress. After a reconnect, a job still in memory that the printer no longer runs is finished
+  as a live end would be (`_finish_unseen`): by the printer's `FINISH` or `FAILED` when that is
+  still its job, else by its last progress (completed at `COMPLETE_AT_PERCENT` or more, else
+  cancelled), ending when the bridge last saw it. After a restart, `reconcile` says.
 
 `job_id` is `<gcode_start_time>-<subtask_name>`: the printer's `task_id` is 0 for a print that
 didn't go through the cloud. A printer that gives no start time gets the remembered job's id
@@ -35,7 +38,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from printlog_bridge.core.current_job import CurrentJob
+from printlog_bridge.core.current_job import (
+    UNSEEN_PROGRESS_NOTE,
+    UNSEEN_TIME_NOTE,
+    CurrentJob,
+    unseen_outcome,
+)
 from printlog_bridge.core.events import (
     EventSink,
     ImageKind,
@@ -83,6 +91,8 @@ class Job:
     """The slicer's numbers for the plate being printed, from the 3MF."""
     slots: dict[int, int] = field(default_factory=dict)
     """Each filament's slot, by its id in the project."""
+    progress: float = 0.0
+    """How far it had got (0 to 1) when last seen running."""
 
 
 class JobTracker:
@@ -149,6 +159,12 @@ class JobTracker:
     async def _reconcile(self, state: str) -> None:
         remembered = self.current.job
         running = self._job_id() if state in ACTIVE else None
+        kept = self.job
+        if kept is not None and kept.start is not None and kept.job_id != running:
+            # The connection dropped, the bridge didn't restart: the job and its progress are
+            # still here, so it ends as a live end would.
+            await self._finish_unseen(kept, state)
+            return
         outcome = None
         last_job_ended = state in ("FINISH", "FAILED") and remembered is not None
         if last_job_ended and self._job_id() == remembered.job_id:  # type: ignore[union-attr]
@@ -162,6 +178,7 @@ class JobTracker:
             # The bridge restarted while it ran. Its file is read again at its end.
             self.job = Job(remembered.job_id, remembered.file_name, remembered.started_at)
             self.job.start = remembered
+            self.job.progress = (self.current.progress or 0.0) / 100
         elif self.job is not None:
             self.job = None  # ended while disconnected: reconciled above
 
@@ -170,8 +187,8 @@ class JobTracker:
             job_id = self._job_id()
             if self.job is not None and self.job.job_id != job_id:
                 # Another job without this one's end seen: what the printer can't tell.
-                for event in self.current.reconcile(job_id):
-                    await self.sink.emit(event)
+                if self.job.start is not None:
+                    await self._finish_unseen(self.job, state)
                 self.job = None
             if self.job is None:
                 # Not its print_error yet: the last job's cancel lingers a few seconds.
@@ -179,10 +196,12 @@ class JobTracker:
                 log.info("[printer %s] job %s is under way", self.printer, job_id)
             else:
                 self._note_error()
+            if state in PRINTING:
+                self.job.progress = self._progress()
             if self.job.start is None and state in PRINTING:
                 await self._start(self.job)
             elif self.job.start is not None:
-                self.current.seen()
+                self.current.seen(self.job.progress * 100)
         elif state in ENDED and self.job is not None:
             job = self.job
             self._note_error()
@@ -213,11 +232,11 @@ class JobTracker:
             estimated_duration_s=duration,
             estimated_filament_mm=sum(mm.values()) or None,
             estimated_filament_g=sum(grams.values()) or None,
-            estimated_filament_g_by_slot=grams if len(grams) > 1 else {},
+            estimated_filament_g_by_slot=grams,
         )
         job.start = start
         await self.sink.emit(start)
-        self.current.started(start)
+        self.current.started(start, job.progress * 100)
         if three is None or job.plate is None:
             return
         thumbnail = three.thumbnail(job.plate.index)
@@ -236,8 +255,32 @@ class JobTracker:
 
         await self.sink.emit(JobSlicerSettings(self.printer, job.job_id, read=read_settings))
 
-    async def _finish(self, job: Job, outcome: JobOutcome, note: str | None) -> None:
-        if job.plate is None:  # its file couldn't be had at the start: once more
+    async def _finish_unseen(self, job: Job, state: str) -> None:
+        """Ends `job`, kept in memory, whose end the bridge didn't see: by the printer's end state
+        while that is still this job's, else by how far it had got. It ends when last seen."""
+        if state in ("FINISH", "FAILED") and self._job_id() == job.job_id:
+            self._note_error()
+            outcome, note = self._outcome(state, job.error)
+            note = f"{note} {UNSEEN_TIME_NOTE}" if note else UNSEEN_TIME_NOTE
+            progress = max(job.progress, self._progress())
+        else:
+            outcome, note = unseen_outcome(job.progress * 100), UNSEEN_PROGRESS_NOTE
+            progress = job.progress
+        await self._finish(job, outcome, note, progress=progress, at=self.current.last_seen)
+
+    async def _finish(
+        self,
+        job: Job,
+        outcome: JobOutcome,
+        note: str | None,
+        *,
+        progress: float | None = None,
+        at: datetime | None = None,
+    ) -> None:
+        """`progress` (0 to 1) is how far a job that didn't complete got: the status's when not
+        given. `at` is when it ended: now when not given."""
+        if job.plate is None and self._job_id() == job.job_id:
+            # Its file couldn't be had at the start: once more, while the printer still has it.
             three = await self._open()
             plate = (
                 three.plate(plate_of(str(self.status.get("gcode_file") or ""))) if three else None
@@ -245,9 +288,12 @@ class JobTracker:
             if plate is not None:
                 job.plate = plate
                 job.slots = filament_slots([f.id for f in plate.filaments], self.status)
-        progress = 1.0 if outcome is JobOutcome.COMPLETED else self._progress()
+        if outcome is JobOutcome.COMPLETED:
+            progress = 1.0
+        elif progress is None:
+            progress = self._progress()
         grams, mm = self._usage(job, progress)
-        now = self.clock()
+        now = max(at, job.started_at) if at is not None else self.clock()
         finished = JobFinished(
             printer=self.printer,
             job_id=job.job_id,
