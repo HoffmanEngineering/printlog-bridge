@@ -14,7 +14,7 @@ from fake_prusalink import PNG
 
 from printlog_bridge.adapters.prusalink.files import JobFile
 from printlog_bridge.adapters.prusalink.jobs import UNSEEN_STATE_NOTE, JobTracker
-from printlog_bridge.core.current_job import UNSEEN_END_NOTE, UNSEEN_TIME_NOTE, CurrentJob
+from printlog_bridge.core.current_job import UNSEEN_PROGRESS_NOTE, UNSEEN_TIME_NOTE, CurrentJob
 from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
@@ -327,18 +327,19 @@ class TestLifecycle:
         t = tracker(tmp_path, printer, sink)
 
         async def scenario():
-            printer.print(job_id=7)
+            printer.print(job_id=7, progress=30.0)
             await poll(t, printer)
             printer.print(job_id=8, name="Cube.bgcode")
             await poll(t, printer)
 
         run(scenario())
 
-        # The first one's start comes again with its end, which the sink recognizes.
-        assert [s.job_id for s in sink.of(JobStarted)] == ["7-Benchy", "7-Benchy", "8-Cube"]
+        assert [s.job_id for s in sink.of(JobStarted)] == ["7-Benchy", "8-Cube"]
         [finished] = sink.of(JobFinished)
         assert finished.job_id == "7-Benchy"
-        assert finished.note == UNSEEN_END_NOTE
+        assert finished.outcome is JobOutcome.CANCELLED
+        assert finished.filament_g == {0: pytest.approx(3.6)}
+        assert finished.note == UNSEEN_PROGRESS_NOTE
 
 
 class TestReconnect:
@@ -372,9 +373,15 @@ class TestReconnect:
         assert finished.outcome is JobOutcome.CANCELLED
         assert finished.note == UNSEEN_TIME_NOTE
 
-    def test_a_job_replaced_by_another_while_away_is_guessed_complete(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("progress", "outcome", "grams"),
+        [(30.0, JobOutcome.CANCELLED, 3.6), (99.0, JobOutcome.COMPLETED, 12.0)],
+    )
+    def test_a_job_replaced_by_another_while_away_goes_by_its_progress(
+        self, tmp_path, progress, outcome, grams
+    ):
         printer = Printer()
-        printer.print()
+        printer.print(progress=progress)
         run(poll(tracker(tmp_path, printer), printer))
 
         sink = Sink()
@@ -384,8 +391,22 @@ class TestReconnect:
         assert [s.job_id for s in sink.of(JobStarted)] == ["7-Benchy", "9-Cube"]
         finished = sink.of(JobFinished)[0]
         assert finished.job_id == "7-Benchy"
-        assert finished.outcome is JobOutcome.COMPLETED
-        assert finished.note == UNSEEN_END_NOTE
+        assert finished.outcome is outcome
+        assert finished.filament_g == {0: pytest.approx(grams)}
+        assert finished.note == UNSEEN_PROGRESS_NOTE
+
+    def test_a_stop_while_away_is_charged_by_the_kept_progress(self, tmp_path):
+        printer = Printer()
+        printer.print(progress=40.0)
+        run(poll(tracker(tmp_path, printer), printer))
+
+        sink = Sink()
+        printer.state = "STOPPED"
+        run(poll(tracker(tmp_path, printer, sink), printer))
+
+        [finished] = sink.of(JobFinished)
+        assert finished.outcome is JobOutcome.CANCELLED
+        assert finished.filament_g == {0: pytest.approx(4.8)}
 
     def test_a_dropped_connection_carries_on_with_the_job(self, tmp_path):
         printer, sink = Printer(), Sink()
@@ -400,6 +421,52 @@ class TestReconnect:
         assert len(sink.of(JobFinished)) == 1
         assert sink.of(JobFinished)[0].outcome is JobOutcome.COMPLETED
         assert printer.reads == 1
+
+    def test_a_stop_after_one_failed_poll_is_charged_as_a_live_stop_would_be(self, tmp_path):
+        printer, sink, clock = Printer(), Sink(), Clock()
+        t = tracker(tmp_path, printer, sink, clock)
+
+        async def scenario():
+            printer.print(progress=40.0)
+            await poll(t, printer, 2)
+            t.connected()  # what the adapter does after one status poll failed
+            clock.now += timedelta(minutes=5)
+            printer.state = "STOPPED"
+            await poll(t, printer)
+
+        run(scenario())
+
+        [finished] = sink.of(JobFinished)
+        assert finished.outcome is JobOutcome.CANCELLED
+        assert finished.filament_g == {0: pytest.approx(4.8)}
+        assert finished.note == UNSEEN_TIME_NOTE
+        assert finished.finished_at == NOW  # when last seen
+
+    @pytest.mark.parametrize(
+        ("progress", "outcome", "grams"),
+        [(30.0, JobOutcome.CANCELLED, 3.6), (99.0, JobOutcome.COMPLETED, 12.0)],
+    )
+    def test_another_job_after_a_reconnect_ends_the_first_by_its_progress(
+        self, tmp_path, progress, outcome, grams
+    ):
+        printer, sink = Printer(), Sink()
+        t = tracker(tmp_path, printer, sink)
+
+        async def scenario():
+            printer.print(job_id=7, progress=progress)
+            await poll(t, printer, 2)
+            t.connected()
+            printer.print(job_id=8, name="Other.bgcode", progress=1.0)
+            await poll(t, printer)
+
+        run(scenario())
+
+        [finished] = sink.of(JobFinished)
+        assert finished.job_id == "7-Benchy"
+        assert finished.outcome is outcome
+        assert finished.filament_g == {0: pytest.approx(grams)}
+        assert finished.note == UNSEEN_PROGRESS_NOTE
+        assert [s.job_id for s in sink.of(JobStarted)] == ["7-Benchy", "8-Other"]
 
 
 def test_a_job_already_running_at_the_first_connect_is_asked_about_once(tmp_path):

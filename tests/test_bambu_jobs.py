@@ -17,7 +17,12 @@ from test_job_logger import run as log_run
 
 from printlog_bridge.adapters.bambu.jobs import IDLE_NOTE, JobTracker
 from printlog_bridge.adapters.bambu.threemf import ThreeMF
-from printlog_bridge.core.current_job import UNSEEN_END_NOTE, UNSEEN_TIME_NOTE, CurrentJob
+from printlog_bridge.core.current_job import (
+    UNSEEN_END_NOTE,
+    UNSEEN_PROGRESS_NOTE,
+    UNSEEN_TIME_NOTE,
+    CurrentJob,
+)
 from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
@@ -409,8 +414,14 @@ class TestReconnect:
         assert finished.note == UNSEEN_TIME_NOTE
         assert len(sink.of(JobFinished)) == 1
 
-    def test_a_job_replaced_by_another_while_away_is_guessed_complete(self, tmp_path):
-        run(feed(tracker(tmp_path), idle_status(), job()))
+    @pytest.mark.parametrize(
+        ("percent", "outcome", "grams"),
+        [(30, JobOutcome.CANCELLED, 3.702), (99, JobOutcome.COMPLETED, 12.34)],
+    )
+    def test_a_job_replaced_by_another_while_away_goes_by_its_progress(
+        self, tmp_path, percent, outcome, grams
+    ):
+        run(feed(tracker(tmp_path), idle_status(), job(mc_percent=percent)))
 
         sink = Sink()
         later = job(
@@ -422,9 +433,77 @@ class TestReconnect:
         assert [s.job_id for s in started] == [f"{START}-Benchy", f"{START + 7200}-Cube"]
         finished = sink.of(JobFinished)[0]
         assert finished.job_id == f"{START}-Benchy"
+        assert finished.outcome is outcome
+        assert finished.filament_g == {0: pytest.approx(grams, abs=0.01)}
+        assert finished.note == UNSEEN_PROGRESS_NOTE
+        assert finished.usage_estimated is True
+
+    def test_a_job_kept_without_its_progress_is_still_guessed_complete(self, tmp_path):
+        """A job an older bridge kept, with no progress beside it."""
+        run(feed(tracker(tmp_path), idle_status(), job()))
+        state = PrinterState.load(tmp_path, "p1s")
+        del state.discovery["current_job"]["progress"]
+        state.save()
+
+        sink = Sink()
+        later = job(gcode_start_time=str(START + 7200), subtask_name="Cube")
+        run(feed(tracker(tmp_path, sink), idle_status(**later)))
+
+        finished = sink.of(JobFinished)[0]
         assert finished.outcome is JobOutcome.COMPLETED
         assert finished.note == UNSEEN_END_NOTE
-        assert finished.usage_estimated is True
+
+    def test_a_cancel_while_disconnected_is_charged_for_how_far_it_got(self, tmp_path):
+        sink = Sink()
+        t = tracker(tmp_path, sink)
+
+        async def scenario():
+            await feed(t, idle_status(), job(mc_percent=40))
+            t.connected()  # MQTT dropped; the job was cancelled meanwhile
+            failed = job(gcode_state="FAILED", print_error=CANCELLED_ERROR, mc_percent=40)
+            await feed(t, idle_status(**failed))
+
+        run(scenario())
+
+        [finished] = sink.of(JobFinished)
+        assert finished.outcome is JobOutcome.CANCELLED
+        assert finished.filament_g == {0: pytest.approx(4.94)}
+        assert finished.filament_mm == {0: pytest.approx(1648.0)}
+        assert finished.note == UNSEEN_TIME_NOTE
+        assert finished.finished_at == STARTED_AT + timedelta(minutes=2)  # when last seen
+
+    @pytest.mark.parametrize(
+        ("percent", "outcome", "grams"),
+        [(30, JobOutcome.CANCELLED, 3.702), (99, JobOutcome.COMPLETED, 12.34)],
+    )
+    def test_another_job_after_a_reconnect_ends_the_first_by_its_progress(
+        self, tmp_path, percent, outcome, grams
+    ):
+        sink = Sink()
+        t = tracker(tmp_path, sink)
+        later = job(
+            gcode_start_time=str(START + 7200),
+            subtask_name="Other",
+            gcode_file="Other.gcode.3mf",
+            mc_percent=2,
+        )
+
+        async def scenario():
+            await feed(t, idle_status(), job(mc_percent=percent))
+            t.connected()
+            await feed(t, idle_status(**later))
+
+        run(scenario())
+
+        first = sink.of(JobFinished)[0]
+        assert first.job_id == f"{START}-Benchy"
+        assert first.outcome is outcome
+        assert first.filament_g == {0: pytest.approx(grams, abs=0.01)}
+        assert first.note == UNSEEN_PROGRESS_NOTE
+        assert [s.job_id for s in sink.of(JobStarted)] == [
+            f"{START}-Benchy",
+            f"{START + 7200}-Other",
+        ]
 
     def test_a_dropped_connection_carries_on_with_the_job(self, tmp_path):
         sink = Sink()
