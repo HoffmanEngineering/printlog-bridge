@@ -67,6 +67,7 @@ async def logging_to(
     state_dir: Path,
     *,
     clock=None,
+    monotonic=None,
     backoff=FAST_BACKOFF,
     image_timeout: float | None = None,
     spools: bool = False,
@@ -80,6 +81,8 @@ async def logging_to(
     options = {}
     if clock:
         options["clock"] = clock
+    if monotonic:
+        options["monotonic"] = monotonic
     if image_timeout is not None:
         options["image_timeout"] = image_timeout
     if max_attachment_bytes is not None:
@@ -643,13 +646,17 @@ class TestOldEntries:
         api = FakePrintLogApi()
         api.offline = True
         now = [STARTED_AT]
+        running = [0.0]
 
         async def scenario():
-            async with logging_to(api, tmp_path, clock=lambda: now[0]) as logger:
+            async with logging_to(
+                api, tmp_path, clock=lambda: now[0], monotonic=lambda: running[0]
+            ) as logger:
                 try:
                     await logger.emit(started())
                     await logger.send_due()
                     now[0] += MAX_AGE + timedelta(minutes=1)
+                    running[0] += (MAX_AGE + timedelta(minutes=1)).total_seconds()
                     api.offline = False
                     with caplog.at_level(logging.WARNING, logger="printlog_bridge"):
                         await logger.send_due()
@@ -666,6 +673,32 @@ class TestOldEntries:
         assert "00000A" in caplog.text
         assert read_waiting(tmp_path) == {}
         assert logger.state("voron").jobs["00000A"].finished  # so it is never replayed again
+
+    def test_a_clock_stepped_forward_does_not_drop_what_was_queued(self, tmp_path):
+        """A Pi without a clock boots offline with the time it was shut down (fake-hwclock), two
+        months ago, and a print runs. When the network comes back, NTP steps the clock forward
+        as the API becomes reachable: the print is logged, not given up on as 60 days old."""
+        api = FakePrintLogApi()
+        api.offline = True
+        now = [STARTED_AT]
+
+        async def scenario():
+            async with logging_to(api, tmp_path, clock=lambda: now[0]) as logger:
+                try:
+                    await logger.emit(started())
+                    await logger.emit(finished())
+                    await logger.send_due()
+                    now[0] += timedelta(days=60)  # NTP
+                    api.offline = False
+                    await drain(logger)
+                finally:
+                    logger.close()
+
+        asyncio.run(scenario())
+
+        [print_] = api.prints.values()
+        assert print_["status"] == 3
+        assert read_waiting(tmp_path) == {}
 
 
 class PowerCut(BaseException):
@@ -1241,9 +1274,12 @@ class TestImages:
     def test_an_expired_image_does_not_stop_the_print_from_completing(self, tmp_path):
         api = FakePrintLogApi()
         now = [STARTED_AT]
+        running = [0.0]
 
         async def scenario():
-            async with logging_to(api, tmp_path, clock=lambda: now[0]) as logger:
+            async with logging_to(
+                api, tmp_path, clock=lambda: now[0], monotonic=lambda: running[0]
+            ) as logger:
                 try:
                     await logger.emit(started())
                     await drain(logger)
@@ -1251,6 +1287,7 @@ class TestImages:
                     await logger.emit(image())
                     await logger.send_due()
                     now[0] += MAX_AGE + timedelta(minutes=1)
+                    running[0] += (MAX_AGE + timedelta(minutes=1)).total_seconds()
                     await logger.emit(finished())
                     api.offline = False
                     await drain(logger)

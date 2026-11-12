@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -226,12 +227,14 @@ class JobLogger:
         spools: Spools | None = None,
         max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
         attachment_timeout: float = ATTACHMENT_TIMEOUT_S,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         """`before_create(printer)` runs before each print is created. The bridge registers the
         printer's connection there, so the print links to it; ApiUnavailable from it holds the
         print back for the next try, anything else is logged and the print goes ahead. With
         `spools`, each print's usage rows are linked to the spools loaded in their slots. A file
-        to attach larger than `max_attachment_bytes` is skipped."""
+        to attach larger than `max_attachment_bytes` is skipped. `monotonic` counts how long
+        outbox entries wait (core/outbox.py)."""
         self.api = api
         self.spools = spools
         self.printers = dict(printers)
@@ -246,7 +249,7 @@ class JobLogger:
         self.attachments_dir = state_dir / ATTACHMENTS_DIR
         self._plan: tuple[bool, float] | None = None
         """Whether the account has Pro, and when the API said (on the event loop's clock)."""
-        self.outbox = Outbox.open(state_dir, clock=clock)
+        self.outbox = Outbox.open(state_dir, clock=clock, monotonic=monotonic)
         self._outcomes: dict[str, tuple[str, JobOutcome]] = {}
         """Each printer's last job seen ending in this run, and how it ended, for whether its
         snapshot is the default. One per printer, and gone once the snapshot comes."""
@@ -842,7 +845,7 @@ class JobLogger:
         for entry in self.outbox.drop_expired():
             log.warning(
                 "[printer %s] gave up on job %s: its %s couldn't reach 3D Print Log in 30 days "
-                "(queued %s; last error: %s)",
+                "of the bridge running (queued %s; last error: %s)",
                 entry.printer, entry.job_id, entry.kind, entry.queued_at.isoformat(),
                 entry.last_error or "none",
             )  # fmt: skip

@@ -14,6 +14,7 @@ from printlog_bridge.core.api_client import (
     ApiUnavailable,
     AuthRejected,
 )
+from printlog_bridge.core.device import DeviceToken
 
 
 def with_api(handler, call):
@@ -98,6 +99,65 @@ def serve(routes, call):
             await server.close()
 
     return asyncio.run(scenario())
+
+
+class TestRedirects:
+    """aiohttp follows redirects by default and, on a redirect to another origin, drops only
+    `Authorization`: `X-Api-Key` went along (seen with aiohttp 3.8.6, 3.9.5 and 3.14.5). The
+    API never redirects, so a 3xx is answered as an API that isn't working right."""
+
+    @staticmethod
+    def redirected(status, *, api_key=None, device=None, call=None):
+        seen = []
+
+        async def elsewhere(request):
+            seen.append(dict(request.headers))
+            return web.json_response({"id": 1})
+
+        async def scenario():
+            other = web.Application()
+            other.router.add_route("*", "/{tail:.*}", elsewhere)
+            other_server = TestServer(other, host="127.0.0.1")
+            await other_server.start_server()
+            # localhost against 127.0.0.1: another host name, as well as another port
+            target = str(other_server.make_url("/api/Users/me")).replace("127.0.0.1", "localhost")
+
+            async def redirect(_request):
+                return web.Response(status=status, headers={"Location": target})
+
+            api = web.Application()
+            api.router.add_route("*", "/{tail:.*}", redirect)
+            api_server = TestServer(api, host="127.0.0.1")
+            await api_server.start_server()
+            try:
+                base = str(api_server.make_url("")).rstrip("/")
+                async with ApiClient(base, api_key=api_key, device=device) as client:
+                    await (call or (lambda c: c.current_user()))(client)
+            finally:
+                await api_server.close()
+                await other_server.close()
+
+        with pytest.raises(ApiUnavailable) as raised:
+            asyncio.run(scenario())
+        return raised.value, seen
+
+    @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+    def test_the_api_key_never_follows_a_redirect(self, status):
+        error, seen = self.redirected(
+            status, api_key="key-123", call=lambda c: c.create_print({"title": "Benchy"})
+        )
+
+        assert seen == []
+        assert error.status == status
+        assert str(status) in str(error)
+
+    def test_a_device_token_never_follows_a_redirect_either(self):
+        device = DeviceToken(token="pld_secret", api_url="http://127.0.0.1")
+
+        error, seen = self.redirected(302, device=device)
+
+        assert seen == []
+        assert error.status == 302
 
 
 class TestPrints:
@@ -428,3 +488,80 @@ class TestSlots:
 
         assert e.value.status == 403
         assert "does not have access" in str(e.value)
+
+
+class TestProblemCodes:
+    """The problem's `code` comes from the whole body; only the message is cut to 300 chars."""
+
+    @staticmethod
+    def problem(status, code, detail_length):
+        async def refuse(_request):
+            return web.json_response(
+                {
+                    "type": "https://tools.ietf.org/html/rfc9110#section-15.5.4",
+                    "title": "Forbidden",
+                    "status": status,
+                    "detail": "x" * detail_length,
+                    "code": code,
+                    "traceId": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-00",
+                },
+                status=status,
+            )
+
+        return refuse
+
+    def test_a_long_superseded_answer_is_still_superseded(self):
+        from printlog_bridge.core.api_client import TokenSuperseded
+
+        async def scenario():
+            app = web.Application()
+            app.router.add_post("/api/Prints", self.problem(403, "device_token_superseded", 400))
+            server = TestServer(app)
+            await server.start_server()
+            try:
+                base = str(server.make_url("")).rstrip("/")
+                device = DeviceToken(token="pld_old", api_url=base)
+                async with ApiClient(base, device=device) as client:
+                    await client.create_print({})
+            finally:
+                await server.close()
+
+        with pytest.raises(TokenSuperseded):
+            asyncio.run(scenario())
+
+    def test_a_long_refusal_keeps_its_code_and_a_short_message(self):
+        refuse = self.problem(400, "insufficient_scope", 400)
+
+        with pytest.raises(ApiRejected) as raised:
+            serve([("PUT", "/api/bridges/me", refuse)], lambda c: c.check_in({}))
+
+        assert raised.value.code == "insufficient_scope"
+        assert "x" * 400 not in str(raised.value)
+
+
+class TestOtherClientErrors:
+    """A 4xx the API won't answer differently next time is rejected, rather than tried every
+    minute for 30 days. 404, 405 and 409 stay worth retrying: the API answers 409 when two
+    requests race to finish a print (api#199), and a 404 or 405 on an endpoint the bridge relies
+    on is a misrouted request or an API being deployed far more often than a permanent answer.
+    """
+
+    @pytest.mark.parametrize("status", [406, 410, 411, 414, 422, 431, 451])
+    def test_a_permanent_refusal_is_rejected(self, status):
+        async def refuse(_request):
+            return web.Response(status=status, text="no")
+
+        with pytest.raises(ApiRejected) as raised:
+            serve([("POST", "/api/Prints", refuse)], lambda c: c.create_print({}))
+
+        assert raised.value.status == status
+
+    @pytest.mark.parametrize("status", [404, 405, 408, 409, 421, 425, 429])
+    def test_an_answer_that_may_change_is_tried_again(self, status):
+        async def refuse(_request):
+            return web.Response(status=status)
+
+        with pytest.raises(ApiUnavailable) as raised:
+            serve([("POST", "/api/Prints", refuse)], lambda c: c.create_print({}))
+
+        assert raised.value.status == status

@@ -5,6 +5,13 @@ when the bridge does; a printer connected in the app starts and stops when the d
 
 A stopped printer's queued events still go out: the job logger keeps it, so a print it started
 is still logged as far as the bridge saw it.
+
+An adapter returns only when cancelled, so one that raises has a bug (a firmware message it
+can't read, say). A config-file printer's takes the bridge down, and the service manager starts
+it again. A printer connected in the app is watched again on its own after a wait that doubles
+from `RESTART_MIN_S` to `RESTART_MAX_S` (and starts over once it has run for
+`RESTART_RESET_S`), so one printer's bug neither stops the others nor leaves it unwatched until
+the bridge restarts. The error is logged and shown in `status` until it connects again.
 """
 
 from __future__ import annotations
@@ -23,6 +30,23 @@ from printlog_bridge.core.status import StatusBoard
 from printlog_bridge.core.trace import Trace
 
 log = logging.getLogger(__name__)
+
+RESTART_MIN_S = 10.0
+RESTART_MAX_S = 15 * 60.0
+RESTART_RESET_S = 60 * 60.0
+"""An adapter that ran this long before it failed is tried again after `RESTART_MIN_S`."""
+
+
+def restart_delay(failures: int) -> float:
+    """How long to wait before watching a printer again after its adapter's `failures`th error
+    in a row."""
+    return min(RESTART_MIN_S * 2 ** min(max(failures - 1, 0), 30), RESTART_MAX_S)
+
+
+def _words(seconds: float) -> str:
+    if seconds < 120:
+        return f"{seconds:.0f}s" if seconds >= 1 else f"{seconds:.2f}s"
+    return f"{seconds / 60:.0f} min"
 
 
 class Watchers:
@@ -58,7 +82,7 @@ class Watchers:
     def start(self, printer: PrinterConfig, *, fatal: bool = True) -> None:
         """Starts watching `printer`. With `fatal`, an adapter that fails (a bug: adapters
         return only when cancelled) takes the bridge down, as before; otherwise it is logged and
-        that printer alone stops."""
+        that printer alone stops, and is watched again after a growing wait."""
         if printer.printer_id is None:
             raise ValueError(f"[printer {printer.name}] has no printer_id")
         name = printer.name
@@ -94,13 +118,44 @@ class Watchers:
             "[printer %s] watching: %s, logging to printer %s",
             name, printer.adapter.describe(), printer.printer_id,
         )  # fmt: skip
-        task = asyncio.ensure_future(printer.adapter.run(self.sink, self.board.printer(name)))
+        report = self.board.printer(name)
+        task = asyncio.ensure_future(
+            printer.adapter.run(self.sink, report) if fatal else self._keep_watching(printer)
+        )
         self._tasks[name] = task
         task.add_done_callback(lambda t, name=name, fatal=fatal: self._ended(name, t, fatal))
         if not fatal:  # started while running: show it in 3D Print Log now, not in 5 minutes
             beat = asyncio.ensure_future(self.heartbeat.beat(name))
             self._beats.add(beat)
             beat.add_done_callback(self._beats.discard)
+
+    async def _keep_watching(self, printer: PrinterConfig) -> None:
+        """Runs a non-fatal printer's adapter, and runs it again after a growing wait each time
+        it fails, until cancelled (by `stop`, so a printer let go isn't started again)."""
+        loop = asyncio.get_running_loop()
+        name = printer.name
+        failures = 0
+        while True:
+            began = loop.time()
+            try:
+                await printer.adapter.run(self.sink, self.board.printer(name))
+                return
+            except Exception as error:
+                if loop.time() - began >= RESTART_RESET_S:
+                    failures = 0
+                failures += 1
+                delay = restart_delay(failures)
+                log.error(
+                    "[printer %s] stopped watching after an error: %r. It is watched again in "
+                    "%s.",
+                    name, error, _words(delay), exc_info=error,
+                )  # fmt: skip
+                self.board.printer(name).disconnected(
+                    f"the bridge stopped watching it after an error ({error!r}); it tries again "
+                    f"in {_words(delay)}"
+                )
+            await asyncio.sleep(delay)
+            log.info("[printer %s] watching again after an error", name)
 
     def _ended(self, name: str, task: asyncio.Task, fatal: bool) -> None:
         if task.cancelled():
