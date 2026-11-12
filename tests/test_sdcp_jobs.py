@@ -452,6 +452,20 @@ class TestReconnects:
         assert done.outcome is JobOutcome.CANCELLED
         assert done.filament_g == {0: 6.0}
 
+    def test_a_one_tool_job_on_tool_2_keeps_its_estimate_there_through_a_restart(self, tmp_path):
+        class Tool2(Files):
+            async def read(self, path: str) -> JobFile:
+                return JobFile(grams={1: 12.0}, mm={1: 4000.0}, duration_s=3000.0)
+
+        t, sink, _ = tracker(PrinterState.load(tmp_path, "cc"), files=Tool2())
+        feed(t, status(T0, 13, progress=50))
+        assert sink.of(JobStarted)[0].estimated_filament_g_by_slot == {1: 12.0}
+        again, sink2, _ = tracker(PrinterState.load(tmp_path, "cc"))  # no reader now
+        feed(again, status(T0 + 60, 8, progress=50))
+        [done] = sink2.of(JobFinished)
+        assert done.filament_g == {1: 6.0}
+        assert done.filament_mm == {1: 2000.0}
+
     def test_the_ended_job_is_forgotten(self, tmp_path):
         state = PrinterState.load(tmp_path, "cc")
         t, _, _ = tracker(state)

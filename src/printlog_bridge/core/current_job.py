@@ -139,12 +139,15 @@ def _estimate(
     start: JobStarted,
 ) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
     """The slicer's estimate as usage (grams, millimeters, milliliters): grams per slot when
-    the file has them, else the totals on slot 0."""
-    if start.estimated_filament_g_by_slot:
-        return dict(start.estimated_filament_g_by_slot), {}, {}
-    grams = {0: start.estimated_filament_g} if start.estimated_filament_g else {}
-    mm = {0: start.estimated_filament_mm} if start.estimated_filament_mm else {}
-    ml = {0: start.estimated_volume_ml} if start.estimated_volume_ml else {}
+    the file has them for several, else the totals on the job's one slot, or on slot 0 when
+    the adapter didn't know it."""
+    by_slot = start.estimated_filament_g_by_slot
+    if len(by_slot) > 1:
+        return dict(by_slot), {}, {}
+    slot = next(iter(by_slot), 0)
+    grams = {slot: start.estimated_filament_g} if start.estimated_filament_g else dict(by_slot)
+    mm = {slot: start.estimated_filament_mm} if start.estimated_filament_mm else {}
+    ml = {slot: start.estimated_volume_ml} if start.estimated_volume_ml else {}
     return grams, mm, ml
 
 

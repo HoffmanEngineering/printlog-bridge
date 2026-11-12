@@ -213,7 +213,7 @@ class JobTracker:
             estimated_duration_s=duration,
             estimated_filament_mm=sum(mm.values()) or None,
             estimated_filament_g=sum(grams.values()) or None,
-            estimated_filament_g_by_slot=grams if len(grams) > 1 else {},
+            estimated_filament_g_by_slot=grams,
         )
         job.start = start
         await self.sink.emit(start)

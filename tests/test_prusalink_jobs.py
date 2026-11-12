@@ -148,7 +148,7 @@ class TestLifecycle:
         assert start.started_at == NOW - timedelta(seconds=90)
         assert start.estimated_duration_s == 3600.0
         assert start.estimated_filament_g == 12.0
-        assert start.estimated_filament_g_by_slot == {}
+        assert start.estimated_filament_g_by_slot == {0: 12.0}
         [image] = sink.of(JobImage)
         assert run(image.fetch()) == PNG
         [settings] = sink.of(JobSlicerSettings)
@@ -272,6 +272,38 @@ class TestLifecycle:
         finished = sink.of(JobFinished)[0]
         assert finished.filament_g == {0: 10.0, 2: 2.5, 4: 1.25}
         assert finished.filament_mm == {0: 3300.0, 2: 800.0}
+
+    def test_a_one_tool_job_has_its_estimate_on_that_tool(self, tmp_path):
+        printer, sink = Printer(), Sink()
+        printer.file = JobFile(grams={2: 12.0}, mm={2: 4000.0})  # an XL printing on tool 3
+        t = tracker(tmp_path, printer, sink)
+
+        async def scenario():
+            printer.print(progress=50.0)
+            await poll(t, printer)
+            printer.state = "FINISHED"
+            await poll(t, printer)
+
+        run(scenario())
+
+        assert sink.of(JobStarted)[0].estimated_filament_g_by_slot == {2: 12.0}
+        assert sink.of(JobFinished)[0].filament_g == {2: 12.0}
+
+    def test_a_one_tool_job_ended_after_a_restart_stays_on_its_tool(self, tmp_path):
+        printer = Printer()
+        printer.file = JobFile(grams={2: 12.0}, mm={2: 4000.0})
+        printer.print(progress=50.0)
+        run(poll(tracker(tmp_path, printer), printer))
+
+        sink = Sink()
+        t = tracker(tmp_path, printer, sink)
+        run(poll(t, printer))
+        printer.state = "FINISHED"
+        run(poll(t, printer))
+
+        finished = sink.of(JobFinished)[0]
+        assert finished.filament_g == {2: 12.0}
+        assert finished.filament_mm == {2: 4000.0}  # from the start, on the same tool
 
     def test_a_job_without_a_file_read_is_logged_without_usage(self, tmp_path):
         printer, sink = Printer(), Sink()

@@ -117,6 +117,15 @@ def test_grams_per_slot_are_the_estimate_of_a_multi_tool_job(tmp_path):
     assert finished.filament_mm == {}
 
 
+def test_a_one_slot_jobs_estimate_stays_on_its_slot(tmp_path):
+    current(tmp_path).started(start(estimated_filament_g_by_slot={3: 13.1}))
+
+    _, finished = current(tmp_path).reconcile(None)
+
+    assert finished.filament_g == {3: 13.1}
+    assert finished.filament_mm == {3: 4400.0}
+
+
 def test_never_seen_again_ends_when_it_was_remembered(tmp_path):
     clock = Clock()
     current(tmp_path, clock).started(start())
