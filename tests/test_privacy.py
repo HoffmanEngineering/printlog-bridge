@@ -635,7 +635,9 @@ class TestOnlyOutboundConnections:
         clients = re.compile(
             r"ClientSession\(|open_unix_connection|open_connection\(|socket\.socket|"
             r"create_datagram_endpoint|urllib\.request|http\.client|import requests|"
-            r"import httpx|ftplib\.FTP"
+            r"import httpx|ftplib\.FTP|"
+            # The adapters' HTTP clients make their sessions with adapters/common/http.py's.
+            r"common\.http import (\([^)]*|[^\n]*)\bsession\b"
         )
         found = {
             path.relative_to(SRC).as_posix()
@@ -651,6 +653,7 @@ class TestOnlyOutboundConnections:
             "adapters/moonraker/session.py",
             "adapters/moonraker/discovery.py",
             "adapters/common/mqtt.py",
+            "adapters/common/http.py",
             "adapters/bambu/ftps.py",
             "adapters/bambu/discovery.py",
             "adapters/prusalink/client.py",

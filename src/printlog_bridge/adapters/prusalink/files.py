@@ -44,7 +44,7 @@ from printlog_bridge.core.slicer_settings import (
 )
 from printlog_bridge.core.status import PrinterReport
 
-from .bgcode import JPG, PNG, BgcodeInfo, BgcodeReader, NotBgcode
+from .bgcode import JPG, MAX_THUMBNAIL_BYTES, PNG, BgcodeInfo, BgcodeReader, NotBgcode
 from .client import PrusaLinkClient, Refused
 
 log = logging.getLogger(__name__)
@@ -53,7 +53,6 @@ MAX_BGCODE_HEAD_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_GCODE_BYTES = 64 * 1024 * 1024
 HEAD_BYTES = 64 * 1024
 TAIL_BYTES = 512 * 1024
-MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
 READ_TIMEOUT_S = 180.0
 """For the whole read: a plain G-code file over a MINI's network can take minutes."""
 WARNING = "files"
@@ -107,6 +106,11 @@ class PrusaLinkFiles:
                     "[printer %s] can't read the job's file (%s), so it is logged without the "
                     "slicer's estimates", self.printer, e,
                 )  # fmt: skip
+            except Exception as e:  # a file the bridge can't read never stops a print's logging
+                log.warning(
+                    "[printer %s] can't read the job's file (%s: %s), so it is logged without "
+                    "the slicer's estimates", self.printer, type(e).__name__, e,
+                )  # fmt: skip
             else:
                 self.report.warn(WARNING, None)
         self._key, self._file = key, found
@@ -143,7 +147,9 @@ class PrusaLinkFiles:
         async with self.client.stream(path) as chunks:
             async for chunk in chunks:
                 read += len(chunk)
-                if reader.feed(chunk) or read >= MAX_BGCODE_HEAD_BYTES:
+                # Decoding (Heatshrink is pure Python) runs in a thread, so it never holds up
+                # the other printers and `timeout` can end it.
+                if await asyncio.to_thread(reader.feed, chunk) or read >= MAX_BGCODE_HEAD_BYTES:
                     break
         for problem in reader.info.problems:
             log.info("[printer %s] in the job's file, %s", self.printer, problem)

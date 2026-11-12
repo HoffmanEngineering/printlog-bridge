@@ -125,9 +125,12 @@ class MqttClient:
                 raise MqttClosed(f"connection lost ({e.__class__.__name__})") from None
             if first >> 4 != _PUBLISH:
                 continue  # SUBACK, PINGRESP
-            length = struct.unpack(">H", body[:2])[0]
-            topic = body[2 : 2 + length].decode("utf-8", errors="replace")
+            length = struct.unpack(">H", body[:2])[0] if len(body) >= 2 else 0
             offset = 2 + length + (2 if first & 0x06 else 0)  # a packet id at QoS 1 or 2
+            if len(body) < offset:
+                await self.close()
+                raise MqttClosed("malformed PUBLISH")
+            topic = body[2 : 2 + length].decode("utf-8", errors="replace")
             return topic, body[offset:]
 
     async def close(self) -> None:

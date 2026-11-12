@@ -52,7 +52,12 @@ from urllib.parse import quote
 
 import aiohttp
 
-from printlog_bridge import __version__
+from printlog_bridge.adapters.common.http import (
+    MAX_JSON_BYTES,
+    read_capped,
+    session,
+    url_on,
+)
 from printlog_bridge.adapters.common.timeouts import bounded
 from printlog_bridge.core.images import image_type
 from printlog_bridge.core.secrets import scrub
@@ -340,9 +345,7 @@ class DuetClient:
 
     def _session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
-            self._http = aiohttp.ClientSession(
-                headers={"User-Agent": f"printlog-bridge/{__version__}"}
-            )
+            self._http = session()
         return self._http
 
     async def _request(
@@ -354,13 +357,13 @@ class DuetClient:
                                                 "params": _traced_params(params)}))  # fmt: skip
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with self._session().get(
-            self.base_url + path,
+            url_on(self.base_url, path),
             params=dict(params) if params else None,
             headers=headers,
             timeout=timeout,
             allow_redirects=False,
         ) as response:
-            text = await response.text(errors="replace")
+            text = (await read_capped(response, MAX_JSON_BYTES)).decode("utf-8", errors="replace")
             status = response.status
         body: Any = None
         if text.strip():

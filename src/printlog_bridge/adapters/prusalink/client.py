@@ -25,7 +25,13 @@ from typing import Any
 
 import aiohttp
 
-from printlog_bridge import __version__
+from printlog_bridge.adapters.common.http import (
+    MAX_JSON_BYTES,
+    inflated,
+    read_capped,
+    session,
+    url_on,
+)
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 DEFAULT_USER = "maker"
@@ -71,7 +77,7 @@ class PrusaLinkClient:
         `Refused` for credentials the printer turns down, and aiohttp's and asyncio's errors for
         a printer that can't be reached."""
         async with self._get(path, aiohttp.ClientTimeout(total=self.timeout)) as response:
-            text = await response.text(errors="replace")
+            text = (await read_capped(response, MAX_JSON_BYTES)).decode("utf-8", errors="replace")
             body: Any = None
             if text.strip():
                 with contextlib.suppress(ValueError):
@@ -97,14 +103,14 @@ class PrusaLinkClient:
             if response.status != 200:
                 raise FileNotFoundError(f"{path}: HTTP {response.status}")
             try:
-                yield response.content.iter_chunked(CHUNK_BYTES)
+                yield inflated(response, CHUNK_BYTES)
             finally:
                 response.close()
 
     @contextlib.asynccontextmanager
     async def _get(self, path: str, timeout: aiohttp.ClientTimeout):
         session = self._session_for()
-        url = self.base_url + path
+        url = url_on(self.base_url, path)
         for _attempt in range(3):
             if self.trace is not None:
                 self.trace.record(SEND, json.dumps({"method": "GET", "path": path}))
@@ -130,9 +136,7 @@ class PrusaLinkClient:
 
     def _session_for(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers={"User-Agent": f"printlog-bridge/{__version__}"}
-            )
+            self._session = session()
         return self._session
 
     def _headers(self, path: str) -> dict[str, str]:

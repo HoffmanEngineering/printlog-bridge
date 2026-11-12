@@ -193,3 +193,37 @@ def test_a_broker_that_hangs_up_on_connect_is_closed_not_refused(cert):
 
     with pytest.raises(mqtt.MqttClosed):
         run(scenario())
+
+
+class _Writer:
+    def write(self, data):
+        pass
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [
+        bytes([0x30, 0x01, 0x00]),  # too short for the topic's length
+        bytes([0x30, 0x03, 0x00, 0x09, 0x61]),  # a topic longer than the packet
+        bytes([0x32, 0x03, 0x00, 0x01, 0x61]),  # QoS 1 without its packet id
+    ],
+    ids=["short", "long-topic", "no-packet-id"],
+)
+def test_a_malformed_publish_closes_the_connection(packet):
+    async def scenario():
+        reader = asyncio.StreamReader()
+        reader.feed_data(packet)
+        client = mqtt.MqttClient(reader, _Writer(), 60)  # type: ignore[arg-type]
+        try:
+            await client.receive()
+        finally:
+            assert client.closed
+
+    with pytest.raises(mqtt.MqttClosed, match="malformed PUBLISH"):
+        run(scenario())

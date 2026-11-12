@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
+import threading
+import time
 
 import pytest
 from fake_bambu import ACCESS_CODE, PNG, FakeFtps, certificate, make_3mf
 
-from printlog_bridge.adapters.bambu.ftps import BambuFtps, FilesRefused, FileTooLarge, candidates
+from printlog_bridge.adapters.bambu.files import BambuFiles
+from printlog_bridge.adapters.bambu.ftps import (
+    BambuFtps,
+    FetchCanceled,
+    FilesRefused,
+    FileTooLarge,
+    candidates,
+)
 from printlog_bridge.adapters.bambu.threemf import Filament, ThreeMF, plate_of
 from printlog_bridge.adapters.bambu.tls import CertificateChanged
+from printlog_bridge.core.status import NullReport
 
 
 @pytest.fixture
@@ -134,3 +145,70 @@ class TestThreeMF:
         assert plate_of("Box.gcode.3mf", 2) == 2
         assert plate_of("Box.gcode.3mf", "0") is None
         assert plate_of("", None) is None
+
+    def test_a_canceled_fetch_stops_reading(self, ftps):
+        ftps.files["/Box.gcode.3mf"] = make_3mf()
+        cancel = threading.Event()
+        cancel.set()
+
+        with pytest.raises(FetchCanceled):
+            client(ftps).fetch(["/Box.gcode.3mf"], cancel=cancel)
+
+
+class SlowFtps:
+    """A fetch that runs until it is canceled or let go, and then hands back a file anyway, as
+    one finishing just as the bridge gave up on it would."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.honors_cancel = True
+        """False: stuck in a read that a cancel can't end."""
+        self.canceled = False
+        self.go = threading.Event()
+        self.finished = threading.Event()
+        self.file = io.BytesIO(b"late")
+
+    def fetch(self, paths, cancel=None):
+        self.calls += 1
+        give_up = time.monotonic() + 3  # so a test that fails doesn't hang
+        try:
+            while not self.go.is_set() and time.monotonic() < give_up:
+                if self.honors_cancel and cancel is not None and cancel.is_set():
+                    self.canceled = True
+                    break
+                time.sleep(0.01)
+            return paths[0], self.file
+        finally:
+            self.finished.set()
+
+
+class TestBambuFiles:
+    STATUS = {"subtask_name": "Box", "gcode_file": "Box.gcode.3mf", "gcode_start_time": "1"}
+
+    def test_a_fetch_that_times_out_is_canceled_and_its_late_file_closed(self):
+        slow = SlowFtps()
+
+        async def scenario():
+            files = BambuFiles("x1c", slow, NullReport(), timeout=0.1)  # type: ignore[arg-type]
+            found = await files.open(self.STATUS)
+            assert await asyncio.get_running_loop().run_in_executor(None, slow.finished.wait, 5)
+            await asyncio.sleep(0.05)  # the late result's callback
+            return found
+
+        assert asyncio.run(scenario()) is None
+        assert slow.canceled
+        assert slow.file.closed
+
+    def test_no_second_fetch_starts_while_one_runs(self):
+        slow = SlowFtps()
+
+        async def scenario():
+            files = BambuFiles("x1c", slow, NullReport(), timeout=0.1)  # type: ignore[arg-type]
+            slow.honors_cancel = False
+            first = await files.open(self.STATUS)
+            second = await files.open(self.STATUS)
+            slow.go.set()
+            await asyncio.get_running_loop().run_in_executor(None, slow.finished.wait, 5)
+            return first, second, slow.calls
+
+        assert asyncio.run(scenario()) == (None, None, 1)
