@@ -409,7 +409,7 @@ class JobTracker:
             estimated_duration_s=file.duration_s,
             estimated_filament_mm=round(sum(file.mm.values()), 1) or None,
             estimated_filament_g=round(sum(file.grams.values()), 3) or None,
-            estimated_filament_g_by_slot=dict(file.grams) if len(file.grams) > 1 else {},
+            estimated_filament_g_by_slot=dict(file.grams),
         )
         percent = _gcode_percent(file.gcode_span, view.filepos)
         self.job = Job(
@@ -559,7 +559,11 @@ def _usage(job: Job, fraction: float) -> tuple[dict[int, float], dict[int, float
         grams = dict(start.estimated_filament_g_by_slot) or (
             {0: start.estimated_filament_g} if start.estimated_filament_g else {}
         )
-        mm = {0: start.estimated_filament_mm} if start.estimated_filament_mm else {}
+        mm = (
+            {next(iter(grams), 0): start.estimated_filament_mm}
+            if start.estimated_filament_mm
+            else {}
+        )
         if len(grams) > 1:
             mm = {}  # the length per tool isn't remembered: weight alone
     return (

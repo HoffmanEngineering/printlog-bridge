@@ -154,6 +154,7 @@ class TestLifecycle:
         assert start.job_id == f"{int(start.started_at.timestamp())}-Benchy"
         assert start.estimated_filament_g == 12.5 and start.estimated_filament_mm == 4130.0
         assert start.estimated_duration_s == 3600
+        assert start.estimated_filament_g_by_slot == {}  # no IFS: no slot to name
         [image] = sink.of(JobImage)
         assert image.kind is ImageKind.THUMBNAIL
         [end] = sink.of(JobFinished)
@@ -341,8 +342,21 @@ class TestAd5x:
             await t.on_detail(detail("completed", model="AD5X", progress=1.0, grams=9.0))
 
         run(scenario())
+        assert sink.of(JobStarted)[0].estimated_filament_g_by_slot == {3: 9.0}
         [end] = sink.of(JobFinished)
         assert end.filament_g == {3: 9.0} and end.filament_mm == {3: 3000.0}
+
+    def test_a_one_slot_print_from_the_feeding_slot_has_its_estimate_there(self):
+        t, sink, _ = tracker(files=Files())
+        station = {"slotCnt": 4, "currentSlot": 2, "slotInfos": []}
+
+        async def scenario():
+            await t.on_detail(detail(model="AD5X", progress=0.1, matlStationInfo=station))
+            await t.on_detail(detail("completed", model="AD5X", progress=1.0))
+
+        run(scenario())
+        assert sink.of(JobStarted)[0].estimated_filament_g_by_slot == {1: 12.5}
+        assert sink.of(JobFinished)[0].filament_g == {1: 12.5}
 
     def test_slots_are_reported_when_they_change(self):
         readings: list[SpoolReading] = []

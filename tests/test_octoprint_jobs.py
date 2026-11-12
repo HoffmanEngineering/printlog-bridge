@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from printlog_bridge.adapters.common.slicer_meta import JobFile
 from printlog_bridge.adapters.octoprint.adapter import _work
 from printlog_bridge.adapters.octoprint.files import from_analysis
 from printlog_bridge.adapters.octoprint.jobs import JobTracker
@@ -262,6 +263,32 @@ def test_a_print_that_died_with_octoprint_is_cancelled_at_its_progress(tmp_path,
     assert finished.filament_mm == {0: 2000.0}
     assert finished.usage_estimated is True
     assert "didn't see this job end" in finished.note
+
+
+def test_a_one_tool_job_on_t1_keeps_its_estimate_there_through_a_restart(tmp_path):
+    class Tool1:
+        async def read(self, job):
+            return JobFile(grams={1: 12.0}, mm={1: 4000.0})
+
+    state = PrinterState.load(tmp_path, "p")
+    sink = Sink()
+    t = JobTracker("p", sink, CurrentJob(state), files=Tool1(), clock=Clock())
+    t.connected()
+
+    async def scenario():
+        await t.on_status(status(T0 + 60, completion=1.0, print_time=60, marks=[START]))
+        await t.on_status(status(T0 + 600, completion=20.0, print_time=600, marks=[START]))
+        state.save()
+        t2, _ = tracker(PrinterState.load(tmp_path, "p"))
+        t2.sink = sink
+        connected = [{"type": "connected", "time": T0 + 690}]
+        await t2.on_status(status(T0 + 700, state="Operational", marks=connected))
+
+    asyncio.run(scenario())
+    assert sink.of(JobStarted)[0].estimated_filament_g_by_slot == {1: 12.0}
+    [finished] = sink.of(JobFinished)
+    assert finished.filament_g == {1: 2.4}
+    assert finished.filament_mm == {1: 800.0}
 
 
 def test_a_printer_in_error_after_a_missed_end_is_a_failure():

@@ -20,9 +20,12 @@ screen, such as a filament mismatch before it starts). When it ends the state is
   estimated.
 
 `job_id` is `<printer's job id>-<file name>`: the counter alone would repeat after a reset of the
-printer. With no history on the printer, `CurrentJob` keeps the running job, and the first status
-after each connect is reconciled: `FINISHED`, `STOPPED` or `ERROR` then is taken as how the
-remembered job ended, which can't be checked, as the job is gone from the status by then.
+printer. With no history on the printer, `CurrentJob` keeps the running job and its progress.
+After a reconnect (one failed poll is one), a job still in memory is carried on by the first
+status as by any poll, its end placed when the bridge last saw it running. After a restart the
+first status is reconciled: `FINISHED`, `STOPPED` or `ERROR` then is taken as how the remembered
+job ended, which can't be checked, as the job is gone from the status by then. Another job, or
+none, ends it by its kept progress, as above.
 """
 
 from __future__ import annotations
@@ -35,7 +38,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
-from printlog_bridge.core.current_job import CurrentJob
+from printlog_bridge.core.current_job import (
+    COMPLETE_AT_PERCENT,
+    UNSEEN_PROGRESS_NOTE,
+    UNSEEN_TIME_NOTE,
+    CurrentJob,
+    unseen_outcome,
+)
 from printlog_bridge.core.events import (
     EventSink,
     ImageKind,
@@ -62,7 +71,6 @@ ENDS = {
     "ERROR": JobOutcome.FAILED,
 }
 AT_REST = frozenset({"IDLE", "READY"})
-COMPLETE_AT_PERCENT = 99.0
 MAX_NAME_IN_ID = 80
 UNSEEN_STATE_NOTE = (
     "The printer went back to idle without the bridge seeing it finish or stop, so it is logged "
@@ -109,6 +117,9 @@ class JobTracker:
         self.state: str | None = None
         self._reconciled = False
         self._known: Mapping[str, Any] | None = None
+        self._unseen = False
+        """The first status after a reconnect, with the job still in memory: an end it shows
+        happened while the bridge wasn't connected."""
 
     @property
     def active(self) -> bool:
@@ -148,6 +159,11 @@ class JobTracker:
                 if details is None:
                     return False
                 running = self._job_id(job["id"], details)
+        if self.job is not None and running != self.job.job_id:
+            # The connection dropped, the bridge didn't restart: the job and its progress are
+            # still here, so this status is taken as a live one would be (`_step`).
+            self._unseen = True
+            return True
         outcome = ENDS.get(state) if running is None and remembered is not None else None
         for event in self.current.reconcile(running, outcome):
             await self.sink.emit(event)
@@ -157,6 +173,7 @@ class JobTracker:
             # The bridge restarted while it ran. Its file isn't read again: the start's
             # estimates are its usage.
             self.job = Job(job["id"], remembered.job_id, remembered)  # type: ignore[index]
+            self.job.progress = self.current.progress or 0.0
         else:
             self.job = None
         return True
@@ -164,18 +181,19 @@ class JobTracker:
     async def _step(
         self, state: str, job: Mapping[str, Any] | None, printer: Mapping[str, Any]
     ) -> None:
+        unseen, self._unseen = self._unseen, False
+        at = self.current.last_seen if unseen else None
         if job is not None and state in WITH_JOB:
             if self.job is not None and self.job.printer_job != job["id"]:
                 # Another job, without this one's end seen: what the printer can't tell.
-                for event in self.current.reconcile(None):
-                    await self.sink.emit(event)
-                self.job = None
+                outcome = unseen_outcome(self.job.progress)
+                await self._finish(outcome, UNSEEN_PROGRESS_NOTE, at=self.current.last_seen)
             if self.job is None:
                 if state in STARTS:
                     await self._start(job)
                 return
             self.job.progress = _percent(job.get("progress"), self.job.progress)
-            self.current.seen()
+            self.current.seen(self.job.progress)
             return
         if self.job is None:
             return
@@ -188,11 +206,13 @@ class JobTracker:
                 note = "The printer stopped the job with an error" + (
                     f": {text}." if isinstance(text, str) and text.strip() else "."
                 )
-            await self._finish(outcome, note)
+            if unseen:
+                note = f"{note} {UNSEEN_TIME_NOTE}" if note else UNSEEN_TIME_NOTE
+            await self._finish(outcome, note, at=at)
         elif state in AT_REST:
             complete = self.job.progress >= COMPLETE_AT_PERCENT
             outcome = JobOutcome.COMPLETED if complete else JobOutcome.CANCELLED
-            await self._finish(outcome, UNSEEN_STATE_NOTE)
+            await self._finish(outcome, UNSEEN_STATE_NOTE, at=at)
         # BUSY or ATTENTION without a job: recovering mid-job; wait.
 
     async def _details(self, job: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -224,11 +244,11 @@ class JobTracker:
             estimated_duration_s=file.duration_s,
             estimated_filament_mm=round(sum(file.mm.values()), 1) or None,
             estimated_filament_g=round(sum(file.grams.values()), 3) or None,
-            estimated_filament_g_by_slot=dict(file.grams) if len(file.grams) > 1 else {},
+            estimated_filament_g_by_slot=dict(file.grams),
         )
         self.job = Job(job["id"], job_id, start, file, _percent(job.get("progress"), 0.0))
         await self.sink.emit(start)
-        self.current.started(start)
+        self.current.started(start, self.job.progress)
         log.info("[printer %s] job %s started", self.printer, job_id)
         if file.thumbnail is not None:
             thumbnail = file.thumbnail
@@ -249,12 +269,15 @@ class JobTracker:
                 JobSlicerSettings(self.printer, job_id, metadata=file.metadata, read=read_settings)
             )
 
-    async def _finish(self, outcome: JobOutcome, note: str | None) -> None:
+    async def _finish(
+        self, outcome: JobOutcome, note: str | None, *, at: datetime | None = None
+    ) -> None:
+        """`at` is when it ended, when not now."""
         job = self.job
         assert job is not None
         progress = 1.0 if outcome is JobOutcome.COMPLETED else job.progress / 100
         grams, mm = _usage(job, progress)
-        now = self.clock()
+        now = max(at, job.start.started_at) if at is not None else self.clock()
         await self.sink.emit(
             JobFinished(
                 printer=self.printer,
@@ -290,7 +313,11 @@ def _usage(job: Job, progress: float) -> tuple[dict[int, float], dict[int, float
         grams = dict(start.estimated_filament_g_by_slot) or (
             {0: start.estimated_filament_g} if start.estimated_filament_g else {}
         )
-        mm = {0: start.estimated_filament_mm} if start.estimated_filament_mm else {}
+        mm = (
+            {next(iter(grams), 0): start.estimated_filament_mm}
+            if start.estimated_filament_mm
+            else {}
+        )
         if len(grams) > 1:
             mm = {}  # the length per tool isn't remembered: weight alone
     return (
