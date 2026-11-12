@@ -21,6 +21,7 @@ from urllib.parse import quote
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.adapters.common.http import url_on
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 from . import webhooks
@@ -88,7 +89,7 @@ class OctoPrintClient:
             self.trace.record(SEND, json.dumps({"method": method, "path": path}))
         request = session.request(
             method,
-            self.base_url + path,
+            url_on(self.base_url, path),
             json=body,
             headers=self._headers,
             timeout=aiohttp.ClientTimeout(total=self.timeout),
@@ -122,7 +123,7 @@ class OctoPrintClient:
             self.trace.record(SEND, json.dumps({"method": "GET", "path": path}))
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=self.timeout, sock_read=30)
         request = session.get(
-            self.base_url + path,
+            url_on(self.base_url, path),
             headers={**self._headers, **(headers or {})},
             timeout=timeout,
             allow_redirects=False,

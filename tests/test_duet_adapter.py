@@ -19,6 +19,7 @@ import pytest
 from fake_duet import BOARD, FIRMWARE, PASSWORD, PNG, FakeDuet
 from fake_moonraker import eventually
 from fake_printlog_api import FakePrintLogApi
+from http_helpers import host_of, http_server
 
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.duet import DuetAdapter
@@ -707,3 +708,20 @@ class TestSessions:
             asyncio.run(DuetFiles("railcore", Failing()).read("0:/gcodes/a.gcode"))
         assert "ClientConnectionError" in caplog.text
         assert PASSWORD not in caplog.text
+
+
+def test_the_client_requests_nothing_off_the_board():
+    """Every request can carry the session key: a path is only ever followed on the board."""
+
+    async def scenario():
+        async with http_server() as other, http_server() as board:
+            client = DuetClient(board.url, password=PASSWORD)
+            client.session_key = "TEST-ONLY-SESSION"
+            try:
+                with pytest.raises(aiohttp.InvalidURL):
+                    await client._request(f"@{host_of(other)}/rr_model", None, auth=True)
+            finally:
+                await client.close()
+            return other.requests, board.requests
+
+    assert asyncio.run(scenario()) == ([], [])

@@ -6,8 +6,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
+import aiohttp
 import pytest
 from fake_prusalink import PASSWORD, FakePrusaLink
+from http_helpers import host_of, http_server
 
 from printlog_bridge.adapters.prusalink.client import PrusaLinkClient, Refused, digest_header
 
@@ -145,3 +147,42 @@ def test_a_stream_stops_where_the_reader_does():
     seen, sent = run(scenario())
     assert seen >= 100_000
     assert sent < 1_000_000
+
+
+class TestOrigin:
+    """A path from the printer (a job's `refs`) is only ever requested from the printer: the
+    credentials go with every request."""
+
+    @pytest.mark.parametrize(
+        "path",
+        ["@{other}/thumb.png", "thumb.png", "http://{other}/thumb.png", "\\{other}/thumb.png"],
+    )
+    def test_a_path_that_leaves_the_printer_is_not_requested(self, path):
+        async def scenario():
+            async with http_server() as other, http_server() as printer:
+                client = PrusaLinkClient(printer.url, api_key="TEST-ONLY-KEY")
+                where = path.format(other=host_of(other))
+                try:
+                    with pytest.raises(aiohttp.InvalidURL):
+                        await client.get_json(where)
+                    with pytest.raises(aiohttp.InvalidURL):
+                        async with client.stream(where):
+                            pass
+                finally:
+                    await client.close()
+                return other.requests, printer.requests
+
+        assert run(scenario()) == ([], [])
+
+    def test_a_double_slash_stays_a_path_on_the_printer(self):
+        async def scenario():
+            async with http_server() as other, http_server() as printer:
+                client = PrusaLinkClient(printer.url, api_key="TEST-ONLY-KEY")
+                try:
+                    await client.get_json(f"//{host_of(other)}/thumb.png")
+                finally:
+                    await client.close()
+                return other.requests, [path for path, _ in printer.requests]
+
+        other, printer = run(scenario())
+        assert other == [] and len(printer) == 1

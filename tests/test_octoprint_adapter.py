@@ -10,16 +10,19 @@ import contextlib
 import json
 from pathlib import Path
 
+import aiohttp
 import bridge_helpers as helpers
 import pytest
 from fake_moonraker import eventually
 from fake_octoprint import API_KEY, VERSION, FakeOctoPrint
 from fake_printlog_api import FakePrintLogApi
+from http_helpers import host_of, http_server
 from test_prusalink_adapter import Report, Sink, running
 
 from printlog_bridge.adapters import ADAPTERS
 from printlog_bridge.adapters.octoprint import OctoPrintAdapter
 from printlog_bridge.adapters.octoprint.adapter import snapshot_url
+from printlog_bridge.adapters.octoprint.client import OctoPrintClient
 from printlog_bridge.adapters.octoprint.discovery import OctoPrintDiscovery
 from printlog_bridge.adapters.octoprint.files import thumbnail_from
 from printlog_bridge.adapters.octoprint.webhooks import posts_to_printlog
@@ -679,3 +682,24 @@ def test_the_recorded_socket_gives_a_completed_and_a_cancelled_job():
     assert done.duration_s == pytest.approx(21.062, abs=2)
     assert cancelled.outcome is JobOutcome.CANCELLED
     assert cancelled.filament_mm == {0: 1.3}  # 5.3% (the last status) of 25 mm
+
+
+def test_the_client_requests_nothing_off_octoprint():
+    """Every request carries the API key: a path is only ever followed on OctoPrint's server."""
+
+    async def scenario():
+        async with http_server() as other, http_server() as server:
+            client = OctoPrintClient(server.url + "/octoprint", "TEST-ONLY-KEY")
+            where = f"@{host_of(other)}/thumb.png"
+            try:
+                with pytest.raises(aiohttp.InvalidURL):
+                    await client.get_json(where)
+                with pytest.raises(aiohttp.InvalidURL):
+                    async with client.stream(where):
+                        pass
+                await client.get_json("/api/version")  # a path under the configured one
+            finally:
+                await client.close()
+            return other.requests, [path for path, _ in server.requests]
+
+    assert asyncio.run(scenario()) == ([], ["/octoprint/api/version"])

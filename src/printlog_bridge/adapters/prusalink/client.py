@@ -26,6 +26,7 @@ from typing import Any
 import aiohttp
 
 from printlog_bridge import __version__
+from printlog_bridge.adapters.common.http import url_on
 from printlog_bridge.core.trace import RECEIVE, SEND, Trace
 
 DEFAULT_USER = "maker"
@@ -104,7 +105,7 @@ class PrusaLinkClient:
     @contextlib.asynccontextmanager
     async def _get(self, path: str, timeout: aiohttp.ClientTimeout):
         session = self._session_for()
-        url = self.base_url + path
+        url = url_on(self.base_url, path)
         for _attempt in range(3):
             if self.trace is not None:
                 self.trace.record(SEND, json.dumps({"method": "GET", "path": path}))
