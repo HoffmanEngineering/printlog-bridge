@@ -537,3 +537,31 @@ class TestProblemCodes:
 
         assert raised.value.code == "insufficient_scope"
         assert "x" * 400 not in str(raised.value)
+
+
+class TestOtherClientErrors:
+    """A 4xx the API won't answer differently next time is rejected, rather than tried every
+    minute for 30 days. 404, 405 and 409 stay worth retrying: the API answers 409 when two
+    requests race to finish a print (api#199), and a 404 or 405 on an endpoint the bridge relies
+    on is a misrouted request or an API being deployed far more often than a permanent answer.
+    """
+
+    @pytest.mark.parametrize("status", [406, 410, 411, 414, 422, 431, 451])
+    def test_a_permanent_refusal_is_rejected(self, status):
+        async def refuse(_request):
+            return web.Response(status=status, text="no")
+
+        with pytest.raises(ApiRejected) as raised:
+            serve([("POST", "/api/Prints", refuse)], lambda c: c.create_print({}))
+
+        assert raised.value.status == status
+
+    @pytest.mark.parametrize("status", [404, 405, 408, 409, 421, 425, 429])
+    def test_an_answer_that_may_change_is_tried_again(self, status):
+        async def refuse(_request):
+            return web.Response(status=status)
+
+        with pytest.raises(ApiUnavailable) as raised:
+            serve([("POST", "/api/Prints", refuse)], lambda c: c.create_print({}))
+
+        assert raised.value.status == status
