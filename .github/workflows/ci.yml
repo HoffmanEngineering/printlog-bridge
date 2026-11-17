@@ -12,7 +12,8 @@ jobs:
   test:
     name: test (Python ${{ matrix.python }})
     timeout-minutes: 8
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is Ubuntu 26.04, for which setup-python has no 3.9 build.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -88,7 +89,8 @@ jobs:
     # The bridge against a real Moonraker (no Klipper) in Docker. See tests/integration/.
     name: integration (Moonraker ${{ matrix.moonraker.name }})
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    # Pinned for Python 3.9, as in the test job.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
