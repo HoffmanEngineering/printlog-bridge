@@ -10,11 +10,14 @@ from __future__ import annotations
 import colorsys
 import re
 
-HEX = re.compile(r"#?([0-9A-Fa-f]{6})")
+HEX = re.compile(r"#?([0-9A-Fa-f]{6})(?:[0-9A-Fa-f]{2})?")
+"""Six hex digits, or eight with an alpha after them: Creality Print 7.3 writes a filament's
+color either way, even in one file (`#1E88E5FF;#D81B60FF;#FFFF00;#FFFFFFFF`)."""
 
 
 def normalized(color: str | None) -> str | None:
-    """`#RRGGBB` in capitals, or None for anything that isn't six hex digits."""
+    """`#RRGGBB` in capitals (an alpha dropped), or None for anything that isn't six or eight
+    hex digits."""
     match = HEX.fullmatch((color or "").strip())
     return f"#{match.group(1).upper()}" if match else None
 
