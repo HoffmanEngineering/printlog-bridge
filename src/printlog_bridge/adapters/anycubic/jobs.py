@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from printlog_bridge.adapters.common.pauses import PauseTracker
 from printlog_bridge.core.current_job import CurrentJob
 from printlog_bridge.core.events import EventSink, JobFinished, JobOutcome, JobStarted
 from printlog_bridge.core.health import utc_now
@@ -194,6 +195,7 @@ class JobTracker:
         self.report = report
         self.clock = clock
         self.job: Job | None = None
+        self._pauses = PauseTracker(printer)
         self.project: dict[str, Any] = {}
         """The job block, each `print` report merged in (a report may carry only part)."""
         self._reconciled = False
@@ -266,6 +268,13 @@ class JobTracker:
             self._reconciled = True
             await self._reconcile(view)
         await self._step(view)
+        pause = self._pauses.update(
+            self.job.job_id if self.job is not None else None,
+            (view.state or "").lower() == "paused",
+            self.clock(),
+        )
+        if pause is not None:
+            await self.sink.emit(pause)
 
     # -- the kept job ---------------------------------------------------------------------
 

@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from printlog_bridge.adapters.common.pauses import PauseTracker
 from printlog_bridge.core.current_job import CurrentJob
 from printlog_bridge.core.events import (
     EventSink,
@@ -130,6 +131,7 @@ class JobTracker:
         self.report = report
         self.clock = clock
         self.job: Job | None = None
+        self._pauses = PauseTracker(printer)
         self.status: str | None = None
         self._reconciled = False
 
@@ -155,6 +157,11 @@ class JobTracker:
             await self._reconcile(model, path if under_way else None)
             self._reconciled = True
         await self._step(model, status, path if under_way else None)
+        pause = self._pauses.update(
+            self.job.job_id if self.job is not None else None, status == "paused", self.clock()
+        )
+        if pause is not None:
+            await self.sink.emit(pause)
 
     # -- identity -------------------------------------------------------------------------
 

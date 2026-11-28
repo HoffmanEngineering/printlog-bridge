@@ -27,6 +27,8 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobPaused,
+    JobResumed,
     JobSlicerSettings,
     JobStarted,
     SpoolReading,
@@ -532,3 +534,38 @@ def test_the_last_jobs_cancel_code_doesnt_make_a_failure_a_cancel(tmp_path):
     )
 
     assert sink.of(JobFinished)[0].outcome is JobOutcome.FAILED
+
+
+def test_a_pause_and_its_resume_are_reported_for_the_job(tmp_path):
+    sink = Sink()
+    t = tracker(tmp_path, sink)
+    run(
+        feed(
+            t,
+            idle_status(),
+            job(mc_percent=10),
+            {"gcode_state": "PAUSE"},
+            {"gcode_state": "RUNNING"},
+        )
+    )
+
+    [pause] = sink.of(JobPaused)
+    [resume] = sink.of(JobResumed)
+    [start] = sink.of(JobStarted)
+    assert pause.job_id == resume.job_id == start.job_id
+    assert pause.at <= resume.at
+
+
+def test_a_failure_carries_the_printers_error_code(tmp_path):
+    sink = Sink()
+    t = tracker(tmp_path, sink)
+    run(
+        feed(
+            t,
+            idle_status(),
+            job(mc_percent=10),
+            {"gcode_state": "FAILED", "print_error": 0x07008011},
+        )
+    )
+    [finished] = sink.of(JobFinished)
+    assert finished.failure_code == "0x07008011"

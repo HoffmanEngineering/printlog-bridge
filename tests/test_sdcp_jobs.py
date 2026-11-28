@@ -14,6 +14,8 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobPaused,
+    JobResumed,
     JobSlicerSettings,
     JobStarted,
     SlicerFile,
@@ -472,3 +474,19 @@ class TestReconnects:
         feed(t, status(T0, 13), status(T0 + 10, 9, progress=100))
         kept = PrinterState.load(tmp_path, "cc").discovery
         assert KEY not in kept and "current_job" not in kept
+
+
+def test_a_pause_and_its_resume_are_reported_for_the_job():
+    t, sink, _ = tracker()
+    feed(
+        t,
+        status(T0, 13, progress=10),
+        status(T0 + 100, 6, progress=40),
+        status(T0 + 400, 13, progress=41, ticks=1500),
+    )
+
+    [pause] = sink.of(JobPaused)
+    [resume] = sink.of(JobResumed)
+    [start] = sink.of(JobStarted)
+    assert pause.job_id == resume.job_id == start.job_id
+    assert pause.at <= resume.at

@@ -45,6 +45,7 @@ from printlog_bridge.core.events import (
 from printlog_bridge.core.state import PrinterState
 from printlog_bridge.core.status import NullReport, PrinterReport
 
+from ..common.pauses import PauseTracker
 from .changes import FilamentChanges
 from .excluded import ExcludedObjects
 from .images import MoonrakerImages
@@ -119,6 +120,7 @@ class JobTracker:
         self._usage = ToolUsage()
         self._excluded = ExcludedObjects()
         self._changes = FilamentChanges(printer)
+        self._pauses = PauseTracker(printer)
         self._status: Mapping[str, Any] = {}
         self._active = 0
         self._job: tuple[str, str, dict[int, float]] | None = None
@@ -186,6 +188,10 @@ class JobTracker:
             self._error_message = print_stats.get("message") or None
         elif state in ("printing", "paused"):
             self._error_message = None  # a new job; an earlier error isn't its story
+        job_id = self._job[0] if self._job is not None and state in PRINTING else None
+        pause = self._pauses.update(job_id, state == "paused", datetime.now(timezone.utc))
+        if pause is not None:
+            await self.sink.emit(pause)
 
     async def on_history(self, action: str, job: Mapping[str, Any]) -> None:
         if action in ("added", "finished"):
@@ -465,6 +471,7 @@ def finished(
     )
     if status == "error" and error_message:
         note = f"{note}: {error_message}"
+    reason = note
     note = "\n\n".join(part for part in (note, excluded) if part) or None
     end_time = job.get("end_time") or job["start_time"] + (job.get("total_duration") or 0)
     filament_mm = per_slot(
@@ -482,6 +489,10 @@ def finished(
         duration_s=job.get("print_duration"),
         filament_mm=filament_mm,
         note=note,
+        failure_code=status if outcome is not JobOutcome.COMPLETED else None,
+        failure_reason=reason if outcome is not JobOutcome.COMPLETED else None,
+        # Klipper's print_duration leaves pauses out; total_duration would add the warm-up.
+        duration_excludes_pauses=True,
     )
 
 

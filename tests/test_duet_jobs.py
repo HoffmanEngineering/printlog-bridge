@@ -20,6 +20,8 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobPaused,
+    JobResumed,
     JobSlicerSettings,
     JobStarted,
 )
@@ -477,3 +479,21 @@ def test_merge_patches_objects_and_arrays_in_place():
     assert base == {"a": {"b": 1, "c": [{"x": 9, "y": 2}, {"x": 8}]}, "d": 1, "e": 2}
     merge(base, {"a": {"c": [{"x": 0}]}})
     assert base["a"]["c"] == [{"x": 0}]  # another length: replaced
+
+
+def test_a_pause_and_its_resume_are_reported_for_the_job():
+    fake = FakeDuet()
+    rig = Rig(fake)
+    fake.print_file("a.gcode")
+    rig.poll()
+    fake.status("paused")
+    rig.poll()
+    fake.status("processing")
+    rig.poll()
+    sink = rig.sink
+
+    [pause] = sink.of(JobPaused)
+    [resume] = sink.of(JobResumed)
+    [start] = sink.of(JobStarted)
+    assert pause.job_id == resume.job_id == start.job_id
+    assert pause.at <= resume.at

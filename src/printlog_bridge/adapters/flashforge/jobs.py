@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from printlog_bridge.adapters.common.pauses import PauseTracker
 from printlog_bridge.core.current_job import CurrentJob
 from printlog_bridge.core.events import (
     EventSink,
@@ -73,6 +74,8 @@ from .protocol import (
     COMPLETED,
     ENDS,
     ERROR,
+    PAUSE,
+    PAUSED,
     PRINTING,
     READY,
     UNDER_WAY,
@@ -207,6 +210,7 @@ class JobTracker:
         self.spools = spools
         self.clock = clock
         self.job: Job | None = None
+        self._pauses = PauseTracker(printer)
         self.view: View | None = None
         self._reconciled = False
         self._polls = 0
@@ -310,6 +314,13 @@ class JobTracker:
             self._reconciled = True
             await self._reconcile(view)
         await self._step(view)
+        pause = self._pauses.update(
+            self.job.job_id if self.job is not None else None,
+            view.state in (PAUSED, PAUSE),
+            self.clock(),
+        )
+        if pause is not None:
+            await self.sink.emit(pause)
 
     def _same_file(self, view: View, job: Job) -> bool:
         if job.path is not None:
@@ -495,6 +506,11 @@ class JobTracker:
                 filament_g=grams,
                 usage_estimated=bool(grams or mm),
                 note=note,
+                failure_code=(
+                    self.view.error_code
+                    if outcome is JobOutcome.FAILED and self.view is not None
+                    else None
+                ),
             )
         )
         self.current.state.discovery.pop(KEY, None)

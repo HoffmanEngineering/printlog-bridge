@@ -19,6 +19,8 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobPaused,
+    JobResumed,
     JobSlicerSettings,
     JobStarted,
     SlicerFile,
@@ -479,3 +481,24 @@ def test_a_job_already_running_at_the_first_connect_is_asked_about_once(tmp_path
     assert len(sink.of(JobStarted)) == 1
     assert sink.of(JobStarted)[0].started_at == NOW - timedelta(minutes=10)
     assert printer.job_requests == 1
+
+
+def test_a_pause_and_its_resume_are_reported_for_the_job(tmp_path):
+    printer, sink = Printer(), Sink()
+    t = tracker(tmp_path, printer, sink)
+
+    async def scenario():
+        printer.print()
+        await poll(t, printer)
+        printer.state = "PAUSED"
+        await poll(t, printer)
+        printer.state = "PRINTING"
+        await poll(t, printer)
+
+    run(scenario())
+
+    [pause] = sink.of(JobPaused)
+    [resume] = sink.of(JobResumed)
+    [start] = sink.of(JobStarted)
+    assert pause.job_id == resume.job_id == start.job_id
+    assert pause.at <= resume.at

@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
+from printlog_bridge.adapters.common.pauses import PauseTracker
 from printlog_bridge.adapters.common.slicer_meta import JobFile
 from printlog_bridge.core.current_job import CurrentJob
 from printlog_bridge.core.events import (
@@ -56,7 +57,17 @@ from printlog_bridge.core.events import (
 from printlog_bridge.core.health import utc_now
 from printlog_bridge.core.status import PrinterReport
 
-from .protocol import BUSY, COMPLETE, ENDS, ERROR, PRINT_STATES, PRINTING, STOPPED, UNDER_WAY
+from .protocol import (
+    BUSY,
+    COMPLETE,
+    ENDS,
+    ERROR,
+    PAUSED,
+    PRINT_STATES,
+    PRINTING,
+    STOPPED,
+    UNDER_WAY,
+)
 
 log = logging.getLogger(__name__)
 
@@ -193,6 +204,7 @@ class JobTracker:
         self.report = report
         self.clock = clock
         self.job: Job | None = None
+        self._pauses = PauseTracker(printer)
         self.status: dict[str, Any] = {}
         """The printer's status, every push merged in."""
         self._reconciled = False
@@ -261,6 +273,11 @@ class JobTracker:
             self._reconciled = True
             await self._reconcile(view)
         await self._step(view)
+        pause = self._pauses.update(
+            self.job.job_id if self.job is not None else None, view.state == PAUSED, self._now()
+        )
+        if pause is not None:
+            await self.sink.emit(pause)
 
     def _same_task(self, view: View, path: str | None, task: str | None) -> bool:
         """`view` names the same file (or none) and no other task."""
