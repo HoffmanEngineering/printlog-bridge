@@ -1021,13 +1021,17 @@ class TestPauses:
                 await fake.set_status(print_stats={"state": "paused"})
                 await eventually(lambda: sink.of(JobPaused))
                 await fake.set_status(print_stats={"state": "printing"})
-                await eventually(lambda: sink.of(JobResumed))
+                # The first sight of the running job is a resume too: wait for the one after
+                # the pause.
+                await eventually(lambda: isinstance(sink.events[-1], JobResumed))
             return sink
 
         sink = asyncio.run(scenario())
 
         [pause] = sink.of(JobPaused)
-        [resume] = sink.of(JobResumed)
+        resume = sink.events[-1]
+        assert isinstance(resume, JobResumed)
+        assert any(e is pause for e in sink.events[:-1])
         assert pause.job_id == resume.job_id == f"000001@{int(T0)}"
         assert pause.at <= resume.at
 
