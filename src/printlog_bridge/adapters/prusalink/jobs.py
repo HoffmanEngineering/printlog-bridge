@@ -148,7 +148,9 @@ class JobTracker:
             self._reconciled = True
         await self._step(state, job, printer)
         pause = self._pauses.update(
-            self.job.job_id if self.job is not None else None, state == "PAUSED", self.clock()
+            self.job.job_id if self.job is not None else None,
+            state in ("PAUSED", "ATTENTION"),
+            self.clock(),
         )
         if pause is not None:
             await self.sink.emit(pause)

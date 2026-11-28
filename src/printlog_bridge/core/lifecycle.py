@@ -425,6 +425,7 @@ class JobLogger:
         if job is None or job.finished or job.ended_at is not None or job.paused_at is not None:
             return  # not a job being logged, or already paused (a replay after a restart)
         job.paused_at = event.at.isoformat()
+        job.pause_seen_at = self.clock().isoformat()
         job.pause_sent = False
         state.save()
         self._wake.set()  # `send_due` works out when it has lasted long enough
@@ -444,17 +445,19 @@ class JobLogger:
         at: datetime,
         resume: bool = False,
     ) -> None:
-        """Ends the job's open pause at `at`: queued, with its resume, if it lasted `MIN_PAUSE`."""
+        """Ends the job's open pause at `at`: queued, with its resume, if it lasted `MIN_PAUSE`.
+        One already sent always gets its resume, however short the printer's clock makes it:
+        without it the print would stay paused until it ends."""
         began = datetime.fromisoformat(str(job.paused_at))
-        lasted = at - began
-        if lasted >= MIN_PAUSE:
+        lasted = max(at - began, timedelta(0))
+        if job.pause_sent or lasted >= MIN_PAUSE:
             if not job.pause_sent:
                 self._queue_timeline(state, printer, job_id, PAUSE, began)
             if resume:
                 self._queue_timeline(state, printer, job_id, RESUME, at)
             job.paused_s += lasted.total_seconds()
             self._event(printer, f"job {job_id}: paused for {_seconds(lasted.total_seconds())}")
-        job.paused_at, job.pause_sent = None, False
+        job.paused_at, job.pause_seen_at, job.pause_sent = None, None, False
         state.save()
 
     def _queue_timeline(
@@ -475,7 +478,9 @@ class JobLogger:
                 if job.paused_at is None or job.pause_sent or job.finished:
                     continue
                 began = datetime.fromisoformat(job.paused_at)
-                left = (began + MIN_PAUSE - now).total_seconds()
+                # Measured on the bridge's clock: the printer's can be minutes off.
+                seen = datetime.fromisoformat(job.pause_seen_at) if job.pause_seen_at else began
+                left = (seen + MIN_PAUSE - now).total_seconds()
                 if left > 0:
                     wait = left if wait is None else min(wait, left)
                     continue

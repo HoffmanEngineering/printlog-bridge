@@ -394,7 +394,10 @@ class TestReconnect:
         t = tracker(tmp_path, sink)
         run(feed(t, idle_status(**job(mc_percent=60))))
 
-        assert sink.events == [first.of(JobStarted)[0]]
+        # Its start again, and a resume: the printer may have resumed it while the bridge was down.
+        assert [e for e in sink.events if not isinstance(e, JobResumed)] == [
+            first.of(JobStarted)[0]
+        ]
         run(feed(t, {"gcode_state": "FINISH", "mc_percent": 100}))
         finished = sink.of(JobFinished)[0]
         assert finished.outcome is JobOutcome.COMPLETED
@@ -550,7 +553,8 @@ def test_a_pause_and_its_resume_are_reported_for_the_job(tmp_path):
     )
 
     [pause] = sink.of(JobPaused)
-    [resume] = sink.of(JobResumed)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
     [start] = sink.of(JobStarted)
     assert pause.job_id == resume.job_id == start.job_id
     assert pause.at <= resume.at

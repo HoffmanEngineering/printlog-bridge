@@ -48,7 +48,8 @@ def test_a_partial_print_report_first_after_a_reconnect_decides_nothing():
         await tracker.on_message("info", info(job_block(progress=41, curr_layer=61)))
 
     asyncio.run(scenario())
-    assert [type(e) for e in sink.events] == [JobStarted]
+    # JobResumed: the first sight of the running job (a pause left open by a restart).
+    assert [type(e) for e in sink.events] == [JobStarted, JobResumed]
 
 
 def test_a_partial_print_report_first_after_a_restart_decides_nothing():
@@ -134,7 +135,8 @@ def test_a_pause_and_its_resume_are_reported_for_the_job():
     asyncio.run(scenario())
 
     [pause] = sink.of(JobPaused)
-    [resume] = sink.of(JobResumed)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
     [start] = sink.of(JobStarted)
     assert pause.job_id == resume.job_id == start.job_id
     assert pause.at <= resume.at

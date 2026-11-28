@@ -64,6 +64,9 @@ class JobRecord:
     same way on every retry so a split slot is never counted twice."""
     paused_at: str | None = None
     """When the job's open pause began (ISO 8601), kept across a restart (api#343)."""
+    pause_seen_at: str | None = None
+    """When the bridge heard of the open pause, on its own clock, which `MIN_PAUSE` is measured
+    against: `paused_at` is the printer's, which can be minutes off."""
     pause_sent: bool = False
     """The open pause has been queued for the print's timeline (it lasted `MIN_PAUSE`)."""
     paused_s: float = 0.0

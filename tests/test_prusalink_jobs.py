@@ -355,7 +355,10 @@ class TestReconnect:
         printer.job["progress"] = 60.0  # type: ignore[index]
         run(poll(t, printer))
 
-        assert sink.events == [first.of(JobStarted)[0]]
+        # Its start again, and a resume: the printer may have resumed it while the bridge was down.
+        assert [e for e in sink.events if not isinstance(e, JobResumed)] == [
+            first.of(JobStarted)[0]
+        ]
         printer.state = "STOPPED"
         run(poll(t, printer))
         finished = sink.of(JobFinished)[0]
@@ -498,7 +501,30 @@ def test_a_pause_and_its_resume_are_reported_for_the_job(tmp_path):
     run(scenario())
 
     [pause] = sink.of(JobPaused)
-    [resume] = sink.of(JobResumed)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
     [start] = sink.of(JobStarted)
     assert pause.job_id == resume.job_id == start.job_id
     assert pause.at <= resume.at
+
+
+def test_a_question_on_the_screen_mid_print_is_a_pause(tmp_path):
+    """ATTENTION stops the print until someone answers (a runout, a filament change)."""
+    printer, sink = Printer(), Sink()
+    t = tracker(tmp_path, printer, sink)
+
+    async def scenario():
+        printer.print()
+        await poll(t, printer)
+        printer.state = "ATTENTION"
+        await poll(t, printer)
+        printer.state = "PRINTING"
+        await poll(t, printer)
+
+    run(scenario())
+
+    [pause] = sink.of(JobPaused)
+    resume = sink.of(JobResumed)[-1]
+    assert pause.job_id == resume.job_id == sink.of(JobStarted)[0].job_id
+    pauses = [type(e) for e in sink.events if isinstance(e, (JobPaused, JobResumed))]
+    assert pauses == [JobResumed, JobPaused, JobResumed]  # first sight, the question, the answer

@@ -493,7 +493,8 @@ def test_a_pause_and_its_resume_are_reported_for_the_job():
     sink = rig.sink
 
     [pause] = sink.of(JobPaused)
-    [resume] = sink.of(JobResumed)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
     [start] = sink.of(JobStarted)
     assert pause.job_id == resume.job_id == start.job_id
     assert pause.at <= resume.at

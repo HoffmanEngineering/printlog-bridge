@@ -23,13 +23,23 @@ class PauseTracker:
         self.printer = printer
         self._job: str | None = None
         self._paused = False
+        self._seen_a_job = False
+        """A job has been seen since the tracker began (since the bridge started)."""
 
     def update(self, job_id: str | None, paused: bool, now: datetime) -> PauseEvent | None:
         """The event for this update, if the job's paused state changed. `job_id` None means no
-        job is running: the state resets, with no resume (the job's end closes its pause)."""
+        job is running: the state resets, with no resume (the job's end closes its pause).
+
+        The first job seen running gets a resume: the bridge may have stopped while it was paused
+        and the printer resumed it meanwhile. The sink ignores it when no pause is open."""
         if job_id != self._job:
             self._job, self._paused = job_id, False
-        if job_id is None or paused == self._paused:
+        if job_id is None:
+            return None
+        first, self._seen_a_job = not self._seen_a_job, True
+        if first and not paused:
+            return JobResumed(printer=self.printer, job_id=job_id, at=now)
+        if paused == self._paused:
             return None
         self._paused = paused
         if paused:

@@ -10,8 +10,24 @@ T0 = datetime(2026, 11, 27, 12, 0, tzinfo=timezone.utc)
 
 def test_nothing_while_the_state_is_unchanged():
     tracker = PauseTracker("k3")
-    assert tracker.update("job1", False, T0) is None
+    tracker.update("job1", False, T0)
     assert tracker.update("job1", False, T0 + timedelta(seconds=5)) is None
+
+
+def test_the_first_running_job_seen_closes_a_pause_left_open_before():
+    """After a restart, the job may have been paused when the bridge stopped and resumed while
+    it was away: the first sight of it running says so (the sink ignores it if no pause is open)."""
+    tracker = PauseTracker("k3")
+
+    assert tracker.update("job1", False, T0) == JobResumed(printer="k3", job_id="job1", at=T0)
+
+
+def test_a_later_job_seen_running_needs_no_resume():
+    tracker = PauseTracker("k3")
+    tracker.update("job1", False, T0)
+    tracker.update(None, False, T0 + timedelta(minutes=1))
+
+    assert tracker.update("job2", False, T0 + timedelta(minutes=2)) is None
 
 
 def test_one_pause_then_one_resume():

@@ -553,7 +553,8 @@ def test_a_pause_and_its_resume_are_reported_on_octoprints_clock():
     asyncio.run(pause_after_30_minutes(t))
     [start] = sink.of(JobStarted)
     [pause] = sink.of(JobPaused)
-    [resume] = sink.of(JobResumed)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
     assert pause.job_id == resume.job_id == start.job_id
     assert pause.at == datetime.fromtimestamp(T0 + 2700, timezone.utc)
     assert resume.at == datetime.fromtimestamp(T0 + 2760, timezone.utc)

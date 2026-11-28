@@ -229,3 +229,58 @@ async def test_a_pause_for_a_job_never_started_is_ignored(tmp_path):
         await drain(logger)
 
     assert sent(api) == []
+
+
+@synced
+async def test_the_pause_minimum_is_measured_on_the_bridges_clock(tmp_path):
+    """A printer clock 60 s behind the bridge doesn't make a 5-second pause look long enough."""
+    api = FakePrintLogApi()
+    async with logging_to(api, tmp_path, clock=Clock(PAUSED_AT + timedelta(seconds=60))) as logger:
+        await logger.emit(started())
+        await logger.emit(paused())
+        await drain(logger)  # the bridge looks while it is still paused
+        await logger.emit(resumed(timedelta(seconds=5)))
+        await drain(logger)
+
+    assert sent(api) == []
+
+
+@synced
+async def test_a_pause_already_sent_always_gets_its_resume(tmp_path):
+    """Once the pause is on the print, its resume follows, however short the printer's clock
+    says it was: without it, the print would stay paused until it ends."""
+    api = FakePrintLogApi()
+    clock = Clock(PAUSED_AT)
+    async with logging_to(api, tmp_path, clock=clock) as logger:
+        await logger.emit(started())
+        await logger.emit(paused())
+        clock.now = PAUSED_AT + MIN_PAUSE
+        await drain(logger)
+        await logger.emit(resumed(timedelta(seconds=10)))
+        await drain(logger)
+
+    assert [kind for kind, _ in sent(api)] == ["pause", "resume"]
+
+
+@synced
+async def test_a_pause_resumed_while_the_bridge_was_down_is_closed_when_it_sees_the_job_running(
+    tmp_path,
+):
+    api = FakePrintLogApi()
+    async with logging_to(api, tmp_path, clock=Clock(PAUSED_AT)) as logger:
+        await logger.emit(started())
+        await logger.emit(paused())
+        await drain(logger)
+
+    api2 = FakePrintLogApi()
+    api2.prints = api.prints
+    back = PAUSED_AT + timedelta(minutes=8)
+    async with logging_to(api2, tmp_path, clock=Clock(back)) as logger:
+        # The restarted adapter's tracker sees the job running: a resume at that moment.
+        await logger.emit(JobResumed(printer="voron", job_id="00000A", at=back))
+        await logger.emit(finished(finished_at=back + timedelta(hours=2), duration_s=7000,
+                                   duration_excludes_pauses=True))  # fmt: skip
+        await drain(logger)
+
+    assert sent(api2) == [("pause", PAUSED_AT.isoformat()), ("resume", back.isoformat())]
+    assert api2.completions[-1]["printTimeInSeconds"] == 7000 + 8 * 60
