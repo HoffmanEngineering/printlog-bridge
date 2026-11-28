@@ -62,6 +62,13 @@ class JobRecord:
     completion: dict[str, Any] | None = None
     """The usage rows and notes worked out the first time the job's end was sent, sent the
     same way on every retry so a split slot is never counted twice."""
+    paused_at: str | None = None
+    """When the job's open pause began (ISO 8601), kept across a restart (api#343)."""
+    pause_sent: bool = False
+    """The open pause has been queued for the print's timeline (it lasted `MIN_PAUSE`)."""
+    paused_s: float = 0.0
+    """Seconds of the job's pauses that were long enough to send, for a duration that leaves
+    them out (`JobFinished.duration_excludes_pauses`)."""
 
 
 class PrinterState:

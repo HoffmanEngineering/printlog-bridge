@@ -9,7 +9,7 @@ leave out (`core/lifecycle.py`), not the adapter's.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, Union
+from typing import Union
 
 from printlog_bridge.core.events import JobPaused, JobResumed
 
@@ -21,10 +21,10 @@ class PauseTracker:
 
     def __init__(self, printer: str) -> None:
         self.printer = printer
-        self._job: Optional[str] = None
+        self._job: str | None = None
         self._paused = False
 
-    def update(self, job_id: Optional[str], paused: bool, now: datetime) -> Optional[PauseEvent]:
+    def update(self, job_id: str | None, paused: bool, now: datetime) -> PauseEvent | None:
         """The event for this update, if the job's paused state changed. `job_id` None means no
         job is running: the state resets, with no resume (the job's end closes its pause)."""
         if job_id != self._job:
