@@ -16,6 +16,8 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobPaused,
+    JobResumed,
     JobStarted,
     SpoolReading,
 )
@@ -504,3 +506,34 @@ class TestReview:
         assert filament_by_slot(answer(1, 2), FILE) == {0: 2.0, 1: 2.0}
         assert filament_by_slot(answer(1, 1), FILE) == {0: 4.0}
         assert filament_by_slot(answer(7), FILE) == {}
+
+
+def test_a_pause_and_its_resume_are_reported_for_the_job():
+    t, sink, _ = tracker()
+
+    async def scenario():
+        await t.on_detail(detail(progress=0.2))
+        await t.on_detail(detail("paused", progress=0.2))
+        await t.on_detail(detail(progress=0.3))
+
+    run(scenario())
+
+    [pause] = sink.of(JobPaused)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
+    [start] = sink.of(JobStarted)
+    assert pause.job_id == resume.job_id == start.job_id
+    assert pause.at <= resume.at
+
+
+def test_a_failure_carries_the_printers_error_code():
+    t, sink, _ = tracker()
+
+    async def scenario():
+        await t.on_detail(detail(progress=0.2))
+        for _ in range(3):
+            await t.on_detail(detail("error", progress=0.2, errorCode="E0015"))
+
+    run(scenario())
+    [end] = sink.of(JobFinished)
+    assert end.failure_code == "E0015"

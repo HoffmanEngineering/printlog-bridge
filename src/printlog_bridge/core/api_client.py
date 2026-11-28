@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -381,6 +381,18 @@ class ApiClient:
             missing_ok=True,
             conflict_ok=True,
             timeout=UPLOAD_TIMEOUT_S,
+        )
+        return status
+
+    async def post_timeline(self, print_id: int, events: Sequence[Mapping[str, Any]]) -> int:
+        """Reports pauses and resumes on the print's timeline (api#343): each `type` (`pause` or
+        `resume`), `occurredAt` and a `key` that is the same on every retry.
+
+        Returns the status: 204 when applied (whatever was ignored as a replay), 404 when the
+        print is gone or the API is older than the endpoint. Raises ApiRejected for 400 and
+        ApiUnavailable for anything else."""
+        status, _ = await self._send(
+            "POST", f"/api/Prints/{print_id}/timeline", {"events": list(events)}, missing_ok=True
         )
         return status
 

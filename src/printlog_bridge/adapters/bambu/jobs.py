@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from printlog_bridge.adapters.common.pauses import PauseTracker
 from printlog_bridge.core.current_job import (
     UNSEEN_PROGRESS_NOTE,
     UNSEEN_TIME_NOTE,
@@ -115,6 +116,7 @@ class JobTracker:
         self.clock = clock
         self.status: dict[str, Any] = {}
         self.job: Job | None = None
+        self._pauses = PauseTracker(printer)
         self._reconciled = False
         self._readings: dict[int, TrayReading] = {}
         self._pending: set[asyncio.Future] = set()
@@ -138,6 +140,11 @@ class JobTracker:
             self._reconciled = True
             await self._reconcile(state)
         await self._step(state)
+        job = self.job
+        started = job.job_id if job is not None and job.start is not None else None
+        pause = self._pauses.update(started, state == "PAUSE", self.clock())
+        if pause is not None:
+            await self.sink.emit(pause)
         self._send_readings()
 
     def point(self) -> JobPoint | None:
@@ -304,6 +311,10 @@ class JobTracker:
             filament_g=grams,
             usage_estimated=bool(grams or mm),
             note=note,
+            failure_code=(
+                f"0x{job.error:08X}" if outcome is JobOutcome.FAILED and job.error else None
+            ),
+            failure_reason=note if outcome is JobOutcome.FAILED else None,
         )
         await self.sink.emit(finished)
         self.current.ended()

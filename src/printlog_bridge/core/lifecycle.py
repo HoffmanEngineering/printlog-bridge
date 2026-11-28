@@ -37,6 +37,12 @@ start: read from the printer when the adapter reports them, scrubbed (`slicer_se
 sent once the print exists. Like a picture, they never hold up their print: an answer that says
 they can't or needn't be recorded (400, 404, 409, 413) drops them, and so do too many failures.
 A print adopted with settings of its own (the uploader's, the Cura plugin's) keeps them.
+
+Pauses go on the print's timeline (api#343). A pause is kept in the job's state while it lasts;
+one shorter than `MIN_PAUSE` is never sent, and a longer one is queued (with the time it began)
+once it has lasted that long, its resume when that comes. A job that ends while paused needs no
+resume: 3D Print Log closes the pause at the end. Like a picture, a pause never holds up its
+print, and an API without the endpoint gets none for `NO_TIMELINE_FOR`.
 """
 
 from __future__ import annotations
@@ -75,6 +81,8 @@ from printlog_bridge.core.events import (
     JobFinished,
     JobImage,
     JobOutcome,
+    JobPaused,
+    JobResumed,
     JobSlicerSettings,
     JobStarted,
 )
@@ -142,12 +150,20 @@ ATTACHMENT_KINDS = frozenset(kind.value for kind in AttachmentKind)
 FILE_KINDS = IMAGE_KINDS | ATTACHMENT_KINDS
 """Entries whose file waits in the state directory (`images/`, `attachments/`) to be sent."""
 SLICER_SETTINGS = OUTBOX_KIND
-OPTIONAL_KINDS = FILE_KINDS | {SLICER_SETTINGS}
+PAUSE, RESUME = "pause", "resume"
+TIMELINE_KINDS = frozenset({PAUSE, RESUME})
+"""Entries for the print's timeline (api#343)."""
+OPTIONAL_KINDS = FILE_KINDS | {SLICER_SETTINGS} | TIMELINE_KINDS
 """Entries that must never hold up their print: given up on after `IMAGE_MAX_ATTEMPTS`."""
 NO_SLICER_SETTINGS = (405, 501)
 """What an API without the slicer settings endpoint (api#164) may answer it with. Its plain
 404 can't be told from a print that's gone, so that only drops the one print's."""
 NO_SLICER_SETTINGS_FOR = timedelta(hours=24)
+MIN_PAUSE = timedelta(seconds=30)
+"""A pause shorter than this never reaches the print's timeline: a layer-change pause, a quick
+look, a tap on the wrong button."""
+NO_TIMELINE_FOR = timedelta(hours=24)
+"""How long no pauses are sent after the API answered that it has no timeline endpoint."""
 """How long none are read or sent after such an answer: it may as well be a maintenance page
 as an API older than the endpoint, and either can change."""
 SPOOL_READ_HOLD = timedelta(hours=1)
@@ -272,6 +288,8 @@ class JobLogger:
         self._no_slicer_settings_until: datetime | None = None
         """The API answered that it has no slicer settings endpoint: none are read or sent until
         then (`NO_SLICER_SETTINGS_FOR`)."""
+        self._no_timeline_until: datetime | None = None
+        """The API answered that it has no timeline endpoint: no pauses are sent until then."""
 
     def close(self) -> None:
         self.outbox.close()
@@ -337,6 +355,10 @@ class JobLogger:
             await self._emit_attachment(state, event)
         elif isinstance(event, FilamentChange):
             self._filament_changed(state, event)
+        elif isinstance(event, JobPaused):
+            self._paused(state, event)
+        elif isinstance(event, JobResumed):
+            self._resumed(state, event)
         elif isinstance(event, JobStarted):
             job = state.jobs.get(event.job_id)
             if job is None:
@@ -375,6 +397,9 @@ class JobLogger:
             self._outcomes[event.printer] = (event.job_id, event.outcome)
             if job.finished:
                 return  # a replay
+            if job.paused_at is not None:
+                # It ends paused: the pause goes ahead of the end, which closes it.
+                self._close_pause(state, event.printer, event.job_id, job, event.finished_at)
             if job.ended_at is None:
                 job.ended_at = event.finished_at.isoformat()
                 state.save()
@@ -394,6 +419,75 @@ class JobLogger:
             f"job {event.at.job_id}: T{event.slot} was paused for a filament change "
             f"({event.reason})",
         )
+
+    def _paused(self, state: PrinterState, event: JobPaused) -> None:
+        job = state.jobs.get(event.job_id)
+        if job is None or job.finished or job.ended_at is not None or job.paused_at is not None:
+            return  # not a job being logged, or already paused (a replay after a restart)
+        job.paused_at = event.at.isoformat()
+        job.pause_seen_at = self.clock().isoformat()
+        job.pause_sent = False
+        state.save()
+        self._wake.set()  # `send_due` works out when it has lasted long enough
+
+    def _resumed(self, state: PrinterState, event: JobResumed) -> None:
+        job = state.jobs.get(event.job_id)
+        if job is None or job.finished or job.paused_at is None:
+            return
+        self._close_pause(state, event.printer, event.job_id, job, event.at, resume=True)
+
+    def _close_pause(
+        self,
+        state: PrinterState,
+        printer: str,
+        job_id: str,
+        job: JobRecord,
+        at: datetime,
+        resume: bool = False,
+    ) -> None:
+        """Ends the job's open pause at `at`: queued, with its resume, if it lasted `MIN_PAUSE`.
+        One already sent always gets its resume, however short the printer's clock makes it:
+        without it the print would stay paused until it ends."""
+        began = datetime.fromisoformat(str(job.paused_at))
+        lasted = max(at - began, timedelta(0))
+        if job.pause_sent or lasted >= MIN_PAUSE:
+            if not job.pause_sent:
+                self._queue_timeline(state, printer, job_id, PAUSE, began)
+            if resume:
+                self._queue_timeline(state, printer, job_id, RESUME, at)
+            job.paused_s += lasted.total_seconds()
+            self._event(printer, f"job {job_id}: paused for {_seconds(lasted.total_seconds())}")
+        job.paused_at, job.pause_seen_at, job.pause_sent = None, None, False
+        state.save()
+
+    def _queue_timeline(
+        self, state: PrinterState, printer: str, job_id: str, kind: str, at: datetime
+    ) -> None:
+        key = f"{state.instance_id}:{job_id}:{kind}:{int(at.timestamp())}"
+        self._queue(printer, job_id, kind, {"at": at.isoformat(), "key": key})
+
+    def _queue_due_pauses(self) -> float | None:
+        """Queues each open pause that has now lasted `MIN_PAUSE`. Returns the seconds until the
+        next one will have, or None when no pause is waiting."""
+        now = self.clock()
+        wait: float | None = None
+        for printer, state in self._states.items():
+            if printer not in self.printers:
+                continue
+            for job_id, job in state.jobs.items():
+                if job.paused_at is None or job.pause_sent or job.finished:
+                    continue
+                began = datetime.fromisoformat(job.paused_at)
+                # Measured on the bridge's clock: the printer's can be minutes off.
+                seen = datetime.fromisoformat(job.pause_seen_at) if job.pause_seen_at else began
+                left = (seen + MIN_PAUSE - now).total_seconds()
+                if left > 0:
+                    wait = left if wait is None else min(wait, left)
+                    continue
+                self._queue_timeline(state, printer, job_id, PAUSE, began)
+                job.pause_sent = True
+                state.save()
+        return wait
 
     def spool_swapped(self, swap: SpoolSwap) -> bool:
         """Keeps a spool assigned to a slot while a job ran, to split the job's usage on that
@@ -700,11 +794,12 @@ class JobLogger:
             await self._emit(self._unqueued[0])
             self._unqueued.pop(0)
         self._drop_expired()
+        pause_wait = self._queue_due_pauses()
         while True:
             now = loop.time()
             heads = [e for e in self.outbox.heads() if e.printer in self.printers]
             if not heads:
-                return None
+                return pause_wait
             if now < self._paused_until:
                 return self._paused_until - now
             due = [e for e in heads if self._due.get(e.seq, 0.0) <= now]
@@ -720,6 +815,8 @@ class JobLogger:
         try:
             if entry.kind == START:
                 await self._send_start(entry)
+            elif entry.kind in TIMELINE_KINDS:
+                await self._send_timeline(entry)
             elif entry.kind == SLICER_SETTINGS:
                 await self._send_slicer_settings(entry)
             elif entry.kind in ATTACHMENT_KINDS:
@@ -964,6 +1061,31 @@ class JobLogger:
             self._logged(
                 entry.printer, f"job {entry.job_id}: slicer settings added to print {job.print_id}"
             )
+
+    async def _send_timeline(self, entry: Entry) -> None:
+        """Puts a pause or resume on the job's print. Never holds the print up: a refusal drops
+        it, and a print gone, or an API without the endpoint, ends it here."""
+        where = f"[printer {entry.printer}] job {entry.job_id}'s {entry.kind}"
+        job = self.state(entry.printer).jobs.get(entry.job_id)
+        if job is None or job.print_id is None:
+            log.info("%s has no print to go on (the print wasn't logged); dropping it", where)
+            return
+        until = self._no_timeline_until
+        if until is not None and self.clock() < until:
+            return
+        event = {"type": entry.kind, "occurredAt": entry.payload["at"], "key": entry.payload["key"]}
+        if await self.api.post_timeline(job.print_id, [event]) != 404:
+            return
+        # A 404 is the print gone, or an API older than the endpoint: only the print says which.
+        if await self.api.get_print(job.print_id) is None:
+            log.info("%s: print %s was deleted in 3D Print Log", where, job.print_id)
+            return
+        self._no_timeline_until = self.clock() + NO_TIMELINE_FOR
+        log.warning(
+            "[printer %s] 3D Print Log doesn't take pauses yet, so none are sent for %s; then the "
+            "bridge tries again",
+            entry.printer, f"{NO_TIMELINE_FOR.total_seconds() / 3600:g} hours",
+        )  # fmt: skip
 
     def _no_slicer_settings(self) -> bool:
         until = self._no_slicer_settings_until
@@ -1334,7 +1456,13 @@ class JobLogger:
             "endedAt": event.finished_at.isoformat(),
         }
         if event.duration_s is not None:
-            body["printTimeInSeconds"] = round(event.duration_s)
+            # Every printer's duration includes its pauses (api#343).
+            paused = job.paused_s if event.duration_excludes_pauses else 0.0
+            body["printTimeInSeconds"] = round(event.duration_s + paused)
+        if event.outcome is not JobOutcome.COMPLETED and (
+            event.failure_code or event.failure_reason
+        ):
+            body["failure"] = {"code": event.failure_code, "message": event.failure_reason}
         completion = job.completion
         if completion is None:
             # With a swap, worked out once, from one look at the swaps, and sent the same way
@@ -1486,6 +1614,13 @@ def _finish_payload(event: JobFinished) -> dict[str, Any]:
         "usage_estimated": event.usage_estimated,
         "note": event.note,
     }
+    # Only when set, so an entry without them is as it was before api#343.
+    if event.failure_code is not None:
+        payload["failure_code"] = event.failure_code
+    if event.failure_reason is not None:
+        payload["failure_reason"] = event.failure_reason
+    if event.duration_excludes_pauses:
+        payload["duration_excludes_pauses"] = True
     if event.volume_ml:  # only then, so a filament job's entry is as it was before #97
         payload["volume_ml"] = {str(slot): ml for slot, ml in event.volume_ml.items()}
     return payload
@@ -1504,6 +1639,9 @@ def _finish_event(entry: Entry) -> JobFinished:
         usage_estimated=bool(payload.get("usage_estimated")),
         note=payload.get("note"),
         volume_ml={int(slot): ml for slot, ml in (payload.get("volume_ml") or {}).items()},
+        failure_code=payload.get("failure_code"),
+        failure_reason=payload.get("failure_reason"),
+        duration_excludes_pauses=bool(payload.get("duration_excludes_pauses")),
     )
 
 

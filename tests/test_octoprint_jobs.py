@@ -20,7 +20,7 @@ from printlog_bridge.adapters.octoprint.adapter import _work
 from printlog_bridge.adapters.octoprint.files import from_analysis
 from printlog_bridge.adapters.octoprint.jobs import JobTracker
 from printlog_bridge.core.current_job import CurrentJob
-from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted
+from printlog_bridge.core.events import JobFinished, JobOutcome, JobPaused, JobResumed, JobStarted
 from printlog_bridge.core.state import MemoryState, PrinterState
 
 SOCKET = Path(__file__).parent / "fixtures" / "octoprint" / "socket.jsonl"
@@ -546,3 +546,30 @@ def test_the_gcode_span_of_a_file():
     assert gcode_span(head, whole[start:], start) is None  # the tail shows no G-code
     start = len(head) + 5
     assert gcode_span(head, whole[start:], start) == (len(head) - 4, len(head) + len(body))
+
+
+def test_a_pause_and_its_resume_are_reported_on_octoprints_clock():
+    t, sink = tracker(clock=Clock(skew=30.0))
+    asyncio.run(pause_after_30_minutes(t))
+    [start] = sink.of(JobStarted)
+    [pause] = sink.of(JobPaused)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
+    assert pause.job_id == resume.job_id == start.job_id
+    assert pause.at == datetime.fromtimestamp(T0 + 2700, timezone.utc)
+    assert resume.at == datetime.fromtimestamp(T0 + 2760, timezone.utc)
+    [finished] = sink.of(JobFinished)
+    assert not finished.duration_excludes_pauses  # OctoPrint's end minus start includes them
+
+
+def test_a_failure_carries_octoprints_error():
+    t, sink = tracker()
+
+    async def scenario():
+        await t.on_status(status(T0 + 60, completion=30.0, print_time=60, marks=[START]))
+        await t.on_event("Error", {"error": "Thermal Runaway"})
+        await t.on_event("PrintFailed", {"path": "a.gcode", "reason": "error"})
+
+    asyncio.run(scenario())
+    [finished] = sink.of(JobFinished)
+    assert finished.failure_reason == "Thermal Runaway"

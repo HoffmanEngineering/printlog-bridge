@@ -52,6 +52,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
+from printlog_bridge.adapters.common.pauses import PauseTracker
 from printlog_bridge.adapters.common.slicer_meta import JobFile
 from printlog_bridge.core.current_job import CurrentJob
 from printlog_bridge.core.events import (
@@ -231,6 +232,7 @@ class JobTracker:
         self._error: str | None = None
         self._offset = timedelta(0)
         """OctoPrint's clock less the bridge's, from the last status."""
+        self._pauses = PauseTracker(printer)
 
     @property
     def active(self) -> bool:
@@ -305,6 +307,10 @@ class JobTracker:
             await self._reconcile(view)
             self._reconciled = True
         await self._step(view)
+        job_id = self.job.job_id if self.job is not None else None
+        pause = self._pauses.update(job_id, view.flags.get("paused") is True, self._now())
+        if pause is not None:
+            await self.sink.emit(pause)
 
     def _started_at(self, view: View) -> datetime:
         mark = view.start_mark()
@@ -522,6 +528,7 @@ class JobTracker:
                 filament_g=grams,
                 usage_estimated=bool(grams or mm),
                 note=note,
+                failure_reason=self._error if outcome is JobOutcome.FAILED else None,
             )
         )
         self.current.state.discovery.pop(KEY, None)

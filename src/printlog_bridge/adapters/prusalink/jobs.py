@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from printlog_bridge.adapters.common.pauses import PauseTracker
 from printlog_bridge.core.current_job import (
     COMPLETE_AT_PERCENT,
     UNSEEN_PROGRESS_NOTE,
@@ -114,6 +115,7 @@ class JobTracker:
         self.report = report
         self.clock = clock
         self.job: Job | None = None
+        self._pauses = PauseTracker(printer)
         self.state: str | None = None
         self._reconciled = False
         self._known: Mapping[str, Any] | None = None
@@ -145,6 +147,13 @@ class JobTracker:
                 return  # the job's details couldn't be had: again at the next poll
             self._reconciled = True
         await self._step(state, job, printer)
+        pause = self._pauses.update(
+            self.job.job_id if self.job is not None else None,
+            state in ("PAUSED", "ATTENTION"),
+            self.clock(),
+        )
+        if pause is not None:
+            await self.sink.emit(pause)
 
     async def _reconcile(self, state: str, job: Mapping[str, Any] | None) -> bool:
         remembered = self.current.job

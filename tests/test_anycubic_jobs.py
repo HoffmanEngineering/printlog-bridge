@@ -10,7 +10,13 @@ from test_prusalink_adapter import Sink
 
 from printlog_bridge.adapters.anycubic.jobs import UNSEEN_END_NOTE, JobTracker
 from printlog_bridge.core.current_job import CurrentJob
-from printlog_bridge.core.events import JobFinished, JobOutcome, JobStarted
+from printlog_bridge.core.events import (
+    JobFinished,
+    JobOutcome,
+    JobPaused,
+    JobResumed,
+    JobStarted,
+)
 from printlog_bridge.core.state import MemoryState
 
 
@@ -42,7 +48,8 @@ def test_a_partial_print_report_first_after_a_reconnect_decides_nothing():
         await tracker.on_message("info", info(job_block(progress=41, curr_layer=61)))
 
     asyncio.run(scenario())
-    assert [type(e) for e in sink.events] == [JobStarted]
+    # JobResumed: the first sight of the running job (a pause left open by a restart).
+    assert [type(e) for e in sink.events] == [JobStarted, JobResumed]
 
 
 def test_a_partial_print_report_first_after_a_restart_decides_nothing():
@@ -113,3 +120,23 @@ def test_a_resin_idle_mid_print_without_a_print_report_ends_by_progress():
     asyncio.run(scenario())
     [done] = sink.of(JobFinished)
     assert done.outcome is JobOutcome.CANCELLED and done.note == UNSEEN_END_NOTE
+
+
+def test_a_pause_and_its_resume_are_reported_for_the_job():
+    sink = Sink()
+
+    async def scenario():
+        tracker = JobTracker("s1", sink, CurrentJob(MemoryState()))
+        tracker.connected()
+        await tracker.on_message("info", info(job_block(progress=40)))
+        await tracker.on_message("info", info(job_block(state="paused", pause=1, progress=40)))
+        await tracker.on_message("info", info(job_block(progress=41)))
+
+    asyncio.run(scenario())
+
+    [pause] = sink.of(JobPaused)
+    # The first sight of the running job is a resume too (a pause left open by a restart).
+    resume = sink.of(JobResumed)[-1]
+    [start] = sink.of(JobStarted)
+    assert pause.job_id == resume.job_id == start.job_id
+    assert pause.at <= resume.at

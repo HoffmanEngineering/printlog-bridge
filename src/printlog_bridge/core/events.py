@@ -105,6 +105,14 @@ class JobFinished:
     """Material used per slot, in milliliters (#97), for a resin printer (the vat is slot 0). A
     slot with a volume is sent by volume, and is always marked an estimate: resin usage is the
     slicer's figure, whatever `usage_estimated` says."""
+    failure_code: str | None = None
+    """For a failed or cancelled job, the printer's own code for why, when it gives one
+    (`klippy_shutdown`, a Bambu `print_error` as `0x0300400C`), for the print's timeline."""
+    failure_reason: str | None = None
+    """That reason in words ("Klipper shutdown"), beside `failure_code`."""
+    duration_excludes_pauses: bool = False
+    """`duration_s` leaves out the time the job was paused (Klipper's `print_duration`). The
+    sink adds the pauses it measured, so every printer's duration includes them (api#343)."""
 
 
 @dataclass(frozen=True)
@@ -236,8 +244,36 @@ class JobAttachment:
     fetch: Callable[[Path, int], Awaitable[bool]] = field(compare=False, repr=False)
 
 
+@dataclass(frozen=True)
+class JobPaused:
+    """The job paused (api#343): from the printer's screen, a macro, a runout, an M600. Adapters
+    report every pause as they see it; the sink leaves out ones shorter than `MIN_PAUSE` and
+    sends the rest with this time, so `at` is when the pause began."""
+
+    printer: str
+    job_id: str
+    at: datetime
+
+
+@dataclass(frozen=True)
+class JobResumed:
+    """The job resumed after a `JobPaused`. A job that ends while paused needs none: 3D Print Log
+    closes the pause at the end."""
+
+    printer: str
+    job_id: str
+    at: datetime
+
+
 JobEvent = Union[
-    JobStarted, JobFinished, JobImage, JobSlicerSettings, JobAttachment, FilamentChange
+    JobStarted,
+    JobFinished,
+    JobImage,
+    JobSlicerSettings,
+    JobAttachment,
+    FilamentChange,
+    JobPaused,
+    JobResumed,
 ]
 
 

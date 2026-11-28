@@ -215,6 +215,7 @@ DEVICE_SCOPES = {
     ("POST", "/api/Prints/{id}/complete"): "prints:write",
     ("POST", "/api/Prints/{id}/image"): "prints:write",
     ("POST", "/api/Prints/{id}/slicer-settings"): "prints:write",
+    ("POST", "/api/Prints/{id}/timeline"): "prints:write",
     ("POST", "/api/Prints/{id}/files/upload-url"): "files:write",
     ("POST", "/api/Prints/{id}/files/confirm"): "files:write",
     ("PUT", "/api/Connections/{instance}"): "connections:write",
@@ -315,6 +316,10 @@ class FakePrintLogApi:
         self.spoolman_ids = True
         """False is an API that doesn't store Spoolman ids: `by-spoolman-id` isn't a route."""
         """Every claim body received, by print id."""
+        self.timeline_route = True
+        """False answers the timeline endpoint 404, as an API without it does (api#343)."""
+        self.timeline_posts: list[tuple[int, list[dict[str, Any]]]] = []
+        """Every timeline batch received, by print id."""
         self.slicer_settings_route = True
         """False answers the slicer settings endpoint 404, as an API without it does."""
         self.slicer_settings_status: int | None = None
@@ -373,6 +378,7 @@ class FakePrintLogApi:
         app.router.add_post("/api/Prints/{id}/complete", self._complete)
         app.router.add_post("/api/Prints/{id}/image", self._upload_image)
         app.router.add_post("/api/Prints/{id}/slicer-settings", self._slicer_settings)
+        app.router.add_post("/api/Prints/{id}/timeline", self._timeline)
         app.router.add_get("/api/Prints/{id}/files", self._files)
         app.router.add_post("/api/Prints/{id}/files/upload-url", self._upload_url)
         app.router.add_post("/api/Prints/{id}/files/confirm", self._confirm)
@@ -1409,6 +1415,24 @@ class FakePrintLogApi:
             found["connectionId"] = connection.get("id")
         found["startDate"] = found["startDate"] or body.get("startDate")
         return web.json_response(found)
+
+    async def _timeline(self, request: web.Request) -> web.Response:
+        """Records pauses and resumes (api#343), validated as the API does."""
+        if not self.timeline_route:
+            return web.Response(status=404)
+        print_id = int(request.match_info["id"])
+        events = (await request.json()).get("events") or []
+        if not events or len(events) > 20:
+            return _problem(400, "events must hold 1 to 20 events.")
+        for event in events:
+            if event.get("type") not in ("pause", "resume"):
+                return _problem(400, "Each event's type must be pause or resume.")
+            if not event.get("occurredAt") or not event.get("key") or len(event["key"]) > 200:
+                return _problem(400, "Each event needs occurredAt and a key.")
+        if print_id not in self.prints:
+            return _problem(404, "Not Found")
+        self.timeline_posts.append((print_id, events))
+        return web.Response(status=204)
 
     async def _slicer_settings(self, request: web.Request) -> web.Response:
         if not self.slicer_settings_route:

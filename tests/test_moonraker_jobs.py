@@ -16,7 +16,14 @@ from session_helpers import ReportRecorder, running
 from printlog_bridge.adapters.moonraker.images import MoonrakerImages
 from printlog_bridge.adapters.moonraker.jobs import JobTracker
 from printlog_bridge.adapters.moonraker.session import Backoff, MoonrakerSession
-from printlog_bridge.core.events import JobFinished, JobOutcome, JobSlicerSettings, JobStarted
+from printlog_bridge.core.events import (
+    JobFinished,
+    JobOutcome,
+    JobPaused,
+    JobResumed,
+    JobSlicerSettings,
+    JobStarted,
+)
 
 FAST = Backoff(initial=0.01, maximum=0.05)
 T0 = 1_791_000_000.0  # 2026-10-03, on the printer's clock
@@ -116,6 +123,7 @@ class TestLiveJobs:
             duration_s=3725.4,
             filament_mm={0: 4321.5},
             note=None,
+            duration_excludes_pauses=True,
         )
 
     @pytest.mark.parametrize(
@@ -998,3 +1006,56 @@ class TestSnapmakerU1Mapping:
 
         assert event.filament_mm[0] == pytest.approx(11000.0, rel=0.01)
         assert event.filament_mm[3] == pytest.approx(500.0, rel=0.01)
+
+
+class TestPauses:
+    """Klipper's paused state, as pause and resume events for the print's timeline (api#343)."""
+
+    def test_a_pause_and_its_resume_are_reported_for_the_running_job(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking(sink) as fake:
+                await fake.start_job(start_time=T0)
+                await eventually(lambda: sink.of(JobStarted))
+                await fake.set_status(print_stats={"state": "printing"})
+                await fake.set_status(print_stats={"state": "paused"})
+                await eventually(lambda: sink.of(JobPaused))
+                await fake.set_status(print_stats={"state": "printing"})
+                # The first sight of the running job is a resume too: wait for the one after
+                # the pause.
+                await eventually(lambda: isinstance(sink.events[-1], JobResumed))
+            return sink
+
+        sink = asyncio.run(scenario())
+
+        [pause] = sink.of(JobPaused)
+        resume = sink.events[-1]
+        assert isinstance(resume, JobResumed)
+        assert any(e is pause for e in sink.events[:-1])
+        assert pause.job_id == resume.job_id == f"000001@{int(T0)}"
+        assert pause.at <= resume.at
+
+    def test_a_job_end_says_its_duration_leaves_out_pauses_and_gives_klippers_failure(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking(sink) as fake:
+                await fake.finish_job(await fake.start_job(), "klippy_shutdown")
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert event.duration_excludes_pauses is True
+        assert (event.failure_code, event.failure_reason) == ("klippy_shutdown", "Klipper shutdown")
+
+    def test_a_completed_job_has_no_failure_code(self):
+        async def scenario():
+            sink = RecordingSink()
+            async with tracking(sink) as fake:
+                await fake.finish_job(await fake.start_job())
+                await eventually(lambda: sink.of(JobFinished))
+            return sink
+
+        [event] = asyncio.run(scenario()).of(JobFinished)
+
+        assert event.failure_code is None
