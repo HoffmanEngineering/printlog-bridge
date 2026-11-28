@@ -33,8 +33,17 @@ def test_accepts_lowercase_hex_without_a_hash():
     assert color_name("15a95d") == "Green"
 
 
-@pytest.mark.parametrize("color", [None, "", "   ", "#FFF", "#GGGGGG", "red", "#E2DEDBFF"])
-def test_is_none_for_anything_but_six_hex_digits(color):
+def test_drops_the_alpha_of_eight_hex_digits():
+    # Creality Print 7.3 writes `; filament_colour = #1E88E5FF;#D81B60FF;#FFFF00;#FFFFFFFF`.
+    assert normalized("#1E88E5FF") == "#1E88E5"
+    assert normalized("d81b6080") == "#D81B60"
+    assert color_name("#FFFFFFFF") == "White"
+
+
+@pytest.mark.parametrize(
+    "color", [None, "", "   ", "#FFF", "#GGGGGG", "red", "#E2DEDBF", "#E2DEDBFFF"]
+)
+def test_is_none_for_anything_but_six_or_eight_hex_digits(color):
     assert color_name(color) is None
     assert normalized(color) is None
 

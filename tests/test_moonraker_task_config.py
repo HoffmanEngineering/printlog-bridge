@@ -170,8 +170,52 @@ class TestPlacedByColor:
 
     def test_a_color_nothing_is_near_is_unplaced(self):
         blue = [SlicedFilament(4.0, "#1E88E5", "PLA"), *FUECOCO[1:]]
+        slots = {**loaded(K3), 4: ("#00FF00", "PLA")}
 
-        assert placed_by_color(blue, loaded(K3)) == ({0: 10.33, 1: 5.58, 2: 3.93}, [0])
+        assert placed_by_color(blue, slots) == ({0: 10.33, 1: 5.58, 2: 3.93}, [0])
+
+    def test_the_one_filament_left_goes_to_the_one_slot_left(self):
+        # Creality Print sends each sliced filament to a slot: with every other filament on
+        # its color, the blue one printed from the one slot nothing else went to.
+        blue = [SlicedFilament(4.0, "#1E88E5", "PLA"), *FUECOCO[1:]]
+
+        assert placed_by_color(blue, loaded(K3)) == ({0: 10.33, 1: 5.58, 2: 3.93, 3: 4.0}, [])
+
+    def test_the_filaments_left_pair_with_the_slots_left_by_the_nearest_pairing(self):
+        # The Snake on Chris's K3 (2026-11-27): Creality Print's default colors, with alpha, as
+        # Moonraker read them from the file, and the CFS's pink, yellow, blue and gray.
+        snake = [
+            SlicedFilament(28.12, "#1E88E5FF", "PLA"),
+            SlicedFilament(23.38, "#D81B60FF", "PLA"),
+            SlicedFilament(21.21, "#FFFF00", "PLA"),
+            SlicedFilament(13.41, "#FFFFFFFF", "PLA"),
+        ]
+        cfs = {
+            0: ("#FF37AF", "PLA"),
+            1: ("#FFF014", "PLA"),
+            2: ("#00A3FF", "PLA"),
+            3: ("#9EA7AE", "PLA"),
+        }
+
+        assert placed_by_color(snake, cfs) == ({2: 28.12, 0: 23.38, 1: 21.21, 3: 13.41}, [])
+
+    def test_the_filaments_left_stay_unplaced_when_two_pairings_are_as_near(self):
+        grays = [SlicedFilament(1.0, "#FF0000", "PLA"), SlicedFilament(2.0, "#00FF00", "PLA")]
+        slots = {0: ("#808080", "PLA"), 1: ("#808080", "PLA")}
+
+        assert placed_by_color(grays, slots) == ({}, [0, 1])
+
+    def test_a_filament_left_doesnt_pair_with_a_slot_of_another_material(self):
+        left = [SlicedFilament(1.0, "#1E88E5", "PLA"), SlicedFilament(2.0, "#FF0000", "PLA")]
+        slots = {0: ("#FF1E1E", "PLA"), 1: ("#FFFFFF", "PETG")}
+
+        assert placed_by_color(left, slots) == ({0: 2.0}, [0])
+
+    def test_a_filament_left_with_no_color_isnt_paired(self):
+        left = [SlicedFilament(1.0, None, "PLA"), SlicedFilament(2.0, "#FF0000", "PLA")]
+        slots = {0: ("#FF1E1E", "PLA"), 1: ("#FFFFFF", "PLA")}
+
+        assert placed_by_color(left, slots) == ({0: 2.0}, [0])
 
     def test_another_material_is_unplaced(self):
         petg = [SlicedFilament(21.76, "#FF0000", "PETG"), *FUECOCO[1:]]

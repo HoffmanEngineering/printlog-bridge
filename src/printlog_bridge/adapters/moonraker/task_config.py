@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from itertools import permutations
 from typing import Any
 
 from printlog_bridge.adapters.moonraker.tools import SlicedFilament
@@ -150,6 +151,9 @@ the filament to be placed there: #FF0000 to the K3's #FF1E1E red is 42."""
 TIE = 10.0
 """How much nearer the nearest slot must be than the next: two slots of one color are a tie,
 and the filament is left unplaced rather than guessed."""
+MAX_PAIRED = 6
+"""The most filaments left over that are paired with the slots left over (`_paired` tries
+every pairing: 720 at six)."""
 
 
 def placed_by_color(
@@ -159,9 +163,13 @@ def placed_by_color(
     """The slicer's grams per filament, in the slots nearest in color, for a printer that
     doesn't say where it sent each tool (a K3). `slots` is `loaded()`'s. A filament goes to the
     nearest slot of the same material (by its first word, when both are known) within `NEAR`,
-    unless another is within `TIE` of it; several may go to one slot, and add up. Returns the
-    grams by slot and the indexes of the filaments not placed (a filament with no grams is
-    neither)."""
+    unless another is within `TIE` of it; several may go to one slot, and add up.
+
+    The slicer's colors needn't be the slots' (Creality Print's defaults are its own, and a
+    CFS reads its own for each spool), so the filaments that are left are then paired with the
+    loaded slots nothing went to, when there are as many of each (`_paired`): Creality Print
+    sends every sliced filament to a slot. Returns the grams by slot and the indexes of the
+    filaments not placed (a filament with no grams is neither)."""
     by_slot: dict[int, float] = {}
     unplaced: list[int] = []
     for index, filament in enumerate(filaments):
@@ -172,7 +180,42 @@ def placed_by_color(
             unplaced.append(index)
         else:
             by_slot[slot] = round(by_slot.get(slot, 0.0) + filament.grams, 4)
-    return by_slot, unplaced
+    free = {slot: value for slot, value in slots.items() if slot not in by_slot}
+    paired = _paired([(index, filaments[index]) for index in unplaced], free)
+    for index, slot in paired.items():
+        by_slot[slot] = round(by_slot.get(slot, 0.0) + filaments[index].grams, 4)
+    return by_slot, [index for index in unplaced if index not in paired]
+
+
+def _paired(
+    left: Sequence[tuple[int, SlicedFilament]],
+    free: Mapping[int, tuple[str | None, str | None]],
+) -> dict[int, int]:
+    """The slot each filament left over printed from, by elimination: with as many filaments
+    left as loaded slots nothing went to, each pairs with one slot of its material, by the
+    pairing whose colors are nearest in all. Nothing is paired when the numbers differ, when a
+    filament or slot has no color, or when another pairing is within `TIE` of the nearest."""
+    if not left or len(left) != len(free) or len(left) > MAX_PAIRED:
+        return {}
+    filament_rgbs = [_rgb(filament.color) for _, filament in left]
+    slot_rgbs = {slot: _rgb(color) for slot, (color, _) in free.items()}
+    if None in filament_rgbs or None in slot_rgbs.values():
+        return {}
+    costs: list[tuple[float, tuple[int, ...]]] = []
+    for order in permutations(free):
+        if not all(
+            _same_material(filament.material, free[slot][1])
+            for (_, filament), slot in zip(left, order)
+        ):
+            continue
+        cost = sum(_distance(a, slot_rgbs[slot]) for a, slot in zip(filament_rgbs, order))
+        costs.append((cost, order))
+    if not costs:
+        return {}
+    costs.sort()
+    if len(costs) > 1 and costs[1][0] - costs[0][0] <= TIE:
+        return {}
+    return {index: slot for (index, _), slot in zip(left, costs[0][1])}
 
 
 def _nearest(
